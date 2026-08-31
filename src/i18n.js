@@ -1,4 +1,8 @@
 import { coerceSupportedLocale, isSupportedLocale, systemPreferredLocale } from "./locales.js";
+// 切块用的是编辑器那边同一套判据（按 UTF-8 字节，不把多字节字符切两半）。它是个纯函数、
+// 不碰 DOM 也不碰网络，所以直接引过来 —— 在这里另抄一份，两份迟早漂开，而漂开的后果是
+// 一边切得对、另一边把超长的条目原样送出去被网关静默丢掉。
+import { chunkText } from "./agent/hover-doc.js";
 
 const EN = {
   "titlebar.open": "Open",
@@ -1959,20 +1963,34 @@ export function setLocale(locale) {
   return ready;
 }
 
+/// 正在路上的临时翻译请求：同一段话不重复问。key 是 `tag\u0000原文`。
+const adhocInFlight = new Map();
+
 /**
  * 立刻把几段话翻成当前语言，**等得到结果**（有上限）。
  *
  * 和上面那套 DOM 观察者驱动的临时翻译共用同一份缓存和同一个接口，区别只在时机：
  * 那边是"先把原文渲染出去，翻好了再换掉"，靠 DOM 还在原地才成立；而这里的调用方
  * （语言服务的悬浮说明）是一次性把 markdown 交给编辑器渲染，之后没有第二次机会。
- * 所以这条路要等——但**必须有上限**：网关慢的时候，悬浮说明宁可是英文，也不能让鼠标停在
- * 那儿转半天什么都不出。超时就照原样返回，缓存里下次自然就有了。
+ *
+ * 三处是踩过坑之后定的，别顺手改回去：
+ *
+ *  ① **切块**。网关那个接口逐项限长 900 **字节**，超了的条目被**静默丢掉**——不报错，
+ *     回包里就是没有这一项。一段稍长的文档字符串很容易超（中文一个字三字节），
+ *     于是"翻译不生效"看起来像功能没做，其实是那一项从来没进过模型。
+ *
+ *  ② **等到点就返回，但请求不掐**。这是一次真实的模型调用，冷启动常常超过几秒；
+ *     早先到点 abort，结果是**永远等不到**、缓存也永远是空的，每次悬浮都还是英文。
+ *     现在超时只决定"这一次先出原文"，请求照跑，落地写进缓存——下一次悬浮就是译文了。
+ *
+ *  ③ **回包里没有的那一项不进缓存**。返回值和原文相同意味着"本来就是目标语言"，可以记；
+ *     而键**缺失**是这一次没成，记下来就等于把它永久钉死在英文上。
  *
  * 一律不抛：它挂在渲染路径上。
  *
  * @returns Map<原文, 译文>；没翻成的条目**不进这张表**，调用方据此保留原文。
  */
-export async function translateNow(list, { timeoutMs = 2500 } = {}) {
+export async function translateNow(list, { timeoutMs = 2500, maxBytes = 800 } = {}) {
   const out = new Map();
   const texts = (Array.isArray(list) ? list : [list])
     .map((x) => String(x ?? "").trim()).filter(Boolean);
@@ -1980,44 +1998,64 @@ export async function translateNow(list, { timeoutMs = 2500 } = {}) {
   if (!isSupportedLocale(currentLocale)) return out;
   const tag = coerceSupportedLocale(currentLocale);
   const cache = getAdhocCache(tag);
+
+  // 每段先切块（见 ①），块才是缓存和请求的单位。
+  const partsOf = new Map(texts.map((t) => [t, chunkText(t, maxBytes)]));
   const miss = [];
-  for (const t of texts) {
-    // 缓存里 identity（原文=译文）也会被存下来，那代表"这段本来就是目标语言"，
-    // 照样算翻过了，不能再排一次队。
-    if (Object.prototype.hasOwnProperty.call(cache, t)) { if (cache[t]) out.set(t, cache[t]); }
-    else if (!miss.includes(t)) miss.push(t);
+  for (const parts of partsOf.values()) {
+    for (const part of parts) {
+      if (Object.prototype.hasOwnProperty.call(cache, part)) continue;
+      if (adhocInFlight.has(adhocPendingKey(tag, part))) continue;
+      if (!miss.includes(part)) miss.push(part);
+    }
   }
-  if (!miss.length || adhocI18nDisabled) return out;
-  if (adhocI18nRequestCount >= ADHOC_I18N_MAX_REQUESTS_PER_SESSION) return out;
-  const root = apiBase();
-  const auth = authHeaders();
-  if (!root || !auth) return out;
+
+  if (miss.length && !adhocI18nDisabled
+      && adhocI18nRequestCount < ADHOC_I18N_MAX_REQUESTS_PER_SESSION
+      && apiBase() && authHeaders()) {
+    const batch = miss.slice(0, 40);
+    const job = adhocTranslateBatch(tag, batch);
+    for (const part of batch) adhocInFlight.set(adhocPendingKey(tag, part), job);
+    // ② 到点就走，但**不掐**请求：它会自己落地写缓存，下一次悬浮就有了。
+    await Promise.race([job, new Promise((r) => setTimeout(r, Math.max(300, timeoutMs)))]);
+  }
+
+  for (const [text, parts] of partsOf) {
+    const got = parts.map((p) => (Object.prototype.hasOwnProperty.call(cache, p) ? cache[p] : ""));
+    if (got.some((v) => !v)) continue;                 // 有一块没翻成，整段保留原文
+    const merged = got.join(parts.length > 1 ? "\n" : "");
+    if (merged.trim() && merged !== text) out.set(text, merged);
+  }
+  return out;
+}
+
+/// 真正发那一次请求。落地时无论成败都把 in-flight 标记摘掉。
+async function adhocTranslateBatch(tag, batch) {
   adhocI18nRequestCount += 1;
   try {
     const entries = {};
-    miss.slice(0, 20).forEach((text, i) => { entries[`doc_${i}`] = text; });
-    const ctl = typeof AbortController === "function" ? new AbortController() : null;
-    const timer = ctl ? setTimeout(() => { try { ctl.abort(); } catch {} }, Math.max(300, timeoutMs)) : null;
-    let data = null;
-    try {
-      const r = await fetch(root + "/api/i18n/pack", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...auth },
-        body: JSON.stringify({ locale: tag, source_locale: "auto", entries }),
-        ...(ctl ? { signal: ctl.signal } : {}),
-      });
-      if (!r.ok) throw new Error("i18n pack failed: " + r.status);
-      data = await r.json();
-    } finally { if (timer) clearTimeout(timer); }
-    const got = data && data.translations && typeof data.translations === "object" ? data.translations : {};
-    miss.slice(0, 20).forEach((text, i) => {
-      const v = String(got[`doc_${i}`] || "").trim();
-      cache[text] = v || text;      // 没翻成也记一笔，否则每次悬浮都重新去问一遍
-      if (v && v !== text) out.set(text, v);
+    batch.forEach((text, i) => { entries[`doc_${i}`] = text; });
+    const r = await fetch(apiBase() + "/api/i18n/pack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ locale: tag, source_locale: "auto", entries }),
     });
-    saveAdhocCache(tag);
-  } catch { /* 超时/断网/网关拒绝：这一轮保留原文，缓存下次再说 */ }
-  return out;
+    if (!r.ok) throw new Error("i18n pack failed: " + r.status);
+    const data = await r.json();
+    const got = data && data.translations && typeof data.translations === "object" ? data.translations : {};
+    const cache = getAdhocCache(tag);
+    let wrote = false;
+    batch.forEach((text, i) => {
+      // ③ 键缺失 = 这一次没成（多半是被那条 900 字节的逐项限长静默丢掉了），不记；
+      //    记下来等于把这段话永久钉死在英文上。
+      const v = String(got[`doc_${i}`] ?? "").trim();
+      if (!v) return;
+      cache[text] = v;
+      wrote = true;
+    });
+    if (wrote) saveAdhocCache(tag);
+  } catch { /* 断网/网关拒绝/解析失败：这一轮保留原文，下次再问 */ }
+  finally { for (const text of batch) adhocInFlight.delete(adhocPendingKey(tag, text)); }
 }
 
 export function getLocale() {

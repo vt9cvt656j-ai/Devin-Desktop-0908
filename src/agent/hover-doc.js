@@ -89,3 +89,45 @@ export async function translateHoverMarkdown(markdown, translateBatch) {
     return out.trim() ? out : src;
   } catch { return src; }
 }
+
+/**
+ * 把一段话切成若干块，每块的 **UTF-8 字节数**不超过 maxBytes。
+ *
+ * 为什么按字节：网关那个翻译接口逐项限长 900 **字节**，超了的条目**被静默丢掉**——
+ * 不报错、回包里就是没有这一项。一段稍长的文档字符串很容易超（中文一个字三字节），
+ * 于是"翻译不生效"看起来像功能没做，实际是请求里那一项从来没被处理过。
+ *
+ * 切点优先空行、其次句末、最后才硬切：在句子中间断开会让翻译读不懂上下文。
+ */
+export function chunkText(text, maxBytes = 800) {
+  const enc = new TextEncoder();
+  const bytes = (x) => enc.encode(x).length;
+  const src = String(text ?? "");
+  if (!src) return [];
+  if (bytes(src) <= maxBytes) return [src];
+  const out = [];
+  let buf = "";
+  const push = () => { if (buf.trim()) out.push(buf.trim()); buf = ""; };
+  // 先按空行分段，段内再按句末切；还超就硬切。
+  for (const para of src.split(/\n\s*\n/)) {
+    for (const piece of para.split(/(?<=[.!?。！？；;])\s+/)) {
+      let rest = piece;
+      while (bytes(rest) > maxBytes) {
+        // 硬切：按字符二分找到不超字节的最长前缀，避免把多字节字符切成两半。
+        let lo = 1, hi = rest.length;
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi) / 2);
+          if (bytes(rest.slice(0, mid)) <= maxBytes) lo = mid; else hi = mid - 1;
+        }
+        push();
+        out.push(rest.slice(0, lo));
+        rest = rest.slice(lo);
+      }
+      if (bytes(buf + " " + rest) > maxBytes) push();
+      buf = buf ? buf + " " + rest : rest;
+    }
+    push();
+  }
+  push();
+  return out.filter(Boolean);
+}

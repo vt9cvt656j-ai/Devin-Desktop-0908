@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { splitDocSegments, docWorthTranslating, translateDocSegments, translateHoverMarkdown } from "../src/agent/hover-doc.js";
+import { splitDocSegments, docWorthTranslating, translateDocSegments, translateHoverMarkdown, chunkText } from "../src/agent/hover-doc.js";
 import { blockFrom, SRC } from "./helpers/source.mjs";
 
 const css = () => readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
@@ -88,18 +88,51 @@ test("hover provider 只认一个注入函数，自己不 import 任何东西", 
     "main.js 没有把翻译流程注入给 lsp-client，或者没给超时");
 });
 
-test("翻译走缓存 + 超时，慢的时候照样出英文", () => {
-  // translateNow 在 i18n.js 里，不在 main.js —— blockFrom 只切 main.js。
+test("翻译：切块、到点就走但不掐请求、回包缺的不进缓存", () => {
+  // 三条都是踩过坑之后定的，任何一条退回去，用户看到的都是「翻译不生效」。
   const i18n = readFileSync(new URL("../src/i18n.js", import.meta.url), "utf8");
   const start = i18n.indexOf("export async function translateNow(");
   assert.ok(start > 0, "i18n 里找不到 translateNow");
-  const fn = i18n.slice(start, i18n.indexOf("\nexport ", start + 10));
-  assert.match(fn, /getAdhocCache\(tag\)/, "没有复用临时翻译的缓存——每次悬浮都要走一次网络");
-  assert.match(fn, /hasOwnProperty\.call\(cache, t\)/,
-    "缓存命中判据用的是真值——原文=译文那种「本来就是目标语言」会被反复重排");
-  assert.match(fn, /AbortController/, "没有超时——网关慢的时候鼠标停在那儿什么都不出");
-  assert.match(fn, /cache\[text\] = v \|\| text;/, "没翻成的也要记一笔，否则每次悬浮都重新去问");
-  assert.match(fn, /catch \{/, "翻译失败没有兜住——它挂在渲染路径上");
+  const fn = i18n.slice(start, i18n.indexOf("\n/// 真正发那一次请求", start));
+
+  // ① 切块。网关逐项限长 900 字节，超了的条目被**静默丢掉**——回包里就是没有这一项。
+  assert.match(fn, /chunkText\(t, maxBytes\)/,
+    "没有按字节切块——长一点的文档字符串会被网关静默丢掉，看起来就是「翻译不生效」");
+  // 切块只能有**一份**实现：另抄一份迟早漂开，而漂开的后果是一边切得对、另一边把超长的
+  // 条目原样送出去被网关静默丢掉。
+  assert.match(i18n, /import \{ chunkText \} from "\.\/agent\/hover-doc\.js"/,
+    "i18n 没有复用那份切块实现——多半是又抄了一份");
+  assert.doesNotMatch(i18n, /function chunkTextForI18n/, "i18n 里又出现了第二份切块实现");
+  // ② 到点就走，但请求不掐。早先到点 abort，结果是永远等不到、缓存永远空的。
+  assert.match(fn, /Promise\.race\(\[job, new Promise/,
+    "没有用 race——要么死等要么掐掉，前者卡鼠标，后者缓存永远暖不起来");
+  assert.doesNotMatch(fn, /AbortController|\.abort\(\)/,
+    "又把请求掐了——它落不了地，缓存就永远是空的，每次悬浮都还是英文");
+  // 同一段话不重复问。
+  assert.match(fn, /adhocInFlight\.has\(adhocPendingKey\(tag, part\)\)/, "没有去重，同一段话会被反复问");
+
+  const send = i18n.slice(i18n.indexOf("async function adhocTranslateBatch("));
+  // ③ 回包里没有的那一项不能进缓存：那是"这次没成"，不是"本来就是目标语言"。
+  assert.match(send, /if \(!v\) return;/,
+    "把回包里缺失的项也写进缓存了——那段话会被永久钉死在英文上");
+  assert.match(send, /finally \{ for \(const text of batch\) adhocInFlight\.delete/,
+    "in-flight 标记没在落地时摘掉——失败一次之后这段话再也不会被重问");
+  assert.match(send, /catch \{/, "翻译失败没有兜住——它挂在渲染路径上");
+});
+
+test("切块按 UTF-8 字节算，且不把多字节字符切两半", () => {
+  // 中文一个字三字节：按字符数算会以为没超，实际早过了网关那条 900 字节的线。
+  const enc = new TextEncoder();
+  for (const src of ["AAA. ".repeat(400), "中文句子测试。".repeat(100), "no-spaces-" + "x".repeat(3000)]) {
+    const parts = chunkText(src, 200);
+    assert.ok(parts.length > 1, "长文本没被切开");
+    for (const p of parts) {
+      assert.ok(enc.encode(p).length <= 200, `有一块超了字节上限：${enc.encode(p).length}`);
+      assert.ok(!/\uFFFD/.test(p), "多字节字符被切两半了");
+    }
+  }
+  assert.deepEqual(chunkText("hi", 200), ["hi"], "短文本被无谓地切了");
+  assert.deepEqual(chunkText("", 200), []);
 });
 
 test("悬浮浮层：配色进主题，内容显示全", () => {
