@@ -216,6 +216,7 @@ import { approvalLabel } from "./agent/approval-label.js";
 import { domainKnowledgeBullets as _domainKnowledgeBullets, domainKnowledgeBrief as _domainKnowledgeBrief, DOMAIN_KNOWLEDGE_BRIEF_BUDGET as _DOMAIN_KNOWLEDGE_BRIEF_BUDGET } from "./agent/domain-knowledge-brief.js";
 import { langBadge as _langBadge, languageIdForPath as _languageIdForPath } from "./agent/language.js";
 import { translateHoverMarkdown as _translateHoverMarkdown } from "./agent/hover-doc.js";
+import { chatTitleFrom as _chatTitleFrom, isDefaultChatName as _isDefaultChatName } from "./agent/chat-title.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
@@ -29586,6 +29587,21 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     return;
   }
   try { sess?.memory?.setExternalCompression?.(_gatewayHandlesCompression(config)); } catch {}
+  /*
+   * 标签页标题取自这一轮的第一句话，不再是 `Chat 1 / Chat 2 / Chat 3`
+   *（用户：「要弄成 cursor 那种 tab 标题的」）。
+   *
+   * 只在它还叫默认名时改一次。判据留了两道：`_titled` 是本次会话内的结构标记，
+   * `_isDefaultChatName` 兜历史里存下来的老会话——它们没有那个标记。
+   *
+   * 不叫模型：标题要在敲下回车的那一刻就出现，而且离线、没配模型、额度用完时都得照样有。
+   */
+  try {
+    if (sess && !sess._titled && _isDefaultChatName(sess.name)) {
+      const _autoTitle = _chatTitleFrom(text);
+      if (_autoTitle) { sess.name = _autoTitle; sess._titled = true; _renderChatTabs(); saveChatHistory(); }
+    }
+  } catch { /* 起不出名字就留着原来的，绝不能让标签变空 */ }
   // One settlement scope covers every auxiliary model call made for this user
   // turn. Main Agent iterations still get their own request IDs below.
   const _billingScopeId = _newIdeRequestId();
