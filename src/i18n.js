@@ -1959,6 +1959,67 @@ export function setLocale(locale) {
   return ready;
 }
 
+/**
+ * 立刻把几段话翻成当前语言，**等得到结果**（有上限）。
+ *
+ * 和上面那套 DOM 观察者驱动的临时翻译共用同一份缓存和同一个接口，区别只在时机：
+ * 那边是"先把原文渲染出去，翻好了再换掉"，靠 DOM 还在原地才成立；而这里的调用方
+ * （语言服务的悬浮说明）是一次性把 markdown 交给编辑器渲染，之后没有第二次机会。
+ * 所以这条路要等——但**必须有上限**：网关慢的时候，悬浮说明宁可是英文，也不能让鼠标停在
+ * 那儿转半天什么都不出。超时就照原样返回，缓存里下次自然就有了。
+ *
+ * 一律不抛：它挂在渲染路径上。
+ *
+ * @returns Map<原文, 译文>；没翻成的条目**不进这张表**，调用方据此保留原文。
+ */
+export async function translateNow(list, { timeoutMs = 2500 } = {}) {
+  const out = new Map();
+  const texts = (Array.isArray(list) ? list : [list])
+    .map((x) => String(x ?? "").trim()).filter(Boolean);
+  if (!texts.length) return out;
+  if (!isSupportedLocale(currentLocale)) return out;
+  const tag = coerceSupportedLocale(currentLocale);
+  const cache = getAdhocCache(tag);
+  const miss = [];
+  for (const t of texts) {
+    // 缓存里 identity（原文=译文）也会被存下来，那代表"这段本来就是目标语言"，
+    // 照样算翻过了，不能再排一次队。
+    if (Object.prototype.hasOwnProperty.call(cache, t)) { if (cache[t]) out.set(t, cache[t]); }
+    else if (!miss.includes(t)) miss.push(t);
+  }
+  if (!miss.length || adhocI18nDisabled) return out;
+  if (adhocI18nRequestCount >= ADHOC_I18N_MAX_REQUESTS_PER_SESSION) return out;
+  const root = apiBase();
+  const auth = authHeaders();
+  if (!root || !auth) return out;
+  adhocI18nRequestCount += 1;
+  try {
+    const entries = {};
+    miss.slice(0, 20).forEach((text, i) => { entries[`doc_${i}`] = text; });
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => { try { ctl.abort(); } catch {} }, Math.max(300, timeoutMs)) : null;
+    let data = null;
+    try {
+      const r = await fetch(root + "/api/i18n/pack", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...auth },
+        body: JSON.stringify({ locale: tag, source_locale: "auto", entries }),
+        ...(ctl ? { signal: ctl.signal } : {}),
+      });
+      if (!r.ok) throw new Error("i18n pack failed: " + r.status);
+      data = await r.json();
+    } finally { if (timer) clearTimeout(timer); }
+    const got = data && data.translations && typeof data.translations === "object" ? data.translations : {};
+    miss.slice(0, 20).forEach((text, i) => {
+      const v = String(got[`doc_${i}`] || "").trim();
+      cache[text] = v || text;      // 没翻成也记一笔，否则每次悬浮都重新去问一遍
+      if (v && v !== text) out.set(text, v);
+    });
+    saveAdhocCache(tag);
+  } catch { /* 超时/断网/网关拒绝：这一轮保留原文，缓存下次再说 */ }
+  return out;
+}
+
 export function getLocale() {
   return currentLocale;
 }

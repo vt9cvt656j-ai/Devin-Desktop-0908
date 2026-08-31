@@ -648,6 +648,10 @@ function isWindows() {
 
 export function createLspManager(options) {
   const {
+    /// 把一批英文文档翻成用户选的语言（i18n 的 translateNow）。**必须注入**：
+    /// lsp-client 是 node --test 直接加载的模块，静态 import i18n 会把整套 DOM/网络
+    /// 依赖一起拖进来，测试当场加载不了。没注入就不翻，悬浮说明照旧出英文。
+    translateDoc,
     backend,
     enabled = true,
     getWorkspaceRoots = () => [],
@@ -1444,8 +1448,24 @@ export function createLspManager(options) {
           position: fromMonacoPosition(position),
         });
         if (!result || !result.contents) return null;
-        const contents = hoverContentsToMarkdown(result.contents);
+        let contents = hoverContentsToMarkdown(result.contents);
         if (!contents.length) return null;
+        /*
+         * 文档按用户选的语言翻出来（用户：「把变量、函数、方法根据用户选择的语言进行自动
+         * 翻译，对每个开发者都能很友好」）。
+         *
+         * 只翻**围栏外的散文**：签名在代码围栏里，翻了就成了一句读不了也抄不走的话，
+         * 比不翻更糟。切段和「值不值得翻」的判据都在 agent/hover-doc.js，纯函数。
+         *
+         * 在这里 await 而不是"先出英文、翻好再换"：hover 是一次性把 markdown 交给编辑器
+         * 渲染，之后没有第二次机会。translateNow 自带超时，慢的时候就照原样出英文。
+         */
+        if (typeof translateDoc === "function") {
+          try {
+            const merged = await translateDoc(contents.map((c) => c.value).join("\n\n"));
+            if (merged && merged.trim()) contents = [{ value: merged, isTrusted: false }];
+          } catch { /* 翻不成就出原文，绝不让悬浮说明因此变空 */ }
+        }
         return { range: toMonacoRange(result.range), contents };
       },
     });

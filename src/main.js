@@ -105,7 +105,7 @@ import { ExtensionHost } from "./ext/host.js";
 import { createExtensionManager } from "./ext/manager.js";
 import { createCommandPalette } from "./ext/palette.js";
 import { createExtensionsPanel } from "./ext/panel.js";
-import { t, initLocale, onLocaleChange, registerLocale, setLocale, applyToDOM, getLocale } from "./i18n.js";
+import { t, initLocale, onLocaleChange, registerLocale, setLocale, applyToDOM, getLocale, translateNow } from "./i18n.js";
 import { buildLanguageOptions, coerceSupportedLocale, localeDisplayName, localeLanguageCode } from "./locales.js";
 import { load as loadStore } from "@tauri-apps/plugin-store";
 import {
@@ -215,6 +215,7 @@ import { escapeAttr as _escAttr, escapeHtml as _escHtml, setBadgeText as _setBad
 import { approvalLabel } from "./agent/approval-label.js";
 import { domainKnowledgeBullets as _domainKnowledgeBullets, domainKnowledgeBrief as _domainKnowledgeBrief, DOMAIN_KNOWLEDGE_BRIEF_BUDGET as _DOMAIN_KNOWLEDGE_BRIEF_BUDGET } from "./agent/domain-knowledge-brief.js";
 import { langBadge as _langBadge, languageIdForPath as _languageIdForPath } from "./agent/language.js";
+import { translateHoverMarkdown as _translateHoverMarkdown } from "./agent/hover-doc.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
@@ -4413,6 +4414,11 @@ monaco.editor.defineTheme("cursor-dark", {
     "peekViewResult.selectionBackground": "#264f78",
     "peekViewResult.selectionForeground": "#e8eaed",
     "peekViewResult.matchHighlightBackground": "#3a5f8a",
+    // 悬浮说明浮层。同样走主题键而不是 CSS 盖类名。
+    "editorHoverWidget.background": "#17171a",
+    "editorHoverWidget.foreground": "#d4d4d4",
+    "editorHoverWidget.border": "#2f2f34",
+    "editorHoverWidget.statusBarBackground": "#1c1c20",
   },
 });
 
@@ -4441,6 +4447,10 @@ monaco.editor.defineTheme("cursor-light", {
     "peekViewResult.selectionBackground": "#d2e3fc",
     "peekViewResult.selectionForeground": "#1d1d1f",
     "peekViewResult.matchHighlightBackground": "#d2e3fc",
+    "editorHoverWidget.background": "#ffffff",
+    "editorHoverWidget.foreground": "#1d1d1f",
+    "editorHoverWidget.border": "#e3e5e8",
+    "editorHoverWidget.statusBarBackground": "#f6f8fa",
   },
 });
 
@@ -10246,6 +10256,9 @@ function _coherentFilePath(path) {
 // plain-browser mock (no real servers to talk to). Providers are registered for
 // the "gap" languages Monaco's bundled service does not cover.
 lspManager = createLspManager({
+  // 悬浮说明里的文档按用户选的语言翻。注入而不是让 lsp-client 自己 import i18n：
+  // 那个模块要能被 node --test 直接加载，静态依赖 i18n 会把 DOM 和网络一起拖进来。
+  translateDoc: (md) => _translateHoverMarkdown(md, (texts) => translateNow(texts, { timeoutMs: 2200 })),
   backend,
   enabled: inTauri,
   getWorkspaceRoots: () => (workspaceRoots.length ? workspaceRoots : rootPath ? [rootPath] : []),

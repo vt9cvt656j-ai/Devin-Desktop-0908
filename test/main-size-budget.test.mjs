@@ -33,6 +33,15 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_900（2026-08-31 第十次）：实测 81,847 行。买到的是悬浮说明（鼠标停在函数/变量上那块）
+ *   三件事：内容显示全（出厂那档高度会把文档字符串切在半句话上）、配色进主题、以及**文档
+ *   按用户选的语言自动翻**——用户原话「对每个开发者都能很友好」。
+ *   纯的那些全在 src/agent/hover-doc.js（切代码围栏、判值不值得翻、拼回去、整段走一遍，
+ *   翻译器从参数进，真跑）；i18n 那边加了个带超时的 translateNow，复用临时翻译的缓存。
+ *   留在 main.js 的只有两处：defineTheme 里的 editorHoverWidget.* 几个键，和把这条流程注入
+ *   给 lsp-client 的那一行——lsp-client 是被测试用 new Function 直接跑的，多一条静态 import
+ *   就整份加载不了，所以只能从外面注入。
+ *
  * · 81_860（2026-08-31 第九次）：实测 81,834 行。买到的是 Peek 浮层（⌘+单击落在定义自己
  *   身上时弹的「引用 (N)」）不再是 Monaco 的出厂样子——亮蓝粗边 + 浅灰列表贴在这个应用的
  *   编辑器上像另一个软件的窗口。配色走主题键（peekView*），而不是拿 CSS 去盖 Monaco 的
@@ -172,7 +181,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_860;
+const MAIN_JS_MAX_LINES = 81_900;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

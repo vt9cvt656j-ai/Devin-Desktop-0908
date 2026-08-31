@@ -16706,3 +16706,30 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .monaco-editor .peekview-widget .tree-container .monaco-list .monaco-list-row .reference {
   padding: 1px 0;
 }
+
+/* ---- 悬浮说明浮层（鼠标停在函数/变量上弹的那块） ----
+   配色走 Monaco 的主题键（main.js 里的 editorHoverWidget.*），这里只补它给不了的：
+   圆角、投影、以及**把内容显示全**。
+   出厂那档 max-height 很矮，长一点的文档字符串会被切在半句话上（用户实拍：停在
+   `Session(` 上只看到「One turn … Usage:」就没了）。放宽到视口的一半并让它自己滚，
+   hover.sticky 默认为真，鼠标可以移进去滚。 */
+.monaco-editor .monaco-hover {
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .14);
+}
+[data-theme="dark"] .monaco-editor .monaco-hover,
+.dark .monaco-editor .monaco-hover { box-shadow: 0 8px 28px rgba(0, 0, 0, .5); }
+.monaco-editor .monaco-hover .monaco-hover-content {
+  max-height: min(52vh, 520px);
+  overflow-y: auto;
+}
+.monaco-editor .monaco-hover .hover-row.markdown-hover > .hover-contents {
+  padding: 6px 10px;
+  line-height: 1.6;
+}
+/* 签名那一行是代码，别让它跟着正文的行距散开。 */
+.monaco-editor .monaco-hover .hover-contents pre {
+  margin: 4px 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
