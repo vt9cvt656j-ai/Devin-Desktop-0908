@@ -33,6 +33,13 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_860（2026-08-31 第九次）：实测 81,834 行。买到的是 Peek 浮层（⌘+单击落在定义自己
+ *   身上时弹的「引用 (N)」）不再是 Monaco 的出厂样子——亮蓝粗边 + 浅灰列表贴在这个应用的
+ *   编辑器上像另一个软件的窗口。配色走主题键（peekView*），而不是拿 CSS 去盖 Monaco 的
+ *   内部类名：类名升级一次就可能对不上，而那时是**静默**退回出厂配色。
+ *   浅色为此要有自己的主题（原来直接用内置的 "vs"，一个键都设不上），rules 为空、只补
+ *   colors，语法着色一个字不动。这两段是 defineTheme 的调用，天然只能在这儿。
+ *
  * · 81_800（2026-08-31 第八次）：实测 81,791 行。买到的是「语言服务没起来时状态栏要说出来」
  *   ——原来一个服务都没起来就 removeStatusBarItem("lsp")，屏幕上干干净净，用户看到的是补全、
  *   ⌘+单击跳转、鼠标悬浮说明同时消失而没有任何解释，于是问「这个 IDE 没有跳转功能吗」。
@@ -165,7 +172,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_800;
+const MAIN_JS_MAX_LINES = 81_860;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

@@ -16678,3 +16678,31 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 .lp__note h4 { margin: 0 0 6px; font-size: 14px; font-weight: 650; }
 .lp__note p { margin: 0; font-size: 12.5px; line-height: 1.6; color: var(--text-dim, #6e6e73); }
+
+/* ---- Peek 浮层（⌘+单击 / Go to References 弹出来的那块） ----
+   配色走 Monaco 的主题键（见 main.js 里 cursor-light / cursor-dark 的 peekView* ），
+   这里只补主题键管不到的那几样：圆角、投影、标题行的高度和字号。
+   选择器都挂在 .monaco-editor 下面 —— 那是 i18n 自动翻译的跳过区，不会被改写。 */
+.monaco-editor .peekview-widget {
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .14);
+}
+[data-theme="dark"] .monaco-editor .peekview-widget,
+.dark .monaco-editor .peekview-widget { box-shadow: 0 8px 28px rgba(0, 0, 0, .5); }
+/* 出厂标题行有 22px 高、11px 字，挤在一起像个调试面板。放到和工具卡同一档。 */
+.monaco-editor .peekview-widget .head .peekview-title {
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  gap: 6px;
+}
+.monaco-editor .peekview-widget .head .peekview-title .filename { font-weight: 600; }
+.monaco-editor .peekview-widget .head .peekview-title .meta { opacity: .72; }
+/* 右侧结果列表：行高太挤，且选中行是方角块。 */
+.monaco-editor .peekview-widget .tree-container .monaco-list-row {
+  border-radius: 6px;
+}
+.monaco-editor .peekview-widget .tree-container .monaco-list .monaco-list-row .reference {
+  padding: 1px 0;
+}

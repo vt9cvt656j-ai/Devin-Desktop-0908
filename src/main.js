@@ -4397,11 +4397,55 @@ monaco.editor.defineTheme("cursor-dark", {
     "editorIndentGuide.background1": "#262629",
     "editorIndentGuide.activeBackground1": "#3b3b40",
     "editorGutter.background": "#101011",
+    // Peek 浮层（⌘+单击落在定义自己身上时出的那个「引用 (N)」）。不写这些键的话它用
+    // Monaco 的出厂配色：亮蓝边框 + 浅灰列表，贴在 #101011 的编辑器上像另一个软件的窗口。
+    // 走主题键而不是 CSS 盖类名——类名是 Monaco 的内部实现，升一次版就可能对不上。
+    "peekView.border": "#3b5a8c",
+    "peekViewTitle.background": "#17171a",
+    "peekViewTitleLabel.foreground": "#e8eaed",
+    "peekViewTitleDescription.foreground": "#9aa0a6",
+    "peekViewEditor.background": "#141416",
+    "peekViewEditor.matchHighlightBackground": "#3a5f8a",
+    "peekViewEditorGutter.background": "#141416",
+    "peekViewResult.background": "#151517",
+    "peekViewResult.lineForeground": "#9aa0a6",
+    "peekViewResult.fileForeground": "#e8eaed",
+    "peekViewResult.selectionBackground": "#264f78",
+    "peekViewResult.selectionForeground": "#e8eaed",
+    "peekViewResult.matchHighlightBackground": "#3a5f8a",
+  },
+});
+
+/*
+ * 浅色主题原来直接用内置的 "vs" —— 于是 Peek 浮层的配色一个键都设不上，出来就是 Monaco 的
+ * 出厂样子（亮蓝粗边、灰列表、方角），和这个应用的其它面板完全不是一套。
+ *
+ * `rules: []` + `inherit: true`：**语法着色一个字都不改**，仍旧是 vs 那一套，
+ * 这里只补 colors。语法色一动，用户看到的是"整个编辑器变了"，那是另一件事。
+ */
+monaco.editor.defineTheme("cursor-light", {
+  base: "vs",
+  inherit: true,
+  rules: [],
+  colors: {
+    "peekView.border": "#a8c7fa",
+    "peekViewTitle.background": "#f6f8fa",
+    "peekViewTitleLabel.foreground": "#1d1d1f",
+    "peekViewTitleDescription.foreground": "#86868b",
+    "peekViewEditor.background": "#ffffff",
+    "peekViewEditor.matchHighlightBackground": "#d2e3fc",
+    "peekViewEditorGutter.background": "#ffffff",
+    "peekViewResult.background": "#fafbfc",
+    "peekViewResult.lineForeground": "#57606a",
+    "peekViewResult.fileForeground": "#1d1d1f",
+    "peekViewResult.selectionBackground": "#d2e3fc",
+    "peekViewResult.selectionForeground": "#1d1d1f",
+    "peekViewResult.matchHighlightBackground": "#d2e3fc",
   },
 });
 
 const THEME_MAP = {
-  light: { monaco: "vs", css: "light" },
+  light: { monaco: "cursor-light", css: "light" },
   dark: { monaco: "cursor-dark", css: "dark" },
 };
 
