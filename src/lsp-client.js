@@ -2098,6 +2098,10 @@ export function createLspManager(options) {
     refreshWorkspace,
     notifyWatchedFiles,
     ensureServer,
+    /// 这个语言归不归我们管（装了服务器就该有补全/跳转/悬浮）。状态栏据此判断
+    /// 「一个服务都没起来」到底是"这个语言本来就没有服务"还是"该有却没起来"——
+    /// 前者不该显示任何东西，后者必须说出来。
+    isManaged,
     /// 这个语言的语言服务**当前真的起来了吗**。
     ///
     /// get_diagnostics 原来在"没有诊断"时一律回一句「语言服务已在分析；LSP 出结果略有

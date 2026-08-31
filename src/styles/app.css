@@ -11272,6 +11272,11 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   color: var(--text);
 }
 
+/* 语言服务该起来却没起来时的那一栏。用琥珀色而不是红色：它不是错误，是"能力现在没有"，
+   点一下就能重试；红色会让人以为出了故障需要处理。 */
+.statusbar__item--warn { color: var(--atc-warning, #bf8700); }
+
+
 /* ---- command palette ---- */
 .palette {
   position: fixed;

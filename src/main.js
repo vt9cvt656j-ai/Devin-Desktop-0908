@@ -214,8 +214,9 @@ import { getCollaborationEngine } from "./agent/collaboration-engine.js";
 import { escapeAttr as _escAttr, escapeHtml as _escHtml, setBadgeText as _setBadge } from "./agent/escape.js";
 import { approvalLabel } from "./agent/approval-label.js";
 import { domainKnowledgeBullets as _domainKnowledgeBullets, domainKnowledgeBrief as _domainKnowledgeBrief, DOMAIN_KNOWLEDGE_BRIEF_BUDGET as _DOMAIN_KNOWLEDGE_BRIEF_BUDGET } from "./agent/domain-knowledge-brief.js";
-import { langBadge as _langBadge } from "./agent/language.js";
+import { langBadge as _langBadge, languageIdForPath as _languageIdForPath } from "./agent/language.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
+import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
 // Global shared state store for sub-agent collaboration
@@ -2731,7 +2732,12 @@ const monacoEditor = monaco.editor.create(editorEl, {
   mouseWheelScrollSensitivity: 1,
   renderValidationDecorations: "on",
   unfoldOnClickAfterEndOfLine: true,
-  definitionLinkOpensInPeek: true,
+  // ⌘/Ctrl + 单击直接**跳过去**，不弹 Peek 浮层——用户要的是 VS Code 那个手感
+  // （「类似与 vscode 中的 Ctrl+鼠标左键」）。true 的意思是"这个鼠标手势永远只开 Peek"，
+  // 于是点了半天页面不动，看着就像没有跳转功能。跨文件跳转本来就通：下面注册了
+  // registerEditorOpener，把目标文件接进我们自己的页签系统。
+  // 命中多个定义时仍然走 Peek（见下面的 gotoLocation），那和 VS Code 一致。
+  definitionLinkOpensInPeek: false,
   gotoLocation: { multiple: "peek", multipleDefinitions: "peek", multipleDeclarations: "peek", multipleImplementations: "peek", multipleTypeDefinitions: "peek", multipleReferences: "peek" },
   colorDecorators: true,
   folding: true, // 启用代码折叠
@@ -10305,9 +10311,40 @@ function updateLspStatusBar() {
       "lsp",
       { text: `LSP: ${parts.join(" ")}`, order: 10, tooltip: `Active: ${ready.join(", ") || "none"}\nStarting: ${starting.join(", ") || "none"}` },
     );
-  } else {
-    removeStatusBarItem("lsp");
+    return;
   }
+  /*
+   * 一个服务都没起来时**不能把这一栏整条摘掉**。
+   *
+   * 摘掉之后用户看到的是：补全没了、⌘+单击不跳了、鼠标悬浮也不再弹函数说明，而状态栏
+   * 干干净净什么都没写——于是他问的是「这个 IDE 没有跳转功能吗」「悬浮怎么没弹窗了」。
+   * 静默的缺席被读成"这个功能不存在"，这个仓库在别处已经为同一种错付过账。
+   *
+   * 判据只在「当前文件的语言本来就该有服务」时才显示：Markdown、纯文本那些本来就没有
+   * 服务，给它们写一句「未启动」是另一种噪音。
+   */
+  const _lang = (() => { try { return monacoEditor.getModel()?.getLanguageId() || ""; } catch { return ""; } })();
+  if (!_lang || !lspManager.isManaged?.(_lang)) { removeStatusBarItem("lsp"); return; }
+  const _why = (() => { try { return lspManager.lastStopReason?.(_lang) || ""; } catch { return ""; } })();
+  setStatusBarItem(
+    "lsp",
+    {
+      text: `LSP: ${_lang} 未启动`,
+      order: 10,
+      className: "statusbar__item--warn",
+      tooltip: (_why ? `上次停止：${_why}\n` : "")
+        + "补全、跳转、悬浮说明都依赖它。点一下重试。",
+    },
+    () => {
+      showToast(`正在启动 ${_lang} 语言服务…`);
+      Promise.resolve(lspManager.ensureServer?.(_lang))
+        .then((client) => {
+          updateLspStatusBar();
+          if (!client) showToast(`${_lang} 语言服务没起来${_why ? "：" + _why.slice(0, 120) : "（多半是没装，或者启动超时）"}`);
+        })
+        .catch((e) => { updateLspStatusBar(); showToast(`${_lang} 语言服务启动失败：${String(e?.message || e).slice(0, 120)}`); });
+    },
+  );
 }
 
 // Wire the real debug adapter client.
@@ -22235,11 +22272,25 @@ function _renderMentionsToHtml(text) {
     const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
     // 带前缀的引用（@github:owner/repo 等）不是本地路径。发送后消息里只剩纯文本，而下面
     // 那条判据只按"有没有扩展名"猜文件/文件夹 —— 仓库会被画成文件夹图标、名字还被截尾。
+    // 从编辑器拖进来的那一段代码：气泡里也画成一枚片（和输入框里那枚一模一样），
+    // 而不是把整段代码摊在消息里。图标用这个文件真正的图标，标签是「文件名:起-止」。
+    const code = _parseSelectionToken(rel);
+    if (code) {
+      const name = code.rel.split("/").filter(Boolean).pop() || code.rel;
+      const label = _selectionLabel(code.rel, code.startLine, code.endLine);
+      out += `<span class="msg-mention msg-mention--code" data-rel="${relAttr}" data-kind="code" title="${relAttr}">`
+        + `${iconImg(fileIconUrl(name))}<span class="msg-mention__name">${_escHtmlLite(label)}</span></span>`;
+      last = re.lastIndex;
+      continue;
+    }
     const pfx = /^(github|gitlab|mcp):(.+)$/.exec(rel);
     if (pfx) {
       const kind = pfx[1];
-      // 只显示仓库名，owner 收进 tooltip（title 已是完整的 github:owner/repo）。
-      const shown = kind === "mcp" ? pfx[2] : (pfx[2].split("/").filter(Boolean).pop() || pfx[2]);
+      // 每一种片都是同一条规则：**只显示最后一段名字**，完整值收进 tooltip（title 已是
+      // 完整的 github:owner/repo、mcp:server/uri）。输入框那边 _makeComposerChip 一直就是
+      // 这么干的；早先只给 github/gitlab 截，mcp 在气泡里摊出整条 server/uri，同一枚片在
+      // 输入框和气泡里长得不一样（用户：「其他的这种组件囊卡片也要和这个一样的规则」）。
+      const shown = pfx[2].split("/").filter(Boolean).pop() || pfx[2];
       const ico = kind === "mcp" ? iconSvg("i-mcp", "ic--doc") : iconSvg(`i-brand-${kind}`, "ic--doc");
       out += `<span class="msg-mention msg-mention--${kind}" data-rel="${relAttr}" data-kind="${kind}" title="${relAttr}">`
         + `${ico}<span class="msg-mention__name">${_escHtmlLite(shown)}</span></span>`;
@@ -30047,7 +30098,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // element: 是预览里选中的那个 DOM 元素，详情存在 _previewPicked 里，不是磁盘上的路径。
   // 不加进这张表的话，下面 _mentioned 会拿它去 readTextFile/readDir，两次都抛、被静默
   // 吞掉，还白占一个 @ 名额。
-  const _REMOTE_AT = /^(github|gitlab|gitee|codeberg|model|element):/i;
+  const _REMOTE_AT = /^(github|gitlab|gitee|codeberg|model|element|code):/i;
   const _mentionedAll = [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
   const _mentioned = _mentionedAll.filter((v) => !_REMOTE_AT.test(v));
 
@@ -30187,6 +30238,32 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       } catch { /* unreadable — skip */ }
     }
     if (_atOmitted > 0) _atContext += `\n\n（另有 ${_atOmitted} 个 @file/@dir 内容因本轮上下文预算未内联；需要时用 read_file / list_dir 精准读取。）`;
+  }
+
+  /*
+   * `@code:<相对路径>#<起>-<止>` → 用户从编辑器里拖进来的那一段代码。
+   *
+   * 和 @element / @文件 同一个道理：他已经指着这段说话了，正确的工具调用数是 0。
+   * 输入框和历史里只留这个短记号（气泡里渲染成一枚片），代码在这里按行号从磁盘取回来。
+   *
+   * 不另存快照是有意的：路径 + 行号就够把那几行拿回来，而且拿到的是**当前**的内容——
+   * 用户拖完又改了这个文件时，给模型看改后的才对。代价是他改动之后行号可能已经飘了，
+   * 这一点和 @文件 引用同源，没有更好的解。
+   */
+  for (const tok of [...text.matchAll(/(?:^|\s)(@code:[^\s]+)/g)]
+    .map((m) => m[1]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 6)) {
+    const ref = _parseSelectionToken(tok);
+    if (!ref || !_contextRoot) continue;
+    try {
+      const fp = ref.rel.startsWith("/") ? ref.rel : _contextRoot.replace(/\/$/, "") + "/" + ref.rel.replace(/^\.?\//, "");
+      const code = _sliceLines(await backend.readTextFile(fp), ref.startLine, ref.endLine);
+      if (code.trim()) {
+        _atContext += _selectionText({
+          rel: ref.rel, lang: _languageIdForPath(ref.rel),
+          startLine: ref.startLine, endLine: ref.endLine, code,
+        });
+      }
+    } catch { /* 文件没了 / 读不了：记号照样留在正文里，模型知道用户指的是哪几行 */ }
   }
   // Per-turn DYNAMIC context lives HERE (end of the message list), not in the
   // system prompt — so it never invalidates the cached static prefix above. Only
@@ -58339,7 +58416,12 @@ function _createToolStep(call) {
     // 需要你确认：对话气泡里挖空一个问号。原来是一个实心圆里放问号，像个通用的"帮助/说明"标记；气泡才说得清这是**在问你**、并且等你回话。
     askuser: `<svg viewBox="0 0 16 16" fill="currentColor" fill-rule="evenodd" clip-rule="evenodd"><path d="M8 1.25c-3.87 0-7 2.46-7 5.5 0 1.77 1.07 3.34 2.73 4.35-.15.9-.6 1.73-1.3 2.4a.45.45 0 00.36.77c1.5-.13 2.86-.7 3.94-1.55.42.05.84.08 1.27.08 3.87 0 7-2.46 7-5.5s-3.13-5.5-7-5.5zM6.35 5.32c.33-.66 1-1.06 1.87-1.06 1.15 0 2.05.74 2.05 1.77 0 .73-.4 1.2-1.03 1.6-.5.32-.66.5-.66.85v.1a.55.55 0 01-.55.55h-.32a.55.55 0 01-.55-.55v-.2c0-.72.35-1.17 1-1.58.47-.3.62-.48.62-.79 0-.34-.28-.58-.68-.58-.36 0-.6.16-.74.45a.55.55 0 01-.7.27l-.03-.01a.55.55 0 01-.28-.72zm1.7 4.66a.8.8 0 100 1.6.8.8 0 000-1.6z"/></svg>`,
     current_time: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm0 1.5a6.5 6.5 0 110 13 6.5 6.5 0 010-13z"/><path d="M8.75 4a.75.75 0 00-1.5 0v4.2c0 .26.13.5.35.63l2.6 1.56a.75.75 0 10.77-1.28L8.75 7.7V4z"/></svg>`,
-    // 知识检索：摊开的书 + 书签带。原来是一张画了三条横线的普通文档，和「读文件」几乎一样，16px 下更是糊成一个空白圆角块——看不出这是"去知识库里查"。
+    // 知识检索（内置语料）：摊开的书 + 一枚放大镜。原来 typeIcons 里**根本没有 knowledge 这个键**，
+    // 于是走兜底的 typeIcons.read —— 卡面上画的是一张普通文档，和「读文件」一模一样（用户实拍）。
+    // 那枚放大镜是从右页上**挖空**出来的（fill-rule=evenodd 的圆形子路径），不是叠一层白：
+    // 图标用 currentColor，底色随主题和状态变，叠白在深色下会露出一圈白边。
+    knowledge: `<svg viewBox="0 0 16 16" fill="currentColor" fill-rule="evenodd"><path d="M7.4 4.4C6.2 3.25 4.4 2.6 2.35 2.6A1.55 1.55 0 00.8 4.15v6.9c0 .86.7 1.55 1.55 1.55 1.9 0 3.45.42 4.55 1.2.24.17.5-.02.5-.3V4.4z"/><path d="M8.6 4.4C9.8 3.25 11.6 2.6 13.65 2.6A1.55 1.55 0 0115.2 4.15v3.6a4.6 4.6 0 00-6.6 5.85c-.24.17-.5-.02-.5-.3V4.4z"/><path d="M12.15 8.35a3.15 3.15 0 100 6.3 3.15 3.15 0 000-6.3zm0 1.5a1.65 1.65 0 110 3.3 1.65 1.65 0 010-3.3z"/><path d="M14.28 13.02a.76.76 0 011.08 0l.85.85a.76.76 0 11-1.08 1.08l-.85-.85a.76.76 0 010-1.08z"/></svg>`,
+    // 外部检索工具（*_search）：摊开的书 + 书签带。原来是一张画了三条横线的普通文档，和「读文件」几乎一样，16px 下更是糊成一个空白圆角块——看不出这是"去知识库里查"。
     _ksearch: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M7.4 4.42C6.3 3.5 4.72 3.02 2.7 3.02c-.63 0-1.15.5-1.18 1.13v7.24c0 .64.52 1.16 1.16 1.16 1.85 0 3.3.42 4.4 1.2a.5.5 0 00.32.11V4.6a.5.5 0 00-.2-.18z"/><path d="M8.6 4.42c1.02-.85 2.44-1.33 4.25-1.4v4.3a.4.4 0 01-.63.32l-.86-.62a.4.4 0 00-.47 0l-.86.62a.4.4 0 01-.63-.32V3.2c-.28.05-.55.11-.8.19v10.45a.5.5 0 00.32-.11c1.1-.78 2.55-1.2 4.4-1.2.64 0 1.16-.52 1.16-1.16V4.15c-.03-.63-.55-1.13-1.18-1.13-2.02 0-3.6.48-4.7 1.4z"/></svg>`,
     genimage: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v8.5C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-8.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v5.69l-3.22-3.22a.75.75 0 00-1.06 0L6.44 9.94 4.78 8.28a.75.75 0 00-1.06 0L1.5 10.5V3.75zM5 6.5a1 1 0 11-2 0 1 1 0 012 0z"/></svg>`,
     db: `<svg viewBox="0 0 16 16" fill="currentColor"><ellipse cx="8" cy="3.5" rx="5.5" ry="2"/><path d="M2.5 3.5v9c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2v-9"/><path d="M2.5 7c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2" fill="none" stroke="currentColor" stroke-width=".6" opacity=".3"/><path d="M2.5 10.5c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2" fill="none" stroke="currentColor" stroke-width=".6" opacity=".3"/></svg>`,
@@ -70233,7 +70315,11 @@ async function updateEditorPreference(key, value, { rerender = false } = {}) {
   if (key === "locale") {
     await setLocale(value);
     _saveAccountLanguage(value);
-    showToast(t("feature.settings.localeSwitched", { language: localeDisplayName(value, value) }));
+    // 编辑器那套菜单（右键、查找框、命令面板）是 Monaco 自己的文案，标题在它被 import 的
+    // 那一刻就定死了（见 src/monaco-nls.js），所以这一栏只能在下次启动时跟上。说清楚，
+    // 别让用户以为切换没生效。
+    showToast(t("feature.settings.localeSwitched", { language: localeDisplayName(value, value) })
+      + " · " + t("feature.settings.localeEditorRestart"));
     renderFeaturePanel();
     return;
   }
@@ -74902,6 +74988,10 @@ async function _voiceStart(btn) {
 function _chipText(chip) {
   const kind = chip?.dataset?.kind || "file";
   const rel = chip?.dataset?.rel || "";
+  // 从编辑器拖进来的那一段代码。序列化成短记号 `@code:路径#起-止`，两侧留空格让提及扫描认得出。
+  // 可见文本和历史里只留这个记号（气泡里因此也是一枚片），真正的几行代码在发送期展开进
+  // 上下文——和 @element: 完全同一条路子。
+  if (kind === "code") return " " + (chip?.dataset?.text || "") + " ";
   return " @" + (kind === "file" ? "" : `${kind}:`) + rel + " ";
 }
 
@@ -74949,6 +75039,11 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
       // MCP 不是"品牌"，没有 i-brand-mcp 这个符号；拼出来的名字找不到会静默渲染成空白。
       : kind === "mcp"
         ? iconSvg("i-mcp", "ic--doc")
+      // 拖进来的一段代码：用**这个文件真正的图标**，和上面 file 那支一样。
+      // 图标要从 rel 算，不能从 name 算 —— code 片的 name 是「quota.py:275-284」，
+      // 带着行号去查扩展名会落到兜底图标上。
+      : kind === "code"
+        ? iconImg(fileIconUrl(rel.split("/").filter(Boolean).pop() || rel))
         : iconSvg(`i-brand-${kind}`, "ic--doc");
   }
   const nameEl = document.createElement("span");
@@ -75271,10 +75366,12 @@ async function _dispatchComposerSubmission(draft) {
 // Drop a file/dir chip into the composer at the caret (from a tree drag). The chip is an atomic
 // contentEditable=false card; the @-mention regex the send path needs is satisfied by the VIRTUAL
 // spaces _ceSerialize emits around each chip — so nothing is inserted here but the chip itself.
-function _insertRefAtCursor(rel, kind = "file", labelText = "") {
+function _insertRefAtCursor(rel, kind = "file", labelText = "", dataText = "") {
   if (!rel) return;
   promptEl.focus();
   const chip = _makeComposerChip(rel, kind, labelText);
+  // code 片自己带正文（选中的那段代码），_chipText 发送时读它。
+  if (dataText) chip.dataset.text = dataText;
   const sel = window.getSelection();
   // Insert at the caret if it's inside the composer; else append at the end. Supports MULTIPLE drags
   // (each adds another chip). NO surrounding space so caret navigation past the chip is a single press.
@@ -75407,12 +75504,91 @@ async function _moveIntoDir(paths, destDir) {
     }
   });
 })();
+
+// 编辑器里选中的一段代码，按住往输入框拖 —— 落进去变成一枚片，发送时展开成带出处的代码块。
+//
+// 走鼠标事件，不走 HTML5 拖放：和文件树那条同源（见 _wireTreeDragToComposer 上面的说明）。
+// 没有和它合并，是因为两者能落的地方不一样 —— 树里那条还要画目标目录、还要真的移动文件，
+// 而一段选区只可能落到输入框；合在一起会让树那条的每个判据都多出一支「这次不是文件」。
+//
+// Monaco 自己的「拖动选中文字来移动它」照旧开着，两边不打架，这一点是读它源码确认的：
+// contrib/dnd 的 _onEditorMouseDrop 只在**落点仍在编辑器内容区**时才执行移动命令，落在
+// 输入框上时它只清掉那个落点指示、什么都不改；而且它在 mousedown 之后不会立刻塌掉选区
+// （_dragSelection 把选区记下来），所以拖的全程选区还在，我们照样取得到那段代码。
+(function _wireSelectionDragToComposer() {
+  const box = promptEl.closest(".composer__box") || promptEl.parentElement;
+  if (!box || !editorEl) return;
+  let cand = null, dragging = false, ghost = null;
+  const over = (x, y) => {
+    const r = box.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
+  const clear = () => {
+    cand = null; dragging = false;
+    if (ghost) { ghost.remove(); ghost = null; }
+    document.body.classList.remove("tree-dragging");
+    box.classList.remove("drop-target");
+  };
+  // 捕获阶段只是"记一个候选"，不拦 Monaco：按在选区里也可能只是想把光标点进去。
+  // 真正变成拖，要等鼠标走够距离（下面的阈值）。
+  editorEl.addEventListener("mousedown", (e) => {
+    cand = null;
+    if (e.button !== 0) return;
+    try {
+      const sel = monacoEditor.getSelection();
+      const model = monacoEditor.getModel();
+      if (!sel || sel.isEmpty() || !model) return;
+      const t = monacoEditor.getTargetAtClientPoint(e.clientX, e.clientY);
+      if (!t?.position || !sel.containsPosition(t.position)) return;   // 只有按在选区里才可能是拖
+      cand = {
+        sx: e.clientX, sy: e.clientY,
+        rel: _pathToRel(activePath), lang: model.getLanguageId(),
+        a: sel.startLineNumber, b: sel.endLineNumber,
+        code: model.getValueInRange(sel),
+      };
+    } catch { cand = null; }
+  }, true);
+  document.addEventListener("mousemove", (e) => {
+    if (!cand) return;
+    if (!dragging) {
+      if (Math.abs(e.clientX - cand.sx) + Math.abs(e.clientY - cand.sy) < 6) return;
+      dragging = true;
+      document.body.classList.add("tree-dragging");
+      ghost = document.createElement("div");
+      ghost.className = "row-drag-ghost";
+      ghost.textContent = _selectionLabel(cand.rel, cand.a, cand.b);
+      document.body.appendChild(ghost);
+    }
+    ghost.style.left = `${e.clientX + 12}px`;
+    ghost.style.top = `${e.clientY + 10}px`;
+    box.classList.toggle("drop-target", over(e.clientX, e.clientY));
+  });
+  document.addEventListener("mouseup", (e) => {
+    if (!cand) return;
+    const hit = dragging && over(e.clientX, e.clientY);
+    const c = cand;
+    clear();
+    if (!hit) return;
+    try { window.getSelection().removeAllRanges(); } catch {}
+    // 片带的是**短记号**（@code:路径#起-止），不是整段代码：这样发出去的气泡里也是一枚片，
+    // 而不是一大坨代码（用户：「发出去的内容也要是组件囊」）。代码在发送期按这个记号从磁盘
+    // 取回来，和 @element: 那条同一个路子。
+    _insertRefAtCursor(c.rel, "code", _selectionLabel(c.rel, c.a, c.b),
+      _selectionToken(c.rel, c.a, c.b));
+  });
+})();
+
 // Swallow the click that follows a drag so the dragged file isn't also opened/selected.
 // 只吞树内的点击：旧版全局吞，拖完文件紧接着点 文件/Git/大纲/测试 页签会被白吞一次。
 document.addEventListener("click", (e) => { if (_suppressTreeClick) { _suppressTreeClick = false; if (e.target && e.target.closest && e.target.closest("#tree")) { e.stopPropagation(); e.preventDefault(); } } }, true);
 // 左右方向键跨过内联的片。片是 contentEditable=false 的原子节点，WKWebView 不总能在它两侧
 // 摆放光标——片若是输入框第一个元素，按左键"没反应"（两侧垫零宽空格试过，不够）。所以自己
 // 接管：只在"光标紧挨着片"时越过它，其余一律放行，不影响逐字移动和选区。判断在模块里。
+// 「是不是一枚片」按**结构**判，不按类名：输入框里任何 contentEditable=false 的原子元素都算。
+// 下面三条规则（方向键一下跨过去、退格一次只删一个、那一格空格跟着光标走）讲的是"原子节点
+// 挡住了光标"这件事，跟片是文件、仓库还是 MCP 资源无关。写死 composer-chip 的话，以后加一种
+// 别的片就得记得回来改这两处——那种「手工维护的名单」正是本仓踩过的坑。
+const _isComposerAtom = (n) => n?.nodeType === 1 && n.getAttribute?.("contenteditable") === "false";
 promptEl.addEventListener("keydown", (e) => {
   if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
   if (e.shiftKey || e.altKey || e.metaKey || e.ctrlKey || e.isComposing) return;
@@ -75422,7 +75598,7 @@ promptEl.addEventListener("keydown", (e) => {
   if (!promptEl.contains(r.startContainer)) return;
   const left = e.key === "ArrowLeft";
   const chip = chipBeside({ container: promptEl, node: r.startContainer, offset: r.startOffset, left,
-    isChip: (n) => n.classList?.contains("composer-chip") });
+    isChip: _isComposerAtom });
   if (!chip) return;
   e.preventDefault();
   // 落位之前先保证光标和片之间有一个真空格，光标停到空格的**外**侧。
@@ -75449,7 +75625,7 @@ promptEl.addEventListener("keydown", (e) => {
   if (!promptEl.contains(r.startContainer)) return;
   const back = e.key === "Backspace";                 // 退格删左边那个，Delete 删右边那个
   const chip = chipBeside({ container: promptEl, node: r.startContainer, offset: r.startOffset, left: back,
-    isChip: (n) => n.classList?.contains("composer-chip") });
+    isChip: _isComposerAtom });
   if (!chip) return;
   e.preventDefault();
   // 把光标停在被删片原来的位置上，再只移除它自己。

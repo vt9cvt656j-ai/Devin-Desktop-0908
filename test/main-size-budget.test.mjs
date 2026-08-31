@@ -33,6 +33,12 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_800（2026-08-31 第八次）：实测 81,791 行。买到的是「语言服务没起来时状态栏要说出来」
+ *   ——原来一个服务都没起来就 removeStatusBarItem("lsp")，屏幕上干干净净，用户看到的是补全、
+ *   ⌘+单击跳转、鼠标悬浮说明同时消失而没有任何解释，于是问「这个 IDE 没有跳转功能吗」。
+ *   现在写明「LSP: <语言> 未启动」，带上上次的停止原因，点一下重试。
+ *   这一段搬不出去：它要读 monacoEditor 的当前 model、要调 lspManager、要写状态栏 DOM。
+ *
  * · 81_760（2026-08-31 第七次）：实测 81,696 行。买到的是「在编辑器里选中一段代码，
  *   按住拖进对话框」（用户原话：「我鼠标选中的内容 要能够直接拖拽到对话框那里 使用」）。
  *   落下去是一枚片，发送时展开成带出处的代码块——出处不是装饰，模型得知道是哪个文件的
@@ -159,7 +165,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_760;
+const MAIN_JS_MAX_LINES = 81_800;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
