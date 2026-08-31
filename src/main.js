@@ -218,6 +218,7 @@ import { langBadge as _langBadge, languageIdForPath as _languageIdForPath } from
 import { translateHoverMarkdown as _translateHoverMarkdown } from "./agent/hover-doc.js";
 import { chatTitleFrom as _chatTitleFrom, isDefaultChatName as _isDefaultChatName } from "./agent/chat-title.js";
 import { contextUsageView as _contextUsageView } from "./agent/context-usage.js";
+import { contextPartsView as _contextPartsView } from "./agent/context-parts.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
@@ -21374,6 +21375,25 @@ function _finalRunSettlement(runUsage) {
  * 判据和排版都在 src/agent/context-usage.js，纯函数。
  */
 let _ctxPanelEl = null;
+/// 把这一轮记下来的客户端分块，喂给 agent/context-parts.js 的判据。
+function _ctxPartsRows() {
+  try {
+    const sess = _currentSession();
+    const p = sess?._ctxParts;
+    if (!p) return { rows: [], notes: [] };
+    const parts = [
+      // 走网关时客户端那份系统提示词会被整条替换，所以只有非网关线路才有这一项。
+      { key: "system", label: "系统提示词", tokens: p.system },
+      { key: "rules", label: "用户规则 / 习惯", tokens: p.rules },
+      { key: "skills", label: "技能", tokens: p.skills },
+      { key: "blocks", label: "语言 / 自适应 / 鉴权块", tokens: p.blocks },
+      { key: "tools", label: p.l0 ? "工具定义（MCP 与自声明）" : "工具定义", tokens: p.tools },
+      { key: "history", label: "对话历史 + 本轮请求", tokens: p.history },
+    ];
+    const v = _contextPartsView({ parts, total: Number(_ctxMeter?.prompt) || 0, l0: !!p.l0 });
+    return v.pending ? { rows: [], notes: [] } : { rows: v.rows, notes: v.notes };
+  } catch { return { rows: [], notes: [] }; }
+}
 function _closeContextPanel() {
   if (_ctxPanelEl) { try { _ctxPanelEl.remove(); } catch {} _ctxPanelEl = null; }
 }
@@ -21391,14 +21411,26 @@ function _toggleContextPanel(anchor) {
     `<div class="ctx-panel__row"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
     + `<span class="ctx-panel__label">${esc(r.label)}</span>`
     + `<span class="ctx-panel__val">${esc(r.text)}</span></div>`).join("");
-  const notes = view.notes.map((n) => `<div class="ctx-panel__note">${esc(n)}</div>`).join("");
+  // 第二段：这些字是从哪来的。判据在 agent/context-parts.js。
+  const src = _ctxPartsRows();
+  const partsHtml = src.rows.length
+    ? `<div class="ctx-panel__sec">来源</div>`
+      + `<div class="ctx-panel__bar ctx-panel__bar--src">${src.rows.map((r) =>
+          `<i class="ctx-panel__seg ctx-panel__seg--${r.key}" style="flex:${r.tokens}"></i>`).join("")}</div>`
+      + src.rows.map((r) =>
+        `<div class="ctx-panel__row"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
+        + `<span class="ctx-panel__label">${esc(r.label)}</span>`
+        + `<span class="ctx-panel__val">${r.estimated ? '<em class="ctx-panel__est">估</em>' : ""}${esc(r.text)}</span></div>`).join("")
+    : "";
+  const notes = [...view.notes, ...src.notes].map((n) => `<div class="ctx-panel__note">${esc(n)}</div>`).join("");
   box.innerHTML =
     `<div class="ctx-panel__head"><span class="ctx-panel__title">上下文用量</span>`
     + `<button class="ctx-panel__x" type="button" aria-label="关闭">&times;</button></div>`
     + (view.empty
       ? `<div class="ctx-panel__empty">这个会话还没有上报过用量。发一轮之后这里就是上游给的真实读数。</div>`
       : `<div class="ctx-panel__sum"><span class="ctx-panel__pct">${esc(view.headline)}</span>`
-        + `<span class="ctx-panel__tot">${esc(view.sub)}</span></div>${seg}<div class="ctx-panel__rows">${rows}</div>`)
+        + `<span class="ctx-panel__tot">${esc(view.sub)}</span></div>${seg}`
+        + `<div class="ctx-panel__sec">读进去的</div><div class="ctx-panel__rows">${rows}</div>${partsHtml}`)
     + (notes ? `<div class="ctx-panel__notes">${notes}</div>` : "");
   document.body.appendChild(box);
   _ctxPanelEl = box;
@@ -21483,14 +21515,37 @@ function _renderTokenMeter() {
       el = document.createElement("span");
       el.id = "tokenMeter";
       el.className = "cache-ring";
-      el.setAttribute("role", "button");
-      el.tabIndex = 0;
-      el.addEventListener("click", () => _toggleContextPanel(el));
-      el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); _toggleContextPanel(el); } });
       el.innerHTML = `<svg class="cache-ring__svg" viewBox="0 0 36 36" aria-hidden="true"><circle class="cache-ring__track" cx="18" cy="18" r="15.5"></circle><circle class="cache-ring__progress" cx="18" cy="18" r="15.5" pathLength="100"></circle></svg><span class="cache-ring__label">0</span>`;
       const voice = document.getElementById("voiceBtn");
       if (voice && voice.parentElement) voice.parentElement.insertBefore(el, voice);
       else document.body.appendChild(el);
+    }
+    /*
+     * 接线放在**拿到 el 之后**，不能放进上面那个 `if (!el)` 里。
+     *
+     * #tokenMeter 是 Shell.jsx 静态渲染出来的（那一行写着 role="status"），boot.jsx 先
+     * flushSync 渲染 Shell 再 import main.js —— 所以 getElementById 永远拿得到，
+     * `if (!el)` 是**死分支**：写在里面的监听器一次都不会挂上，role/tabIndex 也永远不生效，
+     * 连 `.cache-ring[role="button"]` 那条 cursor:pointer 都匹配不到。
+     * 用户实拍「点了没用，也没有这个东西」，就是这条。
+     *
+     * 用 pointerdown 不用 click：AI 回复期间渲染繁忙，WKWebView 会吞掉 click（按下+松开
+     * 配对），本仓的齿轮菜单和新建项目弹窗都为此改过。而"上下文在涨"恰恰是最想点开它的
+     * 时候。同一次按压派生的 click 用一次性捕获吞掉，免得刚开就被"点外面"关掉。
+     */
+    if (!el.dataset.ctxWired) {
+      el.dataset.ctxWired = "1";
+      el.setAttribute("role", "button");
+      el.tabIndex = 0;
+      el.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        _toggleContextPanel(el);
+        const eat = (ev) => { ev.stopPropagation(); ev.preventDefault(); document.removeEventListener("click", eat, true); };
+        document.addEventListener("click", eat, true);
+        setTimeout(() => document.removeEventListener("click", eat, true), 500);
+      });
+      el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); _toggleContextPanel(el); } });
     }
     el.hidden = false;
     el.classList.toggle("is-estimated", !!state.estimated);
@@ -30222,6 +30277,30 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 送上去、网关自己也会注入；走用户自己的端点时，它会原样落在他的日志里。
   // 代价：那条路上模型看不到开局窗口之外的工具名录，只能靠 search_tools 精确名查找。
   const messages = [{ role: "system", content: fullPrompt + (_ipSafeRoute(config) ? _toolHint : "") }];
+  /*
+   * 记下这一轮**客户端自己拼过**的那几块，供上下文面板按来源拆分。
+   *
+   * 只记这里量得到的：走网关（L0，默认线）时，上面那条 system 消息会被
+   * _l0MessagesWithSkills 整条丢掉、只留 clientBlocks + skillsBlock，内置工具也只发名字。
+   * 所以两套都记下来，面板按线路挑：网关线用 clientBlocks，自定义端点用 fullPrompt。
+   * 剩下量不到的那部分由面板按「上游真实读数 − 这些」倒推，并写明是倒推的。
+   */
+  try {
+    const _l0 = _l0On(config);
+    sess._ctxParts = {
+      l0: _l0,
+      at: Date.now(),
+      rules: _estimateTokens(userRulesBlock),
+      skills: _estimateTokens(skillsBlock),
+      // 语言 / 自适应 / 模型族微调 / 鉴权：L0 下这几块跟着 clientBlocks 一起活下来。
+      blocks: _estimateTokens(languageBlock + adaptiveBlock + _modelFamilyTuning(config.model) + _authContextBlock()),
+      // 系统提示词只在**非网关**线路上真的发出去（网关线会被整条替换）。
+      system: _l0 ? 0 : _estimateTokens(sysPrompt + _modelStyleTuning(config.model) + (_ipSafeRoute(config) ? _toolHint : "")),
+      // 对话历史：这一轮真正带上去的那些消息（不含上面那条 system）。
+      history: 0,
+      tools: 0,
+    };
+  } catch { /* 记不下就不显示分项，绝不能因此发不出去 */ }
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
   // user may have switched tabs during the awaits above.
   // 历史投影单调、不随本轮改写；本轮要回看的旧图在 _history.priorMedia 里，附到本轮消息末尾。
@@ -30545,6 +30624,16 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 旧图附在本轮消息末尾（不回头改写历史条目，见 _memoryMessagesForModel）。
   const userContent = _appendContentParts(await _attachmentAwareContent(_userText, attachments, config, 7_000_000, false, text), _history.priorMedia);
   messages.push({ role: "user", content: userContent });
+  // 历史 + 本轮这条用户消息，是「对话」那一项的真实体积（不含最前面那条 system）。
+  // 记在这里而不是上面：本轮的动态前导、@ 引用展开、账本都拼进 userContent 之后才成形。
+  try {
+    if (sess._ctxParts) {
+      sess._ctxParts.history = messages.slice(1).reduce((n, m) => n + _estimateTokens(
+        typeof m.content === "string" ? m.content
+          : Array.isArray(m.content) ? m.content.map((c) => (c && typeof c.text === "string" ? c.text : "")).join("")
+          : ""), 0);
+    }
+  } catch {}
   if (!opts.alreadyInTranscript) sess.memory.push({ role: "user", content: text, attachments });
   // 会话需求账本：用户每条实质要求入账（接续词/纯寒暄不записыв入），每轮开工整本
   // 注入——治"项目多轮对话失忆，不知道我具体需求"：老要求在几百条工具结果里被
@@ -31011,6 +31100,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   });
   try {
     const useTools = hasToolAccess && _toolSchemas.length > 0 && backend.aiChatWithTools;
+    // 真正随请求体发出去的那部分工具 schema。L0 下内置工具只发名字（走 HTTP 头），
+    // 所以这个数在网关线上只覆盖 MCP / 用户声明工具——面板的标签会说清楚。
+    try { if (sess._ctxParts && useTools) sess._ctxParts.tools = _estimateTokens(JSON.stringify(_toolSchemas)); } catch {}
     {
       const requestConfig = { ...config };
       let providerMessages = _sanitizeProviderMessages(messages);

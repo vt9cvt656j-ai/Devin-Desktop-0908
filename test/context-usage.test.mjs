@@ -55,10 +55,9 @@ test("接线：环可点、面板真用这份判据、点外面会关", () => {
   assert.match(fn, /style="flex:\$\{r\.value\}"/, "分段条的宽度不是那个数本身，条和数会对不上");
   assert.match(fn, /document\.addEventListener\("mousedown", away, true\)/, "点面板外面关不掉");
   assert.match(fn, /setTimeout\(\(\) => \{/, "关闭监听没有推迟一帧——这一次点击会立刻把它关掉");
-  // 环得是个按钮，键盘也能开。
-  assert.match(SRC, /el\.setAttribute\("role", "button"\)/, "环还是 status，读屏软件不会说它能点");
-  assert.match(SRC, /el\.addEventListener\("click", \(\) => _toggleContextPanel\(el\)\)/, "环没接上点击");
-  assert.match(SRC, /e\.key === "Enter" \|\| e\.key === " "/, "键盘打不开这个面板");
+  // 「环真的被接成一个可点的按钮」这件事不在这里守：源码里有没有 addEventListener 这行字，
+  // 和运行时它有没有真的挂上，是两回事——上一版就是把接线写进了一个恒假的分支，
+  // 这种文本断言照样绿，功能却是死的。真跑的那几条在 test/context-parts.test.mjs。
   const c = css();
   assert.match(c, /\.cache-ring\[role="button"\] \{ cursor: pointer/, "环看不出可以点");
   for (const k of ["cached", "cacheWrite", "uncached", "completion"]) {

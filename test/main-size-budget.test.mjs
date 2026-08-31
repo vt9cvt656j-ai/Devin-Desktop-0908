@@ -33,6 +33,18 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 82_100（2026-08-31 第十三次）：实测 82,048 行。买到的是两件事：
+ *   ① 上下文环**真的点得开**——上一版把接线写进了 `if (!el)`，而 #tokenMeter 是 Shell.jsx
+ *      静态渲染的，那个分支一次都不会进；连 role=button 和 cursor:pointer 都没生效。
+ *      改成拿到元素之后按 dataset 标记一次性绑定，并按本仓惯例用 pointerdown（WKWebView
+ *      在渲染繁忙时吞 click）。
+ *   ② 面板第二段「来源」：发送那一刻把客户端真拼过的几块（用户规则 / 技能 / 语言与鉴权块 /
+ *      工具 schema / 对话历史）逐块估下来记在 session 上，量不到的那部分（网关注入的系统
+ *      提示词与内置工具定义）按「上游真实读数 − 这些」倒推。判据在
+ *      src/agent/context-parts.js，纯函数；留在 main.js 的是三处**记录点**——它们必须待在
+ *      拼装现场（fullPrompt / messages / _toolSchemas 各自成形的那一行），搬走就只能改成
+ *      "把整套拼装再传一遍"。
+ *
  * · 82_020（2026-08-31 第十二次）：实测 81,956 行。买到的是「点上下文环弹出用量面板」——
  *   原来这些数只在 hover 的 tooltip 里，要把鼠标悬在一个 22px 的小圆环上不动，读到的还是
  *   一段没有结构的文本。判据和排版全在 src/agent/context-usage.js（纯函数，真跑）；
@@ -194,7 +206,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 82_020;
+const MAIN_JS_MAX_LINES = 82_100;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

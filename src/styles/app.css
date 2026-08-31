@@ -16776,6 +16776,27 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .ctx-panel__seg--cacheWrite,  .ctx-panel__dot--cacheWrite  { background: #f5a623; }  /* 新写：这次的投入 */
 .ctx-panel__seg--uncached,    .ctx-panel__dot--uncached    { background: #7c6cf0; }  /* 原价读的 */
 .ctx-panel__seg--completion,  .ctx-panel__dot--completion  { background: #e5687a; }  /* 输出 */
+/* 第二段「来源」：客户端量得到的那几块 + 倒推出来的网关那一项。 */
+.ctx-panel__sec {
+  margin: 12px 0 6px; font-size: 10.5px; font-weight: 700; letter-spacing: .08em;
+  color: var(--text-dim); text-transform: none;
+}
+.ctx-panel__sum + .ctx-panel__bar + .ctx-panel__sec { margin-top: 2px; }
+.ctx-panel__bar--src { margin-bottom: 9px; }
+/* 「估」这个小角标：带它的数是本地按文本估的，不带的是上游真数或按真数倒推的。
+   两种数摆在同一列，不标出来就会被一起当成真的。 */
+.ctx-panel__est {
+  display: inline-block; margin-right: 4px; padding: 0 3px;
+  font-size: 9px; font-style: normal; line-height: 13px; border-radius: 3px;
+  color: var(--text-dim); background: rgba(128, 128, 128, .16);
+}
+.ctx-panel__seg--system,   .ctx-panel__dot--system   { background: #8e8e93; }
+.ctx-panel__seg--rules,    .ctx-panel__dot--rules    { background: #34a853; }
+.ctx-panel__seg--skills,   .ctx-panel__dot--skills   { background: #f5a623; }
+.ctx-panel__seg--blocks,   .ctx-panel__dot--blocks   { background: #4bb3c4; }
+.ctx-panel__seg--tools,    .ctx-panel__dot--tools    { background: #7c6cf0; }
+.ctx-panel__seg--history,  .ctx-panel__dot--history  { background: #e5687a; }
+.ctx-panel__seg--gateway,  .ctx-panel__dot--gateway  { background: #b28ce8; }
 .ctx-panel__notes {
   margin-top: 10px; padding-top: 9px;
   border-top: 1px solid rgba(128, 128, 128, .14);
