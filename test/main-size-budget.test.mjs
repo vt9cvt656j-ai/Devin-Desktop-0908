@@ -33,6 +33,13 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_960（2026-08-31 第十一次）：实测 81,891 行。这一轮买到的是两件事：会话标签页的标题
+ *   取自第一句话（纯逻辑在 src/agent/chat-title.js，main.js 里只有 sendPrompt 里那一小段
+ *   接线），以及回复底下那个计时器**自己会停**——原来它靠"每条收尾路径都记得调 stop()"，
+ *   而收尾段里 stop() 前面排着一串会抛的活，任何一处抛出来计时器就永远转下去（用户实拍
+ *   「任务都结束了却还一直在数」）。判据改成每一跳自问「这一轮还活着吗」，加上把 stop 挪到
+ *   finally 的第一行。这几段都要读 session.streaming、要动 DOM、要停 setInterval，搬不出去。
+ *
  * · 81_900（2026-08-31 第十次）：实测 81,847 行。买到的是悬浮说明（鼠标停在函数/变量上那块）
  *   三件事：内容显示全（出厂那档高度会把文档字符串切在半句话上）、配色进主题、以及**文档
  *   按用户选的语言自动翻**——用户原话「对每个开发者都能很友好」。
@@ -181,7 +188,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_900;
+const MAIN_JS_MAX_LINES = 81_960;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

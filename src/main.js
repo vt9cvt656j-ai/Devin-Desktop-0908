@@ -21090,7 +21090,7 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timel
 }
 
 // Token 与金额只读取服务端已落库的 settlement；当前在途请求绝不估算。
-function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeline } = {}) {
+function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeline, isLive } = {}) {
   let el = null;
   let timer = 0;
   let active = true;
@@ -21107,9 +21107,31 @@ function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeli
     if (!active || !el || !body || el === body.lastElementChild) return;
     body.appendChild(el);
   };
+  /*
+   * 这一轮已经结束了就**自己停**，不等任何人来调 stop()。
+   *
+   * 用户实拍：任务早就跑完，回答不动了，那个秒数还在一秒一跳。原因是收尾段里
+   * `_liveStats.stop()` 前面还排着一串会抛的活（写记忆、存盘、渲染建议、改时间线）——
+   * 其中任何一处抛出来，整段收尾就断在那里，计时器没人关，于是**永远**转下去。
+   *
+   * "每条收尾路径都记得调 stop()"是一份手工名单，这个仓库为这类名单付过很多次账。
+   * 判据改成结构性的：每一跳都问一句「这一轮还活着吗」，不活着就冻住。
+   *
+   * 冻住而不是删掉：显式 stop() 的意思是「我马上要渲染最终那行了」，删掉才对；
+   * 而自停发生时最终那行**可能永远不会来**（收尾断了），这时删掉等于把统计整条抹掉。
+   * 冻住则留下一个正确的、不再跳动的数。
+   */
+  const freeze = () => {
+    active = false;
+    if (timer) { clearInterval(timer); timer = 0; }
+    try { watcher?.disconnect(); } catch {}
+    watcher = null;
+    try { el?.classList.remove("turn-stats--live"); } catch {}
+  };
   const tick = () => {
     try {
       if (!active || !body) return;
+      if (el && typeof isLive === "function" && !isLive()) { freeze(); return; }
       if (!el) {
         el = document.createElement("div");
         el.className = "turn-stats turn-stats--live";
@@ -30920,6 +30942,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const _liveStats = _liveTurnStats(body, {
     startedAt: _taskStartedAt,
     getTimeline: () => _turnTimeline,
+    isLive: () => !!sess.streaming,   // 这一轮还在跑吗；不在就自己停
   });
   try {
     const useTools = hasToolAccess && _toolSchemas.length > 0 && backend.aiChatWithTools;
@@ -31120,6 +31143,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     }
   } catch (e) { if (!err) err = String(e); }
   finally {
+    // 内容写完就定格：后面那一串收尾（等计费落定、取结算、写记忆、存盘、渲染建议）是我们
+    // 自己的活，用户读这个数的意思是「这次回答花了多久」，不是「包括收尾在内的一切」。
+    // 放在 finally 的**第一行**：后面任何一步抛出来，计时器都已经停了。
+    const _contentDoneMs = Date.now() - _taskStartedAt;
+    _liveStats.stop();
     clearAgentRetryToast();
     await Promise.allSettled(_turnBillingTasks);
     await _awaitBillableAiTasks(sess._reqId);
@@ -31221,9 +31249,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       const activeAttempt = _agentTimelineActiveAttempt(_plainTimelineTurn, _plainTimelineTurn.endedAt);
       if (activeAttempt && activeAttempt.endedAt == null) activeAttempt.endedAt = _plainTimelineTurn.endedAt;
     }
-    _liveStats.stop();
     _appendTurnStatsFooter(body, {
-      elapsedMs: Date.now() - _taskStartedAt,
+      elapsedMs: _contentDoneMs,
       settlement: _plainSettlement,
       timeline: _turnTimeline,
     });
@@ -52466,6 +52493,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     startedAt: run._recStart,
     getSettlement: () => _liveRunSettlement(session._runUsage),
     getTimeline: () => run.timeline,
+    isLive: _live,   // 这一轮还在跑吗；不在就自己停（见 _liveTurnStats 里的说明）
   });
   session._liveRunStats = _liveStats;
 
