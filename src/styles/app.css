@@ -16733,3 +16733,56 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   padding: 6px 8px;
   border-radius: 6px;
 }
+
+/* ---- 上下文用量面板（点输入框右下那个环弹出来的） ----
+   分段条的颜色只有四种，因为分项只有四项——它们是上游 usage 真报过的那几刀，
+   加起来正好等于上面那个总数。别往这儿加"看着像那么回事"的第五种色块。 */
+.ctx-panel {
+  position: fixed; z-index: 3000; width: 300px; max-width: calc(100vw - 16px);
+  padding: 12px 14px 13px;
+  border-radius: 14px;
+  background: var(--panel-solid, var(--panel, #fff));
+  border: 1px solid var(--line-strong, rgba(0, 0, 0, .1));
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .16);
+  font-family: var(--font);
+  color: var(--text);
+  animation: ctxPanelIn .16s cubic-bezier(.22, 1, .36, 1) both;
+}
+[data-theme="dark"] .ctx-panel, .dark .ctx-panel { box-shadow: 0 12px 34px rgba(0, 0, 0, .55); }
+@keyframes ctxPanelIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.ctx-panel__head { display: flex; align-items: center; margin-bottom: 10px; }
+.ctx-panel__title { font-size: 12.5px; font-weight: 650; }
+.ctx-panel__x {
+  margin-left: auto; width: 20px; height: 20px; line-height: 18px; text-align: center;
+  border: none; background: transparent; color: var(--text-dim); font-size: 16px;
+  border-radius: 6px; cursor: pointer;
+}
+.ctx-panel__x:hover { background: var(--hover); color: var(--text); }
+.ctx-panel__sum { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.ctx-panel__pct { font-size: 13px; font-weight: 650; }
+.ctx-panel__tot { margin-left: auto; font-size: 11.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+/* 分段条：每一段的宽度就是它那个数，所以 flex 直接吃 token 数。 */
+.ctx-panel__bar {
+  display: flex; height: 7px; border-radius: 999px; overflow: hidden;
+  background: rgba(128, 128, 128, .16); margin-bottom: 11px;
+}
+.ctx-panel__seg { display: block; min-width: 2px; }
+.ctx-panel__seg + .ctx-panel__seg { border-left: 1px solid var(--panel-solid, #fff); }
+.ctx-panel__row { display: flex; align-items: center; gap: 8px; font-size: 12px; line-height: 1.9; }
+.ctx-panel__dot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.ctx-panel__label { color: var(--text); }
+.ctx-panel__val { margin-left: auto; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.ctx-panel__seg--cached,      .ctx-panel__dot--cached      { background: #34a853; }  /* 命中：省下来的 */
+.ctx-panel__seg--cacheWrite,  .ctx-panel__dot--cacheWrite  { background: #f5a623; }  /* 新写：这次的投入 */
+.ctx-panel__seg--uncached,    .ctx-panel__dot--uncached    { background: #7c6cf0; }  /* 原价读的 */
+.ctx-panel__seg--completion,  .ctx-panel__dot--completion  { background: #e5687a; }  /* 输出 */
+.ctx-panel__notes {
+  margin-top: 10px; padding-top: 9px;
+  border-top: 1px solid rgba(128, 128, 128, .14);
+  font-size: 11px; line-height: 1.65; color: var(--text-dim);
+}
+.ctx-panel__empty { font-size: 12px; line-height: 1.65; color: var(--text-dim); }
+/* 环现在是个按钮：给出可点的暗示，别让它看着还是个纯展示的小圆。 */
+.cache-ring[role="button"] { cursor: pointer; }
+.cache-ring[role="button"]:hover { filter: brightness(1.08); }
+.cache-ring[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 999px; }

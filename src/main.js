@@ -217,6 +217,7 @@ import { domainKnowledgeBullets as _domainKnowledgeBullets, domainKnowledgeBrief
 import { langBadge as _langBadge, languageIdForPath as _languageIdForPath } from "./agent/language.js";
 import { translateHoverMarkdown as _translateHoverMarkdown } from "./agent/hover-doc.js";
 import { chatTitleFrom as _chatTitleFrom, isDefaultChatName as _isDefaultChatName } from "./agent/chat-title.js";
+import { contextUsageView as _contextUsageView } from "./agent/context-usage.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
@@ -21360,6 +21361,67 @@ function _finalRunSettlement(runUsage) {
   return _liveRunSettlement(runUsage);
 }
 
+/*
+ * 点上下文环 → 弹出「上下文用量」面板。
+ *
+ * 原来这些数只在 hover 的 tooltip 里，一行叠一行：想看清得把鼠标悬在一个 22px 的小圆环上
+ * 不动，而且读到的是一段没有结构的文本。用户要的是点开一块能看的面板（第二张图那种）。
+ *
+ * 分项刻意**不是**「系统提示词 / 工具定义 / 规则 / 技能」那一套：那要知道提示词是怎么拼的，
+ * 而 L0 线路上客户端手里根本没有那份文本（提示词和工具 schema 由网关注入，这是产品的既定
+ * 保护）。硬显示就只能拿本地估算去填，六个看着精确、加起来对不上总数的数字——正是这个仓库
+ * 做过全站审计的那种「兜底冒充真值」。所以分的是上游真报过的那几刀，加起来正好等于总数。
+ * 判据和排版都在 src/agent/context-usage.js，纯函数。
+ */
+let _ctxPanelEl = null;
+function _closeContextPanel() {
+  if (_ctxPanelEl) { try { _ctxPanelEl.remove(); } catch {} _ctxPanelEl = null; }
+}
+function _toggleContextPanel(anchor) {
+  if (_ctxPanelEl) { _closeContextPanel(); return; }
+  const view = _contextUsageView(_ctxMeter || {}, _tok || {});
+  const box = document.createElement("div");
+  box.className = "ctx-panel";
+  const esc = (x) => _escHtml(String(x ?? ""));
+  const seg = view.rows.length
+    ? `<div class="ctx-panel__bar">${view.rows.map((r) =>
+        `<i class="ctx-panel__seg ctx-panel__seg--${r.key}" style="flex:${r.value}"></i>`).join("")}</div>`
+    : "";
+  const rows = view.rows.map((r) =>
+    `<div class="ctx-panel__row"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
+    + `<span class="ctx-panel__label">${esc(r.label)}</span>`
+    + `<span class="ctx-panel__val">${esc(r.text)}</span></div>`).join("");
+  const notes = view.notes.map((n) => `<div class="ctx-panel__note">${esc(n)}</div>`).join("");
+  box.innerHTML =
+    `<div class="ctx-panel__head"><span class="ctx-panel__title">上下文用量</span>`
+    + `<button class="ctx-panel__x" type="button" aria-label="关闭">&times;</button></div>`
+    + (view.empty
+      ? `<div class="ctx-panel__empty">这个会话还没有上报过用量。发一轮之后这里就是上游给的真实读数。</div>`
+      : `<div class="ctx-panel__sum"><span class="ctx-panel__pct">${esc(view.headline)}</span>`
+        + `<span class="ctx-panel__tot">${esc(view.sub)}</span></div>${seg}<div class="ctx-panel__rows">${rows}</div>`)
+    + (notes ? `<div class="ctx-panel__notes">${notes}</div>` : "");
+  document.body.appendChild(box);
+  _ctxPanelEl = box;
+  // 贴着环放，且不许出界。
+  try {
+    const r = anchor.getBoundingClientRect();
+    const w = box.offsetWidth || 280;
+    box.style.left = `${Math.max(8, Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2))}px`;
+    box.style.top = `${Math.max(8, r.top - (box.offsetHeight || 200) - 10)}px`;
+  } catch {}
+  box.querySelector(".ctx-panel__x")?.addEventListener("click", _closeContextPanel);
+  // 点面板以外的地方就关。挂在 document 上、下一帧再挂，否则**这一次**点击立刻把它关掉。
+  setTimeout(() => {
+    const away = (e) => {
+      if (!_ctxPanelEl) { document.removeEventListener("mousedown", away, true); return; }
+      if (_ctxPanelEl.contains(e.target) || anchor.contains(e.target)) return;
+      _closeContextPanel();
+      document.removeEventListener("mousedown", away, true);
+    };
+    document.addEventListener("mousedown", away, true);
+  }, 0);
+}
+
 function _renderTokenMeter() {
   const k = _tokenShort;
   const state = _ctxMeter || {};
@@ -21421,7 +21483,10 @@ function _renderTokenMeter() {
       el = document.createElement("span");
       el.id = "tokenMeter";
       el.className = "cache-ring";
-      el.setAttribute("role", "status");
+      el.setAttribute("role", "button");
+      el.tabIndex = 0;
+      el.addEventListener("click", () => _toggleContextPanel(el));
+      el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); _toggleContextPanel(el); } });
       el.innerHTML = `<svg class="cache-ring__svg" viewBox="0 0 36 36" aria-hidden="true"><circle class="cache-ring__track" cx="18" cy="18" r="15.5"></circle><circle class="cache-ring__progress" cx="18" cy="18" r="15.5" pathLength="100"></circle></svg><span class="cache-ring__label">0</span>`;
       const voice = document.getElementById("voiceBtn");
       if (voice && voice.parentElement) voice.parentElement.insertBefore(el, voice);

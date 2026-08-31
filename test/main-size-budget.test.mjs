@@ -33,6 +33,12 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 82_020（2026-08-31 第十二次）：实测 81,956 行。买到的是「点上下文环弹出用量面板」——
+ *   原来这些数只在 hover 的 tooltip 里，要把鼠标悬在一个 22px 的小圆环上不动，读到的还是
+ *   一段没有结构的文本。判据和排版全在 src/agent/context-usage.js（纯函数，真跑）；
+ *   留在 main.js 的是弹层：要 getBoundingClientRect 定位、要往 body 上挂、要挂
+ *   document 级的"点外面就关"，搬出去只会变成把这些再传回来的假模块。
+ *
  * · 81_960（2026-08-31 第十一次）：实测 81,891 行。这一轮买到的是两件事：会话标签页的标题
  *   取自第一句话（纯逻辑在 src/agent/chat-title.js，main.js 里只有 sendPrompt 里那一小段
  *   接线），以及回复底下那个计时器**自己会停**——原来它靠"每条收尾路径都记得调 stop()"，
@@ -188,7 +194,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_960;
+const MAIN_JS_MAX_LINES = 82_020;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
