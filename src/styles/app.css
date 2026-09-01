@@ -49,6 +49,9 @@
      皮肤规则改写，用它当基准就是自引用。两套主题各留一份。 */
   --panel-solid-opaque: #f5f5f7;
   --panel-2-opaque: #fbfbfd;
+  /* 弹层（/ 命令面板、对话框…）的底。比 --panel-solid 高一档，浮在面板上而不是融进去。
+     浅色是纯白：这套板是 #e9e9ec → #f5f5f7 → 白，白面浮在灰面板上正是这类产品的长相。 */
+  --popover-surface: #ffffff;
   /* 输入条右下角那颗按钮的两态。发送＝近黑（不是品牌蓝，见 .send 的说明）；
      停止＝红，环和方块共用它。深色那份在下面的 [data-theme="dark"] 里。 */
   --send-bg: #0d0d0f;
@@ -130,6 +133,8 @@
   --panel-2: #1f1f23;
   --panel-solid-opaque: #18181b;
   --panel-2-opaque: #1f1f23;
+  /* 深色反过来：弹层比面板亮。#101011（--editor-bg）比面板还暗，方向是反的，不能用。 */
+  --popover-surface: #242429;
   /* 深色里反过来：按钮近白、箭头近黑，和 ChatGPT/Claude 一致。
      红也要提一档，#e5484d 压在深底上会往棕里掉。 */
   --send-bg: #f2f2f4;

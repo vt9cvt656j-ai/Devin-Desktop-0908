@@ -275,8 +275,12 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   留在 main.js 的 213 行是搬不动的那部分：设置页那一节的 DOM 构造（预览块、上传、
  *   浓度滑块、拖动时实时预览而松手才落盘）、canvas 缩放编码、以及把结果挂到根元素上。
  *   判据就是这条测试自己写的那个 ——「只依赖参数、没有 DOM、没有模块级可变状态」。
+ * · 82_740（2026-09-01，抬 20 行）：实测 82,725 行。买到的是 `/` 命令弹窗**贴着输入条对齐**：
+ *   左缘、宽度、上沿三个值改成同源地按 .composer__box 算（原来按文本区算、还封在 380px，
+ *   于是它比下面那条窄一截）。多出来的行是那段说明加两行取值。同一笔里还把弹层底色从
+ *   --panel-solid 换成 --popover-surface —— 那部分在 CSS 和主题桥里，不占 main.js。
  */
-const MAIN_JS_MAX_LINES = 82_720;
+const MAIN_JS_MAX_LINES = 82_740;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

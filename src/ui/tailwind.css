@@ -37,7 +37,10 @@
   --color-foreground: var(--text);
   --color-card: var(--panel-2);
   --color-card-foreground: var(--text);
-  --color-popover: var(--panel-solid);
+  /* 弹层**不能**用 --panel-solid：助手栏、侧栏、面板本身就是那个色，弹层压在上面就
+     和背景同色，只剩一圈边框 —— 同一个毛病在工具卡上已经犯过一次。
+     --popover-surface 在两套主题里都比 --panel-solid 高一档（见 app.css 的定义）。 */
+  --color-popover: var(--popover-surface);
   --color-popover-foreground: var(--text);
 
   /* 强调色 —— 项目自己的蓝，浅色 #0a84ff / 深色 #4daafc */

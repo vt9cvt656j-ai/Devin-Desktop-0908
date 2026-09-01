@@ -78159,12 +78159,21 @@ function _updateSlashMenu() {
   });
   if (!_slashMatches.length) return _hideSlash();
   _slashActive = 0;
-  const r = promptEl.getBoundingClientRect();
-  _slashMenu.style.left = r.left + "px";
-  // Narrower than the prompt: two short columns of text do not need its full width, and the
-  // old 520px cap made three commands look like a dialog.
-  _slashMenu.style.width = Math.min(r.width, 380) + "px";
-  _slashMenu.style.bottom = viewportH() - r.top + 6 + "px";
+  /*
+   * 宽度和左边缘都跟着**输入条那个圆角盒子**（.composer__box），不是里面的文本区。
+   *
+   * 原来按 promptEl 算、还封在 380px。用户实拍：弹窗比下面那条窄一截，右边差出一块，
+   * 「宽度要和下面的对话框对齐」。这类贴着输入框弹出来的面板，对齐是它像不像一个
+   * 整体的唯一线索——窄一点点比窄很多更显得没做好。
+   *
+   * 上沿也按盒子算：盒子里除了文本区还有下面那条模式/模型栏，按文本区算菜单会插进
+   * 盒子里去。三个值同源，菜单才是"贴在这条输入条上面"，而不是三个各算各的。
+   */
+  const box = promptEl.closest(".composer__box") || promptEl;
+  const b = box.getBoundingClientRect();
+  _slashMenu.style.left = b.left + "px";
+  _slashMenu.style.width = b.width + "px";
+  _slashMenu.style.bottom = viewportH() - b.top + 6 + "px";
   _slashMenu.hidden = false;
   _renderSlashActive();
 }

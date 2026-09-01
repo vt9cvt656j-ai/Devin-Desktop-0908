@@ -487,7 +487,13 @@ function makeSlashMatcher(mcpRows) {
     _mcpSlashCommands: () => mcpRows,
     // 用户自己声明的命令：本文件测的是 MCP 模板的匹配，这里给空。
     _userSlashCommands: () => [],
-    promptEl: { value: "", getBoundingClientRect: () => ({ left: 0, top: 0, width: 400 }) },
+    // closest 也要有：菜单的宽度/左缘/上沿现在跟着输入条那个圆角盒子（.composer__box）算，
+    // 不再按文本区。返回 null 就走 `|| promptEl` 那条兜底，位置对这几条匹配测试无所谓。
+    promptEl: {
+      value: "",
+      closest: () => null,
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 400 }),
+    },
     _slashMenu: { style: {}, hidden: true },
     // 视口高度现在走 viewportH()（CSS 视口，不是物理像素 —— 见 src/agent/layout-density.js）。
     // 这套注入清单是手工维护的：给热函数加一个辅助函数，这里不补就整组 ReferenceError。
