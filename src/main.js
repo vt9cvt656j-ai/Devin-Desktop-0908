@@ -14918,7 +14918,7 @@ function _modelContextRows(m) {
   return _micSliderHtml({ kind: "ctx", title: "上下文", options: opts, index: idx });
 }
 
-function _modelCatalogEntry(id = "", group = "", connId = "") {
+function _modelCatalogEntry(id = "", group = "") {
   // **自定义模型要按真实模型名去查目录。**
   //
   // 自定义模型的选择器 id 是 `custom:<随机>` 这种内部键，拿它去目录里找必然找不到 ——
@@ -14953,27 +14953,14 @@ function _modelCatalogEntry(id = "", group = "", connId = "") {
   if (!wantGroup) {
     try { wantGroup = String(loadConfig()?.modelGroup || "").trim(); } catch { wantGroup = ""; }
   }
-  // **同一个分组里也可能有两行同名。** 上面那段只解决了「同 id 在两个分组」，而分组
-  // （后台那个把模型并进另一个标题的开关）会把另一条线路的模型并进同一个标题下 ——
-  // 于是「智普」组里同时出现两行 glm-5.3-flash：一行来自专属线路（倍率 1），一行来自
-  // 智普的一个出口（倍率 2）。只按 (id, 组名) 找的话，点哪一行都返回列表里靠前的那条
-  // （服务端按 sort 下发），而 gatewayRouteId 会被写成那一条的 —— 用户点的是便宜那行，
-  // 请求发去贵的那条线路，账单也跟着那条走（网关按被选中的**线路**计费）。
-  //
-  // 被点中的那一行手里就攥着确定的答案（`connId`，来自 /api/models 的 conn_id）。
-  // 传了就用它，别再回查。没传时行为逐字不变。
-  const wantConn = String(connId || "").trim();
   let fallback = null;
-  let groupHit = null;
   for (const g of MODEL_GROUPS || []) {
     for (const model of g.models || []) {
       if (String(model?.id || "").toLowerCase() !== targetLc) continue;
-      if (wantConn && String(model?.connId || "") === wantConn) return model;
-      if (wantGroup && g.label === wantGroup && !groupHit) groupHit = model;
+      if (wantGroup && g.label === wantGroup) return model;
       if (!fallback) fallback = model;
     }
   }
-  if (groupHit) return groupHit;
   // 没指定分组、或者那个分组已经没了（线路被停用/改名）时退回第一条 —— 那是旧行为，
   // 比返回 null 让整块信息消失强。
   return fallback;
@@ -15133,15 +15120,15 @@ async function loadBackendModels() {
 function _firstGatewayModelId() {
   for (const group of MODEL_GROUPS) {
     for (const model of group.models || []) {
-      if (model?.id && model.isDefault === true) return { id: model.id, group: group.label || "", connId: model.connId || "" };
+      if (model?.id && model.isDefault === true) return { id: model.id, group: group.label || "" };
     }
   }
   for (const group of MODEL_GROUPS) {
     for (const model of group.models || []) {
-      if (model?.id) return { id: model.id, group: group.label || "", connId: model.connId || "" };
+      if (model?.id) return { id: model.id, group: group.label || "" };
     }
   }
-  return { id: "", group: "", connId: "" };
+  return { id: "", group: "" };
 }
 
 async function _ensureGatewayModelSelected() {
@@ -16382,7 +16369,7 @@ async function showCustomModelsDialog() {
         // 删的正好是当前选中的模型 → 回退到第一个网关模型，避免发送时查无此模型。
         if ((loadConfig().model || "") === it.id) {
           const first = _firstGatewayModelId();
-          if (first.id) await selectModel(first.id, first.group, first.connId);
+          if (first.id) await selectModel(first.id, first.group);
         }
         renderList();
         refreshModelBadge();
@@ -17484,10 +17471,7 @@ function buildModelMenu() {
       item.addEventListener("mouseenter", () => showModelInfoCard(m, item));
       const grpLabel = group.label;
       item.addEventListener("click", () => {
-        // **把 m.connId 一起传走。** 不传的话下游只能按 (id, 组名) 回查，而同一个组里
-        // 可能有两行同名（后台把另一条线路分组到了这个标题下）—— 那时点哪一行都会解析
-        // 成列表里靠前的那条，请求发去的线路和账单都不是用户点的那个。
-        selectModel(m.id, grpLabel, m.connId);
+        selectModel(m.id, grpLabel);
         closeModelMenu();
       });
       modelMenu.appendChild(item);
@@ -17547,11 +17531,11 @@ function buildModelMenu() {
   modelMenu.appendChild(cfg);
 }
 
-async function selectModel(model, modelGroup, connId = "") {
+async function selectModel(model, modelGroup) {
   const c = await loadConfigAsync();
   // 连线路 id 一起存：请求时要靠它告诉网关"用户点的是这一组"。
   // 存 id 而不是分组名，是因为分组名会被后台改（改完这个偏好就悄悄失效了）。
-  const _picked = _modelCatalogEntry(model, modelGroup, connId);
+  const _picked = _modelCatalogEntry(model, modelGroup);
   // **先钉窗口级，再写共享配置、再刷界面。** 所有读配置的地方都走 `_aiConfigForRuntime`
   // 那个漏斗，窗口级选择在那里盖过共享配置 —— 所以只要这一行还没执行，`refreshModelBadge`
   // 读回来的就还是上一个模型：标签纹丝不动，用户看到的是「点了没反应，选不动」。
@@ -21532,8 +21516,11 @@ function _ctxPanelPlace(box, anchor) {
     const r = anchor.getBoundingClientRect();
     const w = box.offsetWidth || 300;
     const h = box.offsetHeight || 200;
-    box.style.left = `${Math.max(8, Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2))}px`;
-    box.style.top = `${Math.max(8, r.top - h - 10)}px`;
+    // 夹取用 viewportW()/viewportH()，**不是** window.innerWidth：后者在缩放过的窗口上
+    // 是物理像素，而 style.left 写的是 CSS 像素——两个坐标系混在一起，放大之后面板会
+    // 飞出屏幕。全仓有一条守卫专门扫这种混用，这一行当初漏了。
+    box.style.left = `${Math.max(8, Math.min(viewportW() - w - 8, r.left + r.width / 2 - w / 2))}px`;
+    box.style.top = `${Math.max(8, Math.min(viewportH() - h - 8, r.top - h - 10))}px`;
   } catch {}
 }
 

@@ -3771,8 +3771,13 @@ test("Advanced Tools settings exposes the supported IDE language preference", ()
     "Advanced Tools settings should render a language selector before appearance settings");
   assert.match(SRC, /if \(key === "locale"\) value = coerceSupportedLocale/,
     "language changes must be coerced to the supported language set before persistence");
-  assert.match(SRC, /showToast\(t\("feature\.settings\.localeSwitched", \{ language: localeDisplayName\(value, value\) \}\)\)/,
+  assert.match(SRC, /showToast\(t\("feature\.settings\.localeSwitched", \{ language: localeDisplayName\(value, value\) \}\)/,
     "language changes should give visible feedback");
+  // 2026-08-31：这句提示后面接了一段「编辑器菜单要下次启动才跟上」。Monaco 的文案在它被
+  // import 的那一刻就定死了（见 src/monaco-nls.js），当场切不了——不说清楚，用户看到右键
+  // 菜单还是旧语言，会以为整个切换没生效。
+  assert.match(SRC, /t\("feature\.settings\.localeEditorRestart"\)/,
+    "没告诉用户编辑器菜单要下次启动才跟上——他会以为语言切换根本没生效");
   assert.match(I18N, /function dictionaryFor\(locale\)[\s\S]{0,120}coerceSupportedLocale\(locale\)[\s\S]{0,360}translations\[tag\][\s\S]{0,220}translations\.en/,
     "i18n should use supported languages and fall back cleanly while dynamic packs load");
   assert.match(I18N, /const FIRST_PARTY_LOCALE_TAGS = new Set\(\["en", "zh-CN", "ja"\]\);/,
@@ -3797,7 +3802,10 @@ test("Advanced Tools settings exposes the supported IDE language preference", ()
     "setLocale should expose the dynamic language-pack readiness promise");
   assert.match(SRC, /const desiredLocale = coerceSupportedLocale\(p\.locale[\s\S]{0,180}if \(getLocale\(\) !== desiredLocale\) await setLocale\(desiredLocale\);[\s\S]{0,120}createToolHeader\(body, t\("feature\.settings\.title"\)/,
     "Settings must synchronize the active i18n locale before rendering translated labels");
-  assert.match(SRC, /if \(key === "locale"\) \{[\s\S]{0,80}await setLocale\(value\);[\s\S]{0,160}renderFeaturePanel\(\);[\s\S]{0,80}return;/,
+  // 窗口放宽到 600：SRC 是**注释抹成空白后**的源码，空白仍占位置——中间加一段解释就会把
+  // 两个锚点推出窗口，而断言依旧"看起来对"。这条正是本仓库那类「函数一长就静默失效」的
+  // 固定窗口切片；判据要守的是**顺序**（切完语言再重画），不是两者之间隔多少字符。
+  assert.match(SRC, /if \(key === "locale"\) \{[\s\S]{0,120}await setLocale\(value\);[\s\S]{0,600}renderFeaturePanel\(\);[\s\S]{0,80}return;/,
     "language changes should wait for the selected locale to be ready before repainting Advanced Tools");
   assert.match(I18N, /for \(const tag of \["zh-CN", "ja", "ko", "de", "es", "pt", "ru"\]\)[\s\S]{0,260}michael-ide\.i18n-pack\.\$\{tag\}\.v1[\s\S]{0,260}michael-ide\.i18n-pack\.\$\{tag\}\.v2[\s\S]{0,260}michael-ide\.i18n-adhoc\.\$\{tag\}\.v3[\s\S]{0,260}michael-ide\.i18n-adhoc\.\$\{tag\}\.v4[\s\S]{0,260}michael-ide\.i18n-adhoc\.\$\{tag\}\.v5/,
     "startup should remove locale caches known to contain stale or wrong translations");
@@ -5330,7 +5338,10 @@ test("存储形状再序列化一次必须幂等——关标签页不许丢需�
     _pendingSendsForStorage: pendingForStorage,
     serializeMessagesForPersistence,
     _snapshotTranscript: () => "",
-    _ctxReadingForStorage: load("_ctxReadingForStorage"),
+    // _ctxReadingForStorage 里嵌了 _ctxPartsForStorage（上下文来源的分项跟读数搭同一班车
+    // 落盘）。这张注入表是手工的：漏一个，被测函数里那次调用就是 ReferenceError——
+    // 而它在产品代码里是模块级函数，完全正常。
+    _ctxReadingForStorage: load("_ctxReadingForStorage", { _ctxPartsForStorage: load("_ctxPartsForStorage") }),
   });
 
   const memory = new ConversationMemory();
@@ -5346,6 +5357,9 @@ test("存储形状再序列化一次必须幂等——关标签页不许丢需�
     _intentState: { kind: "build" },
     _semanticProfileFlags: ["frontend"],
     _ctxRealFloor: { total: 12000, input: 9000, output: 3000, cacheRead: null, cacheWrite: 0, model: "grok-4.6", requestId: "r1", at: 7 },
+    // 上下文**来源**的分项和读数搭同一班车落盘。它同样要过幂等这一关：掉了的话，
+    // 重启之后来源面板七行全是 0，而用户看到的是"这功能坏了"。
+    _ctxParts: { l0: true, at: 7, system: 7240, rules: 0, skills: 0, tools: 0, mcp: 0, subagent: 0, history: 8010 },
     _lastRunState: { steps: 9 },
     _pendingSends: [],
   };
@@ -5368,6 +5382,10 @@ test("存储形状再序列化一次必须幂等——关标签页不许丢需�
   assert.deepEqual(second.plan, first.plan, "计划必须逐字保住");
   assert.deepEqual(second.contract, first.contract, "验收契约必须逐字保住");
   assert.equal(second.anchorRoot, first.anchorRoot, "anchorRoot 丢了就不知道在哪个目录干活");
+  // 上下文来源的分项：第一遍要存下来，第二遍不许被清空（它挂在 ctxFloor.parts 里）。
+  assert.equal(first.ctxFloor?.parts?.system, 7240, "第一遍就没存下来源分项，下面那条判据会变成恒真");
+  assert.deepEqual(second.ctxFloor?.parts, first.ctxFloor?.parts,
+    "来源分项在第二次序列化时丢了——重启之后那七行会全变成 0");
 });
 
 // 存下来了但没人读回，等于没存。恢复侧原本只读了 intentState/semanticFlags/ctxFloor/
@@ -6303,7 +6321,16 @@ test("token cache meter is a persistent context ring beside the composer voice b
   // The ring carries the token count; the arc carries how full the window is. A percentage in
   // the middle rounded a real 125k conversation to "0" against a membership-sized window.
   assert.match(SRC, /label\.textContent = pct >= 100 \? "满" : String\(pct\)/);
-  assert.match(SRC, /el\.dataset\.tooltip = tooltip/);
+  // 2026-08-31：环上那层**纯文字**提示已经被悬停面板取代（用户要求：悬停出「上下文用量」、
+  // 点击出「上下文来源」）。所以判据反过来了——Shell.jsx 在静态标记里写死了一个
+  // data-tooltip，必须**主动摘掉**，否则纯文字那层和面板会同时冒出来，叠成两块。
+  assert.match(SRC, /el\.removeAttribute\("data-tooltip"\)/,
+    "静态标记里那个 data-tooltip 没摘——悬停时会和面板叠成两层");
+  assert.doesNotMatch(SRC, /el\.dataset\.tooltip = tooltip/,
+    "纯文字提示又写回来了，它和悬停面板是两套，不能并存");
+  // 读屏那条路不能跟着一起没：它现在挂在 aria-label 上，内容仍是「多大 / 窗口多大」。
+  assert.match(SRC, /el\.setAttribute\("aria-label", `\$\{text\}\\n\$\{tooltip\}`\)/,
+    "读屏标签没了——纯文字层删掉之后，屏幕阅读器就完全读不到这个环了");
   assert.match(SRC, /上下文 \$\{k\(state\.total\)\} \/ \$\{k\(state\.limit\)\}，\$\{pct\}%/,
     "the screen-reader label states the size and the window, not a bare percentage");
   assert.match(APP_CSS, /\.cache-ring\s*\{[^}]*margin-left:\s*auto;[\s\S]*?width:\s*30px;[\s\S]*?height:\s*30px;/);
@@ -6314,8 +6341,13 @@ test("token cache meter is a persistent context ring beside the composer voice b
   assert.match(APP_CSS, /\.cache-ring\.is-danger\s*\{[^}]*#ef4444/);
   assert.doesNotMatch(APP_CSS, /\.cache-ring\.is-danger\s*\{[^}]*box-shadow/);
   assert.match(APP_CSS, /\.cache-ring\.is-full\s*\{[^}]*cache-ring-full-pulse/);
-  assert.match(APP_CSS, /\.cache-ring:hover::after/);
-  assert.match(APP_CSS, /content:\s*attr\(data-tooltip\)/);
+  // 纯文字那层的 CSS 也一并删了（和上面同一笔）。留着就是一条随时会和面板同时生效的死规则。
+  assert.doesNotMatch(APP_CSS, /\.cache-ring:hover::after/,
+    "纯文字提示的样式又回来了——它会和悬停面板同时显示");
+  // 悬停/点击现在由 JS 接管，两条都要在。
+  assert.match(SRC, /el\.addEventListener\("pointerenter", \(\) => _showContextHover\(el\)\)/,
+    "悬停不再弹用量面板");
+  assert.match(SRC, /_toggleContextPanel\(el\)/, "点击不再弹来源面板");
 });
 
 test("Claude tuning cannot override complete writes or force ritual searches", () => {
@@ -17738,7 +17770,13 @@ test("reply stats footer uses exact server settlements on both chat paths", () =
   assert.doesNotMatch(SRC, /credits_cents \/ 100|total_spent_cents \/ 100|cost_cents \/ 100/,
     "all user-facing balance and usage money must use the shared 6.63:1 denomination");
   // Both the plain-chat finalizer and the agent-run finalizer must append the footer.
-  assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - _taskStartedAt/,
+  // 2026-08-31：普通聊天这条也改成**在内容结束时定格**（和 agent 那条同一个理由——用户报
+  // 「任务都结束了计时器还在数」）。契约没变，变的是形状：值仍旧从 _taskStartedAt 算起，
+  // 也就是**整个用户可见的任务**，不是最后一次物理重试；只是提前在 finally 里算好冻住，
+  // 而不是在页脚那一行现取 Date.now()——后面还要 await 计费落定和结算，现取会把收尾也算进去。
+  assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: _contentDoneMs,\s*\n\s*settlement: _plainSettlement,/,
+    "plain chat 的页脚没用定格值");
+  assert.match(SRC, /const _contentDoneMs = Date\.now\(\) - _taskStartedAt;/,
     "plain chat reports the whole user-visible task, not only the final physical attempt");
   // agent 那条的耗时在**内容结束时定格**（`_contentDoneMs`，见「耗时在内容结束时定格」
   // 那条测试）：收尾要 await 两次网络往返，用 Date.now() 会把对账也算进「回答花了多久」。
