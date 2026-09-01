@@ -8450,7 +8450,19 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 /* 环上原来那层纯文字提示（.cache-ring::after 读 data-tooltip）已删：它和悬停面板
    会在同一个位置叠成两层。现在悬停出的是 .ctx-panel--usage，样式在下面那一段。 */
-
+/* Voice-input button, sits right after the cache ring / left of ⌘↩. */
+/* 这条**不能**跟着上面那层提示一起被删掉：删了之后按钮退回浏览器默认的 <button> 样式，
+   在浅色下就是一块黑底方块（用户实拍「语音输入按钮周围有黑块」）。它是上一次删提示时
+   被误伤的邻居——删一段 CSS 时按大括号数右边界，多数一个就会连累下一条规则。 */
+.voice-btn {
+  margin-left: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; flex: none;
+  border: 0; border-radius: 8px; background: transparent;
+  color: var(--text-dim); cursor: pointer;
+  transition: background .14s ease, color .14s ease, box-shadow .14s ease;
+  --vol: 1;
+}
 .voice-btn:hover { background: var(--hover); color: var(--text); }
 .voice-btn__mic { width: 17px; height: 17px; }
 /* live waveform (shown while recording): 5 bars pulse via keyframes, and the whole strip scales by

@@ -144,3 +144,23 @@ test("分项的数是发送时真记下来的，不是打开面板时现估的",
     "网关线路上也把客户端那份系统提示词算进去了——它根本没发出去，会把网关那一项的倒推压小");
   assert.match(SRC, /sess\._ctxParts\.history = messages\.slice\(1\)/, "对话历史那一块没记，或者把 system 也算进去了");
 });
+
+test("语音按钮的底样式还在——它是上次删提示时被误伤的邻居", () => {
+  // 用户实拍：「语音输入按钮周围变丑，有黑块」。真因不是这个按钮被改过，而是上一次删
+  // `.cache-ring::after` 那层纯文字提示时**多数了一个右大括号**，把紧挨着它的
+  // `.voice-btn { … }` 一起删了。没有这条规则，按钮退回浏览器默认的 <button> 样式：
+  // 浅色下就是一块黑底方块。
+  //
+  // 守的是「这条规则在、且它把默认样式压住了」，不是某个具体数值。
+  const css = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
+  const i = css.indexOf("\n.voice-btn {");
+  assert.ok(i > 0, "语音按钮的底样式没了——它会退回浏览器默认样式，浅色下是一块黑方块");
+  const rule = css.slice(i, css.indexOf("}", i));
+  for (const [prop, why] of [
+    ["background: transparent", "不压住默认底色，浅色下就是一块黑方块"],
+    ["border: 0", "不去掉默认边框，按钮会带一圈立体边"],
+    ["border-radius", "没有圆角，和旁边的环不是一套"],
+  ]) {
+    assert.ok(rule.includes(prop), `.voice-btn 少了 ${prop}——${why}`);
+  }
+});
