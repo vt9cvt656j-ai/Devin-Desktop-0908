@@ -66,3 +66,27 @@ export function skinPanelAlpha(opacity) {
   const a = 1 - (clampSkinOpacity(opacity) / 100) * (1 - SKIN_PANEL_MIN_ALPHA);
   return Math.max(SKIN_PANEL_MIN_ALPHA, Math.min(1, a));
 }
+
+/**
+ * 编码阶梯：先缩到哪一档，再按什么格式/画质试。
+ *
+ * **为什么必须有 jpeg，而且不能只靠 webp。** Safari / WKWebView（这个应用在 macOS 上
+ * 只能跑它）对不认识的 toDataURL 类型不会报错，会**静默回退成 PNG**。于是原来那条
+ * 「webp 三档 → png 兜底」的阶梯在 mac 上实际是「png 四次」——而一张 2560px 的照片
+ * 存成 PNG 常常 5–10MB，四次全部超限，最后抛「图片太大」。用户放一张正常的照片就被拒。
+ *
+ * jpeg 是 canvas 上唯一各家都必然支持、且对照片压得动的格式，所以它必须在阶梯里，
+ * 并且排在 png 前面。png 只留给带透明通道的图（jpeg 会把透明压成黑）。
+ *
+ * 尺寸也要能退：单靠降画质压不下来的图（很大的截图、插画），缩一档立刻就够了。
+ */
+export const SKIN_ENCODE_LADDER = Object.freeze([
+  { maxSide: 2560, type: "image/webp", quality: 0.85 },
+  { maxSide: 2560, type: "image/jpeg", quality: 0.82 },
+  { maxSide: 1920, type: "image/webp", quality: 0.82 },
+  { maxSide: 1920, type: "image/jpeg", quality: 0.78 },
+  { maxSide: 1440, type: "image/jpeg", quality: 0.75 },
+  { maxSide: 1080, type: "image/jpeg", quality: 0.7 },
+  { maxSide: 2560, type: "image/png" },
+  { maxSide: 1440, type: "image/png" },
+]);

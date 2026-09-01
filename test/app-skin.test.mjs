@@ -79,3 +79,79 @@ test("CSS 不许自己再算一遍", () => {
   assert.doesNotMatch(skin, /calc\([^)]*--skin-panel-a[^)]*\*/, "CSS 又在自己乘系数了");
   assert.match(skin, /var\(--skin-panel-a\)/, "面板没有用算好的那个值");
 });
+
+// ── 编码阶梯 ────────────────────────────────────────────────────────────────
+// 用户实拍：「现在放图片能用了？？？？」—— 一张正常照片被拒。
+// 原因不在上传、不在 CSP，在编码那一步：Safari / WKWebView 对不认识的 toDataURL 类型
+// **不报错，静默回退成 PNG**。原来的阶梯是「webp×3 → png」，在 mac 上实际是「png×4」，
+// 而一张 2560px 的照片存成 PNG 常常 5–10MB，四次全部超上限，最后抛「图片太大」。
+import { SKIN_ENCODE_LADDER } from "../src/agent/app-skin.js";
+
+/** 按各家引擎的真实行为伪造 toDataURL。体积按 (边长² × 每格字节) 粗估。 */
+function fakeCanvas({ webp = true, bytesPerPx }) {
+  const c = { width: 0, height: 0 };
+  c.getContext = () => ({ drawImage() {} });
+  c.toDataURL = (type, q) => {
+    // Safari：不支持的类型不报错，返回 PNG。这正是那条静默失败的来源。
+    const real = (type === "image/webp" && !webp) ? "image/png" : type;
+    const px = c.width * c.height;
+    const per = bytesPerPx[real] ?? 3;
+    const bytes = real === "image/png" ? px * per : px * per * (q ?? 0.8);
+    return `data:${real};base64,` + "A".repeat(Math.max(1, Math.round(bytes)));
+  };
+  return c;
+}
+
+/** 把 main.js 那段阶梯逻辑照搬过来跑（同一份 SKIN_ENCODE_LADDER 驱动）。 */
+function encode(canvas, w, h) {
+  const ctx = canvas.getContext("2d");
+  let lastSide = 0;
+  for (const step of SKIN_ENCODE_LADDER) {
+    if (step.maxSide !== lastSide) {
+      lastSide = step.maxSide;
+      const scale = Math.min(1, step.maxSide / Math.max(w, h));
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
+      ctx.drawImage();
+    }
+    let out = "";
+    try { out = canvas.toDataURL(step.type, step.quality); } catch { continue; }
+    if (normalizeAppSkin(out)) return out;
+  }
+  return null;
+}
+
+test("Safari 把 webp 悄悄换成 PNG 时，一张正常照片仍然能存下来", () => {
+  // 4032×3024 的手机照片，PNG 约 3 字节/像素、jpeg/webp 约 0.35。
+  const bytesPerPx = { "image/png": 3, "image/jpeg": 0.35, "image/webp": 0.25 };
+  const got = encode(fakeCanvas({ webp: false, bytesPerPx }), 4032, 3024);
+  assert.ok(got, "mac 上一张普通照片被整条阶梯拒掉了——这就是用户撞到的那个「图片太大」");
+  assert.match(got, /^data:image\/jpeg;base64,/, "回退时该落到 jpeg，而不是继续在 PNG 上打转");
+  assert.ok(normalizeAppSkin(got), "存下来的东西自己过不了校验");
+});
+
+test("支持 webp 的引擎上仍然优先用 webp（画质体积都更好）", () => {
+  const bytesPerPx = { "image/png": 3, "image/jpeg": 0.35, "image/webp": 0.25 };
+  const got = encode(fakeCanvas({ webp: true, bytesPerPx }), 4032, 3024);
+  assert.match(got, /^data:image\/webp;base64,/, "有 webp 却没用");
+});
+
+test("阶梯里必须有 jpeg，且排在 png 前面", () => {
+  // jpeg 是 canvas 上唯一各家都必然支持、且对照片压得动的格式。
+  // 它一旦被拿掉或排到 png 后面，mac 上就退回原来那条静默失败的路。
+  const types = SKIN_ENCODE_LADDER.map((s) => s.type);
+  assert.ok(types.includes("image/jpeg"), "阶梯里没有 jpeg —— mac 上会退回「一直在编 PNG」");
+  assert.ok(types.indexOf("image/jpeg") < types.indexOf("image/png"), "jpeg 排到 png 后面了");
+  // 尺寸也要能退：单靠降画质压不下来的图，缩一档立刻就够。
+  const sides = [...new Set(SKIN_ENCODE_LADDER.map((s) => s.maxSide))];
+  assert.ok(sides.length >= 3, `只有 ${sides.length} 档尺寸，压不动的图没有退路`);
+  assert.equal(Math.max(...sides), 2560, "最大边不再是 2560，注释和上限就对不上了");
+});
+
+test("怎么都压不下去时是明确失败，不是存一个半截的东西", () => {
+  // 一张纯噪声的巨图：任何格式都压不动。这时必须抛，不能返回一个超限的串
+  // ——超限的串会被 normalizeAppSkin 判成空，表现是"上传成功但什么都没发生"。
+  const bytesPerPx = { "image/png": 40, "image/jpeg": 40, "image/webp": 40 };
+  const got = encode(fakeCanvas({ webp: true, bytesPerPx }), 8000, 8000);
+  assert.equal(got, null, "压不下去却返回了东西");
+});

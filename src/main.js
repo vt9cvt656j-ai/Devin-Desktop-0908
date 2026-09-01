@@ -223,7 +223,7 @@ import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffVi
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { pointInTermSelection as _pointInTermSelection, termChipLabel as _termChipLabel, termSnippetText as _termSnippetText } from "./agent/term-drag.js";
 import { normalizeAskOptions as _normalizeAskOptions, askMode as _askMode, askAnswerText as _askAnswerText, askAnswerLabel as _askAnswerLabel } from "./agent/ask-user.js";
-import { normalizeAppSkin, clampSkinOpacity, skinPanelAlpha } from "./agent/app-skin.js";
+import { normalizeAppSkin, clampSkinOpacity, skinPanelAlpha, SKIN_ENCODE_LADDER } from "./agent/app-skin.js";
 import { toolIconSvg as _toolIconSvg, toolIconFamily as _toolIconFamily } from "./agent/tool-icons.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
@@ -4305,21 +4305,28 @@ async function appSkinFromFile(file) {
   const w = img.naturalWidth || img.width;
   const h = img.naturalHeight || img.height;
   if (!w || !h) throw new Error(t("feature.appearance.appSkin.invalid"));
+  // 按 SKIN_ENCODE_LADDER 一档一档试（尺寸 + 格式 + 画质）。阶梯为什么长这样、
+  // 为什么 jpeg 必须在里面且排在 png 前面，见 src/agent/app-skin.js 里那段说明 ——
+  // 一句话：Safari 对不认识的 toDataURL 类型**静默回退成 PNG**，只靠 webp 的话
+  // 在 mac 上等于一直在编 PNG，一张正常照片就会撞上限被拒。
+  //
   // 只缩不放：本来就小的图再放大只会糊，还白占体积。
-  const scale = Math.min(1, 2560 / Math.max(w, h));
+  let lastSide = 0;
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(w * scale));
-  canvas.height = Math.max(1, Math.round(h * scale));
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error(t("feature.appearance.appSkin.invalid"));
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  // webp 先试，画质/体积比 png 好一个数量级；不行再降质量，最后才认输。
-  for (const q of [0.85, 0.7, 0.55]) {
-    const out = canvas.toDataURL("image/webp", q);
+  for (const step of SKIN_ENCODE_LADDER) {
+    if (step.maxSide !== lastSide) {
+      lastSide = step.maxSide;
+      const scale = Math.min(1, step.maxSide / Math.max(w, h));
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    }
+    let out = "";
+    try { out = canvas.toDataURL(step.type, step.quality); } catch { continue; }
     if (normalizeAppSkin(out)) return out;
   }
-  const png = canvas.toDataURL("image/png");
-  if (normalizeAppSkin(png)) return png;
   throw new Error(t("feature.appearance.appSkin.tooLarge"));
 }
 
