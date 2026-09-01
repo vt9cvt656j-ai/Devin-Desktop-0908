@@ -10286,6 +10286,19 @@ lspManager.onCompletionSymbols = (symbols) => {
 };
 lspManager.registerProviders();
 
+/*
+ * 语言服务的自动看护。策略全在 lsp-client（怎么起、退避多久、什么时候停手），这里只管
+ * **什么时候去看一眼**——三个时机补的都是 didOpen 覆盖不到的段：切标签页（model 早建好
+ * 了，不产生 didOpen）、窗口回到前台（人不在时被系统回收内存杀掉是最常见的死法）、
+ * 20 秒巡检（应用刚起来那阵子工作区还没就绪，或者启动失败过一次）。
+ * 每次都很便宜：服务在跑就是一次 Map 查询，起不来的语言那边有冷却。
+ */
+const _lspWatch = () => { try { lspManager?.ensureForOpenModels?.(); } catch { /* 看护失败不能影响编辑 */ } };
+monacoEditor.onDidChangeModel(() => _lspWatch());
+window.addEventListener("focus", _lspWatch);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) _lspWatch(); });
+setInterval(() => { if (!document.hidden) _lspWatch(); }, 20000);
+
 let _envLoadTimer = null;
 let _modApiTimer = null;
 
@@ -10386,14 +10399,18 @@ function updateLspStatusBar() {
   const _lang = (() => { try { return monacoEditor.getModel()?.getLanguageId() || ""; } catch { return ""; } })();
   if (!_lang || !lspManager.isManaged?.(_lang)) { removeStatusBarItem("lsp"); return; }
   const _why = (() => { try { return lspManager.lastStopReason?.(_lang) || ""; } catch { return ""; } })();
+  // 正在自动重启的话得说出来。自愈过程中界面上还写着「未启动」，用户读到的是"它就是死了"，
+  // 于是要么去点、要么去重启应用——而它两秒后本来就会自己回来。
+  const _retrying = (() => { try { return !!lspManager.restartPending?.(_lang); } catch { return false; } })();
   setStatusBarItem(
     "lsp",
     {
-      text: `LSP: ${_lang} 未启动`,
+      text: `LSP: ${_lang} ${_retrying ? "重启中…" : "未启动"}`,
       order: 10,
       className: "statusbar__item--warn",
       tooltip: (_why ? `上次停止：${_why}\n` : "")
-        + "补全、跳转、悬浮说明都依赖它。点一下重试。",
+        + (_retrying ? "正在自动重启，稍等一下。点一下可以立刻再试。"
+          : "补全、跳转、悬浮说明都依赖它。点一下重试。"),
     },
     () => {
       showToast(`正在启动 ${_lang} 语言服务…`);

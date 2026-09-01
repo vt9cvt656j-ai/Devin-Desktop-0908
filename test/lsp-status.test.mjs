@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { fnSource, SRC, CODE } from "./helpers/source.mjs";
+import { fnSource, load, SRC, CODE } from "./helpers/source.mjs";
 
 test("一个服务都没起来时不再摘掉那一栏，而是写明「未启动」", () => {
   const fn = fnSource("updateLspStatusBar", { code: true });
@@ -50,4 +50,49 @@ test("悬浮/跳转/补全的 provider 一直是注册着的——问题从来�
   assert.match(SRC, /monaco\.editor\.registerEditorOpener\(\{/, "跨文件跳转的 opener 没了");
   // 编辑器没有把悬浮关掉。
   assert.doesNotMatch(CODE, /hover:\s*\{\s*enabled:\s*false/, "编辑器把悬浮关掉了");
+});
+
+// ── 全自动：没起来自己起、坏了自己重启 ─────────────────────────────────────
+//
+// 用户实拍：「LSP坏了 或者 没启动都要全自动」。真凶在 lsp-client（并发 didOpen 把自己
+// 杀干净了，见 lsp-autostart.test.mjs 跑真代码那一份）；这里守的是**界面这一侧**：
+// 自愈的时候要看得出来在自愈，以及那几个"去看一眼"的时机没被删掉。
+
+function renderStatus({ restartPending = false, running = false } = {}) {
+  const items = new Map();
+  const fn = load("updateLspStatusBar", {
+    lspManager: {
+      status: () => (running ? [{ lang: "python", initialized: true }] : []),
+      isManaged: (l) => l === "python",
+      lastStopReason: () => "进程退出，没有留下任何错误输出",
+      restartPending: () => restartPending,
+      ensureServer: async () => null,
+    },
+    monacoEditor: { getModel: () => ({ getLanguageId: () => "python" }) },
+    setStatusBarItem: (k, v, onClick) => items.set(k, { ...v, onClick }),
+    removeStatusBarItem: (k) => items.delete(k),
+    showToast: () => {},
+  });
+  fn();
+  return items.get("lsp");
+}
+
+test("正在自动重启时，状态栏说的是「重启中」而不是「未启动」", () => {
+  const retrying = renderStatus({ restartPending: true });
+  assert.match(retrying.text, /重启中/, "自愈途中还写着「未启动」——用户读成「它就是死了」，于是去重启整个应用");
+  assert.match(retrying.tooltip, /自动重启/, "提示里没说它正在自己恢复");
+  // 没在重启的时候仍旧是「未启动」，两种状态不能混成一种。
+  const idle = renderStatus({ restartPending: false });
+  assert.match(idle.text, /未启动/);
+  assert.doesNotMatch(idle.text, /重启中/, "没排重启却说在重启");
+});
+
+test("「去看一眼」的三个时机一个都不能少", () => {
+  // 只靠 didOpen 覆盖不到：切标签页（model 早建好了，不产生 didOpen）、
+  // 窗口回到前台（不在的时候被系统回收内存杀掉是最常见的死法）、
+  // 以及应用刚起来那阵子工作区还没就绪。
+  assert.match(CODE, /monacoEditor\.onDidChangeModel\(\(\) => _lspWatch\(\)\)/, "切标签页时不再补一次");
+  assert.match(CODE, /window\.addEventListener\("focus", _lspWatch\)/, "窗口回到前台时不再补一次");
+  assert.match(CODE, /setInterval\(\(\) => \{ if \(!document\.hidden\) _lspWatch\(\); \}, \d+\)/, "低频巡检没了");
+  assert.match(CODE, /lspManager\?\.ensureForOpenModels\?\.\(\)/, "看护根本没调到管理器那一侧");
 });

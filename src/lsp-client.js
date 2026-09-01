@@ -725,6 +725,120 @@ export function createLspManager(options) {
   // langId -> 上一次非预期停止的原因（stderr 最后一行看着像错误的那句）。
   const lastStopReason = new Map();
 
+  /*
+   * ── 自动起、自动重启 ─────────────────────────────────────────────────────
+   *
+   * 用户实拍：状态栏一句「LSP: python 未启动」，补全 / 跳转 / 悬浮全没有。
+   * 三条各自独立的路都会把它停在那儿，这一段一起兜住：
+   *
+   * 1. **同一门语言被并发启动**。三个 .py 标签页在恢复时各发一次 didOpen，三次都通过了
+   *    `clients.get()` 那道**同步**检查，然后各自 await 一次 Python 解释器探测——于是后端
+   *    收到三次 lsp_start。第 2、3 次撞上「already running」，走的是「先 stop 再重试」那条
+   *    恢复分支，而它 stop 掉的正是第 1 次刚起好的那个。实测日志：70ms 内 spawn 三次，
+   *    结束时一个 pyright 进程都不剩。这不是"没装"，是**它把自己杀干净了**。
+   *    → 在途启动按语言去重（starting）。
+   *
+   * 2. **起来之后死了**（被系统回收内存、崩溃、收到信号）。原来只清客户端 + 弹一句提示，
+   *    要等用户再打开一个同语言文件才会重来——可他正待在那个文件里，不会再有 didOpen。
+   *    → 退避重启（restarts）。
+   *
+   * 3. **压根没起来过**（启动那一刻工作区还没就绪，或者第 1 条那种自杀）。
+   *    → 切标签页 / 窗口重新获得焦点 / 低频巡检都补一次（ensureForOpenModels）。
+   *
+   * 三条之外还要有刹车：起不来的时候不能空转。启动失败进冷却，连续重启失败到顶就停手并
+   * 说一句——自动恢复可以失败，但不能变成一个看不见的重试风暴。
+   */
+  const starting = new Map();   // langId -> 在途的启动 Promise
+  const restarts = new Map();   // langId -> { n, timer }
+  const coolUntil = new Map();  // langId -> 时间戳；这之前不自动重试
+  const RESTART_DELAYS = [800, 3000, 10000, 30000];
+  const HEALTHY_MS = 60000;     // 活过这么久再死，算新的一轮，退避重新计数
+  const GAVE_UP_COOL_MS = 600000; // 认输之后隔这么久才让巡检再试一次
+
+  /*
+   * 编辑器里**真的开着**的文档：uri -> langId。didOpen 记，didClose 删。
+   *
+   * 判据不能用 `monaco.editor.getModels()`——这个 IDE 会把项目里所有代码文件**预载**成
+   * model（跨文件跳转要用），一个仓库里躺着 .py/.ts/.go/.rs/.sh/.yaml 是常事。照 model
+   * 去起服务，等于用户开一个项目就在后台拉起六个语言服务器，每个几百 MB，而其中五个他
+   * 一眼都没看过。didOpen 走的才是"用户真的打开了这个文件"这条路。
+   */
+  const openDocLang = new Map();
+
+  function _langHasOpenModel(langId) {
+    for (const l of openDocLang.values()) if (l === langId) return true;
+    return false;
+  }
+
+  /// 排着的那次重启撤掉，退避计数一并清零。给「用户明确停掉」「换工作区」用。
+  function _cancelRestart(langId) {
+    const st = restarts.get(langId);
+    if (st?.timer) clearTimeout(st.timer);
+    restarts.delete(langId);
+  }
+
+  /**
+   * 只撤定时器，**退避计数留着**。给「这一次起成功了」用。
+   *
+   * 这两个不能合成一个：起成功就把计数清零，等于放过了最该拦的那种坏法——
+   * 起来 → 立刻死 → 再起来 → 再立刻死。每一轮都"成功"过，计数永远回到 0，
+   * 退避永远停在第一档，于是 800ms 一次地 spawn，无限。
+   * 计数该被清零的判据是**活够久**（见 _scheduleRestart 的 healthy），不是"起来过"。
+   */
+  function _clearRestartTimer(langId) {
+    const st = restarts.get(langId);
+    if (st?.timer) { clearTimeout(st.timer); st.timer = null; }
+  }
+
+  /**
+   * 排一次退避重启。`healthy` 为真表示它上一轮活够久了，退避从头算。
+   *
+   * 没有这门语言的文件开着就不排：起来也没人用，还白占几百 MB。用户回到那个文件时，
+   * didOpen 和巡检都会补上。
+   */
+  function _scheduleRestart(langId, healthy) {
+    if (!enabled || !_langHasOpenModel(langId)) return;
+    const st = restarts.get(langId) || { n: 0, timer: null };
+    if (healthy) st.n = 0;
+    restarts.set(langId, st);
+    if (st.timer) return;
+    if (st.n >= RESTART_DELAYS.length) {
+      // 认输也要说出来，而且要说清还能怎么办——静默停手就是第二次"功能凭空消失"。
+      coolUntil.set(langId, Date.now() + GAVE_UP_COOL_MS);
+      showToast?.(`${langId} 语言服务连着 ${RESTART_DELAYS.length} 次没起来，先不自动重试了——点状态栏那一栏可以手动再来`);
+      onStatus?.();
+      return;
+    }
+    const delay = RESTART_DELAYS[st.n];
+    st.n += 1;
+    st.timer = setTimeout(() => {
+      st.timer = null;
+      if (clients.has(langId) || starting.has(langId) || !_langHasOpenModel(langId)) return;
+      ensureServer(langId);
+    }, delay);
+    st.timer?.unref?.();
+    onStatus?.();
+  }
+
+  /**
+   * 巡检：现在开着的文件里，**该有服务却没起来**的，补一次。
+   *
+   * 「没启动要自动启动」那一半靠它。只靠 didOpen 是不够的——文件早就开着、服务后来才死，
+   * 或者启动那一刻工作区还没就绪，两种情况都不会再来一次 didOpen。
+   */
+  function ensureForOpenModels() {
+    if (!enabled) return;
+    const now = Date.now();
+    const langs = new Set();
+    for (const l of openDocLang.values()) if (isManaged(l)) langs.add(l);
+    for (const langId of langs) {
+      if (clients.has(langId) || starting.has(langId)) continue;
+      if (restarts.get(langId)?.timer) continue;         // 已经排上退避重启了
+      if ((coolUntil.get(langId) || 0) > now) continue;  // 刚失败过，等一会儿
+      ensureServer(langId);
+    }
+  }
+
   function isManaged(langId) {
     return MANAGED_LANGS.includes(langId);
   }
@@ -816,17 +930,45 @@ export function createLspManager(options) {
       monaco.editor.setModelMarkers(m, "lsp:" + langId, []);
     }
     onStatus?.();
+    /*
+     * **死了就自己爬起来。**
+     *
+     * 到这一行为止，界面上发生的是：红线全清、状态栏少一门语言、补全/跳转/悬浮同时失效。
+     * 而原来这里就结束了——重启要等下一次 didOpen，也就是要等用户去打开**另一个**同语言
+     * 文件。可他正待在出事的那个文件里，那次 didOpen 永远不会来。他的描述是"坏了"。
+     *
+     * 上一轮活够久（HEALTHY_MS）就当作偶发，退避从头算；连着秒退的才会一路退到认输。
+     */
+    _scheduleRestart(langId, Date.now() - (client._startedAt || 0) >= HEALTHY_MS);
   }
 
+  /**
+   * 这门语言的服务**保证有一个在跑**（起不来才返回 null）。
+   *
+   * 这一层只做两件事：已经有就直接给，**在途的按语言去重**。去重不是优化，是修一条真
+   * 故障：三个 .py 标签页同时恢复时，三次调用都会通过下面 `clients.get()` 那道同步检查，
+   * 然后各自 await 一次解释器探测，于是后端收到三次 lsp_start——第 2、3 次撞「already
+   * running」走恢复分支，把第 1 次刚起好的那个 stop 掉。实测 70ms 内 spawn 三次，
+   * 收场是一个 pyright 都不剩、状态栏写着「未启动」。
+   */
   async function ensureServer(langId, custom) {
     if (!enabled) return null;
-    let client = clients.get(langId);
-    if (client) {
-      if (client.initPromise) {
-        try { await client.initPromise; } catch { /* fall through */ }
+    const live = clients.get(langId);
+    if (live) {
+      if (live.initPromise) {
+        try { await live.initPromise; } catch { /* fall through */ }
       }
       return clients.get(langId) || null;
     }
+    const inflight = starting.get(langId);
+    if (inflight) return inflight;
+    const p = _startServer(langId, custom);
+    starting.set(langId, p);
+    try { return await p; } finally { if (starting.get(langId) === p) starting.delete(langId); }
+  }
+
+  async function _startServer(langId, custom) {
+    let client;
     if (langId === "vue" && manager._vueTsdk === undefined) {
       /*
        * 用**项目自己的** typescript，不是全局那份。
@@ -876,7 +1018,10 @@ export function createLspManager(options) {
     clients.set(langId, client);
     try {
       await client.start(custom);
+      client._startedAt = Date.now(); // 死的时候据此判断"上一轮活够久了没"
       lastStopReason.delete(langId); // 起来了，别再拿上一次的死因解释这一次
+      _clearRestartTimer(langId);    // 排着的那次不用了；计数留着，交给"活够久"去清
+      coolUntil.delete(langId);
       // No success toast. A language server starting is routine background plumbing the user
       // did not ask for and cannot act on, and it fires again for every language a project
       // touches. The status bar already shows which servers are live ("LSP: python, shell"),
@@ -886,6 +1031,9 @@ export function createLspManager(options) {
       return client;
     } catch (e) {
       if (clients.get(langId) === client) clients.delete(langId);
+      // 起不来就进冷却：巡检每 20 秒来一次，没有这一条就是对着一个装都没装的服务
+      // 反复 spawn。手动点状态栏那一栏走的是 ensureServer，不看冷却，随时能试。
+      coolUntil.set(langId, Date.now() + 60000);
       const msg = String(e && e.message ? e.message : e);
       const alreadyRunning = /already running/i.test(msg);
       if (alreadyRunning) {
@@ -903,6 +1051,9 @@ export function createLspManager(options) {
           const retry = new LspClient(langId, manager);
           clients.set(langId, retry);
           await retry.start(custom);
+          retry._startedAt = Date.now();
+          _clearRestartTimer(langId);
+          coolUntil.delete(langId);
           onStatus?.();
           return retry;
         } catch (e2) {
@@ -1058,6 +1209,7 @@ export function createLspManager(options) {
     const langId = lspLangOf(model, path);
     if (!isManaged(langId)) return;
     const uri = model.uri.toString();
+    openDocLang.set(uri, langId); // 自动看护据此判断"这门语言还有人在用吗"
     const docLang = DOC_LANGUAGE_ID[langId] || langId;
     /*
      * 取样必须放在 await 之后，不能在这一行。
@@ -1118,6 +1270,7 @@ export function createLspManager(options) {
   function didClose(path) {
     if (!enabled || !path) return;
     const uri = pathToUri(path);
+    openDocLang.delete(uri);
     for (const client of clients.values()) client.didClose(uri);
   }
 
@@ -2148,6 +2301,10 @@ export function createLspManager(options) {
      */
     async resetForNewWorkspace() {
       manager._pythonSettings = null;
+      // 排着队的自动重启也要一起撤。它们不在 clients 里（正是因为服务已经没了），
+      // 下面那圈 stop 扫不到——留着就会在新项目里按**旧根**把服务器拉起来。
+      for (const langId of [...restarts.keys()]) _cancelRestart(langId);
+      coolUntil.clear();
       const langs = [...clients.keys()];
       for (const langId of langs) {
         try { await this.stop(langId); } catch { /* 停不掉也要继续停别的 */ }
@@ -2167,6 +2324,9 @@ export function createLspManager(options) {
       return ensureServer(langId, custom);
     },
     async stop(langId) {
+      // 明确停掉的，别让自动重启把它又拉起来（切换工作区、换自定义命令都走这里）。
+      _cancelRestart(langId);
+      coolUntil.delete(langId);
       const client = clients.get(langId);
       if (client) {
         client.shutdown();
@@ -2188,6 +2348,13 @@ export function createLspManager(options) {
     isRunning(langId) {
       return clients.has(langId);
     },
+    /// 这门语言正排着一次自动重启吗。状态栏据此把「未启动」写成「重启中…」——
+    /// 自愈过程中界面必须看得出来它在自愈，否则用户以为它就是死了。
+    restartPending(langId) {
+      return !!restarts.get(String(langId || ""))?.timer;
+    },
+    /// 巡检入口：开着的文件里该有服务却没起来的，补一次。见 ensureForOpenModels。
+    ensureForOpenModels,
     lastStopReason(langId) {
       return lastStopReason.get(langId) || "";
     },
