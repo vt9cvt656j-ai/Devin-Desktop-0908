@@ -146,3 +146,49 @@ test("单选/多选的判据也要写给模型看——两份目录都要有", (
     assert.match(src, /Single vs multi/, `${name} 的工具描述正文里没有这条`);
   }
 });
+
+
+// 工具卡那条主规则的正文。两个锚点都要从 --atc-mono 那一行**往后**找：文件里另有一条
+// 更早的 `.agent-tool-step { overflow: hidden; }` 和一条更早的 `.agent-tool-row {`，
+// 按选择器直接找会切到它们，测出来的是别的规则（固定窗口切源码这个坑本仓栽过好几次）。
+const cardBlock = () => {
+  const i = CSS.indexOf("  --atc-mono: var(--mono);");
+  return CSS.slice(i, CSS.indexOf(".agent-tool-row {", i));
+};
+
+// ── 工具卡：一列扁平的行，不是一摞浮起的卡片 ──────────────────────────────
+//
+// 用户实拍一轮跑十来个工具，说「展示的内容很杂乱……做的和 windsurf、cursor 那种大气
+// 高端点」。原因有三，都在样式里：每张卡带分层阴影 + 悬停上浮 + 滑入动画；图标按类型
+// 分了 43 种粉彩底；成功状态也做成填色药丸。三样叠起来，一屏就是一堆各自发光的彩色板。
+test("工具卡不再浮起来：没有阴影、不上浮、不滑入", () => {
+  // 锚点用 --atc-mono 那一行：文件里另有一条更早的 `.agent-tool-step { overflow: hidden; }`，
+  // 按选择器找会切到它，测出来的是别的规则（这个仓库固定窗口切源码栽过好几次）。
+  const card = cardBlock();
+  assert.doesNotMatch(card, /box-shadow/, "阴影又回来了——十个工具就是十块浮板");
+  assert.doesNotMatch(card, /animation:/, "滑入动画又回来了");
+  assert.doesNotMatch(card, /transform: translateY/, "悬停上浮又回来了");
+  // 间距压到个位数，连着几个工具读起来才是一份清单。
+  assert.match(card, /margin: 3px 0;/, "卡间距又被撑开了");
+});
+
+test("配色从主题变量推导，不再手工同步两份调色板", () => {
+  const card = cardBlock();
+  for (const [name, token] of [["--atc-bg", "--panel-solid"], ["--atc-border", "--line"],
+                               ["--atc-text", "--text"], ["--atc-dim", "--text-dim"], ["--atc-accent", "--accent"]]) {
+    assert.match(card, new RegExp(`${name}: var\\(${token}\\)`), `${name} 没有从 ${token} 推导`);
+  }
+  // 深色那份手工同步的覆盖删掉了：留着会把亮色下刚统一好的灰阶按住。
+  assert.doesNotMatch(CSS, /\[data-theme="dark"\] \.agent-tool-step,\s*\n\.dark \.agent-tool-step \{[^}]*--atc-bg/,
+    "深色那份 --atc-* 覆盖又回来了——两份手工同步的调色板必然漂移");
+});
+
+test("状态只在需要回头看时才上色：成功走灰，失败才红", () => {
+  assert.match(CSS, /\.atc-result--ok \{ color: var\(--atc-dim\); background: transparent; \}/,
+    "成功又变回绿色药丸了——一屏十个绿药丸，成功被喊得比失败还响");
+  assert.match(CSS, /\.atc-result--err \{ color: var\(--atc-danger\); background: transparent; \}/,
+    "失败要么没上色、要么又加回了填色底");
+  // 药丸本身也不要：padding/圆角都归零，剩下的是一行字。
+  const base = CSS.slice(CSS.indexOf("\n.atc-result {"), CSS.indexOf(".atc-result svg"));
+  assert.match(base, /padding: 0; border-radius: 0; background: transparent;/, "状态又变回填色药丸");
+});

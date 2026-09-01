@@ -4467,7 +4467,6 @@ body.zen-mode .editor {
   min-height: 88px;
 }
 
-
 /* 树分区标题 / 保存连接的删除按钮 */
 .mpm-tree__sect {
   padding: 10px 10px 4px;
@@ -4614,7 +4613,6 @@ body.zen-mode .editor {
   gap: 8px;
 }
 
-
 /* 弹窗内的表数据标签页 */
 .mpm-center__table {
   flex: 1 1 0;
@@ -4626,7 +4624,6 @@ body.zen-mode .editor {
   flex: 1 1 0;
   min-height: 0;
 }
-
 
 /* Michael Premium SQL 编辑器（Monaco） */
 .mpm-sqlhost {
@@ -4652,7 +4649,6 @@ body.zen-mode .editor {
   left: 0;
   z-index: 90;
 }
-
 
 /* Michael Premium 可编辑数据网格（增删改查） */
 .mpm-crud { display: flex; align-items: center; gap: 4px; }
@@ -4682,7 +4678,6 @@ body.zen-mode .editor {
   font: 12px var(--mono); box-shadow: 0 0 0 3px var(--mp-focus);
 }
 
-
 /* CRUD 工具条里的蓝色保存按钮：明确背景，别被 .mpm-crud button 的 transparent 覆盖 */
 .mpm-crud .mp-run {
   border: 1px solid color-mix(in srgb, var(--mp-accent) 78%, #001a4d);
@@ -4690,7 +4685,6 @@ body.zen-mode .editor {
   color: #fff;
 }
 .mpm-crud .mp-run:hover:not(:disabled) { filter: brightness(1.05); color: #fff; }
-
 
 /* 高级设置 · MCP 标签页 */
 .mcpfp { display: flex; flex-direction: column; gap: 14px; }
@@ -4865,10 +4859,8 @@ body.zen-mode .editor {
 .mcpfp-card__btns { display: flex; align-items: center; gap: 6px; flex: none; }
 @media (max-width: 1100px) { .mcpfp-market, .mcpfp-installed--cards { grid-template-columns: 1fr; } }
 
-
 .mcpfp-badge--gold { color: #b8860b; background: color-mix(in srgb, #f5a623 16%, transparent); }
 .mcpfp-card--featured { border-color: color-mix(in srgb, #f5a623 30%, var(--line)); }
-
 
 /* MCP 搜索框 + 分页 */
 .mcpfp-searchbox {
@@ -4890,7 +4882,6 @@ body.zen-mode .editor {
 .mcpfp-searchbox__clear svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; }
 .mcpfp-pager { grid-column: 1 / -1; display: flex; align-items: center; justify-content: center; gap: 14px; padding: 10px 0 2px; }
 .mcpfp-pager__info { font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
-
 
 /* 记忆中心 · 知识图谱星球 */
 .mc-globe-wrap {
@@ -4943,7 +4934,6 @@ body.zen-mode .editor {
   font: 11px var(--font); color: rgba(70, 90, 130, 0.6);
   pointer-events: none;
 }
-
 
 .mc-title { display: inline-flex; align-items: center; gap: 9px; }
 .mc-brain { display: grid; place-items: center; width: 26px; height: 26px; flex: none; }
@@ -6381,47 +6371,54 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   display: flex; flex-direction: column; gap: 6px;
 }
 
+/*
+ * 工具卡：**一列扁平的行**，不是一摞浮起的卡片。
+ *
+ * 用户实拍一轮跑十来个工具，说「展示的内容很杂乱」。原因有二，都在这一段：
+ *  ① 每张卡都带 `0 8px 20px -8px` 的分层阴影 + 悬停上浮 + 滑入动画 —— 十个工具就是十块
+ *     各自浮起来的白板，页面没有一条安静的基线。
+ *  ② 图标块按工具类型上了 43 种粉彩底（绿/橙/蓝/紫/红…）—— 一屏下来是一条彩虹。
+ * Cursor / Windsurf 的做法反过来：行是扁的、贴着读，图标单色，颜色**只留给状态**。
+ * 所以这里去掉阴影、去掉上浮、去掉滑入，边框收成一条发丝线，间距压到 3px：
+ * 连着几个工具读起来是一份清单，不是一堆卡片。
+ *
+ * 配色也不再手写两套。--atc-* 全部从主题变量推导，明暗各自成立，
+ * 底下那份 [data-theme="dark"] 的覆盖因此可以整块删掉（原来两份是手工同步的）。
+ */
 .agent-tool-step {
   /* 指回统一的等宽栈，中文才不会在这一层重新掉回宋体。 */
   --atc-mono: var(--mono);
-  --atc-bg: #ffffff;
-  --atc-border: #ecedf0;      /* 极淡边——Mac 靠阴影不靠硬边框 */
-  --atc-head: #ffffff;        /* 纯白头，干净 */
-  --atc-text: #1d1d1f;        /* Mac 近黑 */
-  --atc-dim: #86868b;         /* Mac 次要灰 */
-  --atc-accent: #1a73e8;      /* Google blue 600 */
-  --atc-success: #188038;     /* Google green */
-  --atc-warning: #e37400;     /* Google amber */
-  --atc-danger: #d93025;      /* Google red */
-  border-radius: 14px; overflow: hidden;
+  --atc-bg: var(--panel-solid);
+  --atc-border: var(--line);
+  --atc-head: transparent;
+  --atc-text: var(--text);
+  --atc-dim: var(--text-dim);
+  --atc-accent: var(--accent);
+  --atc-success: #2a9d5c;
+  --atc-warning: #d98324;
+  --atc-danger: #e05252;
+  border-radius: 10px; overflow: hidden;
   border: 1px solid var(--atc-border);
   background: var(--atc-bg);
-  margin: 7px 0;
-  animation: atcSlideUp .28s cubic-bezier(.22,1,.36,1) both;
-  /* Mac 风柔和分层悬浮阴影（明显能看出卡片"浮"起来）*/
-  box-shadow: 0 1px 2px rgba(60,64,67,.10), 0 8px 20px -8px rgba(60,64,67,.14);
-  transition: box-shadow .2s ease, border-color .2s ease, transform .2s ease;
+  margin: 3px 0;
+  transition: border-color .15s ease, background .15s ease;
 }
-.agent-tool-step:hover {
-  border-color: #e2e3e7;
-  box-shadow: 0 2px 6px rgba(60,64,67,.12), 0 14px 32px -10px rgba(60,64,67,.20);
-  transform: translateY(-1px);   /* 悬停轻微上浮，Mac 手感 */
-}
+.agent-tool-step:hover { border-color: var(--line-strong); }
 
 .agent-tool-row {
-  display: flex; align-items: center; gap: 9px;
-  padding: 10px 14px; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 11px; cursor: pointer; user-select: none;
   background: var(--atc-head);
   transition: background .12s;
   position: relative;
 }
 .agent-tool-row::after {
-  content: ''; position: absolute; bottom: 0; left: 14px; right: 14px;
+  content: ''; position: absolute; bottom: 0; left: 11px; right: 11px;
   height: 1px; background: var(--atc-border);
 }
 .agent-tool-step.is-open .agent-tool-row::after { opacity: 1; }
 .agent-tool-step:not(.is-open) .agent-tool-row::after { opacity: 0; }
-.agent-tool-row:hover { background: #f1f3f4; }
+.agent-tool-row:hover { background: var(--hover); }
 
 .agent-tool-row .atc-chev {
   width: 12px; height: 12px; flex-shrink: 0;
@@ -6430,39 +6427,20 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .agent-tool-step.is-open .atc-chev { transform: rotate(90deg); }
 
 /* Type icon */
+/*
+ * 图标：**单色**。原来这里按工具类型分了 43 种粉彩底色，一屏工具下来是一条彩虹——
+ * 用户说的"杂乱"主要就是它。类型的区分本来就由图标**形状**承担（49 个类型各有自己的
+ * svg），再给每种配一个底色是把同一件事说两遍，而且说得很吵。
+ * 颜色只留给**状态**（成功/失败在 .atc-result 上），类型一律走同一档灰。
+ */
 .atc-type-icon {
-  width: 27px; height: 27px; flex-shrink: 0;
+  width: 22px; height: 22px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
-  border-radius: 8px;
-  /* 默认底色。原来这两行是粘在下面 --game_asset 那条规则**行尾**的一截无作用域碎片
-     （`… .atc-type-icon { … } .atc-type-icon { background: #ede7f6; … }`），读起来像笔误，
-     但真的在干活：49 个工具类型里有 24 个没有专属配色，全靠它上色。所以不是删掉，
-     是提上来写明白——外观一字不变，畸形消失。专属配色是 (0,2,0)，照常压过这里。 */
-  background: #ede7f6; color: #4527a0;
+  border-radius: 6px;
+  background: transparent; color: var(--atc-dim);
 }
-.agent-tool-step--write .atc-type-icon,
-.agent-tool-step--multiedit .atc-type-icon { background: #feefe3; color: #e8710a; }
-.agent-tool-step--read .atc-type-icon { background: #e6f4ea; color: #188038; }
-.agent-tool-step--cmd .atc-type-icon { background: #e8f0fe; color: #1a73e8; }
-.agent-tool-step--list .atc-type-icon { background: #f3e8fd; color: #8430ce; }
-.agent-tool-step--edit .atc-type-icon { background: #feefe3; color: #e8710a; }
-.agent-tool-step--search .atc-type-icon,
-.agent-tool-step--find .atc-type-icon,
-.agent-tool-step--websearch .atc-type-icon { background: #e8f0fe; color: #1a73e8; }
-.agent-tool-step--git .atc-type-icon { background: #fce8e6; color: #d93025; }
-.agent-tool-step--delete .atc-type-icon { background: #fce8e6; color: #d93025; }
-.agent-tool-step--think .atc-type-icon,
-.agent-tool-step--memory .atc-type-icon { background: #fef7e0; color: #b8860b; }
-.agent-tool-step--web .atc-type-icon,
-.agent-tool-step--http .atc-type-icon { background: #e0f2f1; color: #00796b; }
-.agent-tool-step--browser .atc-type-icon { background: #e8f5e9; color: #2e7d32; }
-.agent-tool-step--screenshot .atc-type-icon { background: #f3e8fd; color: #7b1fa2; }
-.agent-tool-step--download .atc-type-icon { background: #e8f0fe; color: #1565c0; }
-.agent-tool-step--current_time .atc-type-icon { background: #fff3e0; color: #e65100; }
-.agent-tool-step--game_scaffold .atc-type-icon { background: #e8f5e9; color: #2e7d32; }
-.agent-tool-step--game_asset .atc-type-icon { background: #e3f2fd; color: #1565c0; }
+.agent-tool-step:hover .atc-type-icon { color: var(--atc-text); }
 /* 技能：紫色，和 read 的蓝、write 的绿都不撞——它以前就是回落成 read 那张纸的。 */
-.agent-tool-step--skill .atc-type-icon { background: #ede7f6; color: #5e35b1; }
 /* MCP 用服务自己的真实头像（复用市场卡那套 .mcpfp-icon）。图标位是 27px，而 .mcpfp-icon
    本身按 38px 写的，这里缩到位并去掉底色——头像自己就是底色，再叠一层会出现一圈边。 */
 /* 只留 padding：background 挪到文件末尾的 (0,3,0) 规则，否则同分时被七行之下的
@@ -6473,12 +6451,6 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 }
 /* 没有头像时回落成首字母，字号要跟着缩，否则 27px 里那个字会顶出来。 */
 .agent-tool-step--mcp .atc-type-icon--avatar .mcpfp-icon__letter { font-size: 12px; }
-.agent-tool-step--ksearch .atc-type-icon { background: #e0f2f1; color: #00897b; }
-.agent-tool-step--mcp .atc-type-icon { background: #fce4ec; color: #c62828; }
-.agent-tool-step--computer .atc-type-icon,
-.agent-tool-step--system .atc-type-icon { background: #e3f2fd; color: #1565c0; }
-.agent-tool-step--db .atc-type-icon { background: #fff8e1; color: #f57f17; }
-.agent-tool-step--askuser .atc-type-icon { background: #e8f0fe; color: #1a73e8; }
 .atc-type-icon svg { width: 13px; height: 13px; }
 
 /* Language badge (used inside viewport) */
@@ -6553,7 +6525,9 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
      (even wrapping "读取"). Now it shrinks + caps at ~half the row so the title always wins. */
   flex-shrink: 1; min-width: 0; max-width: 40%; overflow: hidden;
   display: flex; align-items: center; gap: 4px;
-  padding: 3px 10px; border-radius: 999px;
+  /* 从「填色药丸」改成裸文字：一屏十个工具、十个绿药丸，成功这件事被喊得比失败还响。
+     颜色只留给需要用户回头看的那两种（失败 / 超时告警），其余一律走灰。 */
+  padding: 0; border-radius: 0; background: transparent;
   /* text-overflow 在 display:flex 上是**死规则**——它只作用于块容器，而这里的裸文本是
      匿名 flex 项，规则套不上去。实测：405px 的文案塞进 202px，硬切、没有省略号、没有
      tooltip，用户看到一句读不通的残句还不知道后面有内容。真正生效的是下面的 __t，
@@ -6565,7 +6539,7 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .atc-result__t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Neutral, light metadata chip (line count / file count / size) — Google-style, quieter than the
    green success pill which now stays reserved for real write confirmations. */
-.atc-result--info { color: var(--atc-dim, #5f6368); background: rgba(128,128,128,.12); font-weight: 500; }
+.atc-result--info { color: var(--atc-dim); background: transparent; font-weight: 500; }
 /* list_dir file/folder rows */
 .atc-ls { display: flex; flex-direction: column; padding: 6px; gap: 1px; }
 .atc-ls__row { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 7px; font-size: 12.5px; color: var(--atc-text, #1d1d1f); font-family: var(--font); min-width: 0; }
@@ -6577,9 +6551,8 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .atc-ls__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .atc-ls__warn { flex: none; font-size: 11px; opacity: .85; }
 .atc-ls__empty { padding: 8px; color: var(--atc-dim); font-size: 12px; font-family: var(--font); }
-.atc-result--ok {
-  color: var(--atc-success); background: #e6f4ea;
-}
+/* 成功不上底色也不上绿字：它是常态，常态不该占视觉预算。 */
+.atc-result--ok { color: var(--atc-dim); background: transparent; }
 .atc-result--title {
   color: var(--atc-text, #1d1d1f);
   background: transparent;
@@ -6587,19 +6560,15 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   font-size: 12px; font-weight: 600;
   padding: 0 4px;
 }
-.atc-result--err {
-  color: var(--atc-danger); background: #fce8e6;
-}
-.atc-result--pending {
-  color: var(--atc-accent); background: #e8f0fe;
-}
+/* 失败是全卡唯一需要"喊"的状态：只上色、不上底，靠字重和颜色就够。 */
+.atc-result--err { color: var(--atc-danger); background: transparent; }
+.atc-result--pending { color: var(--atc-dim); background: transparent; }
 /* 子体超时被强杀 / 浏览器撞上人机验证——这两个是最需要用户一眼看见的异常，此前
    全表一条规则都没有：渲染成透明底 + 暗灰字，比表示「12 行」的中性 chip 还淡，
    扫一屏卡片时会直接漏掉，以为那个子体正常跑完了。用和 --ok/--err 同族的暖色。 */
+/* 告警和失败同一档：只上色不上底。 */
 .atc-result--timeout,
-.atc-result--warn {
-  color: var(--atc-warning); background: #fef7e0;
-}
+.atc-result--warn { color: var(--atc-warning); background: transparent; }
 /* Telegram-style link preview card below browser screenshots */
 .browser-url-card {
   display: flex; align-items: center; gap: 8px;
@@ -6850,7 +6819,6 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .agent-tool-step--subagent > .atc-viewport > .agent-tool-step { margin-top: 6px; }
 
 /* 批量读取聚合卡：一批 ≥N 个 read 折叠进一张大卡，头部计数，展开看每个文件 */
-.agent-tool-step--readbatch > .agent-tool-row .atc-type-icon { background: #e6f4ea; color: #188038; }
 .agent-tool-step--readbatch > .atc-viewport {
   padding: 8px;
   background: rgba(128, 128, 128, 0.06);
@@ -6889,7 +6857,6 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 }
 .agent-tool-step--askuser .agent-tool-row { cursor: default; background: transparent; border-bottom: 1px solid rgba(128, 128, 128, 0.14); }
 .agent-tool-step--askuser .atc-chev { display: none; }
-.agent-tool-step--askuser .atc-type-icon { color: #1a73e8; }
 .agent-tool-step--askuser .atc-action { color: var(--text-dim); }
 .agent-tool-step--askuser > .atc-viewport { display: block !important; background: transparent; }
 /* ── ask_user card ── */
@@ -7696,14 +7663,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 @keyframes atcFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
 /* Dark mode for tool steps */
-[data-theme="dark"] .agent-tool-step,
-.dark .agent-tool-step {
-  --atc-bg: #0d1117; --atc-border: rgba(255,255,255,.08); --atc-head: rgba(255,255,255,.025);
-  --atc-text: #e6edf3; --atc-dim: rgba(255,255,255,.4);
-  --atc-accent: #6cb6ff; --atc-success: #56d364;
-  --atc-warning: #e3b341; --atc-danger: #f47067;
-  box-shadow: 0 1px 3px rgba(0,0,0,.25);
-}
+/* 深色那份 --atc-* 覆盖删掉了：基座现在直接从主题变量推导（--panel-solid / --line /
+   --text / --text-dim / --accent），明暗各自成立，不需要第二份手工同步的调色板。
+   留着它反而会把亮色下刚统一好的灰阶又按住。 */
 /* Dark mode for the terminal card — mirror the tool-step palette so they match. */
 [data-theme="dark"] .agent-term-card,
 .dark .agent-term-card {
@@ -7721,62 +7683,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .dark .agent-term-risk { color: #f2cc60; background: rgba(187,128,9,.18); border-color: rgba(242,204,96,.24); }
 [data-theme="dark"] .agent-term-output::-webkit-scrollbar-thumb,
 .dark .agent-term-output::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); }
-[data-theme="dark"] .agent-tool-step:hover,
-.dark .agent-tool-step:hover { border-color: rgba(255,255,255,.16); }
-[data-theme="dark"] .agent-tool-row:hover,
-.dark .agent-tool-row:hover { background: rgba(255,255,255,.04); }
-[data-theme="dark"] .agent-tool-step--write .atc-type-icon,
-.dark .agent-tool-step--write .atc-type-icon,
-[data-theme="dark"] .agent-tool-step--multiedit .atc-type-icon,
-.dark .agent-tool-step--multiedit .atc-type-icon,
-[data-theme="dark"] .agent-tool-step--edit .atc-type-icon,
-.dark .agent-tool-step--edit .atc-type-icon { background: #cf6a1c1a; }
-[data-theme="dark"] .agent-tool-step--read .atc-type-icon,
-.dark .agent-tool-step--read .atc-type-icon { background: #3fb9501a; }
-[data-theme="dark"] .agent-tool-step--cmd .atc-type-icon,
-.dark .agent-tool-step--cmd .atc-type-icon { background: #58a6ff1a; }
-[data-theme="dark"] .agent-tool-step--list .atc-type-icon,
-.dark .agent-tool-step--list .atc-type-icon { background: #bc8cff1a; }
-[data-theme="dark"] .agent-tool-step--search .atc-type-icon,
-.dark .agent-tool-step--search .atc-type-icon,
-[data-theme="dark"] .agent-tool-step--find .atc-type-icon,
-.dark .agent-tool-step--find .atc-type-icon,
-[data-theme="dark"] .agent-tool-step--websearch .atc-type-icon,
-.dark .agent-tool-step--websearch .atc-type-icon { background: #58a6ff1a; }
-[data-theme="dark"] .agent-tool-step--git .atc-type-icon,
-.dark .agent-tool-step--git .atc-type-icon,
-[data-theme="dark"] .agent-tool-step--delete .atc-type-icon,
-.dark .agent-tool-step--delete .atc-type-icon { background: #f851491a; }
-[data-theme="dark"] .agent-tool-step--think .atc-type-icon,
-.dark .agent-tool-step--think .atc-type-icon,
-[data-theme="dark"] .agent-tool-step--memory .atc-type-icon,
-.dark .agent-tool-step--memory .atc-type-icon { background: #e3b3411a; }
-[data-theme="dark"] .agent-tool-step--web .atc-type-icon,
-.dark .agent-tool-step--web .atc-type-icon,
-[data-theme="dark"] .agent-tool-step--http .atc-type-icon,
-.dark .agent-tool-step--http .atc-type-icon { background: #4db6ac1a; }
-[data-theme="dark"] .agent-tool-step--browser .atc-type-icon,
-.dark .agent-tool-step--browser .atc-type-icon { background: #66bb6a1a; }
-[data-theme="dark"] .agent-tool-step--screenshot .atc-type-icon,
-.dark .agent-tool-step--screenshot .atc-type-icon { background: #ce93d81a; }
-[data-theme="dark"] .agent-tool-step--current_time .atc-type-icon,
-.dark .agent-tool-step--current_time .atc-type-icon { background: #ff98001a; }
-[data-theme="dark"] .agent-tool-step--game_scaffold .atc-type-icon,
-.dark .agent-tool-step--game_scaffold .atc-type-icon { background: #4caf501a; }
-[data-theme="dark"] .agent-tool-step--game_asset .atc-type-icon,
-.dark .agent-tool-step--game_asset .atc-type-icon { background: #42a5f51a; }
-[data-theme="dark"] .atc-type-icon,
-.dark .atc-type-icon { background: #7c4dff1a; }
-[data-theme="dark"] .agent-tool-step--ksearch .atc-type-icon,
-.dark .agent-tool-step--ksearch .atc-type-icon { background: #26a69a1a; }
-[data-theme="dark"] .agent-tool-step--mcp .atc-type-icon,
-.dark .agent-tool-step--mcp .atc-type-icon { background: #ef53501a; }
-[data-theme="dark"] .agent-tool-step--computer .atc-type-icon,
-.dark .agent-tool-step--computer .atc-type-icon,
-[data-theme="dark"] .agent-tool-step--system .atc-type-icon,
-.dark .agent-tool-step--system .atc-type-icon { background: #42a5f51a; }
-[data-theme="dark"] .agent-tool-step--db .atc-type-icon,
-.dark .agent-tool-step--db .atc-type-icon { background: #fbc02d1a; }
+
 [data-theme="dark"] .atc-result--title, .dark .atc-result--title { color: #e6edf3; }
 [data-theme="dark"] .atc-diff-row--add,
 .dark .atc-diff-row--add { background: rgba(63,185,80,.08); border-left-color: #3fb950; }
@@ -7799,13 +7706,13 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 [data-theme="dark"] .atc-diffstat, .dark .atc-diffstat { background: #21262d; }
 [data-theme="dark"] .atc-diffstat .a, .dark .atc-diffstat .a { color: #3fb950; }
 [data-theme="dark"] .atc-diffstat .d, .dark .atc-diffstat .d { color: #f85149; }
-[data-theme="dark"] .atc-result--ok, .dark .atc-result--ok { background: #0d28181a; }
-[data-theme="dark"] .atc-result--err, .dark .atc-result--err { background: #2c10141a; }
+[data-theme="dark"] .atc-result--ok, .dark .atc-result--ok {  }
+[data-theme="dark"] .atc-result--err, .dark .atc-result--err {  }
 /* --pending 原来只有浅色那一份写死的 #e8f0fe：深色主题下每次落盘都会闪出一圈近白色药丸，
    裹着一颗深色 diffstat，和整套深色卡片观感断裂。--timeout/--warn 同理，一并补齐。 */
-[data-theme="dark"] .atc-result--pending, .dark .atc-result--pending { background: #0d1b2e1a; }
+[data-theme="dark"] .atc-result--pending, .dark .atc-result--pending {  }
 [data-theme="dark"] .atc-result--timeout, .dark .atc-result--timeout,
-[data-theme="dark"] .atc-result--warn, .dark .atc-result--warn { background: #2e21051a; }
+[data-theme="dark"] .atc-result--warn, .dark .atc-result--warn {  }
 [data-theme="dark"] .atc-confirm, .dark .atc-confirm { background: #0d1117; }
 [data-theme="dark"] .atc-confirm-btn--accept, .dark .atc-confirm-btn--accept { background: #238636; border-color: #238636; }
 [data-theme="dark"] .atc-confirm-btn--reject:hover, .dark .atc-confirm-btn--reject:hover { background: #2c1014; }
@@ -11292,7 +11199,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
    点一下就能重试；红色会让人以为出了故障需要处理。 */
 .statusbar__item--warn { color: var(--atc-warning, #bf8700); }
 
-
 /* ---- command palette ---- */
 .palette {
   position: fixed;
@@ -11639,7 +11545,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   align-items: center;
 }
 [data-theme="dark"] .term-ghost { color: rgba(255, 255, 255, 0.38); }
-
 
 /* ---- git log ---- */
 .git-log {
@@ -13194,7 +13099,6 @@ textarea.settings-input {
   border-color: var(--feature-blue, var(--accent));
 }
 
-
 /* ---- Outline Panel ---- */
 .outline-bar {
   display: flex; align-items: center; justify-content: space-between;
@@ -13788,7 +13692,6 @@ textarea.settings-input {
 .mktm__det-info-table td { padding: 8px 0; border-bottom: 1px solid #f1f3f4; }
 .mktm__det-info-table td:first-child { color: #5f6368; width: 100px; font-weight: 500; }
 .mktm__det-info-table code { background: #f1f3f4; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
-
 
   :root[data-theme="dark"] .mktm { background: #292a2d; }
   :root[data-theme="dark"] .mktm__head h2 { color: #e8eaed; }
@@ -14878,7 +14781,6 @@ textarea.settings-input {
   .ex-node, .ex-arrow, .ex-note, .ex-vs__col { opacity: 1 !important; transform: none !important; transition: none !important; }
 }
 
-
 /* ---- Drag a file/dir from the tree → drop on the AI composer to @-reference it ---- */
 .row.dragging { opacity: .45; }
 .composer__box.drop-target {
@@ -15764,7 +15666,6 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 /* MCP 头像：明暗两套底板都要让开。写成 (0,3,0) 且放在文件末尾，才能同时压过
    浅色的 .agent-tool-step--mcp .atc-type-icon 和深色的 [data-theme="dark"] 版本
    ——头像自己就是底色，底下再垫一层会从 .mcpfp-icon 的半透明边框里透出来。 */
-.agent-tool-step--mcp .atc-type-icon.atc-type-icon--avatar { background: none; }
 
 /* 模型卡片右上角的「强力版」开关（只有 Claude 一族会渲染出来）。
    关闭时压成低对比的描边按钮，打开时点亮 —— 它切的是线路，属于会改变这一轮

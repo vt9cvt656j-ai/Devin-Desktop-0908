@@ -520,16 +520,22 @@ test("没有预测时，要把「为什么没有」留下来——否则那句�
   assert.match(fn, /promptEl\.removeAttribute\("title"\)/, "有预测时没有清掉旧的解释");
 });
 
-test("默认底色是明写的，不是粘在别的规则行尾的碎片", () => {
-  // 49 个工具类型里有 24 个没有专属配色，一直靠这两行上色；它原来粘在
-  // --game_asset 那条规则的行尾，读起来像笔误，删掉那 24 个图标会变透明。
+test("工具图标是单色的——按类型分配色的那 43 条已经不在了", () => {
+  // 这条测试原来守的是「那 24 个没有专属配色的图标别变成透明方块」，判据是一条明写的
+  // 默认粉彩底。2026-09-01 判据换了：**按类型分配色整套删掉**（用户实拍一轮十个工具，
+  // 说「展示的内容很杂乱」——一屏下来是一条绿橙蓝紫红的彩虹）。类型的区分本来就由图标
+  // **形状**承担，再给每种配一个底色是把同一件事说两遍，而且说得很吵。
+  // 所以现在守的是反过来那一半：默认样式仍然明写（不会变透明方块），而且不许有人
+  // 按类型把配色加回来。
   // 先剥 CSS 注释：解释这条改动的注释里原样引用了 `{ … }`，不剥的话
   // 下面 [^}]* 会在注释里的那个花括号处断掉（这个仓库同一个坑踩过三次）。
   const APP_CSS = fs.readFileSync("src/styles/app.css", "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
-  assert.doesNotMatch(APP_CSS, /\.agent-tool-step--game_asset \.atc-type-icon \{[^}]*\}\s*\.atc-type-icon \{/,
-    "无作用域的默认底色还粘在 --game_asset 行尾");
-  assert.match(APP_CSS, /\.atc-type-icon \{[^}]*background: #ede7f6; color: #4527a0;[^}]*\}/s,
-    "默认底色丢了——没有专属配色的 24 个工具图标会变成透明方块");
+  assert.match(APP_CSS, /\.atc-type-icon \{[^}]*background: transparent; color: var\(--atc-dim\);[^}]*\}/s,
+    "默认样式没了——图标会变成没颜色的空方块");
+  const perType = [...APP_CSS.matchAll(/\.agent-tool-step--[\w-]+ \.atc-type-icon[^{}]*\{([^}]*)\}/g)]
+    .filter((m) => /background\s*:|(^|;)\s*color\s*:/.test(m[1]));
+  assert.deepEqual(perType.map((m) => m[0].split("{")[0].trim()), [],
+    "又有人按工具类型给图标上色了——那正是用户说的「杂乱」");
 });
 
 test("判断走不走 Anthropic 桥：Haiku 算，牛来/GPT 不算", () => {

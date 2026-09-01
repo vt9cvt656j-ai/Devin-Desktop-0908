@@ -27086,9 +27086,13 @@ test("已接受的工具卡和普通卡片长得一样——不描绿边也不�
   // 那条 3px 竖条是靠 ::before 画的
   assert.doesNotMatch(APP_CSS, /agent-tool-step--accepted[^{]*::before/);
 
-  // 卡片的身份改由已有元素承担：编辑类的图标 chip 是橙色，和读取(绿)/命令(蓝)区分开
-  assert.match(APP_CSS, /\.agent-tool-step--write \.atc-type-icon,[\s\S]{0,80}background:\s*#feefe3/);
-  assert.match(APP_CSS, /\.agent-tool-step--read \.atc-type-icon \{ background: #e6f4ea/);
+  // 卡片的身份原来由「图标 chip 的颜色」承担（编辑橙 / 读取绿 / 命令蓝）。2026-09-01 改了：
+  // 43 种按类型的配色整套删掉——用户实拍一屏十个工具是一条彩虹，说「展示的内容很杂乱」。
+  // 身份改由**图标形状**承担（49 个类型各有自己的 svg），颜色只留给状态。
+  // 所以这里守的变成：图标一律单色，谁都不许再按类型上色。
+  assert.match(APP_CSS, /\.atc-type-icon \{[^}]*color: var\(--atc-dim\)/s, "工具图标不再是单色的");
+  assert.doesNotMatch(APP_CSS, /\.agent-tool-step--(write|read|cmd) \.atc-type-icon[^{]*\{[^}]*background:\s*#/,
+    "又按工具类型给图标上色了");
 
   // 类名要保留：JS 照常打，rejected 拿它做对照
   assert.match(SRC, /agent-tool-step--accepted/);
