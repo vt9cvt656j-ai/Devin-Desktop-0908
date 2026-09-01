@@ -45,6 +45,11 @@
   --panel: rgba(255, 255, 255, 0.7);
   --panel-solid: #f5f5f7;
   --panel-2: #fbfbfd;
+  /* 输入条右下角那颗按钮的两态。发送＝近黑（不是品牌蓝，见 .send 的说明）；
+     停止＝红，环和方块共用它。深色那份在下面的 [data-theme="dark"] 里。 */
+  --send-bg: #0d0d0f;
+  --send-fg: #ffffff;
+  --stop-red: #e5484d;
   --editor-bg: #ffffff;
   --text: #1c1c1e;
   --text-dim: #6e6e73;
@@ -119,6 +124,11 @@
   --panel: rgba(24, 24, 27, 0.86);
   --panel-solid: #18181b;
   --panel-2: #1f1f23;
+  /* 深色里反过来：按钮近白、箭头近黑，和 ChatGPT/Claude 一致。
+     红也要提一档，#e5484d 压在深底上会往棕里掉。 */
+  --send-bg: #f2f2f4;
+  --send-fg: #101012;
+  --stop-red: #ff6b6b;
   --editor-bg: #101011;
   --text: #d6d6d6;
   --text-dim: #8a8a8d;
@@ -8530,9 +8540,15 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
    *
    * 改成圆还有一个结构上的理由：运行中那一态是圆环（.send.is-stop），两态同形，
    * 按钮在发送↔停止之间切换时是"里面的图形变了"，而不是"整个按钮换了个东西"。
+   *
+   * 颜色**不用品牌蓝**，用近黑/近白（--send-bg 那一对）。这是 ChatGPT / Claude /
+   * Perplexity 共同的做法，而且理由是结构性的：输入条上真正要被看见的是"现在能不能发"
+   * 和"现在在不在跑"，不是再来一次品牌色。#007aff 是 iOS 的系统蓝，它一出现整条输入条
+   * 就读成"系统控件"而不是产品自己的东西——用户原话「不够国外大厂风格」。
+   * 停止态那一圈红因此也立得住：一屏上只有两个高饱和的点，黑=发，红=停。
    */
-  color: #fff;
-  background: var(--accent);
+  color: var(--send-fg);
+  background: var(--send-bg);
   border: none;
   border-radius: 50%;
   cursor: pointer;
@@ -8540,11 +8556,12 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   transition: filter 0.13s ease, transform 0.08s ease, opacity 0.13s ease, background 0.13s ease;
 }
 .send .ic {
-  width: 17px;
-  height: 17px;
+  width: 18px;
+  height: 18px;
 }
 .send:hover {
-  filter: brightness(0.93);   /* 平色按钮要往**暗**里走；提亮会让它发白、看着像失焦 */
+  /* 近黑的按钮压暗看不出来，改成整体提一点透明度感：用 opacity 而不是 brightness。 */
+  opacity: .85;
 }
 .send:active {
   transform: scale(0.94);
@@ -8569,10 +8586,11 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
  */
 .send.is-stop {
   background: transparent;
-  color: var(--text);
+  color: var(--stop-red);   /* 环、转的那段弧、中间的方块，全走这一个颜色 */
   border-radius: 50%;
   box-shadow: none;
   animation: none;
+  opacity: 1;
 }
 .send.is-stop .ic {
   width: 26px;              /* 环要撑满按钮，不然它看起来像个缩在里面的小图标 */
@@ -8580,7 +8598,13 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 .send.is-stop:hover {
   filter: none;
-  background: var(--hover);
+  opacity: 1;
+  /* 悬停底也走红，比中性灰更说明"点下去会发生什么"。用 color-mix 从同一个红派生，
+     不再手写第二个色值——两个红各自漂移过一次，这次只留一个源。 */
+  background: color-mix(in srgb, var(--stop-red) 12%, transparent);
+}
+@supports not (color: color-mix(in srgb, red 50%, transparent)) {
+  .send.is-stop:hover { background: var(--hover); }
 }
 .send-stop__track { opacity: .26; }
 .send-stop__arc {

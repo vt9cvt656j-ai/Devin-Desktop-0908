@@ -201,6 +201,16 @@ t2("停止按钮：单色细环 + 方块，红色渐变和红光脉冲不许回�
   const rm = CSS.slice(CSS.indexOf("@media (prefers-reduced-motion: reduce) {", CSS.indexOf(".send-stop__arc")));
   assert.match(rm.slice(0, 260), /\.send-stop__arc \{ animation: none; stroke-dasharray: none;/,
     "开了「减少动态效果」之后剩一段不动的弧，看着像画错了");
+
+  // 用户 2026-09-01 点名：环、转的那段弧、中间的方块都走红。
+  // 三样共用 currentColor，所以只要按钮的 color 是那个红，三样就都是——
+  // 反过来说，这一条一破，三样一起变回灰。
+  assert.match(block, /color: var\(--stop-red\)/, "停止态不再是红的");
+  for (const [theme, anchor] of [["浅色", ":root {"], ["深色", '[data-theme="dark"] {']]) {
+    const i = CSS.indexOf(anchor);
+    const decls = CSS.slice(CSS.indexOf("{", i) + 1, CSS.indexOf("}", i));
+    assert.match(decls, /--stop-red:\s*#[0-9a-f]{3,8}/i, `${theme}没有定义 --stop-red，按钮会退成透明`);
+  }
 });
 
 t2("发送按钮：平色圆 + 描边箭头，且没内容时看得出来不能点", () => {
@@ -213,9 +223,22 @@ t2("发送按钮：平色圆 + 描边箭头，且没内容时看得出来不能�
   assert.match(block, /border-radius: 50%;/, "不是圆了——运行态是圆环，两态必须同形");
   // 没东西可发时要看得出来。以前 disabled 设了但一条样式都没有，按钮照旧是饱和的蓝。
   assert.match(CSS, /\.send:disabled \{[^}]*cursor: default;/, "禁用态没样式——看上去完全可点，点了没反应");
+  // 不许再退回品牌蓝：#007aff 是 iOS 的系统蓝，一出现整条输入条就读成"系统控件"。
+  // 用户两次点名（「太丑了」「不够国外大厂风格」）之后定的是近黑/近白那一对。
+  assert.doesNotMatch(block, /background: var\(--accent\)/, "发送按钮又回到品牌蓝了");
+  assert.match(block, /background: var\(--send-bg\)/, "发送按钮的底不再走 --send-bg");
+  for (const [theme, anchor] of [["浅色", ":root {"], ["深色", '[data-theme="dark"] {']]) {
+    const i = CSS.indexOf(anchor);
+    const decls = CSS.slice(CSS.indexOf("{", i) + 1, CSS.indexOf("}", i));
+    assert.match(decls, /--send-bg:\s*#[0-9a-f]{3,8}/i, `${theme}没有定义 --send-bg`);
+    assert.match(decls, /--send-fg:\s*#[0-9a-f]{3,8}/i, `${theme}没有定义 --send-fg`);
+  }
 
   // 首屏那一份和运行时替换的那一份必须是同一个箭头，否则第一次发送前后会换画法。
   const icon = CODE.slice(CODE.indexOf("const _SEND_ICON"), CODE.indexOf("const _STOP_ICON"));
+  // 箭头要**粗**：这个图标压在一小块纯色上，用工具图标那套 1.75 的细描边会飘。
+  const w = /stroke-width="([\d.]+)"/.exec(icon);
+  assert.ok(w && Number(w[1]) >= 2.4, `箭头笔画只有 ${w?.[1]}，在实心圆里会显得又细又飘`);
   assert.doesNotMatch(icon, /#i-arrow-up/, "又去借 Git 推送那个雪碧图了——动它会连带改掉推送按钮");
   const d = [...icon.matchAll(/d="([^"]+)"/g)].map((m) => m[1]);
   assert.ok(d.length >= 2, "箭头的路径没了");

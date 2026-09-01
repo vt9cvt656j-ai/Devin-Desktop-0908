@@ -75639,10 +75639,14 @@ promptEl.addEventListener("input", () => {
 _cePlaceholder();
 /*
  * 发送箭头自己画一份，不再借 `#i-arrow-up` 那个雪碧图：那一个还挂在 Git 的推送按钮上，
- * 动它就把两处一起改了。而且整套图标已经换成 24 网格描边（见 src/agent/tool-icons.js），
- * 这里跟上，输入条里就不会只剩这一个是另一套画法。
+ * 动它就把两处一起改了。
+ *
+ * 比例照 ChatGPT / Claude 那个：**杆长、头宽、笔画粗**（2.6，比工具图标的 1.75 粗得多）。
+ * 上一版用的是工具图标那套 1.75 的细描边——放进一个 30px 的实心圆里显得又细又飘，
+ * 用户原话「太丑了 不够国外大厂风格」。按钮图标和列表图标不是一个量级的东西：
+ * 前者要在一小块纯色上立得住，后者要在一屏几十个里不吵。
  */
-const _SEND_ICON = `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M5.5 11.5L12 5l6.5 6.5"/></svg>`;
+const _SEND_ICON = `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20V6.4"/><path d="M6 12.4L12 6.4l6 6"/></svg>`;
 /*
  * 停止按钮：**一圈细环 + 中间一个圆角方块**，单色。
  *
