@@ -168,6 +168,22 @@ pub struct AiConfig {
     /// 网关线路永远不带它。判据与翻译全在 `crate::protocol`。
     #[serde(default)]
     pub protocol: Option<String>,
+    /// 用户自带上游（自定义模型走网关代发时才有）。
+    ///
+    /// 这三样一起出现：`base_url` 指向**网关**，而请求最终要转发到的是 `byo_base`，
+    /// 用 `byo_key` 鉴权、按 `byo_proto` 翻译。这样走一趟网关，是为了让服务端把完整的
+    /// 系统提示词和工具描述装配进去（自定义端点原来是客户端直连，那条路上拿不到，
+    /// 智能体因此一直弱一截）—— 而提示词和工具描述**始终不进客户端**。
+    ///
+    /// 这里只负责原样转成三个请求头；地址合法性（只收 https、DNS 解析之后逐个查网段、
+    /// 连接钉在验过的 IP 上）由网关的 `byo_upstream` 判，那是唯一一道 SSRF 防线。
+    /// 客户端不做这个判断：客户端的校验对攻击者是可绕过的。
+    #[serde(default)]
+    pub byo_base: Option<String>,
+    #[serde(default)]
+    pub byo_key: Option<String>,
+    #[serde(default)]
+    pub byo_proto: Option<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -766,6 +782,17 @@ fn chat_completions_url(base_url: &str) -> Result<String, String> {
 /// returned untouched so the request is byte-for-byte identical to before.
 fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::RequestBuilder {
     let mut rb = rb;
+    // 自带上游：原样转成三个头。合法性由网关判（见 AiConfig::byo_base 的说明）。
+    // 密钥只在这一跳的头里出现，不落日志、不落盘。
+    if let Some(base) = config.byo_base.as_deref().filter(|v| !v.trim().is_empty()) {
+        rb = rb.header("x-ide-byo-base", base.trim());
+        if let Some(key) = config.byo_key.as_deref().filter(|v| !v.trim().is_empty()) {
+            rb = rb.header("x-ide-byo-key", key.trim());
+        }
+        if let Some(proto) = config.byo_proto.as_deref().filter(|v| !v.trim().is_empty()) {
+            rb = rb.header("x-ide-byo-proto", proto.trim());
+        }
+    }
     if let Some(request_id) = config.request_id.as_deref().filter(|value| {
         (8..=128).contains(&value.len())
             && value

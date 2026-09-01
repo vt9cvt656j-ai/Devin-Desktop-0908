@@ -299,8 +299,19 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   当前标签，全程没看过开关。判据抽进 src/agent/live-follow.js（纯函数，测试真跑）：
  *   关掉什么都不做、光标永远不动、人在打字时不抢标签也不滚视口。留在 main.js 的是
  *   _followOk 那个取上下文的壳（要问 Monaco 的 hasTextFocus）和八个接入点。
+ * · 82_990（2026-09-01，抬 70 行）：实测 82,948 行。买到的是**自定义模型也能跑完整的
+ *   智能体和工具**。原来那条路是客户端直连用户填的第三方地址，而完整系统提示词和 142 个
+ *   工具描述由网关在服务端注入（`prompts::assemble_into`）、长上下文压缩也在网关侧 ——
+ *   直连全都拿不到，所以自定义模型的智能体一直弱一截。
+ *   改法不是把提示词发给客户端（那等于把产品 IP 放进每个人的机器），而是让**远程**自定义
+ *   端点的请求走一趟网关：网关照常装配，再转发到用户填的地址、用用户自己的密钥，计费置零。
+ *   本机端点（localhost）维持直连 —— 网关转发到 localhost 打的是服务器自己的 localhost，
+ *   这是结构性的，不是待办。
+ *   留在 main.js 的是选路判据 `_byoViaGateway`、覆写那一支、两道闸的让开、以及三处文案
+ *   （「密钥仅保存在本机」对远程端点不再成立，不改就是骗人）。SSRF 校验、合成线路、
+ *   钉 IP 的连接全在 server/src/byo_upstream.rs（11 条 Rust 测试）。
  */
-const MAIN_JS_MAX_LINES = 82_920;
+const MAIN_JS_MAX_LINES = 82_990;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

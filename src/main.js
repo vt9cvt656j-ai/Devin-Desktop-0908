@@ -14219,6 +14219,34 @@ function _formatAiHttpError(status, statusText, body) {
   return `AI request failed (${label}): ${_aiErrorDetailFromBody(body)}`;
 }
 
+/**
+ * 这条自定义端点该不该走网关代发。
+ *
+ * 判据只有一条：**它是不是一个网关够得着的远程 https 地址**。
+ *  · 是 → 走网关：服务端装配完整提示词和工具，用户拿回完整能力，IP 不进客户端。
+ *  · 不是（本机 / 明文 http / 填得不成样子）→ 维持直连，功能与今天逐字相同。
+ *
+ * 本机为什么不能走网关：网关转发到 `localhost` 打的是**服务器自己的** localhost。
+ * 这不是「以后修一修」，是结构性的。
+ *
+ * 这里的判断是**为了选路**，不是安全边界 —— 真正的校验（含 DNS 解析之后逐个查网段、
+ * 连接钉在验过的 IP 上）在网关的 byo_upstream 里。客户端的校验对攻击者一律可绕过，
+ * 所以两边都要有，各司其职。
+ */
+function _byoViaGateway(custom) {
+  const raw = String(custom?.baseUrl || "").trim();
+  if (!raw) return false;
+  let u;
+  try { u = new URL(raw); } catch { return false; }
+  if (u.protocol !== "https:") return false;   // 明文到第三方＝密钥裸奔，也和网关侧判据一致
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h === "127.0.0.1" || h === "::1") return false;
+  if (h.endsWith(".local") || h.endsWith(".localhost")) return false;
+  // 私网字面量：网关那边会拒，这里先不发，省一次必然失败的往返。
+  if (/^10\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;
+  return true;
+}
+
 function _isGatewayConfig(config) {
   // 自定义模型直连第三方端点：不是网关请求（L0 提示词注入 / ide-key 兜底都不适用）。
   // 注意用 customModelId 而不是遗留存储字段 customModel（那是个被 _configForStorage
@@ -14231,6 +14259,9 @@ function _isGatewayConfig(config) {
   // 遗留直连和「子智能体换模型后丢了 customModelId、但 baseUrl 仍是用户端点」这两种，
   // 单看 baseUrl **在结构上无法区分**。所以真要修后者，得在子智能体那条路上把线路标记
   // 保住，而不是在这里换判据。
+  // 走网关代发的自定义端点**是**网关请求：L0 必须注入，那正是这条路存在的理由。
+  // 判据用 byoBase 而不是地址——理由同上面那段注释：按地址判会误伤遗留直连配置。
+  if (config && config.byoBase) return true;
   return !(config && config.customModelId);
 }
 
@@ -16330,7 +16361,7 @@ async function showCustomModelsDialog() {
         <div class="cm-field cm-field--key">
           <label for="cmInKey">对接密钥</label>
           <span class="cm-input-wrap"><input class="cm-in-key" id="cmInKey" type="password" placeholder="sk-…" maxlength="500" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" aria-describedby="cmHintKey"><button class="cm-reveal" type="button" aria-label="显示密钥" aria-pressed="false" aria-controls="cmInKey"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg></button></span>
-          <p class="cm-field__hint" id="cmHintKey">部分本地服务可留空。</p>
+          <p class="cm-field__hint" id="cmHintKey">部分本地服务可留空。远程地址会经我们的服务器转发（这样才能拿到完整的提示词和工具）；本机地址直连，不经过服务器。</p>
           <p class="cm-field__err" id="cmErrKey"></p>
         </div>
         <div class="cm-field">
@@ -17538,10 +17569,17 @@ function showModelInfoCard(m, anchorEl) {
    * 长上下文压缩也会关闭。不说清楚，放开这个开关等于交付一个坏功能。
    */
   const noteEl = card.querySelector(".mic-note");
-  if (String(m.id || "").startsWith(_CUSTOM_MODEL_PREFIX)) {
-    noteEl.textContent = "走自己的端点时智能体会弱一些：工具描述和完整系统提示词由服务端按需下发，这条路上拿不到；长上下文压缩也会关闭。";
-  } else {
+  const _cm = String(m.id || "").startsWith(_CUSTOM_MODEL_PREFIX) ? _customModelById(m.id) : null;
+  if (!_cm) {
     noteEl.remove();
+  } else if (_byoViaGateway(_cm)) {
+    // 远程端点现在走网关代发：完整提示词和工具由服务端装配，能力和网关模型一样。
+    // 但有一件事必须说清楚 —— **请求会经过我们的服务器**，而弹窗里原来写的是
+    // 「地址与密钥仅保存在本机，不会上传」。那句话对这条路不再成立，不说就是骗人。
+    noteEl.textContent = "完整能力：提示词、工具和长上下文压缩都由服务端装配，和内置模型一样。请求经我们的服务器转发到你填的地址（用你自己的密钥计费，我们不收费）。";
+  } else {
+    // 本机端点只能直连（服务器够不着你的 localhost），所以仍然是精简的那条路。
+    noteEl.textContent = "本机端点直连，不经过我们的服务器 —— 因此工具描述和完整系统提示词拿不到，长上下文压缩也会关闭，智能体会弱一些。";
   }
   const desc = (m.desc && m.desc.trim()) || officialModelDesc(m.id);
   const dEl = card.querySelector(".mic-desc");
@@ -30031,7 +30069,31 @@ async function _readyAiConfig(overrideConfig = null) {
   // 覆写放在下面那两道校验**之前**——否则校验的是一组本轮根本不会用到的网关字段，
   // 一个只用自己端点的用户会被「请先登录账号」拦住，而他压根不需要登录。
   const _custom = _customModelById(config.model);
-  if (_custom) {
+  if (_custom && _byoViaGateway(_custom)) {
+    /*
+     * 远程自定义端点：**走网关代发**。
+     *
+     * 请求发给网关（带用户自己的登录令牌），网关照常装配完整系统提示词和工具描述、
+     * 做长上下文压缩，最后转发到 `x-ide-byo-base` 那个地址、用 `x-ide-byo-key` 鉴权。
+     * 用户因此拿回完整的智能体能力，而**提示词和工具描述一次都没进过客户端** ——
+     * 应用被逆向或抓包都取不到。计费在网关侧置零：token 是用他自己的密钥买的。
+     *
+     * baseUrl 指向网关、apiKey 用登录令牌，所以下面那道「网关必须有 token」的校验对它
+     * 成立，不再走 `!_custom` 那条豁免 —— 代发要认账号。
+     */
+    config.baseUrl = MICHAEL_API;
+    config.apiKey = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || config.apiKey || "";
+    config.model = _custom.name;
+    config.byoBase = _custom.baseUrl;
+    config.byoKey = _custom.apiKey || "";
+    config.byoProto = cmProtocol(_custom.protocol);
+    config.customModelId = _custom.id;
+    // 到网关这一跳永远是 OpenAI 形状；翻译成用户那家的协议在网关那边按 byoProto 做。
+    config.protocol = "openai";
+  } else if (_custom) {
+    // 本机端点（localhost / 127.0.0.1）只能直连：网关转发到 localhost 打的是**服务器**
+    // 自己的 localhost，不是用户的机器。这条路上仍然拿不到完整提示词和工具描述 ——
+    // 那不是疏漏：「本机」防不住 IP 提取，攻击者的机器也是他的本机。
     config.baseUrl = _custom.baseUrl;
     config.apiKey = _custom.apiKey;
     config.model = _custom.name;
@@ -52155,6 +52217,10 @@ async function _fetchCompletionText(url, headers, payload, signal) {
  * 东西；那之后这道闸会变成多余的。
  */
 function _ipSafeRoute(config) {
+  // 走网关代发的自定义端点：客户端手里**根本没有可发的东西** —— 提示词和工具描述
+  // 全在网关，由它注入。这正是上面那段注释说的「正解」，所以这道止血闸对这条路让开：
+  // 编排、收尾评审、意图画像那几条腿一并回来。
+  if (config && config.byoBase) return true;
   return !(config && config.customModelId);
 }
 
