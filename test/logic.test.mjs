@@ -32974,16 +32974,26 @@ test("开箱默认模型由网关指定，不再是字母序碰出来的那个",
     ] },
     { label: "GPT", models: [{ id: "gpt-5.6-sol", isDefault: false }] },
   ];
+  // 返回值多带了一个 connId（e1c4bd3「同一个分组里两行同名」那笔）：删模型后的回退也要
+  // 把**线路**带上，否则那条路又把线路丢了，账单跟着别的出口走。这里跟着一起带。
   const pick = load("_firstGatewayModelId", { MODEL_GROUPS: groups });
-  assert.deepEqual(pick(), { id: "claude-opus-5", group: "Claude" },
+  assert.deepEqual(pick(), { id: "claude-opus-5", group: "Claude", connId: "" },
     "网关标了默认就该用它，而不是列表里排在前面的那个");
 
   // 老网关不下发这个字段 → 一个都没标 → 沿用旧行为，行为不变。
   const legacy = [{ label: "Claude", models: [{ id: "claude-fable-5" }, { id: "claude-opus-5" }] }];
   assert.deepEqual(load("_firstGatewayModelId", { MODEL_GROUPS: legacy })(),
-    { id: "claude-fable-5", group: "Claude" }, "网关没标时必须退回旧行为");
+    { id: "claude-fable-5", group: "Claude", connId: "" }, "网关没标时必须退回旧行为");
 
-  assert.deepEqual(load("_firstGatewayModelId", { MODEL_GROUPS: [] })(), { id: "", group: "" });
+  // connId 真有值时要原样带出来——它就是这一笔要解决的那件事。
+  const dup = [{ label: "智普", models: [
+    { id: "glm-5.3-flash", isDefault: true, connId: "c-dedicated" },
+    { id: "glm-5.3-flash", isDefault: true, connId: "c-zhipu" },
+  ] }];
+  assert.deepEqual(load("_firstGatewayModelId", { MODEL_GROUPS: dup })(),
+    { id: "glm-5.3-flash", group: "智普", connId: "c-dedicated" }, "回退路径把 connId 丢了");
+
+  assert.deepEqual(load("_firstGatewayModelId", { MODEL_GROUPS: [] })(), { id: "", group: "", connId: "" });
 
   // 目录组装处要真的把这一位读进来，否则上面的偏好永远是死的。
   assert.match(SRC, /isDefault: it\.default === true/,
