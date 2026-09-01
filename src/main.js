@@ -222,6 +222,7 @@ import { contextPartsView as _contextPartsView } from "./agent/context-parts.js"
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { pointInTermSelection as _pointInTermSelection, termChipLabel as _termChipLabel, termSnippetText as _termSnippetText } from "./agent/term-drag.js";
+import { normalizeAskOptions as _normalizeAskOptions, askMode as _askMode, askAnswerText as _askAnswerText, askAnswerLabel as _askAnswerLabel } from "./agent/ask-user.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
 // Global shared state store for sub-agent collaboration
@@ -62390,113 +62391,112 @@ async function _executeToolStepInner(step, call, root, run) {
       const _auRepeatNote = _auN === 2
         ? `\n\n〔这是本次任务第 2 次提问〕你已经问过一次并拿到了答案。剩下的分歧自己定，把假设写进回答；再问一次就不会弹卡片了。`
         : "";
-      const opts = (Array.isArray(call.options) ? call.options : []).map((o) => String(o || "").trim()).filter(Boolean).slice(0, 5);
-      const _auTimeout = 120;
+      const opts = _normalizeAskOptions(call.options);   // 纯字符串 / {label, description} 都收
       const _auRecommended = call.recommended;
-      const _auMulti = call.multiSelect && opts.length >= 2;
       const _auConfirm = call.confirmText;
+      // 单选/多选/只给输入框的判据写在模块里（askMode），连同"为什么默认单选"的理由。
+      const _auMode = _auConfirm ? "confirm" : _askMode({ options: opts, multiSelect: call.multiSelect });
+      const _auMulti = _auMode === "multi";
       res.className = "atc-result"; res.textContent = "等你选择…";
       step.classList.add("is-open");
       _chatFollow(run && run.session);
       if (typeof vp === "undefined" || !vp) return { type: "askuser", path: "", content: "（无法渲染交互卡片，按你认为最合理的方案继续）" + _auRepeatNote };
       return await new Promise((resolve) => {
         let done = false;
-        let _auTimer = null, _auCountdown = _auTimeout;
         const _auSelected = new Set();
         let _releaseInteraction = () => {};
-        const finish = (answer, label) => {
+        const finish = (kind, payload) => {
           if (done) return; done = true;
-          if (_auTimer) clearInterval(_auTimer);
           document.removeEventListener("keydown", _auKeyHandler);
           _releaseInteraction();
-          vp.innerHTML = `<div class="au-done">${_escHtml(label || answer)}</div>`;
+          const answer = _askAnswerText(kind, payload);
+          vp.innerHTML = `<div class="au-done">${_escHtml(_askAnswerLabel(kind, payload))}</div>`;
           res.className = "atc-result atc-result--ok"; res.textContent = "已回复";
-          // 记进**会话级**台账（跨 run 存活），下次再问同一个问题时直接把这句话交回去。
-          _rememberAskedQuestion(run?.session, q, answer);
+          _rememberAskedQuestion(run?.session, q, answer);   // 会话级台账，跨 run 存活
           resolve({ type: "askuser", path: "", content: answer + _auRepeatNote });
         };
-        _releaseInteraction = _registerRunInteraction(run, () => {
-          finish("[已取消] 当前等待已因任务停止或被新的请求替换，不要继续此步骤。", "已取消");
-        });
-        if (!_runInteractionLive(run)) {
-          finish("[已取消] 当前等待已因任务停止或被新的请求替换，不要继续此步骤。", "已取消");
-          return;
-        }
+        _releaseInteraction = _registerRunInteraction(run, () => finish("cancel"));
+        if (!_runInteractionLive(run)) { finish("cancel"); return; }
+        const _auSubmitMulti = () => {
+          const labels = [..._auSelected].sort((a, b) => a - b).map((i) => opts[i].label);
+          if (labels.length) finish("multi", { labels });
+        };
+        const _auSyncMulti = () => {
+          vp.querySelectorAll("._auOpt").forEach((b) => {
+            const on = _auSelected.has(+b.dataset.i);
+            b.classList.toggle("au-opt--checked", on);
+            b.setAttribute("aria-checked", on ? "true" : "false");
+          });
+          const sub = vp.querySelector("._auMultiSubmit");
+          if (sub) { sub.disabled = _auSelected.size === 0; sub.textContent = _auSelected.size ? `提交所选（${_auSelected.size}）` : "提交所选"; }
+        };
+        const _auToggle = (i) => { if (_auSelected.has(i)) _auSelected.delete(i); else _auSelected.add(i); _auSyncMulti(); };
         const _auKeyHandler = (e) => {
           if (done) return;
-          const custom = vp.querySelector("._auCustom");
-          if (custom && document.activeElement === custom) return;
+          const focused = document.activeElement;
+          if (focused && focused.classList?.contains("au-custom")) {
+            // 输入框里 ⌘/Ctrl+Enter 直接提交所选，省得再去够那个按钮。
+            if (_auMulti && e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); _auSubmitMulti(); }
+            return;
+          }
           if (_auConfirm) return;
           const n = +e.key;
           if (n >= 1 && n <= opts.length) {
             e.preventDefault();
-            if (_auMulti) {
-              if (_auSelected.has(n - 1)) _auSelected.delete(n - 1); else _auSelected.add(n - 1);
-              vp.querySelectorAll("._auOpt").forEach((b) => { const bi = +b.dataset.i; b.classList.toggle("au-opt--checked", _auSelected.has(bi)); });
-              const sub = vp.querySelector("._auMultiSubmit"); if (sub) sub.disabled = _auSelected.size === 0;
-            } else {
-              finish("用户选择了：「" + opts[n - 1] + "」。就按这个需求继续做。", "你选了：" + opts[n - 1]);
-            }
-          }
+            if (_auMulti) _auToggle(n - 1);
+            else finish("single", { label: opts[n - 1].label });
+          } else if (_auMulti && e.key === "Enter") { e.preventDefault(); _auSubmitMulti(); }
         };
         document.addEventListener("keydown", _auKeyHandler);
         const btns = opts.map((o, i) => {
           const isRec = _auRecommended === i;
-          const recTag = isRec ? `<span class="au-rec">推荐</span>` : "";
-          if (_auMulti) return `<button class="au-opt _auOpt${isRec ? " au-opt--rec" : ""}" data-i="${i}"><span class="au-check"></span><span class="au-badge">${i + 1}</span><span>${_escHtml(o)}</span>${recTag}</button>`;
-          return `<button class="au-opt _auOpt${isRec ? " au-opt--rec" : ""}" data-i="${i}"><span class="au-badge">${i + 1}</span><span>${_escHtml(o)}</span>${recTag}</button>`;
+          return `<button type="button" class="au-opt _auOpt${isRec ? " au-opt--rec" : ""}" data-i="${i}"`
+            + ` role="${_auMulti ? "checkbox" : "radio"}" aria-checked="false">`
+            + (_auMulti ? `<span class="au-check"></span>` : `<span class="au-badge">${i + 1}</span>`)
+            + `<span class="au-opt__body"><span class="au-opt__label">${_escHtml(o.label)}`
+            + (isRec ? `<em class="au-rec">推荐</em>` : "") + `</span>`
+            + (o.description ? `<span class="au-opt__desc">${_escHtml(o.description)}</span>` : "")
+            + `</span></button>`;
         }).join("");
-        const multiSubmitBtn = _auMulti ? `<button class="au-send _auMultiSubmit" disabled>提交所选</button>` : "";
+        // 抬头写明**这是哪一种选择**：多选卡片长得和单选一样时，用户点了第一项就走。
+        const kindHint = _auConfirm ? "危险操作 · 需要输入确认文本"
+          : _auMulti ? "多选 · 可以勾多项，选好后提交"
+          : opts.length ? "单选 · 点一项即可，也可以自己写"
+          : "自己写一句就行";
         const confirmRow = _auConfirm
-          ? `<div class="au-confirm-row"><span class="au-confirm-warn">请输入 <b>${_escHtml(_auConfirm)}</b> 以确认</span><div class="au-row"><input class="au-custom _auConfirmInput" placeholder="输入确认文本…"><button class="au-send au-send--danger _auConfirmBtn" disabled>确认执行</button></div></div>`
-          : `<div class="au-row"><input class="au-custom _auCustom" placeholder="或者，自己输入你的需求…"><button class="au-send _auSend">发送</button></div>`;
+          ? `<div class="au-confirm-row"><span class="au-confirm-warn">请输入 <b>${_escHtml(_auConfirm)}</b> 以确认</span><div class="au-row"><input class="au-custom _auConfirmInput" placeholder="输入确认文本…"><button type="button" class="au-send au-send--danger _auConfirmBtn" disabled>确认执行</button></div></div>`
+          : `<div class="au-row"><input class="au-custom _auCustom" placeholder="${opts.length ? "或者，自己输入你的需求…" : "把你想要的写在这里…"}"><button type="button" class="au-send _auSend">发送</button></div>`;
         vp.innerHTML =
-          `<div class="au-card">` +
-            `<div class="au-q">${_escHtml(q)}</div>` +
-            btns +
-            (_auMulti ? `<div style="display:flex;justify-content:flex-end;margin-top:8px">${multiSubmitBtn}</div>` : "") +
-            confirmRow +
-            (_auConfirm ? "" : `<div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px"><button class="au-auto _auAuto">让 AI 自行判断</button><span class="au-timer _auTimer"></span></div>`) +
-          `</div>`;
+          `<div class="au-card">`
+          + `<div class="au-head"><span class="au-kind">${_escHtml(kindHint)}</span></div>`
+          + `<div class="au-q">${_escHtml(q)}</div>`
+          + (btns ? `<div class="au-opts" role="${_auMulti ? "group" : "radiogroup"}">${btns}</div>` : "")
+          + (_auMulti ? `<div class="au-multibar"><button type="button" class="au-send _auMultiSubmit" disabled>提交所选</button></div>` : "")
+          + confirmRow
+          + (_auConfirm ? "" : `<div class="au-foot"><button type="button" class="au-auto _auAuto">让 AI 自行判断</button></div>`)
+          + `</div>`;
+        vp.querySelectorAll("._auOpt").forEach((b) => b.addEventListener("click", () => {
+          const i = +b.dataset.i;
+          if (_auMulti) _auToggle(i); else finish("single", { label: opts[i].label });
+        }));
         if (_auMulti) {
-          vp.querySelectorAll("._auOpt").forEach((b) => b.addEventListener("click", () => {
-            const i = +b.dataset.i;
-            if (_auSelected.has(i)) _auSelected.delete(i); else _auSelected.add(i);
-            b.classList.toggle("au-opt--checked", _auSelected.has(i));
-            const sub = vp.querySelector("._auMultiSubmit"); if (sub) sub.disabled = _auSelected.size === 0;
-          }));
-          const msub = vp.querySelector("._auMultiSubmit");
-          if (msub) msub.addEventListener("click", () => {
-            const picked = [..._auSelected].sort((a, b) => a - b).map((i) => opts[i]);
-            finish("用户选择了多项：「" + picked.join("」「") + "」。就按这些需求继续做。", "你选了：" + picked.join("、"));
-          });
-        } else {
-          vp.querySelectorAll("._auOpt").forEach((b) => b.addEventListener("click", () => { const i = +b.dataset.i; finish("用户选择了：「" + opts[i] + "」。就按这个需求继续做。", "你选了：" + opts[i]); }));
+          _auSyncMulti();
+          vp.querySelector("._auMultiSubmit")?.addEventListener("click", _auSubmitMulti);
         }
         if (_auConfirm) {
           const cInput = vp.querySelector("._auConfirmInput");
           const cBtn = vp.querySelector("._auConfirmBtn");
           if (cInput && cBtn) {
             cInput.addEventListener("input", () => { cBtn.disabled = cInput.value.trim() !== _auConfirm; });
-            cBtn.addEventListener("click", () => { if (cInput.value.trim() === _auConfirm) finish("用户已输入确认文本「" + _auConfirm + "」确认执行。继续。", "已确认：" + _auConfirm); });
+            cBtn.addEventListener("click", () => { if (cInput.value.trim() === _auConfirm) finish("confirm", { text: _auConfirm }); });
             cInput.addEventListener("keydown", (e) => { if (e.key === "Enter" && cInput.value.trim() === _auConfirm) { e.preventDefault(); cBtn.click(); } });
           }
         } else {
           const custom = vp.querySelector("._auCustom");
-          const send = () => { const t = custom.value.trim(); if (t) finish("用户输入了具体需求：" + t + "。就按这个继续做。", "你的需求：" + t); };
+          const send = () => { const t = custom.value.trim(); if (t) finish("custom", { text: t }); };
           vp.querySelector("._auSend").addEventListener("click", send);
-          custom.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); send(); } });
-          vp.querySelector("._auAuto").addEventListener("click", () => finish("用户让你自行判断——按你认为最合理的方案直接继续做，别再问。", "AI 自行判断"));
-        }
-        const timerEl = vp.querySelector("._auTimer");
-        if (timerEl && !_auConfirm) {
-          const _updateTimer = () => { timerEl.innerHTML = `<b>${_auCountdown}s</b> 后自动继续`; };
-          _updateTimer();
-          _auTimer = setInterval(() => {
-            _auCountdown--;
-            _updateTimer();
-            if (_auCountdown <= 0) finish("用户未在限时内回复，请按你认为最合理的方案直接继续做。", "超时·AI 自行判断");
-          }, 1000);
+          custom.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) { e.preventDefault(); send(); } });
+          vp.querySelector("._auAuto").addEventListener("click", () => finish("auto"));
         }
         setTimeout(() => { try { (vp.querySelector("._auCustom") || vp.querySelector("._auConfirmInput"))?.focus(); } catch {} }, 0);
       });
