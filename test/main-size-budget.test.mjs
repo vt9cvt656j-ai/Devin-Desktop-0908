@@ -268,8 +268,15 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   这次三条全部把记账包进 try，另给智能体那条加了第二道判据 run._loopExitedAt
  *   （finally 头两句之一，前面没有任何可抛的东西）。多出来的行几乎全是这段来龙去脉 +
  *   三处 try 的缩进；判据本身是 AST 扫描的测试，不是注释。
+ * · 82_720（2026-09-01，抬 220 行）：实测 82,713 行。买到的是**「自定义软件皮肤」这个功能**：
+ *   用户传一张图铺在整个 IDE 后面，外框按浓度半透让它透出来，代码区始终实底。
+ *   能搬的已经搬了 —— 校验、夹取、以及"图层浓度"和"面板保留多少不透明度"那两条算式
+ *   都在 src/agent/app-skin.js（纯函数，测试真跑，含 62% 的可读性下限）。
+ *   留在 main.js 的 213 行是搬不动的那部分：设置页那一节的 DOM 构造（预览块、上传、
+ *   浓度滑块、拖动时实时预览而松手才落盘）、canvas 缩放编码、以及把结果挂到根元素上。
+ *   判据就是这条测试自己写的那个 ——「只依赖参数、没有 DOM、没有模块级可变状态」。
  */
-const MAIN_JS_MAX_LINES = 82_500;
+const MAIN_JS_MAX_LINES = 82_720;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

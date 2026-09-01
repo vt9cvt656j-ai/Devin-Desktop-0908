@@ -223,6 +223,7 @@ import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffVi
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { pointInTermSelection as _pointInTermSelection, termChipLabel as _termChipLabel, termSnippetText as _termSnippetText } from "./agent/term-drag.js";
 import { normalizeAskOptions as _normalizeAskOptions, askMode as _askMode, askAnswerText as _askAnswerText, askAnswerLabel as _askAnswerLabel } from "./agent/ask-user.js";
+import { normalizeAppSkin, clampSkinOpacity, skinPanelAlpha } from "./agent/app-skin.js";
 import { toolIconSvg as _toolIconSvg, toolIconFamily as _toolIconFamily } from "./agent/tool-icons.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
@@ -4164,6 +4165,9 @@ const DEFAULT_EDITOR_SETTINGS = {
   fontSize: 13,
   fontFamily: MONO_STACK,
   appIcon: "",
+  // 自定义皮肤：一张铺满窗口的底图 + 它的浓度（0–100）。空串 = 没设皮肤，一切照旧。
+  appSkin: "",
+  appSkinOpacity: 45,   // 默认就要看得见：22% 时有效可见度不到 2%，等于没生效
   lineHeight: 0,
   tabSize: 4,
   wordWrap: "off",
@@ -4272,6 +4276,74 @@ const BUNDLED_APP_ICON_SRC = new URL("./assets/logo.png", import.meta.url).href;
 
 function appIconSrc(value = effectivePrefs().appIcon) {
   return normalizeAppIcon(value) || BUNDLED_APP_ICON_SRC;
+}
+
+/*
+ * ── 自定义皮肤 ──────────────────────────────────────────────────────────────
+ *
+ * 一张用户自己的图铺在整个窗口后面，前面的界面按浓度**半透**，图从缝里透出来。
+ *
+ * 两条设计上的硬约束，都是为了"好看"不以"看不清"为代价：
+ *
+ *  ① **代码区不参与半透。** 编辑器的底色由 Monaco 自己的主题给，不走 CSS 变量，所以
+ *     天然不受影响 —— 这不是妥协，是想要的：壁纸透过来的是外框（标题栏、侧栏、面板、
+ *     助手栏），代码本身始终是实底。macOS 和 Warp 的做法一样，也正是它显得高级的原因。
+ *  ② **面板透明度有下限。** 浓度拉到 100 时面板仍保留 65% 不透明度（见 app.css 里
+ *     --skin-panel-a 的算法）。让用户能把界面调到读不清字，是把"可配置"做成了陷阱。
+ *
+ * 校验、夹取、以及那两个下限的算式都在 src/agent/app-skin.js —— 纯函数，测试真跑。
+ * 这一半只做 DOM 和 canvas：上传、缩到 2560px 再编码（手机原图十几兆，直接塞进偏好
+ * 文件会让每次保存都变慢）、把结果挂到根元素上。
+ */
+async function appSkinFromFile(file) {
+  if (!file || !String(file.type || "").startsWith("image/")) {
+    throw new Error(t("feature.appearance.appSkin.invalid"));
+  }
+  if (file.size > 24 * 1024 * 1024) throw new Error(t("feature.appearance.appSkin.tooLarge"));
+  const raw = await readFileAsDataUrl(file);
+  const img = await loadImageDataUrl(raw);
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error(t("feature.appearance.appSkin.invalid"));
+  // 只缩不放：本来就小的图再放大只会糊，还白占体积。
+  const scale = Math.min(1, 2560 / Math.max(w, h));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(w * scale));
+  canvas.height = Math.max(1, Math.round(h * scale));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error(t("feature.appearance.appSkin.invalid"));
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  // webp 先试，画质/体积比 png 好一个数量级；不行再降质量，最后才认输。
+  for (const q of [0.85, 0.7, 0.55]) {
+    const out = canvas.toDataURL("image/webp", q);
+    if (normalizeAppSkin(out)) return out;
+  }
+  const png = canvas.toDataURL("image/png");
+  if (normalizeAppSkin(png)) return png;
+  throw new Error(t("feature.appearance.appSkin.tooLarge"));
+}
+
+/**
+ * 把皮肤挂到文档根上。
+ *
+ * 状态全部落在根元素：一个 data-skin 开关 + 两个自定义属性。样式那边只认这三样，
+ * 于是"皮肤生效"这件事在 CSS 里是一处判断，不需要在每个面板上各挂一份。
+ */
+function applyAppSkin(value = effectivePrefs().appSkin, opacity = effectivePrefs().appSkinOpacity) {
+  const root = document.documentElement;
+  const src = normalizeAppSkin(value);
+  const a = clampSkinOpacity(opacity);
+  if (!src) {
+    root.removeAttribute("data-skin");
+    root.style.removeProperty("--skin-img");
+    root.style.removeProperty("--skin-panel-a");
+    return;
+  }
+  root.style.setProperty("--skin-img", `url("${src}")`);
+  // 只有这一个派生值，由 src/agent/app-skin.js 算（那儿有可读性下限，且能被测试真跑）。
+  // 底图本身永远画满：浓度控制的是面板让出多少，让出多少就看见多少。
+  root.style.setProperty("--skin-panel-a", `${(skinPanelAlpha(a) * 100).toFixed(2)}%`);
+  root.setAttribute("data-skin", "on");
 }
 
 function setAppIconSource(img, src = appIconSrc()) {
@@ -4405,6 +4477,7 @@ function applyEditorPrefs() {
   applyModelOptions();
   if (p.theme) { currentTheme = normalizeTheme(p.theme); applyEditorTheme(); }
   applyAppIcon(p.appIcon);
+  applyAppSkin(p.appSkin, p.appSkinOpacity);
   autoSaveEnabled = p.autoSave !== false;
 }
 
@@ -70824,6 +70897,8 @@ async function updateEditorPreference(key, value, { rerender = false } = {}) {
   if (key === "country") value = normalizeCountryCode(value, DEFAULT_EDITOR_SETTINGS.country);
   if (key === "theme") value = normalizeTheme(value);
   if (key === "appIcon") value = normalizeAppIcon(value);
+  if (key === "appSkin") value = normalizeAppSkin(value);
+  if (key === "appSkinOpacity") value = clampSkinOpacity(value);
   _editorPrefs[key] = value;
   await saveEditorPrefs();
   if (key === "theme") {
@@ -70832,6 +70907,12 @@ async function updateEditorPreference(key, value, { rerender = false } = {}) {
   }
   if (key === "appIcon") {
     applyAppIcon(value);
+    if (rerender) renderFeaturePanel();
+    return;
+  }
+  if (key === "appSkin" || key === "appSkinOpacity") {
+    // 两个键改哪一个都要整体重算：浓度决定面板透到什么程度，图决定有没有东西可透。
+    applyAppSkin(_editorPrefs.appSkin, _editorPrefs.appSkinOpacity);
     if (rerender) renderFeaturePanel();
     return;
   }
@@ -71265,6 +71346,136 @@ function renderAppIconSettings(body, p) {
   });
 }
 
+/*
+ * 「自定义软件皮肤」那一节。
+ *
+ * 排在软件图标下面，因为它俩是同一类事（拿用户自己的图替换外观），而皮肤影响面更大，
+ * 放前面会盖过图标那一行。
+ *
+ * 没设皮肤时**不显示浓度条**：一个调不出任何变化的滑块只会让人以为坏了。
+ */
+function renderAppSkinSettings(body, p) {
+  const sec = document.createElement("div");
+  sec.className = "settings-group appearance-skin-group";
+  const h = document.createElement("h3");
+  h.className = "settings-group__title";
+  h.textContent = t("feature.appearance.appSkin.section");
+  sec.appendChild(h);
+
+  const row = document.createElement("div");
+  row.className = "settings-row settings-row--skin";
+  const meta = document.createElement("div");
+  meta.className = "settings-row__meta";
+  const label = document.createElement("span");
+  label.className = "settings-row__label";
+  label.textContent = t("feature.appearance.appSkin.label");
+  const hint = document.createElement("span");
+  hint.className = "settings-row__hint";
+  hint.textContent = t("feature.appearance.appSkin.hint");
+  meta.append(label, hint);
+
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/*";
+  input.hidden = true;
+
+  const control = document.createElement("div");
+  control.className = "settings-row__control skin-control";
+  const current = normalizeAppSkin(p.appSkin);
+  const preview = document.createElement("div");
+  preview.className = `skin-preview${current ? " is-set" : ""}`;
+  if (current) {
+    preview.style.backgroundImage = `url("${current}")`;
+  } else {
+    // 空态画的是"这里会出现一张图"，不是一句 placeholder 文案：一张淡淡的山景线稿，
+    // 和上传后的样子占同一块地方，切换时不跳。
+    preview.innerHTML = `<svg viewBox="0 0 48 32" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+      + `<rect x="2.8" y="2.8" width="42.4" height="26.4" rx="3"/>`
+      + `<circle cx="15" cy="11.5" r="3"/>`
+      + `<path d="M4 24l9.5-9 6.5 6.2 7.5-8 16.5 15.5"/></svg>`;
+  }
+  const actions = document.createElement("div");
+  actions.className = "skin-actions";
+  const upload = document.createElement("button");
+  upload.type = "button";
+  upload.className = "btn btn--primary";
+  upload.textContent = t(current ? "feature.appearance.appSkin.replace" : "feature.appearance.appSkin.upload");
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.className = "btn";
+  reset.textContent = t("feature.appearance.appSkin.reset");
+  reset.disabled = !current;
+  actions.append(upload, reset);
+  control.append(preview, actions, input);
+  row.append(meta, control);
+  sec.appendChild(row);
+
+  if (current) {
+    const orow = document.createElement("div");
+    orow.className = "settings-row settings-row--skin-opacity";
+    const ometa = document.createElement("div");
+    ometa.className = "settings-row__meta";
+    const olabel = document.createElement("span");
+    olabel.className = "settings-row__label";
+    olabel.textContent = t("feature.appearance.appSkin.opacity");
+    const ohint = document.createElement("span");
+    ohint.className = "settings-row__hint";
+    ohint.textContent = t("feature.appearance.appSkin.opacityHint");
+    ometa.append(olabel, ohint);
+
+    const octl = document.createElement("div");
+    octl.className = "settings-row__control skin-opacity-control";
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = "0";
+    slider.max = "100";
+    slider.step = "1";
+    slider.className = "skin-slider";
+    slider.value = String(clampSkinOpacity(p.appSkinOpacity));
+    const num = document.createElement("span");
+    num.className = "skin-opacity-value";
+    num.textContent = `${slider.value}%`;
+    octl.append(slider, num);
+    orow.append(ometa, octl);
+    sec.appendChild(orow);
+
+    // 拖动时**实时**改，松手才落盘：每一帧写一次偏好文件会把拖动拖卡。
+    slider.addEventListener("input", () => {
+      const v = clampSkinOpacity(slider.value);
+      num.textContent = `${v}%`;
+      document.documentElement.style.setProperty("--skin-panel-a", `${(skinPanelAlpha(v) * 100).toFixed(2)}%`);
+    });
+    slider.addEventListener("change", async () => {
+      await updateEditorPreference("appSkinOpacity", clampSkinOpacity(slider.value));
+    });
+  }
+
+  body.appendChild(sec);
+
+  upload.addEventListener("click", () => input.click());
+  input.addEventListener("change", async () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (!file) return;
+    upload.disabled = true;
+    upload.textContent = t("feature.appearance.appSkin.processing");
+    try {
+      const skin = await appSkinFromFile(file);
+      await updateEditorPreference("appSkin", skin, { rerender: true });
+      showToast(t("feature.appearance.appSkin.applied"));
+    } catch (e) {
+      showToast(e?.message || t("feature.appearance.appSkin.invalid"));
+      upload.disabled = false;
+      upload.textContent = t(current ? "feature.appearance.appSkin.replace" : "feature.appearance.appSkin.upload");
+    }
+    // 成功时不用恢复按钮文案：rerender 会把整节重画。
+  });
+  reset.addEventListener("click", async () => {
+    await updateEditorPreference("appSkin", "", { rerender: true });
+    showToast(t("feature.appearance.appSkin.resetDone"));
+  });
+}
+
 async function renderAppearanceTool(body) {
   await loadEditorPrefs();
   const p = effectivePrefs();
@@ -71283,6 +71494,7 @@ async function renderAppearanceTool(body) {
   );
   body.appendChild(themeGrid);
   renderAppIconSettings(body, p);
+  renderAppSkinSettings(body, p);
 
   const sec = document.createElement("div");
   sec.className = "settings-group appearance-options";

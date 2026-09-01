@@ -45,6 +45,10 @@
   --panel: rgba(255, 255, 255, 0.7);
   --panel-solid: #f5f5f7;
   --panel-2: #fbfbfd;
+  /* 皮肤要从"本来的实色"里调半透，所以得留一份不透明的原值：--panel-solid 自己会被
+     皮肤规则改写，用它当基准就是自引用。两套主题各留一份。 */
+  --panel-solid-opaque: #f5f5f7;
+  --panel-2-opaque: #fbfbfd;
   /* 输入条右下角那颗按钮的两态。发送＝近黑（不是品牌蓝，见 .send 的说明）；
      停止＝红，环和方块共用它。深色那份在下面的 [data-theme="dark"] 里。 */
   --send-bg: #0d0d0f;
@@ -124,6 +128,8 @@
   --panel: rgba(24, 24, 27, 0.86);
   --panel-solid: #18181b;
   --panel-2: #1f1f23;
+  --panel-solid-opaque: #18181b;
+  --panel-2-opaque: #1f1f23;
   /* 深色里反过来：按钮近白、箭头近黑，和 ChatGPT/Claude 一致。
      红也要提一档，#e5484d 压在深底上会往棕里掉。 */
   --send-bg: #f2f2f4;
@@ -12130,6 +12136,10 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .feature-panel__body > .tool-head,
 .feature-panel__body > .settings-group,
 .feature-panel__body > .tool-actions,
+/* 主题缩略图那两张也要进这个名单。少了它，它走的是上面 `> *` 的 820px，比下面每一节
+   宽 60px、左右各露出 30px —— 用户实拍：「都有点超了，和下面就对不齐」。
+   两张缩略图是这一页最大的一块，边缘对不齐时整页会读成"没对齐"，而不是"这块宽一点"。 */
+.feature-panel__body > .appearance-theme-grid,
 .feature-panel__body > .tool-list { max-width: 760px; }
 .tool-head { margin-bottom: 28px; }
 .tool-head h2 {
@@ -13007,7 +13017,11 @@ textarea.settings-input {
   display: grid;
   grid-template-columns: repeat(2, minmax(200px, 1fr));
   gap: 14px;
-  margin: 0 0 30px;
+  /* `margin: 0 auto 30px`，**左右必须是 auto**。原来写的是 `0 0 30px`，那把
+     `.feature-panel__body > *` 的 margin-left/right: auto 覆盖掉了 —— 于是下面每一节
+     居中、只有这两张缩略图靠左，左边整整突出去一截。用户实拍：「都有点超了，
+     和下面就对不齐了」。宽度也一起收到和下面同一档（见 760px 那条规则）。 */
+  margin: 0 auto 30px;
 }
 /*
  * 主题卡不再是"卡"：外面那圈描边+底色是多余的一层盒子——缩略图本身已经是一个有边界的
@@ -13026,6 +13040,8 @@ textarea.settings-input {
   text-align: left;
 }
 .appearance-theme-card__preview {
+  /* 高度保持写死。一度改成 aspect-ratio，结果网格收窄之后缩略图反而**更高**了
+     （373 宽 × 16:11 ＝ 256 高，比原来的 186 还高）——用户要的是收窄，不是变大。 */
   height: 186px;
   overflow: hidden;
   border-radius: 10px;
@@ -13076,6 +13092,155 @@ textarea.settings-input {
 
 /* ---- 浅色一套 ---- */
 .appearance-theme-card--light .appearance-theme-card__preview { background: #f1f1f3; }
+
+/* ═══ 自定义软件皮肤 ═══════════════════════════════════════════════════════
+ *
+ * 一张用户自己的图铺在整个窗口后面，界面按浓度半透，图从缝里透出来。
+ * 开关和参数全在根元素上（main.js 的 applyAppSkin）：data-skin / --skin-img / --skin-a。
+ *
+ * **面板透明度有下限，这不是保守是必须的。** --skin-panel-a 最低 0.62：浓度拉满时
+ * 面板仍有六成不透明，正文在任何一张底图上都还读得清。让用户能把界面调到看不清字，
+ * 是把"可配置"做成陷阱。图那一层自己也封在 0.55 —— 再浓就不是皮肤是壁纸了。
+ *
+ * **代码区不参与。** Monaco 的底色由它自己的主题给、不走这些变量，所以透出来的是外框
+ * （标题栏、侧栏、面板、助手栏），代码始终是实底。这正是这种做法显得高级的原因：
+ * macOS 和 Warp 都是只让外框透。
+ */
+/* --skin-panel-a（面板保留多少不透明度）由 JS 算好写进来，见 src/agent/app-skin.js 的
+   skinPanelAlpha。**算式不在这里重写一遍**：同一个语义写两处迟早各漂一次，而这一处漂了
+   的后果是字看不清。下面只给没有皮肤时的兜底值。 */
+:root { --skin-panel-a: 100%; }
+/* 底图层。fixed + 负 z-index：它铺满窗口且不随任何面板滚动，也永远压在内容下面。
+   pointer-events 关掉，否则它会吃掉整窗口的点击。 */
+:root[data-skin="on"] body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image: var(--skin-img);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  pointer-events: none;
+}
+/* 窗口底色让开，否则底图被它整块盖住。 */
+:root[data-skin="on"] body { background: transparent; }
+/* .layout 是面板之间那层容器，让它透出去；标题栏和状态栏**不要**整块透明 ——
+   它俩自己就画 --panel-solid，跟着面板一起半透就行；整块透明会让底图在那两条上
+   原样露出来，浓度调低时也压不住。 */
+:root[data-skin="on"] .layout { background: transparent; }
+/* 各个面板按 --skin-panel-a 半透。只改这几个变量，所有消费它们的规则自动跟上。 */
+:root[data-skin="on"] {
+  --bg: transparent;
+  --panel-solid: color-mix(in srgb, var(--panel-solid-opaque) var(--skin-panel-a), transparent);
+  --panel-2: color-mix(in srgb, var(--panel-2-opaque) var(--skin-panel-a), transparent);
+}
+/* color-mix 不可用的老引擎：整套皮肤降级成"只铺底图、面板照旧不透"。
+   图仍然在标题栏和状态栏后面透出来，不至于什么都没有，而且一个字都不会变糊。 */
+@supports not (color: color-mix(in srgb, red 50%, transparent)) {
+  :root[data-skin="on"] {
+    --bg: var(--panel-solid-opaque);
+    --panel-solid: var(--panel-solid-opaque);
+    --panel-2: var(--panel-2-opaque);
+  }
+}
+
+/* ── 设置页里那一节 ───────────────────────────────────────────────────── */
+/* 这一行的控件比别的设置行宽得多（预览块 + 两个按钮 / 滑块 + 数字）。
+   .settings-row 是 space-between + gap，默认两边都能压缩，于是控件被挤到按钮竖排断字、
+   滑块缩成一个点。判据：**控件不许压缩，要压压说明文字**。 */
+.settings-row--skin .settings-row__meta,
+.settings-row--skin-opacity .settings-row__meta { min-width: 0; }
+.settings-row--skin .settings-row__control,
+.settings-row--skin-opacity .settings-row__control { flex: none; }
+.skin-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.skin-actions .btn { white-space: nowrap; }
+/* 预览块和上传后长同一个样子、占同一块地方，空态换成一张淡线稿——
+   切换时不跳，用户也一眼知道"这里会出现一张图"。 */
+.skin-preview {
+  width: 104px;
+  height: 66px;
+  flex: none;
+  border-radius: 9px;
+  border: 1px solid var(--feature-border, var(--line));
+  background: var(--feature-control, var(--editor-bg));
+  background-size: cover;
+  background-position: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--feature-dim, var(--text-dim));
+  overflow: hidden;
+}
+.skin-preview svg { width: 34px; height: 34px; opacity: .5; }
+.skin-preview.is-set { border-color: var(--feature-border-strong, var(--line-strong)); }
+.skin-actions { display: flex; gap: 8px; }
+.skin-opacity-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  /* 定宽，不是 min-width。上面把这一行的控件设成了 flex:none（不许被说明文字挤扁），
+     于是容器按内容收缩，而里面 `flex:1` 的滑块在收缩容器里分不到宽度 —— 结果滑块塌成
+     一个圆点。给一个确定的宽度，滑块才有得分。 */
+  width: 268px;
+}
+.skin-opacity-value {
+  min-width: 42px;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;   /* 拖动时数字不许左右跳 */
+  color: var(--feature-dim, var(--text-dim));
+}
+.skin-slider {
+  flex: 1;
+  min-width: 0;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 16px;              /* 输入框本身要够高才放得下滑块，轨道另画（见下） */
+  background: transparent;
+  outline: none;
+  cursor: pointer;
+}
+/*
+ * 轨道必须画在 ::-webkit-slider-runnable-track 上，**不能靠 input 自己的 background**。
+ * `-webkit-appearance: none` 之后 track 是一个独立的子部件，它自带的（透明）背景压在
+ * input 的背景上面 —— 实测就是这样：滑块在、位置也对，轨道整条不见。
+ */
+.skin-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--feature-border-strong, var(--line-strong));
+}
+.skin-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--feature-border-strong, var(--line-strong));
+}
+.skin-slider::-webkit-slider-thumb {
+  margin-top: -6px;          /* 把 16px 的滑块压回 4px 轨道的正中 */
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--feature-blue, var(--accent));
+  border: 2px solid var(--feature-card, var(--panel-2));
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .22);
+  cursor: grab;
+}
+.skin-slider:active::-webkit-slider-thumb { cursor: grabbing; }
+.skin-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--feature-blue, var(--accent));
+  border: 2px solid var(--feature-card, var(--panel-2));
+  cursor: grab;
+}
 .appearance-theme-card--light .thp__rail i { background: rgba(0, 0, 0, .13); }
 .appearance-theme-card--light .thp__rail i.is-on { background: rgba(0, 0, 0, .26); }
 .appearance-theme-card--light .thp__h { background: rgba(0, 0, 0, .55); }
