@@ -37,43 +37,36 @@ function short(n) {
  */
 export function contextPartsView(opts) {
   // 解构的默认值只兜 undefined，兜不住 null——而这一层挂在点击路径上，调用方一次取空
-  // 就会在用户按下去的那一刻抛出来（上一个模块刚为同一件事红过一次）。
-  const { parts = [], total = 0, l0 = true, toolsStripped = true } = opts || {};
+  // 就会在用户按下去的那一刻抛出来。
+  const { parts = [], total = 0, l0 = true } = opts || {};
   const list = (Array.isArray(parts) ? parts : [])
     .filter((p) => p && p.key && Math.round(Number(p.tokens) || 0) > 0)
     .map((p) => ({ key: String(p.key), label: String(p.label || p.key), tokens: Math.round(Number(p.tokens) || 0) }));
   const known = list.reduce((n, p) => n + p.tokens, 0);
   const real = Math.max(0, Math.round(Number(total) || 0));
 
-  // ① 没有真数就不显示分项：倒推没有分母，剩下的只是一堆估算，摆出来会被当成真的。
-  if (real <= 0) {
-    return { pending: true, rows: [], notes: ["上游还没报过这一轮的用量，等这一轮跑完再看"], known, real: 0 };
-  }
+  // 没有真数就整段不显示：倒推没有分母，剩下的只是一堆估算，摆出来会被当成真的。
+  if (real <= 0) return { pending: true, rows: [], known, real: 0 };
 
   const rows = list.map((p) => ({ ...p, text: short(p.tokens), estimated: true }));
-  const notes = [];
   const residual = real - known;
-
-  if (l0) {
-    if (residual > 0) {
-      rows.push({
-        key: "gateway",
-        label: "网关注入（系统提示词 + 内置工具定义）",
-        tokens: residual,
-        text: short(residual),
-        estimated: false,
-        derived: true,
-      });
-      notes.push("网关那一项是按「上游真实读数 − 客户端各块」倒推的，不是估出来的");
-    } else {
-      // ② 倒推为负：客户端估大了。说出来，别显示负数，也别悄悄抹平。
-      notes.push(`客户端各块估算之和（${short(known)}）已超过上游读数（${short(real)}），说明估算偏大，网关那一项无法倒推`);
-    }
-    notes.push("走网关时，客户端拼的系统提示词会被整条替换、内置工具只发名字，所以那两项在这里量不到");
-  } else if (toolsStripped) {
-    notes.push("发布版把内置工具的描述剥空了，「工具定义」这一项只是下限");
+  /*
+   * 走网关时，客户端拼的系统提示词会被整条替换、内置工具只发名字——那两样的**体积**
+   * 客户端量不到。所以按「上游真实读数 − 客户端各块」倒推，并把这件事写进**标签本身**
+   * （「· 网关组装」），而不是在面板下面另起一段说明：用户点名删掉了那几行注解，
+   * 而出处不能跟着一起消失。
+   *
+   * 倒推为负说明客户端估大了，那就不画这一行——一个负数或者一个抹平成 0 的数，
+   * 比没有这一行更糟。
+   */
+  if (l0 && residual > 0) {
+    rows.push({
+      key: "gateway",
+      label: "系统提示词 + 工具定义 · 网关组装",
+      tokens: residual,
+      text: short(residual),
+      estimated: false,
+    });
   }
-
-  notes.push("带「估」的几项是按文本估算的 token，和上游的分词结果会有出入");
-  return { pending: false, rows, notes, known, real };
+  return { pending: false, rows, known, real };
 }

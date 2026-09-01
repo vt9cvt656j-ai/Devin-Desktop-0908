@@ -16770,7 +16770,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .ctx-panel__seg--system,   .ctx-panel__dot--system   { background: #8e8e93; }
 .ctx-panel__seg--rules,    .ctx-panel__dot--rules    { background: #34a853; }
 .ctx-panel__seg--skills,   .ctx-panel__dot--skills   { background: #f5a623; }
-.ctx-panel__seg--blocks,   .ctx-panel__dot--blocks   { background: #4bb3c4; }
+.ctx-panel__seg--mcp,      .ctx-panel__dot--mcp      { background: #4bb3c4; }
 .ctx-panel__seg--tools,    .ctx-panel__dot--tools    { background: #7c6cf0; }
 .ctx-panel__seg--history,  .ctx-panel__dot--history  { background: #e5687a; }
 .ctx-panel__seg--gateway,  .ctx-panel__dot--gateway  { background: #b28ce8; }

@@ -791,7 +791,7 @@ test("the reading survives a restart, including records written before the break
 
   // 来源分项搭的是同一班车：它也是本地重算不出来的（只有发送那一刻算得出），
   // 所以必须和读数一起活过重启。
-  const withParts = { _ctxRealFloor: null, _ctxParts: { l0: true, at: 7, rules: 1400, skills: 2800, blocks: 0, tools: 2000, history: 63000, system: 0 } };
+  const withParts = { _ctxRealFloor: null, _ctxParts: { l0: true, at: 7, rules: 1400, skills: 2800, mcp: 2000, tools: 500, history: 63000, system: 900 } };
   applyReading(withParts, { input: 69_200, output: 100, cacheRead: 0, cacheWrite: 0, model: "m", requestId: "r2" });
   const back = readingFromStorage(JSON.parse(JSON.stringify(readingForStorage(withParts))));
   assert.equal(back.parts?.history, 63_000, "来源分项没活过重启——面板会退回「还拆不出来源」");

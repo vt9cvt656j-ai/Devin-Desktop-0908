@@ -102,18 +102,20 @@ test("接线不许再写回那个死分支", () => {
   assert.match(fn, /if \(!el\.dataset\.ctxWired\)/, "没有一次性绑定标记——每次刷新都会再挂一个监听器");
 });
 
-test("来源分项：量得到的照实报，量不到的按差额倒推并说明白", () => {
+test("来源分项：量得到的照实报，量不到的按差额倒推，出处写进标签", () => {
   const v = contextPartsView({
-    parts: [{ key: "rules", label: "用户规则", tokens: 1200 }, { key: "history", label: "对话历史", tokens: 5000 }],
+    parts: [{ key: "rules", label: "用户规则", tokens: 1200 }, { key: "history", label: "对话", tokens: 5000 }],
     total: 17200, l0: true,
   });
   const gw = v.rows.find((r) => r.key === "gateway");
-  assert.ok(gw, "网关注入那一项没出来——用户想看的「系统提示词 / 工具定义」正是这一项");
+  assert.ok(gw, "网关那一项没出来——用户想看的「系统提示词 / 工具定义」正是这一项");
   assert.equal(gw.tokens, 17200 - 6200, "倒推的数不对");
   assert.equal(gw.estimated, false, "倒推项被标成了估算——它是按真数减出来的");
   assert.ok(v.rows.filter((r) => r.key !== "gateway").every((r) => r.estimated), "客户端那几块没标成估算");
-  assert.ok(v.notes.some((n) => n.includes("倒推")), "没说清楚网关那一项是怎么来的");
-  assert.ok(v.notes.some((n) => n.includes("量不到")), "没说清楚为什么客户端量不到系统提示词和内置工具");
+  // 出处写进**标签本身**：面板下面那段说明按点名删了，出处不能跟着一起消失。
+  assert.match(gw.label, /网关组装/, "看不出这一项是网关那边组装的");
+  assert.match(gw.label, /系统提示词.*工具定义/, "没说清这一项装的是什么");
+  assert.equal(v.notes, undefined, "面板下面那段说明又回来了");
 });
 
 test("三种不确定都不许糊过去", () => {
@@ -121,15 +123,14 @@ test("三种不确定都不许糊过去", () => {
   const p = contextPartsView({ parts: [{ key: "a", label: "x", tokens: 100 }], total: 0, l0: true });
   assert.equal(p.pending, true);
   assert.equal(p.rows.length, 0, "没有真数还画分项——那是一堆估算冒充真值");
-  // ② 倒推为负 = 客户端估大了：如实说，不显示负数、也不悄悄归零。
+  // ② 倒推为负 = 客户端估大了：那就不画这一行。一个负数、或者一个抹平成 0 的数，
+  //    都比没有这一行更糟。
   const neg = contextPartsView({ parts: [{ key: "a", label: "x", tokens: 9999 }], total: 100, l0: true });
   assert.ok(!neg.rows.some((r) => r.key === "gateway"), "倒推为负还画了网关那一项");
   assert.ok(neg.rows.every((r) => r.tokens > 0), "出现了非正数的分项");
-  assert.ok(neg.notes.some((n) => n.includes("估算偏大")), "估大了却不说");
-  // ③ 非网关线路：系统提示词和工具确实在客户端，但发布版把内置工具描述剥空了。
+  // ③ 非网关线路：系统提示词和工具确实在客户端，没有"网关组装"这一项。
   const direct = contextPartsView({ parts: [{ key: "system", label: "系统提示词", tokens: 3000 }], total: 3000, l0: false });
-  assert.ok(!direct.rows.some((r) => r.key === "gateway"), "非网关线路不该有「网关注入」这一项");
-  assert.ok(direct.notes.some((n) => n.includes("下限")), "没说明工具那一项只是下限");
+  assert.ok(!direct.rows.some((r) => r.key === "gateway"), "非网关线路不该有「网关组装」这一项");
   // 坏输入不许抛：它挂在点击路径上。
   for (const bad of [null, undefined, { parts: "x" }, { parts: [null, {}] }]) assert.doesNotThrow(() => contextPartsView(bad));
 });
@@ -141,8 +142,21 @@ test("分项的数是发送时真记下来的，不是打开面板时现估的",
   assert.match(SRC, /rules: _estimateTokens\(userRulesBlock\)/, "用户规则那一块没记");
   assert.match(SRC, /skills: _estimateTokens\(skillsBlock\)/, "技能那一块没记");
   // 系统提示词只在**非网关**线路上真的发出去（网关线会被 _l0MessagesWithSkills 整条替换）。
-  assert.match(SRC, /system: _l0 \? 0 : _estimateTokens\(/,
-    "网关线路上也把客户端那份系统提示词算进去了——它根本没发出去，会把网关那一项的倒推压小");
+  // 「系统提示词」这一项两条线路各算各的：走网关时客户端那份被整条替换，活下来的只有
+  // clientBlocks；自定义端点才是客户端自己拼的整份。算错哪一边，网关那一项的倒推就偏。
+  assert.match(SRC, /system: _l0\s*\n?\s*\? _estimateTokens\(languageBlock \+ adaptiveBlock/,
+    "走网关时「系统提示词」没有按活下来的那部分算");
+  assert.match(SRC, /: _estimateTokens\(sysPrompt \+ _modelStyleTuning/,
+    "自定义端点那一侧没有按客户端拼的整份算");
+  // MCP 单列：它是用户自己装上去的东西，得看得见每轮为它多付多少。
+  assert.match(SRC, /sess\._ctxParts\.mcp = _estimateTokens\(JSON\.stringify\(_toolSchemas\.filter\(_isMcp\)\)\)/,
+    "MCP 的 schema 没单独计量");
+  assert.match(SRC, /sess\._ctxParts\.tools = _estimateTokens\(JSON\.stringify\(_toolSchemas\.filter\(\(t\) => !_isMcp\(t\)\)\)\)/,
+    "工具定义没有把 MCP 摘出去，两格会重复计一遍");
+  // 分类名跟 Claude Code 那套走。
+  for (const label of ["系统提示词", "工具定义", "用户规则", "技能", "MCP 与动态工具", "对话"]) {
+    assert.ok(SRC.includes(`label: "${label}"`), `分项少了「${label}」这一类，或者名字又自造了`);
+  }
   assert.match(SRC, /sess\._ctxParts\.history = messages\.slice\(1\)/, "对话历史那一块没记，或者把 system 也算进去了");
 });
 
@@ -172,9 +186,9 @@ test("重启之后来源分项还在——它和上下文读数搭同一班车�
   // 本地重算不出来——和上下文读数同一个性质，所以塞进 ctxFloor：它的写点和读点各有两个、
   // 四条路都是通的，不必再开一份白名单。
   const forStorage = load("_ctxPartsForStorage", {});
-  const live = { _ctxParts: { l0: true, at: 1234, system: 0, rules: 1400, skills: 2800, blocks: 900, tools: 2000, history: 63000 } };
+  const live = { _ctxParts: { l0: true, at: 1234, system: 900, rules: 1400, skills: 2800, tools: 500, mcp: 2000, history: 63000 } };
   const stored = forStorage(live);
-  assert.deepEqual(stored, { l0: true, at: 1234, system: 0, rules: 1400, skills: 2800, blocks: 900, tools: 2000, history: 63000 },
+  assert.deepEqual(stored, { l0: true, at: 1234, system: 900, rules: 1400, skills: 2800, tools: 500, mcp: 2000, history: 63000 },
     "落盘形状丢了字段——重启后那几行就少了");
   // 从存储形状再跑一遍要等价（读点就是这么调的）：形状同构，才经得起归档→恢复→再归档。
   assert.deepEqual(forStorage({ ctxFloor: { parts: stored } }), stored, "存储形状回不去，归档一次就丢");
@@ -184,7 +198,7 @@ test("重启之后来源分项还在——它和上下文读数搭同一班车�
   assert.equal(forStorage(null), undefined);
   // 脏值不许穿过去。
   assert.deepEqual(forStorage({ _ctxParts: { rules: "x", history: -5, skills: 1.7, l0: 0, at: "z" } }),
-    { l0: false, at: 0, system: 0, rules: 0, skills: 2, blocks: 0, tools: 0, history: 0 });
+    { l0: false, at: 0, system: 0, rules: 0, skills: 2, tools: 0, mcp: 0, history: 0 });
 });
 
 test("落盘和回灌四条路都带上它，且它进了持久化指纹", () => {

@@ -20571,9 +20571,10 @@ function _ctxPartsForStorage(session) {
   if (!p || typeof p !== "object") return undefined;
   const n = (v) => Math.max(0, Math.round(Number(v) || 0));
   const out = { l0: !!p.l0, at: Number(p.at) || 0 };
-  for (const k of ["system", "rules", "skills", "blocks", "tools", "history"]) out[k] = n(p[k]);
+  const KEYS = ["system", "rules", "skills", "tools", "mcp", "history"];
+  for (const k of KEYS) out[k] = n(p[k]);
   // 一项都没有就别写：空对象存进去只会让"还拆不出来源"变成"全是 0"，后者更像坏了。
-  return ["system", "rules", "skills", "blocks", "tools", "history"].some((k) => out[k] > 0) ? out : undefined;
+  return KEYS.some((k) => out[k] > 0) ? out : undefined;
 }
 function _ctxReadingFromStorage(stored) {
   const total = Math.max(0, Number(stored?.total) || 0);
@@ -21406,18 +21407,18 @@ function _ctxPartsRows() {
     const sess = _currentSession();
     const p = sess?._ctxParts;
     if (!p) return { rows: [], notes: [] };
+    // 分类名跟 Claude Code 那套走，不自造只有自己看得懂的名字。
     const parts = [
-      // 走网关时客户端那份系统提示词会被整条替换，所以只有非网关线路才有这一项。
       { key: "system", label: "系统提示词", tokens: p.system },
-      { key: "rules", label: "用户规则 / 习惯", tokens: p.rules },
+      { key: "tools", label: "工具定义", tokens: p.tools },
+      { key: "rules", label: "用户规则", tokens: p.rules },
       { key: "skills", label: "技能", tokens: p.skills },
-      { key: "blocks", label: "语言 / 自适应 / 鉴权块", tokens: p.blocks },
-      { key: "tools", label: p.l0 ? "工具定义（MCP 与自声明）" : "工具定义", tokens: p.tools },
-      { key: "history", label: "对话历史 + 本轮请求", tokens: p.history },
+      { key: "mcp", label: "MCP 与动态工具", tokens: p.mcp },
+      { key: "history", label: "对话", tokens: p.history },
     ];
     const v = _contextPartsView({ parts, total: Number(_ctxMeter?.prompt) || 0, l0: !!p.l0 });
-    return v.pending ? { rows: [], notes: v.notes || [] } : { rows: v.rows, notes: v.notes };
-  } catch { return { rows: [], notes: [] }; }
+    return v.pending ? { rows: [] } : { rows: v.rows };
+  } catch { return { rows: [] }; }
 }
 
 /*
@@ -21464,10 +21465,11 @@ function _ctxPanelHtml(kind) {
           + `<span class="ctx-panel__label">${esc(r.label)}</span>`
           + `<span class="ctx-panel__val">${r.estimated ? '<em class="ctx-panel__est">估</em>' : ""}${esc(r.text)}</span></div>`).join("")}</div>`
     : `<div class="ctx-panel__empty">还拆不出来源：这一轮的上下文要等上游报过用量之后才有分母可分。</div>`;
-  const notes = src.notes.map((n) => `<div class="ctx-panel__note">${esc(n)}</div>`).join("");
+  // 来源卡下面不再挂说明段：出处已经写进每一行的标签（「· 网关组装」）和「估」字角标里，
+  // 面板下面每多一句，真正要看的那几个数就被往上顶一截（用户点名删的）。
   return `<div class="ctx-panel__head"><span class="ctx-panel__title">上下文来源</span>`
     + `<button class="ctx-panel__x" type="button" aria-label="关闭">&times;</button></div>`
-    + body + (notes ? `<div class="ctx-panel__notes">${notes}</div>` : "");
+    + body;
 }
 
 /// 贴着环放，且不许出界。两块面板共用。
@@ -30366,13 +30368,22 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       at: Date.now(),
       rules: _estimateTokens(userRulesBlock),
       skills: _estimateTokens(skillsBlock),
-      // 语言 / 自适应 / 模型族微调 / 鉴权：L0 下这几块跟着 clientBlocks 一起活下来。
-      blocks: _estimateTokens(languageBlock + adaptiveBlock + _modelFamilyTuning(config.model) + _authContextBlock()),
-      // 系统提示词只在**非网关**线路上真的发出去（网关线会被整条替换）。
-      system: _l0 ? 0 : _estimateTokens(sysPrompt + _modelStyleTuning(config.model) + (_ipSafeRoute(config) ? _toolHint : "")),
-      // 对话历史：这一轮真正带上去的那些消息（不含上面那条 system）。
+      /*
+       * 「系统提示词」= **这一轮客户端真发出去的那份**，两条线路各是一半：
+       *  · 走网关：客户端拼的那份被 _l0MessagesWithSkills 整条丢掉，活下来的只有
+       *    clientBlocks（语言 / 自适应 / 模型族微调 / 鉴权）——那就是客户端这一侧的系统提示词；
+       *  · 自定义端点：客户端自己拼的整份原样发出。
+       * 分类名跟 Claude Code 那套走（系统提示词 / 工具定义 / 用户规则 / 技能 /
+       * MCP 与动态工具 / 对话），不再自造「语言 / 自适应 / 鉴权块」这种只有我自己看得懂的名字。
+       */
+      system: _l0
+        ? _estimateTokens(languageBlock + adaptiveBlock + _modelFamilyTuning(config.model) + _authContextBlock())
+        : _estimateTokens(sysPrompt + _modelStyleTuning(config.model) + (_ipSafeRoute(config) ? _toolHint : "")),
+      // 对话：这一轮真正带上去的那些消息（不含最前面那条 system）。
       history: 0,
+      // 工具定义 / MCP 与动态工具：请求体里真带的那些 schema，发送前分开量（见下面的 useTools 处）。
       tools: 0,
+      mcp: 0,
     };
   } catch { /* 记不下就不显示分项，绝不能因此发不出去 */ }
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
@@ -31174,9 +31185,21 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   });
   try {
     const useTools = hasToolAccess && _toolSchemas.length > 0 && backend.aiChatWithTools;
-    // 真正随请求体发出去的那部分工具 schema。L0 下内置工具只发名字（走 HTTP 头），
-    // 所以这个数在网关线上只覆盖 MCP / 用户声明工具——面板的标签会说清楚。
-    try { if (sess._ctxParts && useTools) sess._ctxParts.tools = _estimateTokens(JSON.stringify(_toolSchemas)); } catch {}
+    /*
+     * 真正随请求体发出去的那部分工具 schema，按来源拆成两格。
+     *
+     * MCP 那一格单列，是因为它是**用户自己装上去的东西**——他要知道装了这些服务之后
+     * 每一轮要多付多少。内置工具在网关线上只发名字（走 HTTP 头），不在这个数里，
+     * 它落在「网关组装」那一行。
+     */
+    try {
+      if (sess._ctxParts && useTools) {
+        const _mcpNames = new Set((_mcpToolCache || []).map((t) => String(t?.function?.name || "")).filter(Boolean));
+        const _isMcp = (t) => _mcpNames.has(String(t?.function?.name || ""));
+        sess._ctxParts.mcp = _estimateTokens(JSON.stringify(_toolSchemas.filter(_isMcp)));
+        sess._ctxParts.tools = _estimateTokens(JSON.stringify(_toolSchemas.filter((t) => !_isMcp(t))));
+      }
+    } catch {}
     {
       const requestConfig = { ...config };
       let providerMessages = _sanitizeProviderMessages(messages);
