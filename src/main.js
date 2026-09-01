@@ -2590,7 +2590,24 @@ if (chatEl) {
 // tab (a core multi-tab smoothness fix).
 let _chatFollowRAF = 0;
 let _chatFollowSession = null;
-function _chatFollow(forSession) {
+/**
+ * 跟随流式内容滚到底。参数两种都收：**会话**（这一轮属于谁），或者**刚写过的那个 DOM
+ * 节点**（我改的这块在不在用户眼前）——后者给只拿得到 container 的 _liveToolProgress /
+ * _liveWritePreview / _runSubAgent 用。漏传就等于"按当前标签处理"，而 chatEl 里永远只挂
+ * 着当前标签的容器：**后台标签每 90ms 一帧就把你正看的那个标签拽到底**，一秒十来次。
+ * 原来 26 个调用点只有 4 个传了参数，流式刷新路径上一处都没传，那道门等于不存在。
+ */
+function _chatFollow(forSessionOrNode) {
+  let forSession = null;
+  if (forSessionOrNode && typeof forSessionOrNode === "object") {
+    if (forSessionOrNode.nodeType === 1) {
+      // 节点不在可见的聊天区里 = 这一笔是后台标签写的，别碰滚动条。
+      if (!chatEl || !chatEl.contains(forSessionOrNode)) return;
+      forSession = typeof _currentSession === "function" ? _currentSession() : null;
+    } else {
+      forSession = forSessionOrNode;
+    }
+  }
   if (forSession && typeof _currentSession === "function" && forSession !== _currentSession()) return;
   if (!_chatPinned || !chatEl) return;
   _chatFollowSession = forSession || (typeof _currentSession === "function" ? _currentSession() : null);
@@ -21719,9 +21736,14 @@ async function highlightCode(code, lang, opts = {}) {
   // 每一次最终渲染都仍然看到"正在流式"，一律返回 null——代码块从头到尾没有颜色，只有
   // 重启软件、历史被重新渲染（那时没人在流式）才会有色。用户实拍到的就是这个。
   //
-  // 顺带另一半：这里查的是**所有**会话，别的标签页在跑也会把这个标签页的最终渲染一起
-  // 掐掉。豁免同样解决它。
-  if (!opts.final && Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming)) return null;
+  // 顺带另一半：这里原来查**所有**会话——别的标签页在跑，这个标签页的代码卡就没颜色。
+  // final 豁免只救了回合末那一次；非 final 那条路（展开折叠的代码卡、前台自己的流式）
+  // 照旧被后台掐掉。要避的开销是"一次流式里逐帧叠加 colorize"，那只发生在**用户正看着
+  // 的那个会话**在流式时；后台标签在跑，不构成跳过前台这一次上色的理由。
+  const _selfStreaming = (() => {
+    try { const s = _currentSession(); return !!(s && s.streaming); } catch { return false; }
+  })();
+  if (!opts.final && _selfStreaming) return null;
   // 并发限流：超过 2 路排队，让出主线程。
   if (_highlightActive >= _HIGHLIGHT_MAX_CONCURRENT) {
     await new Promise((resolve) => _highlightQueue.push(resolve));
@@ -22784,7 +22806,12 @@ function _setStreaming(sess, on) {
   }
   try {
     const c = sess.container;
-    if (c && document.contains(c)) {
+    // 判据是「这个容器还是这个会话的」，不是「它在不在文档里」。切标签会把 chatEl 的
+    // 子节点全摘掉再挂新标签的容器，于是后台标签的容器**离开了 document**——而它的回合
+    // 还在正常跑。原来写的 document.contains(c) 对它恒假，整段收尾被跳过：is-streaming
+    // 没摘、思考卡还在、光标还在闪、操作条永远藏着。切回去看到的，是一个**已经跑完**的
+    // 回合长得和「中途断了」一模一样。清理只动这个容器自己的子树，在不在文档里都有效。
+    if (c) {
       c.classList.toggle("is-streaming", !!on);
       if (!on) {
         _removeAllThinking(c);
@@ -28118,7 +28145,7 @@ async function _runDirectImageGen(text, config, sess, attachments = []) {
   const startedAt = Date.now();
   const body = addMessage("assistant", "", sess);
   if (body) { const sp = document.createElement("div"); sp.className = "agent-seg"; sp.innerHTML = `<span class="atc-spin"></span> 用 ${_escHtml(config.model)} 生成图片中（自动优化提示词）…`; body.appendChild(sp); }
-  try { _chatFollow(); } catch {}
+  try { _chatFollow(sess); } catch {}
   sess.memory.push({ role: "user", content: text, attachments });
   saveChatHistory({ immediate: true });
   try {
@@ -28157,7 +28184,7 @@ async function _runDirectImageGen(text, config, sess, attachments = []) {
     _appendTurnStatsFooter(body, { elapsedMs: Date.now() - startedAt, settlement });
     _setStreaming(sess, false);
     if (sess === _currentSession()) _setSendBtnStop(false);
-    try { _chatFollow(); } catch {}
+    try { _chatFollow(sess); } catch {}
   }
 }
 
@@ -29455,7 +29482,10 @@ function _steerRunningAgent(sess, text, attachments = []) {
   let intentContext = null;
   let intentPromise = null;
   try {
-    if (_lastGoodAiConfig && _normalizeAiMode(_currentAiMode) === "agent") {
+    // 配置和模式都取**这个会话自己的**：steer 是发给 sess 里正在跑的那一轮的，
+    // 拿前台标签的模型/线路去做意图裁决，裁的是另一条线路上的事。
+    const _steerCfg = sess._lastAiConfig || _lastGoodAiConfig;
+    if (_steerCfg && _normalizeAiMode(sess.mode || _currentAiMode) === "agent") {
       const root = String(sess.project || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
       intentContext = _aiIntentContextForTurn(sess, t, {
         root,
@@ -29466,7 +29496,7 @@ function _steerRunningAgent(sess, text, attachments = []) {
       // Starts while the current model turn is still winding down. The loop awaits this exact
       // single-flight promise before choosing the next route, so steering is semantic without
       // adding a second serial wait after the current response finishes.
-      intentPromise = _aiIntentProfile(t, _lastGoodAiConfig, sess, intentContext).catch(() => null);
+      intentPromise = _aiIntentProfile(t, _steerCfg, sess, intentContext).catch(() => null);
     }
   } catch {}
   try { sess.memory?.recordUserCorrection?.(t); } catch {}
@@ -29892,11 +29922,16 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const _earlyRoot = String(sess?.project || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
   // 判据和预热那边共用一份（`_intentActivePath`）—— 不共用的话指纹对不上，预取白跑。
   const _earlyActiveForSession = _intentActivePath(_earlyRoot);
-  const effectiveMode = _normalizeAiMode(_currentAiMode);
+  // 本轮模式取**这个会话自己的**。_currentAiMode 只代表前台标签的选择器指着哪儿（五个
+  // 写入点都同时写了 _currentSession().mode，所以 sess.mode 才是每个会话的真值）。而
+  // sendPrompt 不只被"当前标签按回车"触发：插话重发、「用 Agent 执行此方案」都会拿一个
+  // **后台** sess 进来——原来它们按前台的模式跑，还把结果**永久写回**目标会话。
+  const effectiveMode = _normalizeAiMode(sess?.mode || _currentAiMode);
   _turnEngineeringEarly._isAgentMode = (effectiveMode === "agent");
   config.ideStepIndex = 0;
   config.ideStepKind = effectiveMode === "chat" ? "chat" : "intent";
-  _currentAiMode = effectiveMode;
+  // 全局那份是界面状态，只有当前标签才有资格改它。
+  if (sess === _currentSession()) _currentAiMode = effectiveMode;
   sess.mode = effectiveMode;
   // Agent routing is finalized from the semantic decision below. Starting on the full path is the
   // safe fail-open behavior: an unavailable classifier must not demote a real project request into
@@ -29911,7 +29946,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // gates, so firing a second paid model request before its answer only adds latency and load.
   // The exact physical promise/context/key travel with the run. The 8s foreground view may
   // resolve null, but the physical promise keeps running and can be adopted at a later boundary.
-  _lastGoodAiConfig = config; // 运行中 steer 复用（只读凭证，不触发登录/模型加载）
+  // 运行中 steer 复用（只读凭证，不触发登录/模型加载）。**两份都留**：全局那份会被任何
+  // 标签页的下一轮覆盖——A 跑着、B 发一条，A 的实时引导就拿到了 B 的模型/线路/端点。
+  // 全局那份留给输入框预热（本来就只服务当前标签，且有 loadConfig 兜底）。
+  sess._lastAiConfig = config;
+  _lastGoodAiConfig = config;
   const _turnIntentKey = effectiveMode === "chat" ? "" : _aiIntentCacheKey(
     text,
     _turnIntentContext.sessionId || sess?.id,
@@ -29939,7 +29978,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     _turnEngineeringResolved = _engineeringProfileWithAiIntent(text, sess, _turnIntentContext);
     _turnEngineeringResolved._isAgentMode = effectiveMode === "agent";
   }
-  _setSendBtnStop(true);
+  // 只有当前标签才切成「停止」。关掉那一侧七个调用点全判了 session，只有这个打开点没判：
+  // 后台标签一起轮，你正看着的空闲标签按钮就变「停止」，点它什么都不发生（type 已改成
+  // button，回车也不提交）。体感是「发不出去、卡住了」，而那个标签根本没在跑。
+  if (sess === _currentSession()) _setSendBtnStop(true);
   // Mark this session streaming NOW — BEFORE any pre-processing await — so the
   // Stop button is live through the whole turn and a hang in compaction / context
   // gathering can be interrupted (was: streaming only set later, so an early hang
@@ -30998,7 +31040,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     catch { tb.textContent = raw; }
     _agentTimelineMarkVisible(_turnTimeline, _plainTimelineTurn, "thinking");
     if (_stick) tb.scrollTop = tb.scrollHeight; // auto-follow the newest reasoning
-    _chatFollow();
+    _chatFollow(sess);
   };
   const setThink = () => {
     ensureThink();
@@ -31160,7 +31202,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     if (view && _plainStreamDiag.firstRenderMs == null) {
       _plainStreamDiag.firstRenderMs = Date.now() - _plainStreamDiag.attemptStartedAt;
     }
-    _chatFollow();
+    _chatFollow(sess);
   };
   const flushStream = () => {
     flushRaf = 0;
@@ -31408,7 +31450,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
               p.then(r => { if (r) p._result = r; });
               _toolPromises.push(p);
               _pendingToolCalls.push(call);
-              _chatFollow();
+              _chatFollow(sess);
               delete _toolArgBuf[id || "_"];
             }
           } catch { /* JSON not complete yet, keep buffering */ }
@@ -31539,7 +31581,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       settlement: _plainSettlement,
       timeline: _turnTimeline,
     });
-    _chatFollow();
+    _chatFollow(sess);
     _drainFollowups(sess); // a message sent while this reply streamed → process it now, as its own turn
     try { _renderComposerGhost(); } catch {} // 一轮结束 → 刷新"接下来最想做什么"
     // 再后台算一次"他下一句会打什么"。这一档要读对话，所以只能在这里发起；
@@ -31554,6 +31596,15 @@ const _DANGEROUS_CMDS = /\bls\s+-[a-zA-Z]*R[a-zA-Z]*\s+\/\s*$|\brm\s+-rf\s+\/\s*
 const _BROAD_SCAN_CMDS = /\bfind\s+\/(?!tmp|var\/log)\b|\bfind\s+~|\bls\s+\/(?:Users|home|etc|var|usr|opt|System|Library)\b|\btree\s+\/|\bdu\s+(?:-[a-z]*\s+)?\/[^t]/;
 let _runningTermCmds = 0;
 const _MAX_CONCURRENT_CMDS = 3;
+// 等位队列。上限是**全局**的（几个标签页各跑并行 worker 就会一起撞上它），而超限原来
+// 直接返回 `code:1 / Too many concurrent commands`——那是**编出来的执行失败**：模型据此
+// 去改代码、换方案、道歉，而命令根本没执行过。喂假事实比让它多等两秒坏得多。改成排队。
+const _termCmdQueue = [];
+const _releaseTermSlot = () => {
+  _runningTermCmds = Math.max(0, _runningTermCmds - 1);
+  const next = _termCmdQueue.shift();
+  if (next) { clearTimeout(next.timer); next.resolve(); }
+};
 function _commandRiskKind(command) {
   const cmd = String(command || "");
   if (_DANGEROUS_CMDS.test(cmd) || _isDangerousCmd(cmd)) return "danger";
@@ -31755,7 +31806,17 @@ async function _agentRunInTerminal(root, command, stepEl, explicitTimeoutSecs) {
     }
   }
   if (_runningTermCmds >= _MAX_CONCURRENT_CMDS) {
-    return { code: 1, stdout: "", stderr: `Too many concurrent commands (${_runningTermCmds}/${_MAX_CONCURRENT_CMDS}). Wait for others to finish.` };
+    // 排队等一个位子。等满 2 分钟就照跑——上限是礼貌性的节流，不是正确性不变量，
+    // 而无限期挂着会让那一轮永远收不了尾（比短暂超限坏得多）。
+    await new Promise((resolve) => {
+      const entry = { resolve, timer: 0 };
+      entry.timer = setTimeout(() => {
+        const i = _termCmdQueue.indexOf(entry);
+        if (i >= 0) _termCmdQueue.splice(i, 1);
+        resolve();
+      }, 120000);
+      _termCmdQueue.push(entry);
+    });
   }
   _runningTermCmds++;
 
@@ -31913,7 +31974,7 @@ async function _agentRunInTerminal(root, command, stepEl, explicitTimeoutSecs) {
     result = { code: 1, stdout: "", stderr: String(e?.message || e) };
   }
 
-  _runningTermCmds = Math.max(0, _runningTermCmds - 1);
+  _releaseTermSlot();
   if (timerInterval) clearInterval(timerInterval);
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -32124,7 +32185,11 @@ function _stripTeachingSections(text) {
 // 缓存挂在函数自身属性上——测试的 load() 提取函数体时也能工作。
 function _cleanAgentText(text) {
   text = String(text == null ? "" : text);
-  if (text === _cleanAgentText._cacheIn) return _cleanAgentText._cacheOut;
+  // 缓存要**多槽**。单槽在一个标签页里够用（acc 只在有新 token 时才变，多数帧命中），
+  // 但两个标签页同时流式时两边交替调进来，互相把对方那一格顶掉——命中率归零，每帧都付
+  // 全价（多趟全文正则，150KB 回复每帧约 1MB 临时字符串）。「多开标签就变卡」有一半在这。
+  const _c = _cleanAgentText._cache || (_cleanAgentText._cache = new Map());
+  if (_c.has(text)) return _c.get(text);
   try { _perfPhase(`_cleanAgentText len=${text.length}`); } catch {}
   const input = text;
   text = _transformFileContentTags(text);
@@ -32140,8 +32205,9 @@ function _cleanAgentText(text) {
     // markers — they otherwise survive as real <p>...</p> content and freeze into snapshots
     .replace(/(^|\n)[ \t]*(?:\.{2,}|…|。{2,})+[ \t]*(?=\n|$)/g, "$1")
     .replace(/\n{3,}/g, "\n\n").trim();
-  _cleanAgentText._cacheIn = input;
-  _cleanAgentText._cacheOut = text;
+  _c.set(input, text);
+  // Map 保插入序，超了就删最老的那格。
+  if (_c.size > 4) _c.delete(_c.keys().next().value);
   return text;
 }
 
@@ -32153,7 +32219,9 @@ function _cleanAgentText(text) {
 // remaining stall is attributable.
 function _parseStreamSegments(text) {
   text = String(text == null ? "" : text);
-  if (text === _parseStreamSegments._in) return _parseStreamSegments._out;
+  // 同样是多槽：单槽在两个标签页交替 flush 时命中率归零（理由见 _cleanAgentText）。
+  const _c = _parseStreamSegments._cache || (_parseStreamSegments._cache = new Map());
+  if (_c.has(text)) return _c.get(text);
   try { _perfPhase(`_parseStreamSegments len=${text.length}`); } catch {}
   const segs = [];
   const lines = text.split("\n");
@@ -32225,8 +32293,8 @@ function _parseStreamSegments(text) {
     textBuf += (textBuf ? "\n" : "") + line; i++;
   }
   if (textBuf) segs.push({ type: "text", content: textBuf, complete: false });
-  _parseStreamSegments._in = text;
-  _parseStreamSegments._out = segs;
+  _c.set(text, segs);
+  if (_c.size > 4) _c.delete(_c.keys().next().value);
   return segs;
 }
 
@@ -48928,7 +48996,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     _vpObserver = new MutationObserver(() => { if (_vpPinned && card.classList.contains("is-open")) vp.scrollTop = vp.scrollHeight; });
     _vpObserver.observe(vp, { childList: true, subtree: true, characterData: true });
   } catch {}
-  _chatFollow();
+  _chatFollow(container);
 
   // === Streaming output throttling: reuse main conversation's incremental rendering & 500ms throttle ===
   let _lastRenderTime = 0;
@@ -48937,7 +49005,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     _lastRenderTime = Date.now();
     // Reuse _clipStreamCode to bound DOM updates to O(窗口)
     vp.textContent = _clipStreamCode(content).view;
-    _chatFollow();
+    _chatFollow(container);
   };
   // 节流**必须有尾沿**。这里和主对话那条流式节流不是一回事：那边每个 token 都调一次，
   // 丢掉的中间帧下一帧就补上了；这边是**每一轮**才调一次，两轮在 500ms 内先后结束时
@@ -49633,7 +49701,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     res.className = "atc-result atc-result--err";
     res.textContent = t("subagent.noSteps");
     card.classList.remove("is-open");
-    _chatFollow();
+    _chatFollow(container);
     // **先看 report，再说"没干活"。**
     //
     // 这块原来无条件返回下面那两句散文，而它排在底下三个前缀判定（[TIMEOUT] /
@@ -49687,7 +49755,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       ? t(_stepKey(_writesDone.length ? "subagent.workerSteps" : "subagent.workerStepsNoWrite"), { count: toolCount })
       : t(_stepKey("subagent.researchSteps"), { count: toolCount });
   card.classList.remove("is-open");
-  _chatFollow();
+  _chatFollow(container);
   // Context OUT: fold this child's report into the shared findings so it integrates into the
   // main agent's ongoing context (via its scratchpad) and later/sibling children can read it —
   // instead of surviving only as the one ≤8000-char tool-result that gets compacted away.
@@ -57718,7 +57786,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       _liveStats.stop();
       if (session._liveRunStats === _liveStats) session._liveRunStats = null;
     }
-    _chatFollow();
+    _chatFollow(session);
   }
 }
 
@@ -58386,7 +58454,7 @@ function _liveToolProgress(entry, container) {
     card.innerHTML = '<div class="code-card__head"><span class="code-card__lang"><span class="atc-spin"></span><span class="code-card__label"></span></span><span class="code-card__streaming-meta"><span class="code-card__linecount"></span></span></div>';
     container.appendChild(card);
     entry.progCard = card;
-    _chatFollow();
+    _chatFollow(container);
   }
   const friendly = _TOOL_PROGRESS_LABELS[entry.name] || entry.name;
   const label = entry.progCard.querySelector(".code-card__label");
@@ -58409,7 +58477,7 @@ function _liveWritePreview(entry, container, root = "") {
     entry.streamCard = card;
     entry._shownLen = 0;
     entry._shownLines = 1;
-    _chatFollow();
+    _chatFollow(container);
   }
 
   // 2) Keep the filename in sync as the `path` field streams. Re-read every call
@@ -66774,7 +66842,7 @@ async function _agentFollowUp(toolResults, container, session) {
 
   const body = container;
   body.appendChild(thinkingCard());
-  _chatFollow();
+  _chatFollow(session);
 
   const messages = [
     { role: "system", content: _P("agent", _AI_MODE_PROMPTS.agent) },
@@ -66805,7 +66873,7 @@ async function _agentFollowUp(toolResults, container, session) {
       if (!_streamE2) { _streamE2 = document.createElement("div"); _streamE2.className = "agent-seg agent-seg--stream"; body.appendChild(_streamE2); }
       if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownStream(_streamE2, c, { streaming: true, showCaret: false, highlighter: highlightCode }); }
     }
-    _chatFollow();
+    _chatFollow(session);
   };
   const _ffSchedule = () => {
     if (_ffTimer) return;
@@ -66842,7 +66910,7 @@ async function _agentFollowUp(toolResults, container, session) {
       saveChatHistory({ immediate: true });
     }
   }
-  _chatFollow();
+  _chatFollow(session);
 }
 
 // ---- AI inline code completion (Edit Prediction) ----

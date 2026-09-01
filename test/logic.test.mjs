@@ -8229,7 +8229,10 @@ test("Auto mode is removed and stale sessions fall back to Agent", () => {
   assert.equal(normalize("plan"), "plan");
   assert.match(SRC, /mode:\s*_normalizeAiMode\(mode \|\| _currentAiMode \|\| "agent"\)/,
     "new chat sessions should normalize stale or missing modes to Agent");
-  assert.match(SRC, /const effectiveMode = _normalizeAiMode\(_currentAiMode\);/,
+  // 2026-08-31：判据从「读全局 _currentAiMode」改成「读这个会话自己的 mode」——多标签页下
+  // 后台会话被前台的模式选择器带跑（还会被永久写回）。这条测试守的是**不再走 Auto 路由**，
+  // 直接用已选模式；从哪儿读这个已选模式不是它要管的事。
+  assert.match(SRC, /const effectiveMode = _normalizeAiMode\(sess\?\.mode \|\| _currentAiMode\);/,
     "send path should use the selected mode directly instead of Auto routing");
   assert.doesNotMatch(SRC, /const _autoResolvedMode = _resolveAutoAiMode/,
     "send path must not call the old Auto router");
@@ -22853,8 +22856,10 @@ test("#89-1 _cleanAgentText 缓存：同输入直接返回，避免重复正则"
   const r2 = clean(input);
   assert.equal(r1, r2, "同输入必须返回相同结果");
   assert.equal(r1, "hello world\n\nsecond paragraph");
-  assert.equal(clean._cacheIn, input, "缓存必须记住最后一次输入");
-  assert.equal(clean._cacheOut, r1, "缓存必须记住最后一次输出");
+  // 2026-08-31 改成四槽 Map：单槽在两个聊天标签页同时流式时命中率归零（两边的 flush
+  // 交替调进来，互相把对方那一格顶掉），每帧都要重跑多趟全文正则。
+  assert.ok(clean._cache instanceof Map, "缓存必须存在（退回单槽/没有缓存都不行）");
+  assert.equal(clean._cache.get(input), r1, "缓存必须记住这次的输入和输出");
 });
 
 test("#89-2 highlightCode 流式期间跳过 + 并发限流", () => {
@@ -22862,9 +22867,13 @@ test("#89-2 highlightCode 流式期间跳过 + 并发限流", () => {
   // 发生在每个模型回合结束时、session.streaming 要等整个运行结束才清——于是智能体跑动
   // 期间每一次最终渲染都仍然看到"正在流式"，一律返回 null。用户实拍：代码块从头到尾
   // 没有颜色，只有重启软件、历史被重新渲染（那时没人在流式）才有色。
-  // 而且它查的是**所有**会话：别的标签页在跑，也会把这个标签页的定稿一起掐掉。
-  assert.match(SRC, /if \(!opts\.final && Array\.isArray\(_chatSessions\) && _chatSessions\.some\(\(s\) => s && s\.streaming\)\) return null;/,
+  // 而且它原来查的是**所有**会话：别的标签页在跑，也会把这个标签页的代码卡一起掐掉
+  // （2026-08-31 修正为只看当前会话——final 豁免只救了回合末那一次，展开折叠代码卡那条
+  // 非 final 的路照旧被后台标签掐掉）。
+  assert.match(SRC, /if \(!opts\.final && _selfStreaming\) return null;/,
     "流式期间必须跳过逐帧上色，但最终渲染要有豁免口——没有豁免口它就是恒定生效的");
+  assert.doesNotMatch(extractFn("highlightCode", { code: true }), /_chatSessions\.some\(/,
+    "闸门又查回了所有会话——开两个标签页，其中一个在跑，另一个所有代码块都是灰的");
   assert.match(SRC, /_HIGHLIGHT_MAX_CONCURRENT/,
     "必须有并发限流常量");
   assert.match(SRC, /if \(_highlightActive >= _HIGHLIGHT_MAX_CONCURRENT\)/,
@@ -23998,9 +24007,14 @@ test("the per-delta segment parse is marked, memoised and throttled", () => {
   const fn = extractFn("_parseStreamSegments");
   assert.match(fn, /_perfPhase\(`_parseStreamSegments len=/,
     "must be instrumented, or the sentinel stays blind to it");
-  assert.match(fn, /if \(text === _parseStreamSegments\._in\) return _parseStreamSegments\._out;/,
+  // 记忆化改成了**四槽 Map**（2026-08-31）：单槽在两个聊天标签页同时流式时命中率归零，
+  // 两边的 flush 交替调进来互相把对方那一格顶掉，每帧都付全价。判据仍是「同样的输入
+  // 不许重解析」，只是"上一次"变成了"最近四次"。
+  assert.match(fn, /if \(_c\.has\(text\)\) return _c\.get\(text\);/,
     "identical input must not be re-parsed");
-  assert.match(fn, /_parseStreamSegments\._out = segs;/, "…and the result must be cached");
+  assert.match(fn, /_c\.set\(text, segs\);/, "…and the result must be cached");
+  assert.match(fn, /if \(_c\.size > \d+\) _c\.delete\(_c\.keys\(\)\.next\(\)\.value\);/,
+    "多槽缓存必须有上限，否则长回复会把内存吃穿");
 
   assert.match(SRC, /const _due = !renderStream\._at \|\| \(_nowMs - renderStream\._at\) >= 150;/,
     "the per-delta call must be throttled — the memo always misses on a growing accumulator");
