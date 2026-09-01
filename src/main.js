@@ -21416,7 +21416,9 @@ function _ctxPanelHtml(kind) {
       ? `<div class="ctx-panel__empty">这个会话还没有上报过用量。发一轮之后这里就是上游给的真实读数。</div>`
       : `<div class="ctx-panel__sum"><span class="ctx-panel__pct">${esc(view.headline)}</span>`
         + `<span class="ctx-panel__tot">${esc(view.sub)}</span></div>`
-        + `<div class="ctx-panel__bar">${view.rows.map((r) =>
+        // 条只吃正数：命中 0 那一行要显示，但不该在条上占一格（min-width 会给它 2px，
+        // 看起来像"有那么一点点命中"）。
+        + `<div class="ctx-panel__bar">${view.rows.filter((r) => r.value > 0).map((r) =>
             `<i class="ctx-panel__seg ctx-panel__seg--${r.key}" style="flex:${r.value}"></i>`).join("")}</div>`
         + `<div class="ctx-panel__rows">${view.rows.map((r) =>
             `<div class="ctx-panel__row"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
@@ -21424,8 +21426,7 @@ function _ctxPanelHtml(kind) {
             + `<span class="ctx-panel__val">${esc(r.text)}</span></div>`).join("")}</div>`;
     const notes = view.notes.map((n) => `<div class="ctx-panel__note">${esc(n)}</div>`).join("");
     return `<div class="ctx-panel__head"><span class="ctx-panel__title">上下文用量</span></div>`
-      + body + (notes ? `<div class="ctx-panel__notes">${notes}</div>` : "")
-      + `<div class="ctx-panel__hint">点一下看这些字是从哪来的</div>`;
+      + body + (notes ? `<div class="ctx-panel__notes">${notes}</div>` : "");
   }
   const src = _ctxPartsRows();
   const of = Math.max(0, Number(_ctxMeter?.prompt) || 0);

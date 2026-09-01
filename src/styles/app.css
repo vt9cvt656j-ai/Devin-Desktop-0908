@@ -16713,12 +16713,6 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
    而且不做入场位移——鼠标划过时一块卡片"跳"出来比直接出现更晃眼。 */
 .ctx-panel--usage { pointer-events: none; animation-name: ctxPanelFade; }
 @keyframes ctxPanelFade { from { opacity: 0; } to { opacity: 1; } }
-/* 悬停那块底下那行小字：告诉用户"还能点"。点开的那块不需要，它已经在眼前了。 */
-.ctx-panel__hint {
-  margin-top: 9px; padding-top: 8px;
-  border-top: 1px solid rgba(128, 128, 128, .14);
-  font-size: 10.5px; color: var(--text-dim); text-align: center;
-}
 .ctx-panel--usage .ctx-panel__head { margin-bottom: 8px; }
 .ctx-panel {
   position: fixed; z-index: 3000; width: 300px; max-width: calc(100vw - 16px);

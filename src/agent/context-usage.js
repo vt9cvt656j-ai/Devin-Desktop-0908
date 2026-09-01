@@ -40,7 +40,16 @@ export function contextUsageView(state = {}, totals = {}) {
   const uncached = Math.max(0, prompt - (cached || 0) - cacheWrite);
 
   const rows = [];
-  if (cached) rows.push({ key: "cached", label: "缓存命中", value: cached, text: short(cached) });
+  // 命中 0 也要**把这一行摆出来**。
+  //
+  // 原来 0 就整行不画，屏幕上只剩「未缓存输入」——用户读到的是"这个功能没做/是假的"
+  // （实拍原话：「做成真实的，真实的缓存命中那些显示，而不是虚假内容」）。
+  // 而 0 恰恰是**上游报回来的真数**：会话第一次请求本来就没有可命中的前缀。
+  // 把它写出来，和「上游根本没报缓存字段」（cached === null，下面那条 note）才分得开——
+  // 这两件事在旧版界面上长得一模一样。
+  if (cached || (cached === 0 && prompt > 0)) {
+    rows.push({ key: "cached", label: "缓存命中", value: cached, text: short(cached) });
+  }
   if (cacheWrite) rows.push({ key: "cacheWrite", label: "新写入缓存", value: cacheWrite, text: short(cacheWrite) });
   if (uncached) rows.push({ key: "uncached", label: cached == null && !cacheWrite ? "输入" : "未缓存输入", value: uncached, text: short(uncached) });
   if (completion) rows.push({ key: "completion", label: "本轮输出", value: completion, text: short(completion) });
@@ -50,14 +59,16 @@ export function contextUsageView(state = {}, totals = {}) {
   if (s.windowReported === false && total > 0) notes.push(`窗口未上报 · ${short(limit)} 是按模型名推的，百分比仅供参考`);
   if (s.estimated) notes.push("本地估算 · 供应商尚未上报本轮用量");
   if (cached == null && prompt > 0) notes.push("上游没报缓存字段，无法拆出命中/新写");
-  const tierLimit = Math.max(0, Number(s.tierLimit) || 0);
-  if (tierLimit > limit) notes.push(`档位可留存 ${short(tierLimit)}，压缩后送进 ${short(limit)} 窗口`);
+  // 报了、但这一轮是 0：说清楚它是真数，不是"没做"。
+  if (cached === 0 && prompt > 0) notes.push("本轮缓存命中 0 —— 这是上游报回来的真数，同一段前缀要连着用才会命中");
   const t = totals || {};
   if (t.anyReal) {
     const hit = Number(t.inWithCacheInfo) > 0 ? Math.round((Number(t.cached) || 0) / Number(t.inWithCacheInfo) * 100) : null;
     notes.push(`会话累计 输入 ${short(t.in)} · 输出 ${short(t.out)}${hit == null ? "" : ` · 缓存命中 ${hit}%`}`);
   }
-  if (s.model) notes.push(String(s.model));
+  // 档位那一行和模型名不进这块面板（用户点名删的）：模型名在下面的选择器和每条回复的
+  // 抬头上各写着一次，档位是账户属性、不是"这一轮读了多少"。两者都还在 aria-label 的
+  // 详版里，读屏软件读不了这块面板。
 
   return {
     pct,
