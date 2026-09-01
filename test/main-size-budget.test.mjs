@@ -258,8 +258,18 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   相关的那个 API，Safari 17.4 才有，那批渲染缺陷正是 17.x 修掉的），老引擎行为不变。
  *   多出来的 20 行是那段判据的来龙去脉 + 一个可直接跑的小函数（_engineRenderClasses，
  *   它就是为了让这道判据能被测试真跑而拆出来的）。
+ * · 82_500（2026-09-01，抬 40 行）：实测 82,493 行。买到的是**「明明做完了还一直在运行中」
+ *   那条彻底封掉**——用户原话「你修复十几次了都没修复好」。三条收尾路径（智能体循环 /
+ *   纯对话 / 生图）形状一样：finally 里排着一串裸语句，然后才轮到 _setStreaming(x, false)。
+ *   finally 保证「进入」不保证「跑完」，任意一句抛出，停止按钮和实时计时器就一起卡死，
+ *   而且一个字都不报。纯对话那条尤其致命——夹在中间的是两个网络往返（等计费落定、
+ *   向网关取结算），网关抖一下就 reject。之前那次「计时器自停」的修复读的是
+ *   session.streaming，而它正是被跳过的那一行置回的，等于依赖着自己要绕开的东西。
+ *   这次三条全部把记账包进 try，另给智能体那条加了第二道判据 run._loopExitedAt
+ *   （finally 头两句之一，前面没有任何可抛的东西）。多出来的行几乎全是这段来龙去脉 +
+ *   三处 try 的缩进；判据本身是 AST 扫描的测试，不是注释。
  */
-const MAIN_JS_MAX_LINES = 82_460;
+const MAIN_JS_MAX_LINES = 82_500;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

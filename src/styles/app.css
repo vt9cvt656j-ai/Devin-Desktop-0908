@@ -8521,40 +8521,76 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  /*
+   * 发送态：**实心圆 + 描边箭头**，没有渐变、没有外发光、没有内高光。
+   *
+   * 原来是 iOS 那一路：上下渐变的蓝、一圈蓝色投影、顶上一道白色内高光、9px 圆角。
+   * 这三样是 2015 年前后的做法；现在这一代（ChatGPT / Claude / Linear / Vercel）
+   * 一律是**平的一块颜色**，形状交给圆，重量交给颜色本身。
+   *
+   * 改成圆还有一个结构上的理由：运行中那一态是圆环（.send.is-stop），两态同形，
+   * 按钮在发送↔停止之间切换时是"里面的图形变了"，而不是"整个按钮换了个东西"。
+   */
   color: #fff;
-  background: linear-gradient(180deg, #2b95ff, var(--accent));
+  background: var(--accent);
   border: none;
-  border-radius: 9px;
+  border-radius: 50%;
   cursor: pointer;
-  box-shadow: 0 1px 2px rgba(10, 132, 255, 0.4),
-    inset 0 1px 0 rgba(255, 255, 255, 0.25);
-  transition: filter 0.13s ease, transform 0.08s ease, opacity 0.13s ease;
+  box-shadow: none;
+  transition: filter 0.13s ease, transform 0.08s ease, opacity 0.13s ease, background 0.13s ease;
 }
 .send .ic {
   width: 17px;
   height: 17px;
 }
 .send:hover {
-  filter: brightness(1.06);
+  filter: brightness(0.93);   /* 平色按钮要往**暗**里走；提亮会让它发白、看着像失焦 */
 }
 .send:active {
   transform: scale(0.94);
 }
+/*
+ * 没东西可发的时候。以前 sendBtn.disabled = true 设了、样式一条没有 —— 按钮照旧是
+ * 那个饱和的蓝，看上去完全可点，点了没反应。
+ */
+.send:disabled {
+  background: var(--line-strong);
+  color: var(--panel-solid);
+  cursor: default;
+  filter: none;
+  transform: none;
+}
+/*
+ * 停止态：**单色、无底、一圈在转的细环**。
+ *
+ * 原来是红色渐变胶囊 + 红光一呼一吸。两个问题：红色在这类界面里是留给破坏性动作的
+ * （停止生成不是破坏性的），而那圈红光一直在动 —— 用户分不出"模型在跑"和"界面卡住了"。
+ * 现在环真的在转：它停了就是真停了。
+ */
 .send.is-stop {
-  background: linear-gradient(180deg, #f55050, #e03030);
-  box-shadow: 0 1px 2px rgba(240,48,48,.4), inset 0 1px 0 rgba(255,255,255,.2);
-  animation: send-stop-pulse 2s ease-in-out infinite;
+  background: transparent;
+  color: var(--text);
+  border-radius: 50%;
+  box-shadow: none;
+  animation: none;
 }
 .send.is-stop .ic {
-  width: 13px;
-  height: 13px;
+  width: 26px;              /* 环要撑满按钮，不然它看起来像个缩在里面的小图标 */
+  height: 26px;
 }
 .send.is-stop:hover {
-  filter: brightness(1.1);
+  filter: none;
+  background: var(--hover);
 }
-@keyframes send-stop-pulse {
-  0%, 100% { box-shadow: 0 1px 2px rgba(240,48,48,.4), inset 0 1px 0 rgba(255,255,255,.2); }
-  50% { box-shadow: 0 1px 8px rgba(240,48,48,.6), inset 0 1px 0 rgba(255,255,255,.2); }
+.send-stop__track { opacity: .26; }
+.send-stop__arc {
+  transform-origin: 12px 12px;
+  animation: send-stop-spin 1.1s linear infinite;
+}
+@keyframes send-stop-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  /* 不转了就改成整圈，否则只剩一段静止的弧，看着像画错了 */
+  .send-stop__arc { animation: none; stroke-dasharray: none; opacity: .55; }
 }
 
 /* ---- model picker + dropdown ---- */

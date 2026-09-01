@@ -441,8 +441,10 @@ export function Shell() {
                     <span className="voice-btn__wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
                   </button>
                   <span className="composer__hint"></span>
+                  {/* 首屏这一份要和 main.js 的 _SEND_ICON 一模一样：不一致的话，第一次
+                      发送前后箭头会换一种画法。 */}
                   <button className="send" id="sendBtn" type="submit" data-i18n-title="assistant.send" title="发送">
-                    <svg className="ic"><use href="#i-arrow-up" /></svg>
+                    <svg className="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 19V5" /><path d="M5.5 11.5L12 5l6.5 6.5" /></svg>
                   </button>
                 </div>
               </div>

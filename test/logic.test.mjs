@@ -24419,8 +24419,14 @@ test("run collaboration cleanup is idempotent across await, normal completion, S
   ]);
 
   const loop = extractFn("_runAgenticLoop");
-  const finalizerStart = loop.indexOf("  finally {\n    planSteps = _settleRunPlan(run);");
-  assert.ok(finalizerStart > 0, "the main run finalizer must remain structurally identifiable");
+  // 锚点从 `planSteps = _settleRunPlan(run);` 换成 `_loopExitedAt`：2026-09-01 把整段记账
+  // 包进 try 之后，_settleRunPlan 不再是 finally 的第一句（收尾里任何一句抛出都会把
+  // 停止按钮和计时器卡死，见 test/live-turn-stats.test.mjs）。_loopExitedAt 现在是
+  // finally 的头两句之一，而且那个位置是被测试钉死的，比 _settleRunPlan 稳。
+  const _exitMark = loop.indexOf("run._loopExitedAt = Date.now();");
+  assert.ok(_exitMark > 0, "the main run finalizer must remain structurally identifiable");
+  const finalizerStart = loop.lastIndexOf("  finally {", _exitMark);
+  assert.ok(finalizerStart > 0, "找不到 _loopExitedAt 所在的那个 finally");
   // 切到 finally 里那次会话释放为止，不要固定 2200 字符窗口——这一段一变长
   //（这次是补了"收尾前先收割已落定作业"）尾部就掉出窗口，断言以「finally 没释放监听」
   // 的形式假红。今天第五条同形状的了。
