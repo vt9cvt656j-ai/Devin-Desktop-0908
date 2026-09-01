@@ -31652,6 +31652,8 @@ let _termLock = Promise.resolve();
 let _termOpened = false;
 const _DANGEROUS_CMDS = /\bls\s+-[a-zA-Z]*R[a-zA-Z]*\s+\/\s*$|\brm\s+-rf\s+\/\s*$|\bdd\s+if=|\bmkfs\b|\bformat\s+[cCdD]:/;
 const _BROAD_SCAN_CMDS = /\bfind\s+\/(?!tmp|var\/log)\b|\bfind\s+~|\bls\s+\/(?:Users|home|etc|var|usr|opt|System|Library)\b|\btree\s+\/|\bdu\s+(?:-[a-z]*\s+)?\/[^t]/;
+// 扎堆入场的错峰计数（见 _createToolStep）。放模块级：它跨卡片存活，且只在建卡那一刻读写。
+let _atcBurstAt = 0, _atcBurstN = 0;
 let _runningTermCmds = 0;
 const _MAX_CONCURRENT_CMDS = 3;
 // 等位队列。上限是**全局**的（几个标签页各跑并行 worker 就会一起撞上它），而超限原来
@@ -58905,6 +58907,23 @@ function _createToolStep(call) {
 
 
   const step = document.createElement("div");
+  /*
+   * **同一瞬间落地的卡片要错峰入场。**
+   *
+   * 用户：「一下弹出来一堆那种感觉很不好，让用户看懵逼了」。并行工具、批量读取、
+   * 子智能体收尾——这几种情形会在同一帧里塞进四五张卡，它们的入场动画完全同步，
+   * 于是整块一起闪出来，眼睛没有落点。
+   *
+   * 错峰只针对**扎堆**的那几张：120ms 内连着建的算一批，每张比前一张晚 45ms，
+   * 最多推到 180ms（再久用户就开始等了）。间隔超过 120ms 的照旧立即入场——
+   * 正常一步一步跑的时候，时间本身就是错峰，不该再人为加延迟。
+   */
+  {
+    const _t = Date.now();
+    _atcBurstN = (_t - _atcBurstAt < 120) ? Math.min(_atcBurstN + 1, 4) : 0;
+    _atcBurstAt = _t;
+    if (_atcBurstN) step.style.setProperty("--atc-in", `${_atcBurstN * 45}ms`);
+  }
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
   const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "debug" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "mcpconfig" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;

@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { normalizeAskOptions, askMode, askAnswerText, askAnswerLabel, ASK_MAX_OPTIONS } from "../src/agent/ask-user.js";
-import { blockFrom, CODE } from "./helpers/source.mjs";
+import { blockFrom, fnSource, CODE } from "./helpers/source.mjs";
 
 const CSS = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
 const CATALOG = readFileSync(new URL("../src/agent/tool-catalog.js", import.meta.url), "utf8");
@@ -166,8 +166,10 @@ test("工具卡不再浮起来：没有阴影、不上浮、不滑入", () => {
   // 按选择器找会切到它，测出来的是别的规则（这个仓库固定窗口切源码栽过好几次）。
   const card = cardBlock();
   assert.doesNotMatch(card, /box-shadow/, "阴影又回来了——十个工具就是十块浮板");
-  assert.doesNotMatch(card, /animation:/, "滑入动画又回来了");
-  assert.doesNotMatch(card, /transform: translateY/, "悬停上浮又回来了");
+  // 判据不是"不许有动画"——2026-09-01 加回了一条压小的入场（见下面那条测试）。
+  // 不许回来的是**那一套**：8px 的滑入、悬停上浮，以及配套的阴影。
+  assert.doesNotMatch(card, /animation: atcSlideUp/, "8px 的滑入又回来了");
+  assert.doesNotMatch(card, /:hover \{[^}]*transform/, "悬停上浮又回来了");
   // 间距压到个位数，连着几个工具读起来才是一份清单。
   assert.match(card, /margin: 3px 0;/, "卡间距又被撑开了");
 });
@@ -277,3 +279,56 @@ test("颜色按族分，只有七族，而且只上在描边上", async () => {
 });
 
 
+
+// ── 动效：让一堆卡片"流"出来，而不是"弹"出来 ────────────────────────────
+//
+// 用户：「一下弹出来一堆那种感觉很不好，让用户看懵逼了，而且也不流畅」。三个成因：
+//  ① 上一轮把入场动画整条删了（当时要去掉的是"浮起卡片"那套，连带删过头），卡片硬跳出来；
+//  ② 展开用 max-height 0→600px——比 600 矮就提前走完、比 600 高就截断后弹一下，
+//     同一张卡每次展开的观感还不一样；
+//  ③ 并行工具会在同一帧塞进四五张卡，入场完全同步，整块一起闪。
+test("卡片有入场过渡，而且是压小的那种", () => {
+  const card = cardBlock();
+  assert.match(card, /animation: atcRise \.18s cubic-bezier\(\.16, 1, \.3, 1\) both;/,
+    "入场动画又没了——卡片会硬生生跳出来");
+  const kf = CSS.match(/@keyframes atcRise \{([^}]*\}[^}]*)\}/)[1];
+  assert.match(kf, /translateY\(3px\)/, "位移超过 3px 就成了表演，不是提示");
+  // 不许把"浮起卡片"那套顺手带回来。
+  assert.doesNotMatch(card, /box-shadow/, "阴影又回来了");
+  assert.doesNotMatch(card, /transform: translateY\(-/, "悬停上浮又回来了");
+});
+
+test("展开不许再用 max-height——观感会随内容长短变", () => {
+  const kf = CSS.match(/@keyframes atcViewportOpen \{([\s\S]*?)\n\}/)[1];
+  assert.doesNotMatch(kf, /max-height/,
+    "又用 max-height 了：比它矮的内容动画中途就走完，比它高的会被截住再弹一下");
+  assert.match(kf, /opacity/, "展开完全没有过渡");
+  assert.match(kf, /translateY/, "只淡入没有位移，读不出这块是新展开的");
+});
+
+test("同一批落地的卡片要错峰，正常一步一步跑的不加延迟", () => {
+  const fn = fnSource("_createToolStep", { code: true });
+  assert.match(fn, /_atcBurstN = \(_t - _atcBurstAt < 120\) \? Math\.min\(_atcBurstN \+ 1, 4\) : 0;/,
+    "错峰的判据变了——扎堆窗口或上限被改动");
+  assert.match(fn, /step\.style\.setProperty\("--atc-in", `\$\{_atcBurstN \* 45\}ms`\)/,
+    "延迟没有真的写到卡片上");
+  assert.match(fn, /if \(_atcBurstN\)/,
+    "第一张也被加了延迟——正常一步一步跑时，时间本身就是错峰，不该再等");
+  assert.match(cardBlock(), /animation-delay: var\(--atc-in, 0ms\)/, "样式那一侧没读这个变量，延迟等于没设");
+});
+
+test("跑着的那一行会呼吸，不是从空白直接跳出结果", () => {
+  assert.match(CSS, /\.atc-result--pending \{[^}]*animation: atcBreathe/,
+    "运行中没有任何提示——这一行会从空着直接蹦出一个数");
+  assert.match(CSS, /@keyframes atcBreathe \{ 0%, 100% \{ opacity: \.45; \} 50% \{ opacity: 1; \} \}/);
+});
+
+test("系统开了「减少动态效果」就全部停掉", () => {
+  // 无障碍的硬要求，不是可选项：前庭功能敏感的人看这类位移会不适。
+  const m = CSS.match(/@media \(prefers-reduced-motion: reduce\) \{\s*\n\s*\.agent-tool-step,([\s\S]*?)\n\}/);
+  assert.ok(m, "工具卡这一套动效没有 reduced-motion 兜底");
+  assert.match(m[0], /animation: none !important/);
+  for (const sel of ["is-open .atc-viewport", "atc-result--pending"]) {
+    assert.ok(m[0].includes(sel), `${sel} 的动画没有被停掉`);
+  }
+});

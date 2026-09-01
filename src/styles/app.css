@@ -6404,7 +6404,17 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   background: var(--atc-bg);
   margin: 3px 0;
   transition: border-color .15s ease, background .15s ease;
+  /*
+   * 入场：**淡入 + 3px 上浮，180ms**。上一轮把动画整条删掉是过头了——当时要去掉的是
+   * "浮起来的卡片"那套（阴影 + 悬停上浮 + 8px 滑入），但连带把入场也删了，于是卡片
+   * 变成硬生生地"跳"出来，用户：「一下弹出来一堆，感觉很不好」。
+   * 3px 和 180ms 是刻意压小的：它的作用是让眼睛知道"这里多了一行"，不是表演。
+   * 缓动用 (.16,1,.3,1)——起步快、收尾软，这是这一代产品动效的通用曲线。
+   */
+  animation: atcRise .18s cubic-bezier(.16, 1, .3, 1) both;
+  animation-delay: var(--atc-in, 0ms);
 }
+@keyframes atcRise { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 .agent-tool-step:hover { border-color: var(--line-strong); }
 /* 深色下这四个要各提一档，否则压在深底上会掉进背景里。 */
 [data-theme="dark"] .agent-tool-step, .dark .agent-tool-step {
@@ -6603,7 +6613,10 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   padding: 0 4px;
 }
 .atc-result--err { color: var(--atc-danger); background: transparent; }
-.atc-result--pending { color: var(--atc-dim); background: transparent; }
+/* 还在跑：值轻轻呼吸一下。没有它的话，这一行是"空着 → 突然出现一个数"，
+   那一跳正是"不流畅"的来源之一。 */
+.atc-result--pending { color: var(--atc-dim); background: transparent; animation: atcBreathe 1.5s ease-in-out infinite; }
+@keyframes atcBreathe { 0%, 100% { opacity: .45; } 50% { opacity: 1; } }
 /* 子体超时被强杀 / 浏览器撞上人机验证——这两个是最需要用户一眼看见的异常，此前
    全表一条规则都没有：渲染成透明底 + 暗灰字，比表示「12 行」的中性 chip 还淡，
    扫一屏卡片时会直接漏掉，以为那个子体正常跑完了。用和 --ok/--err 同族的暖色。 */
@@ -6767,9 +6780,17 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   background: rgba(128, 128, 128, .12);
 }
 
+/*
+ * 展开：淡入 + 轻微下沉，**不再用 max-height**。
+ *
+ * 原来是 `max-height: 0 → 600px`：内容比 600 矮时动画在中途就走完了（后半段是空跑，
+ * 观感是"到一半突然停"），比 600 高时又会被截住、结束瞬间"啪"地弹到全高。两种都是
+ * 用户说的"不流畅"，而且**同一张卡每次展开的观感还不一样**，取决于内容多长。
+ * 换成只动 opacity 和 transform：与内容高度无关，永远是同一条曲线。
+ */
 .agent-tool-step.is-open .atc-viewport {
   display: block;
-  animation: atcViewportOpen .2s ease both;
+  animation: atcViewportOpen .19s cubic-bezier(.16, 1, .3, 1) both;
 }
 
 /* 容器查询的锚点。锚 .ld-card 而不是 .atc-viewport：后者带 display:none + 展开动画，
@@ -7696,13 +7717,19 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 .agent-tool-step--rejected .atc-path { text-decoration: line-through; }
 
+/* 系统开了「减少动态效果」就全部停掉——这是无障碍的硬要求，不是可选项。 */
+@media (prefers-reduced-motion: reduce) {
+  .agent-tool-step, .agent-tool-step.is-open .atc-viewport, .atc-result--pending {
+    animation: none !important;
+  }
+}
 @keyframes atcSlideUp {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
 }
 @keyframes atcViewportOpen {
-  from { opacity: 0; max-height: 0; }
-  to { opacity: 1; max-height: 600px; }
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
 }
 @keyframes atcFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
