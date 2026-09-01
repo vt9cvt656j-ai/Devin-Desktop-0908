@@ -21374,7 +21374,8 @@ function _finalRunSettlement(runUsage) {
  * 做过全站审计的那种「兜底冒充真值」。所以分的是上游真报过的那几刀，加起来正好等于总数。
  * 判据和排版都在 src/agent/context-usage.js，纯函数。
  */
-let _ctxPanelEl = null;
+let _ctxPanelEl = null;      // 点开的那块「来源」
+let _ctxHoverEl = null;      // 悬停那块「用量」
 /// 把这一轮记下来的客户端分块，喂给 agent/context-parts.js 的判据。
 function _ctxPartsRows() {
   try {
@@ -21391,56 +21392,96 @@ function _ctxPartsRows() {
       { key: "history", label: "对话历史 + 本轮请求", tokens: p.history },
     ];
     const v = _contextPartsView({ parts, total: Number(_ctxMeter?.prompt) || 0, l0: !!p.l0 });
-    return v.pending ? { rows: [], notes: [] } : { rows: v.rows, notes: v.notes };
+    return v.pending ? { rows: [], notes: v.notes || [] } : { rows: v.rows, notes: v.notes };
   } catch { return { rows: [], notes: [] }; }
 }
+
+/*
+ * 上下文那个环有**两块**面板，各管各的：
+ *
+ *   · 悬停 → 「上下文用量」：这一轮读进去多少、里面哪些命中了缓存。全是上游报的真数。
+ *   · 点击 → 「上下文来源」：这些字是从哪来的（用户规则 / 技能 / 工具 / 对话 / 网关注入）。
+ *
+ * 用户的话：「悬停显示上半段，只有点击时才出来下半段」。分开是有道理的——用量是随时想瞟一眼
+ * 的数，来源是要坐下来读的账；混在一张卡里，每次划过鼠标都糊一屏。
+ *
+ * 悬停那块 pointer-events:none：它绝不能吃掉落在环上的那一下点击。
+ * 原来的 `.cache-ring::after` 纯文字提示已经删掉——同一个位置不能有两层提示。
+ */
+function _ctxPanelHtml(kind) {
+  const esc = (x) => _escHtml(String(x ?? ""));
+  if (kind === "usage") {
+    const view = _contextUsageView(_ctxMeter || {}, _tok || {});
+    const body = view.empty
+      ? `<div class="ctx-panel__empty">这个会话还没有上报过用量。发一轮之后这里就是上游给的真实读数。</div>`
+      : `<div class="ctx-panel__sum"><span class="ctx-panel__pct">${esc(view.headline)}</span>`
+        + `<span class="ctx-panel__tot">${esc(view.sub)}</span></div>`
+        + `<div class="ctx-panel__bar">${view.rows.map((r) =>
+            `<i class="ctx-panel__seg ctx-panel__seg--${r.key}" style="flex:${r.value}"></i>`).join("")}</div>`
+        + `<div class="ctx-panel__rows">${view.rows.map((r) =>
+            `<div class="ctx-panel__row"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
+            + `<span class="ctx-panel__label">${esc(r.label)}</span>`
+            + `<span class="ctx-panel__val">${esc(r.text)}</span></div>`).join("")}</div>`;
+    const notes = view.notes.map((n) => `<div class="ctx-panel__note">${esc(n)}</div>`).join("");
+    return `<div class="ctx-panel__head"><span class="ctx-panel__title">上下文用量</span></div>`
+      + body + (notes ? `<div class="ctx-panel__notes">${notes}</div>` : "")
+      + `<div class="ctx-panel__hint">点一下看这些字是从哪来的</div>`;
+  }
+  const src = _ctxPartsRows();
+  const of = Math.max(0, Number(_ctxMeter?.prompt) || 0);
+  const body = src.rows.length
+    ? `<div class="ctx-panel__sum"><span class="ctx-panel__pct">本轮输入</span>`
+      + `<span class="ctx-panel__tot">${esc(_tokenShort(of))}</span></div>`
+      + `<div class="ctx-panel__bar">${src.rows.map((r) =>
+          `<i class="ctx-panel__seg ctx-panel__seg--${r.key}" style="flex:${r.tokens}"></i>`).join("")}</div>`
+      + `<div class="ctx-panel__rows">${src.rows.map((r) =>
+          `<div class="ctx-panel__row"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
+          + `<span class="ctx-panel__label">${esc(r.label)}</span>`
+          + `<span class="ctx-panel__val">${r.estimated ? '<em class="ctx-panel__est">估</em>' : ""}${esc(r.text)}</span></div>`).join("")}</div>`
+    : `<div class="ctx-panel__empty">还拆不出来源：这一轮的上下文要等上游报过用量之后才有分母可分。</div>`;
+  const notes = src.notes.map((n) => `<div class="ctx-panel__note">${esc(n)}</div>`).join("");
+  return `<div class="ctx-panel__head"><span class="ctx-panel__title">上下文来源</span>`
+    + `<button class="ctx-panel__x" type="button" aria-label="关闭">&times;</button></div>`
+    + body + (notes ? `<div class="ctx-panel__notes">${notes}</div>` : "");
+}
+
+/// 贴着环放，且不许出界。两块面板共用。
+function _ctxPanelPlace(box, anchor) {
+  try {
+    const r = anchor.getBoundingClientRect();
+    const w = box.offsetWidth || 300;
+    const h = box.offsetHeight || 200;
+    box.style.left = `${Math.max(8, Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2))}px`;
+    box.style.top = `${Math.max(8, r.top - h - 10)}px`;
+  } catch {}
+}
+
 function _closeContextPanel() {
   if (_ctxPanelEl) { try { _ctxPanelEl.remove(); } catch {} _ctxPanelEl = null; }
 }
+function _hideContextHover() {
+  if (_ctxHoverEl) { try { _ctxHoverEl.remove(); } catch {} _ctxHoverEl = null; }
+}
+function _showContextHover(anchor) {
+  // 点开的那块在时不弹悬停那块：同一个位置两层卡片会互相盖住。
+  if (_ctxPanelEl) return;
+  _hideContextHover();
+  const box = document.createElement("div");
+  box.className = "ctx-panel ctx-panel--usage";
+  box.innerHTML = _ctxPanelHtml("usage");
+  document.body.appendChild(box);
+  _ctxHoverEl = box;
+  _ctxPanelPlace(box, anchor);
+}
 function _toggleContextPanel(anchor) {
   if (_ctxPanelEl) { _closeContextPanel(); return; }
-  const view = _contextUsageView(_ctxMeter || {}, _tok || {});
+  _hideContextHover();
   const box = document.createElement("div");
-  box.className = "ctx-panel";
-  const esc = (x) => _escHtml(String(x ?? ""));
-  const seg = view.rows.length
-    ? `<div class="ctx-panel__bar">${view.rows.map((r) =>
-        `<i class="ctx-panel__seg ctx-panel__seg--${r.key}" style="flex:${r.value}"></i>`).join("")}</div>`
-    : "";
-  const rows = view.rows.map((r) =>
-    `<div class="ctx-panel__row"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
-    + `<span class="ctx-panel__label">${esc(r.label)}</span>`
-    + `<span class="ctx-panel__val">${esc(r.text)}</span></div>`).join("");
-  // 第二段：这些字是从哪来的。判据在 agent/context-parts.js。
-  const src = _ctxPartsRows();
-  const partsHtml = src.rows.length
-    ? `<div class="ctx-panel__sec">来源</div>`
-      + `<div class="ctx-panel__bar ctx-panel__bar--src">${src.rows.map((r) =>
-          `<i class="ctx-panel__seg ctx-panel__seg--${r.key}" style="flex:${r.tokens}"></i>`).join("")}</div>`
-      + src.rows.map((r) =>
-        `<div class="ctx-panel__row"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
-        + `<span class="ctx-panel__label">${esc(r.label)}</span>`
-        + `<span class="ctx-panel__val">${r.estimated ? '<em class="ctx-panel__est">估</em>' : ""}${esc(r.text)}</span></div>`).join("")
-    : "";
-  const notes = [...view.notes, ...src.notes].map((n) => `<div class="ctx-panel__note">${esc(n)}</div>`).join("");
-  box.innerHTML =
-    `<div class="ctx-panel__head"><span class="ctx-panel__title">上下文用量</span>`
-    + `<button class="ctx-panel__x" type="button" aria-label="关闭">&times;</button></div>`
-    + (view.empty
-      ? `<div class="ctx-panel__empty">这个会话还没有上报过用量。发一轮之后这里就是上游给的真实读数。</div>`
-      : `<div class="ctx-panel__sum"><span class="ctx-panel__pct">${esc(view.headline)}</span>`
-        + `<span class="ctx-panel__tot">${esc(view.sub)}</span></div>${seg}`
-        + `<div class="ctx-panel__sec">读进去的</div><div class="ctx-panel__rows">${rows}</div>${partsHtml}`)
-    + (notes ? `<div class="ctx-panel__notes">${notes}</div>` : "");
+  box.className = "ctx-panel ctx-panel--source";
+  box.innerHTML = _ctxPanelHtml("source");
   document.body.appendChild(box);
   _ctxPanelEl = box;
-  // 贴着环放，且不许出界。
-  try {
-    const r = anchor.getBoundingClientRect();
-    const w = box.offsetWidth || 280;
-    box.style.left = `${Math.max(8, Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2))}px`;
-    box.style.top = `${Math.max(8, r.top - (box.offsetHeight || 200) - 10)}px`;
-  } catch {}
+  _ctxPanelPlace(box, anchor);
   box.querySelector(".ctx-panel__x")?.addEventListener("click", _closeContextPanel);
   // 点面板以外的地方就关。挂在 document 上、下一帧再挂，否则**这一次**点击立刻把它关掉。
   setTimeout(() => {
@@ -21453,7 +21494,6 @@ function _toggleContextPanel(anchor) {
     document.addEventListener("mousedown", away, true);
   }, 0);
 }
-
 function _renderTokenMeter() {
   const k = _tokenShort;
   const state = _ctxMeter || {};
@@ -21508,6 +21548,10 @@ function _renderTokenMeter() {
   if (pct >= 100) lines.push("窗口已满，下一轮会先压缩旧上下文");
   else if (pct >= _CONTEXT_RING_DANGER_PCT) lines.push("接近满载，建议压缩旧上下文");
   if (state.model) lines.push(state.model);
+  // lines 现在只喂 aria-label 之外的那层已经没有了：悬停面板取代了纯文字提示。
+  // 但这几行判据（窗口未上报 / 本地估算 / 最近一次请求 / 档位 / 思考）本身没白写——
+  // _contextUsageView 里逐条对应着同样的判据，且都有测试钉着。这里保留 lines 只为
+  // aria-label 的详版：读屏软件读不了那块面板。
   const tooltip = lines.join("\n");
   try {
     let el = document.getElementById("tokenMeter");
@@ -21546,6 +21590,9 @@ function _renderTokenMeter() {
         setTimeout(() => document.removeEventListener("click", eat, true), 500);
       });
       el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); _toggleContextPanel(el); } });
+      el.addEventListener("pointerenter", () => _showContextHover(el));
+      el.addEventListener("pointerleave", () => _hideContextHover());
+      el.addEventListener("blur", () => _hideContextHover());
     }
     el.hidden = false;
     el.classList.toggle("is-estimated", !!state.estimated);
@@ -21556,8 +21603,10 @@ function _renderTokenMeter() {
     const label = el.querySelector(".cache-ring__label");
     if (label) label.textContent = pct >= 100 ? "满" : String(pct);
     el.removeAttribute("title");
-    el.dataset.tooltip = tooltip;
-    el.setAttribute("aria-label", text);
+    // 纯文字那层提示（.cache-ring::after 读的是 data-tooltip）已经被悬停面板取代。
+    // Shell.jsx 在静态标记里写死了一个 data-tooltip，不摘掉的话两层会同时冒出来。
+    el.removeAttribute("data-tooltip");
+    el.setAttribute("aria-label", `${text}\n${tooltip}`);
   } catch {
     let el = document.getElementById("tokenMeter");
     if (!el) {
@@ -21568,7 +21617,7 @@ function _renderTokenMeter() {
     }
     el.textContent = text;
     el.removeAttribute("title");
-    el.dataset.tooltip = tooltip;
+    el.removeAttribute("data-tooltip");
   }
 }
 

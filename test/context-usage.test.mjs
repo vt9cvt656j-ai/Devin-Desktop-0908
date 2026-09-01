@@ -48,11 +48,13 @@ test("分母是猜的、数是估的，都要当面说出来", () => {
 });
 
 test("接线：环可点、面板真用这份判据、点外面会关", () => {
-  const fn = blockFrom("function _toggleContextPanel(anchor) {");
-  assert.match(fn, /_contextUsageView\(_ctxMeter \|\| \{\}, _tok \|\| \{\}\)/,
+  // 用量那半边现在由**悬停**那块承担，标记在 _ctxPanelHtml("usage") 里拼。
+  const html = blockFrom('function _ctxPanelHtml(kind) {');
+  assert.match(html, /_contextUsageView\(_ctxMeter \|\| \{\}, _tok \|\| \{\}\)/,
     "面板没有用那份判据——多半是又在这儿现算了一遍");
-  assert.match(fn, /view\.empty/, "没上报过用量时没有走「如实说空」那条");
-  assert.match(fn, /style="flex:\$\{r\.value\}"/, "分段条的宽度不是那个数本身，条和数会对不上");
+  assert.match(html, /view\.empty/, "没上报过用量时没有走「如实说空」那条");
+  assert.match(html, /style="flex:\$\{r\.value\}"/, "分段条的宽度不是那个数本身，条和数会对不上");
+  const fn = blockFrom("function _toggleContextPanel(anchor) {");
   assert.match(fn, /document\.addEventListener\("mousedown", away, true\)/, "点面板外面关不掉");
   assert.match(fn, /setTimeout\(\(\) => \{/, "关闭监听没有推迟一帧——这一次点击会立刻把它关掉");
   // 「环真的被接成一个可点的按钮」这件事不在这里守：源码里有没有 addEventListener 这行字，

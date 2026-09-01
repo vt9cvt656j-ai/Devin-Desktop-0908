@@ -8448,49 +8448,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.05); }
 }
-.cache-ring::after {
-  content: attr(data-tooltip);
-  position: absolute;
-  right: -10px;
-  bottom: calc(100% + 10px);
-  /* Above the model/mode menus (70) that share this composer, and above anything the chat can
-     promote itself to. The background is stated with a fallback because a missing custom
-     property does not degrade to opaque — it degrades to see-through. */
-  z-index: 200;
-  width: max-content;
-  max-width: min(320px, 70vw);
-  padding: 9px 10px;
-  border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  background: var(--panel-solid, #fff);
-  color: var(--text);
-  box-shadow: var(--shadow-md);
-  font-size: 12px;
-  font-weight: 520;
-  line-height: 1.45;
-  letter-spacing: 0;
-  text-align: left;
-  white-space: pre-line;
-  pointer-events: none;
-  opacity: 0;
-  transform: translateY(4px);
-  transition: opacity .12s ease, transform .12s ease;
-}
-.cache-ring:hover::after,
-.cache-ring:focus-visible::after {
-  opacity: 1;
-  transform: translateY(0);
-}
-/* Voice-input button, sits right after the cache ring / left of ⌘↩. */
-.voice-btn {
-  margin-left: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 30px; height: 30px; flex: none;
-  border: 0; border-radius: 8px; background: transparent;
-  color: var(--text-dim); cursor: pointer;
-  transition: background .14s ease, color .14s ease, box-shadow .14s ease;
-  --vol: 1;
-}
+/* 环上原来那层纯文字提示（.cache-ring::after 读 data-tooltip）已删：它和悬停面板
+   会在同一个位置叠成两层。现在悬停出的是 .ctx-panel--usage，样式在下面那一段。 */
+
 .voice-btn:hover { background: var(--hover); color: var(--text); }
 .voice-btn__mic { width: 17px; height: 17px; }
 /* live waveform (shown while recording): 5 bars pulse via keyframes, and the whole strip scales by
@@ -16737,6 +16697,17 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 /* ---- 上下文用量面板（点输入框右下那个环弹出来的） ----
    分段条的颜色只有四种，因为分项只有四项——它们是上游 usage 真报过的那几刀，
    加起来正好等于上面那个总数。别往这儿加"看着像那么回事"的第五种色块。 */
+/* 悬停那块只读不点：它绝不能吃掉落在环上的那一下按压（用户就是点不开才报的 bug）。
+   而且不做入场位移——鼠标划过时一块卡片"跳"出来比直接出现更晃眼。 */
+.ctx-panel--usage { pointer-events: none; animation-name: ctxPanelFade; }
+@keyframes ctxPanelFade { from { opacity: 0; } to { opacity: 1; } }
+/* 悬停那块底下那行小字：告诉用户"还能点"。点开的那块不需要，它已经在眼前了。 */
+.ctx-panel__hint {
+  margin-top: 9px; padding-top: 8px;
+  border-top: 1px solid rgba(128, 128, 128, .14);
+  font-size: 10.5px; color: var(--text-dim); text-align: center;
+}
+.ctx-panel--usage .ctx-panel__head { margin-bottom: 8px; }
 .ctx-panel {
   position: fixed; z-index: 3000; width: 300px; max-width: calc(100vw - 16px);
   padding: 12px 14px 13px;

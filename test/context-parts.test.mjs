@@ -53,6 +53,24 @@ test("元素已经在文档里时，环仍然被接成一个可点的按钮", ()
   assert.ok(m.listeners.some(([t]) => t === "keydown"), "键盘打不开面板");
 });
 
+test("悬停出用量、按下出来源——两块分开，且悬停那块不吃点击", () => {
+  // 用户：「悬停显示上半段用量，只有点击时才出来下半段来源」。
+  // 分开是有道理的：用量是随时想瞟一眼的数，来源是要坐下来读的账。
+  const m = renderMeter();
+  const kinds = m.listeners.map(([t]) => t);
+  assert.ok(kinds.includes("pointerenter"), "悬停不出用量面板");
+  assert.ok(kinds.includes("pointerleave"), "移开之后那块面板不会消失");
+  const html = fnSource("_ctxPanelHtml");
+  assert.match(html, /if \(kind === "usage"\)/, "两块面板没有按 kind 分开");
+  assert.match(html, /上下文用量/, "悬停那块的标题没了");
+  assert.match(html, /上下文来源/, "点开那块的标题没了");
+  // 悬停那块只读不点：它绝不能吃掉落在环上的那一下按压（用户就是点不开才报的 bug）。
+  assert.match(fnSource("_showContextHover"), /ctx-panel--usage/, "悬停那块没有自己的类名，样式分不开");
+  assert.match(fnSource("_showContextHover"), /if \(_ctxPanelEl\) return;/,
+    "点开着的时候还弹悬停那块——两层卡片会在同一个位置互相盖住");
+  assert.match(fnSource("_toggleContextPanel"), /_hideContextHover\(\);/, "点开时没有把悬停那块收掉");
+});
+
 test("按下就开，用 pointerdown 不用 click", () => {
   // AI 回复期间渲染繁忙，WKWebView 会吞掉 click（按下+松开配对）——本仓的齿轮菜单和
   // 新建项目弹窗都为此改过。而「上下文在涨」恰恰是最想点开它的时候。

@@ -833,9 +833,12 @@ test("the percentage measures the window the model reads, so it can actually mov
   // 面向用户的 token 量一律 k。
   assert.match(SRC, /label\.textContent = pct >= 100 \? "满" : String\(pct\)/);
   assert.match(SRC, /const lines = \[`上下文 \$\{k\(state\.total\)\} \/ \$\{k\(state\.limit\)\} · \$\{pct\}%`\];/);
-  assert.match(APP_CSS, /\.cache-ring::after \{[^}]*content: attr\(data-tooltip\);/);
-  assert.match(APP_CSS, /\.cache-ring::after \{[^}]*white-space: pre-line;/,
-    "the tooltip is multi-line; without this it collapses into one unreadable run");
+  // 悬停那层从「纯文字提示」换成了一块面板（.ctx-panel--usage）：同一个位置不能有两层。
+  // 它要守的性质没变——悬停时看得到那几行，而且不能吃掉落在环上的那一下点击。
+  assert.doesNotMatch(APP_CSS, /\.cache-ring::after \{/,
+    "纯文字提示又回来了：它和悬停面板会在同一个位置叠成两层");
+  assert.match(APP_CSS, /\.ctx-panel--usage \{[^}]*pointer-events: none;/,
+    "悬停那块会吃掉落在环上的点击——用户正是点不开才报的这个 bug");
 });
 
 test("token 数字一律 k/M，界面上不再有 25,851 这种原数", () => {
@@ -886,8 +889,16 @@ test("行内那一格和悬停面板说的是同一个「输入」", () => {
     promptTokens: ctxInput({ prompt: RAW_PROMPT + CACHED, cacheRead: CACHED, cacheWrite: 0, normalized: true }),
     completionTokens: OUT, cachedTokens: CACHED, cacheCreationTokens: 0, estimated: false });
   const store = {};
+  // 悬停那一侧的文字从 data-tooltip 搬到了 aria-label（纯文字提示已被悬停面板取代，
+  // 但那几行判据一字未改，仍是同一批 lines）——所以这里改成接住 setAttribute。
+  const attrs = {};
   const el = { dataset: {}, style: { setProperty() {} }, classList: { toggle() {} },
-    setAttribute() {}, removeAttribute() {}, querySelector: () => ({ textContent: "" }),
+    setAttribute(k, v) { attrs[k] = v; }, removeAttribute(k) { delete attrs[k]; },
+    // 环现在会挂监听器（悬停出用量、按下出来源）。桩里少了这个方法，_renderTokenMeter
+    // 会在接线那一步抛出去、被它自己的 catch 吞掉，走进兜底分支——于是这条测试红在
+    // "什么都没抓到"，而不是它要守的那件事上。
+    addEventListener() {},
+    querySelector: () => ({ textContent: "" }),
     appendChild() {}, parentElement: null };
   load("_renderTokenMeter", {
     _tokenShort: tokenShort, _ctxMeter: state,
@@ -900,7 +911,7 @@ test("行内那一格和悬停面板说的是同一个「输入」", () => {
     document: { getElementById: (id) => store[id] || null,
       createElement: () => { store.tokenMeter = el; return el; }, body: { appendChild() {} } },
   })();
-  const tip = el.dataset.tooltip;
+  const tip = attrs["aria-label"] || "";
 
   const panelIn = /(?:本轮|最近一次请求) 输入 (\S+)（/.exec(tip)?.[1];
   const panelUncached = /未缓存 (\S+)）/.exec(tip)?.[1];
@@ -954,8 +965,9 @@ test("the hover panel says only what it has to say, on top of the conversation",
   // And it paints above the transcript. A message carries content-visibility, which promotes it
   // to its own stacking context, so DOM order alone did not keep chat text out of the box.
   assert.match(APP_CSS, /\.composer \{ position: relative; z-index: 60; \}/);
-  assert.match(APP_CSS, /\.cache-ring::after \{[\s\S]*?z-index: 200;/);
-  assert.match(APP_CSS, /\.cache-ring::after \{[\s\S]*?background: var\(--panel-solid, #fff\);/,
+  // 同上：悬停面已换成 .ctx-panel。两条性质照旧要守——盖得住聊天区，且底不透。
+  assert.match(APP_CSS, /\.ctx-panel \{[\s\S]*?z-index: 3000;/);
+  assert.match(APP_CSS, /\.ctx-panel \{[\s\S]*?background: var\(--panel-solid, var\(--panel, #fff\)\);/,
     "a missing custom property degrades to see-through, not to opaque");
 });
 
