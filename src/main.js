@@ -21457,17 +21457,18 @@ function _ctxPanelHtml(kind) {
   const src = _ctxPartsRows();
   const of = Math.max(0, Number(_ctxMeter?.prompt) || 0);
   const body = src.rows.length
+    // 「约」只标一次，标在总数上——Claude Code 自己也是这么写的（它的抬头是 ~17.2K）。
+    // 原来每行挂一个「估」字角标：七行就是七个小方块，把真正要看的数挤成了配角。
     ? `<div class="ctx-panel__sum"><span class="ctx-panel__pct">本轮输入</span>`
-      + `<span class="ctx-panel__tot">${esc(_tokenShort(of))}</span></div>`
+      + `<span class="ctx-panel__tot">~${esc(_tokenShort(of))}</span></div>`
       + `<div class="ctx-panel__bar">${src.rows.map((r) =>
           `<i class="ctx-panel__seg ctx-panel__seg--${r.key}" style="flex:${r.tokens}"></i>`).join("")}</div>`
       + `<div class="ctx-panel__rows">${src.rows.map((r) =>
-          `<div class="ctx-panel__row"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
+          `<div class="ctx-panel__row${r.tokens ? "" : " ctx-panel__row--zero"}"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
           + `<span class="ctx-panel__label">${esc(r.label)}</span>`
-          + `<span class="ctx-panel__val">${r.estimated ? '<em class="ctx-panel__est">估</em>' : ""}${esc(r.text)}</span></div>`).join("")}</div>`
+          + `<span class="ctx-panel__val">${esc(r.text)}</span></div>`).join("")}</div>`
     : `<div class="ctx-panel__empty">还拆不出来源：这一轮的上下文要等上游报过用量之后才有分母可分。</div>`;
-  // 来源卡下面不再挂说明段：出处已经写进每一行的标签（「· 网关组装」）和「估」字角标里，
-  // 面板下面每多一句，真正要看的那几个数就被往上顶一截（用户点名删的）。
+  // 来源卡下面不再挂说明段：面板下面每多一句，真正要看的那几个数就被往上顶一截（用户点名删的）。
   return `<div class="ctx-panel__head"><span class="ctx-panel__title">上下文来源</span>`
     + `<button class="ctx-panel__x" type="button" aria-label="关闭">&times;</button></div>`
     + body;

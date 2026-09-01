@@ -240,3 +240,51 @@ test("面板下面不再多那一句解释", () => {
   const none = contextUsageViewForNotes({ prompt: 1000, completion: 0, total: 1000, limit: 8000, pct: 12, cached: null }, {});
   assert.ok(none.notes.some((n) => n.includes("没报缓存字段")), "把「上游没报缓存字段」也一起删了");
 });
+
+test("没配的那几栏是 0 也照样列出来——七行永远是七行", () => {
+  // 用户实拍：面板上只剩「工具定义」和「对话」两行，问「缺少很多内容？？？」。
+  // 他没配规则、没装技能、没接 MCP，那三项确实是 0，而上一版把 0 的行滤掉了——
+  // 于是"这一栏你还没用上"被显示成了"这个功能缺东西"。0 是一条真信息，得留在表里。
+  const v = contextPartsView({
+    parts: [
+      { key: "system", label: "系统提示词", tokens: 7200 },
+      { key: "tools", label: "工具定义", tokens: 0 },
+      { key: "rules", label: "用户规则", tokens: 0 },
+      { key: "skills", label: "技能", tokens: 0 },
+      { key: "mcp", label: "MCP 与动态工具", tokens: 0 },
+      { key: "subagent", label: "子智能体定义", tokens: 0 },
+      { key: "history", label: "对话", tokens: 8000 },
+    ],
+    total: 49100, l0: true,
+  });
+  assert.deepEqual(v.rows.map((r) => r.key),
+    ["system", "tools", "rules", "skills", "mcp", "subagent", "history"],
+    "0 的那几行又被滤掉了——面板会重新变成'缺内容'的样子");
+  assert.deepEqual(v.rows.filter((r) => r.tokens === 0).map((r) => r.key),
+    ["rules", "skills", "mcp", "subagent"], "该是 0 的行不是 0，或者 0 被填成了别的数");
+  // 差额仍旧只补给「工具定义」，且补在它原来的位置上，不因为它是 0 就被挪到别处。
+  assert.equal(v.rows[1].key, "tools");
+  assert.equal(v.rows[1].tokens, 49100 - 7200 - 8000, "差额没补给工具定义");
+  assert.equal(v.rows.reduce((n, r) => n + r.tokens, 0), 49100, "分项之和对不上上游读数");
+});
+
+test("「约」只在抬头标一次，每行不再挂「估」字角标", () => {
+  // 用户实拍：每行右边一个小方块「估」，问「怎么是估算值？？？」。
+  // Claude Code 自己的写法是抬头 ~17.2K，行里只放数——照它做。
+  const rows = [
+    { key: "system", label: "系统提示词", tokens: 7200, text: "7.2K", estimated: true },
+    { key: "rules", label: "用户规则", tokens: 0, text: "0", estimated: true },
+  ];
+  const html = load("_ctxPanelHtml", {
+    _ctxPartsRows: () => ({ rows }),
+    _ctxMeter: { prompt: 49100, total: 49100, limit: 200000, pct: 25, completion: 0, cached: 0, cacheWrite: 0, model: "m", estimated: false },
+    _tokenShort: (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "K" : String(n)),
+    _currentSession: () => ({}),
+    _escHtml: (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])),
+  })("source");
+  assert.ok(!/估/.test(html), "行里还挂着「估」字角标");
+  assert.match(html, /ctx-panel__tot">~49\.1K/, "抬头的总数上没标「约」");
+  // 是 0 的那行要压暗，别跟真有数的行抢眼睛。
+  assert.match(html, /ctx-panel__row ctx-panel__row--zero[\s\S]*用户规则/, "0 的那行没被压暗");
+  assert.ok(!/ctx-panel__row--zero[^>]*>[\s\S]{0,120}系统提示词/.test(html), "有数的行被当成 0 压暗了");
+});

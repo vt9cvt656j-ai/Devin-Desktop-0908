@@ -39,9 +39,16 @@ export function contextPartsView(opts) {
   // 解构的默认值只兜 undefined，兜不住 null——而这一层挂在点击路径上，调用方一次取空
   // 就会在用户按下去的那一刻抛出来。
   const { parts = [], total = 0, l0 = true } = opts || {};
+  /*
+   * **七行一个都不省**，是 0 也照样列出来。
+   *
+   * 原来把 0 的行滤掉，于是没配规则、没装技能、没接 MCP 的人打开面板只看到两行，
+   * 读起来是"这个功能缺东西"（用户实拍：「缺少很多内容？？？」）。而 0 是一条真信息：
+   * 这一栏你还没用上。表格的形状固定下来，数才读得懂。
+   */
   const list = (Array.isArray(parts) ? parts : [])
-    .filter((p) => p && p.key && Math.round(Number(p.tokens) || 0) > 0)
-    .map((p) => ({ key: String(p.key), label: String(p.label || p.key), tokens: Math.round(Number(p.tokens) || 0) }));
+    .filter((p) => p && p.key)
+    .map((p) => ({ key: String(p.key), label: String(p.label || p.key), tokens: Math.max(0, Math.round(Number(p.tokens) || 0)) }));
   const known = list.reduce((n, p) => n + p.tokens, 0);
   const real = Math.max(0, Math.round(Number(total) || 0));
 
@@ -60,13 +67,15 @@ export function contextPartsView(opts) {
    */
   if (l0 && residual > 0) {
     const at = rows.findIndex((r) => r.key === "tools");
-    const row = { key: "tools", label: "工具定义", tokens: residual, text: short(residual), estimated: false };
     // 客户端那边量到的「工具定义」只是随请求体发出的那几条（MCP 已单列），
-    // 网关注入的内置工具不在其中——两者是同一类，合成一行，按真数为准。
-    if (at >= 0) { row.tokens += rows[at].tokens; row.text = short(row.tokens); rows.splice(at, 1); }
-    // 位置跟 Claude Code 一致：系统提示词之后就是工具定义。
-    const after = rows.findIndex((r) => r.key === "system");
-    rows.splice(after >= 0 ? after + 1 : 0, 0, row);
+    // 网关注入的内置工具不在其中——两者是同一类，就地合成一行，按真数为准，不换位置。
+    if (at >= 0) {
+      rows[at] = { ...rows[at], tokens: rows[at].tokens + residual, text: short(rows[at].tokens + residual), estimated: false };
+    } else {
+      const after = rows.findIndex((r) => r.key === "system");
+      rows.splice(after >= 0 ? after + 1 : 0, 0,
+        { key: "tools", label: "工具定义", tokens: residual, text: short(residual), estimated: false });
+    }
   }
   return { pending: false, rows, known, real };
 }

@@ -16748,6 +16748,10 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .ctx-panel__row { display: flex; align-items: center; gap: 8px; font-size: 12px; line-height: 1.9; }
 .ctx-panel__dot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
 .ctx-panel__label { color: var(--text); }
+/* 是 0 的那几行照样列出来（表格形状固定，数才读得懂），但压暗一档，
+   让还没用上的栏目退到背景里，不跟真有数的那两三行抢眼睛。 */
+.ctx-panel__row--zero { opacity: .42; }
+.ctx-panel__row--zero .ctx-panel__dot { background: var(--text-dim) !important; }
 .ctx-panel__val { margin-left: auto; color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .ctx-panel__seg--cached,      .ctx-panel__dot--cached      { background: #34a853; }  /* 命中：省下来的 */
 .ctx-panel__seg--cacheWrite,  .ctx-panel__dot--cacheWrite  { background: #f5a623; }  /* 新写：这次的投入 */
@@ -16760,13 +16764,8 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 .ctx-panel__sum + .ctx-panel__bar + .ctx-panel__sec { margin-top: 2px; }
 .ctx-panel__bar--src { margin-bottom: 9px; }
-/* 「估」这个小角标：带它的数是本地按文本估的，不带的是上游真数或按真数倒推的。
-   两种数摆在同一列，不标出来就会被一起当成真的。 */
-.ctx-panel__est {
-  display: inline-block; margin-right: 4px; padding: 0 3px;
-  font-size: 9px; font-style: normal; line-height: 13px; border-radius: 3px;
-  color: var(--text-dim); background: rgba(128, 128, 128, .16);
-}
+/* 每行不再挂「估」字角标：七行就是七个小方块，把真正要看的数挤成了配角。
+   「约」只标一次，标在抬头的总数上（Claude Code 自己也是这么做的）。 */
 .ctx-panel__seg--system,   .ctx-panel__dot--system   { background: #8e8e93; }
 .ctx-panel__seg--rules,    .ctx-panel__dot--rules    { background: #34a853; }
 .ctx-panel__seg--skills,   .ctx-panel__dot--skills   { background: #f5a623; }
