@@ -78,7 +78,8 @@ test("main.js 真的接上了：按在选区里才算候选，落到输入框才
   assert.match(fnSource("_insertRefAtCursor"), /if \(dataText\) chip\.dataset\.text = dataText;/,
     "插入时没有把记号挂到片上，发送出去会是空的");
   // 记号不许被当成本地路径去读：那会 readTextFile("code:…") 抛错、被吞掉，还白占一个提及名额。
-  assert.match(SRC, /_REMOTE_AT = \/\^\(github\|gitlab\|gitee\|codeberg\|model\|element\|code\):/,
+  // 名单又长了一个（term：终端里拖进来的输出）。守的是「@code: 在名单里」，不是名单的长度。
+  assert.match(SRC, /_REMOTE_AT = \/\^\([a-z|]*\bcode\b[a-z|]*\):/,
     "@code: 没有从本地路径扫描里摘出去");
   // 发送期真的按记号把那几行读回来，展开进上下文。
   assert.match(SRC, /const ref = _parseSelectionToken\(tok\);/, "发送期没有解析 @code: 记号");

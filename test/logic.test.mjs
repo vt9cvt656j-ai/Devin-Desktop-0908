@@ -18407,6 +18407,10 @@ test("closing a terminal before termOpen resolves reaps the late PTY without tou
     trackTermInput() {}, acceptTermGhost() {}, scheduleTermGhost() {}, switchTermTab() {},
     navigator: { platform: "Linux" }, _releaseTauriChannel: (channel) => released.push(channel),
     _detectTerminalChanges() {}, _scheduleTermRefresh() {},
+    // 拖放接线要读 promptEl 和 .composer__box，这两条测试验的是终端生命周期，给个空壳。
+    // 不给的话 createTermTab 在登记账本**之前**就 ReferenceError，两条测试一起变红——
+    // 而产品代码完全正常。这张注入表是手工的，加一个碰热函数的辅助函数就要回来补一次。
+    _wireTermDragToComposer() {},
   });
   const close = load("closeTermTab", {
     termTabs, _releaseTauriChannel: (channel) => released.push(channel), backend, _ghostTimer: 0,
@@ -18832,7 +18836,7 @@ test("a terminal that fails to start stays on screen with the reason", async () 
     termTheme: () => ({}), termResizeObserver: { observe() {} }, activeTermTab: -1,
     clearTermGhost() {}, trackTermInput() {}, acceptTermGhost() {}, scheduleTermGhost() {},
     switchTermTab() {}, navigator: { platform: "MacIntel" }, _releaseTauriChannel() {},
-    _detectTerminalChanges() {}, _scheduleTermRefresh() {},
+    _detectTerminalChanges() {}, _scheduleTermRefresh() {}, _wireTermDragToComposer() {},
     backend: {
       termOpen: async () => { throw new Error("ConPTY 起不来"); },
       termWrite: async () => {}, termResize: async () => {}, termClose: async () => {},

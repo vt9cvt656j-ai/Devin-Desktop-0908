@@ -562,10 +562,16 @@ test("发出去之后 @github:owner/repo 仍然是 GitHub 图标和全名", () =
   // 名字还被截成 `ThesisX`。根因是消息端只按"有没有扩展名"猜文件/文件夹——发送后消息里
   // 只剩纯文本 `@github:owner/repo`，带前缀的引用根本不是本地路径。
   const fn = fnSource("_renderMentionsToHtml");
-  assert.match(fn, /\^\(github\|gitlab\|mcp\):/, "消息端没有识别带前缀的引用");
+  // 2026-08-31 这条前缀名单多了 term（终端里拖进来的输出）。判据不是"名单恰好是这三个"，
+  // 而是**带前缀的引用都得走这一支**——落到下面按扩展名猜的老路，就会被画成文件夹。
+  assert.match(fn, /\^\(github\|gitlab\|mcp\|term\):/, "消息端没有识别带前缀的引用");
   assert.match(fn, /iconSvg\(`i-brand-\$\{kind\}`/, "没有用品牌图标");
   // 只显示仓库名，owner 收进 tooltip：组织名常常比仓库名还长，摆在气泡里挤掉正文。
   assert.match(fn, /pfx\[2\]\.split\("\/"\)\.filter\(Boolean\)\.pop\(\)/, "仓库名没有取最后一段");
+  // 终端片是这条规则的一个例外，而且必须是：它的 pfx[2] 是内部 id（t3），取"最后一段"
+  // 得到的还是 t3。所以它从快照里取标签——和输入框里那枚一模一样，规则的**目的**没变。
+  assert.match(fn, /kind === "term"[\s\S]{0,160}_termChipLabel\(/,
+    "终端片在气泡里显示的是内部 id，而不是它在输入框里那个标签");
   assert.match(fn, /title="\$\{relAttr\}"/, "完整的 owner/repo 要留在 tooltip 里");
   // 本地文件那条老路要留着
   assert.match(fn, /folderIconUrl\(name, false\) : fileIconUrl\(name\)/, "本地文件/文件夹的图标丢了");
@@ -583,7 +589,7 @@ test("每一种片都走同一条规则：只显示最后一段名字", () => {
   // 气泡这边早先只给 github/gitlab 截，mcp 摊出整条 server/uri：同一枚片，在输入框里是
   // 资源名、发出去变成一长条路径。现在两边同一条规则，完整值都收在 title 里。
   const fn = fnSource("_renderMentionsToHtml");
-  assert.match(fn, /const shown = pfx\[2\]\.split\("\/"\)\.filter\(Boolean\)\.pop\(\)/,
+  assert.match(fn, /: \(pfx\[2\]\.split\("\/"\)\.filter\(Boolean\)\.pop\(\) \|\| pfx\[2\]\)/,
     "带前缀的片没有统一取最后一段");
   assert.doesNotMatch(fn, /kind === "mcp" \? pfx\[2\]/, "mcp 又被单独放行、在气泡里摊出整条路径了");
   assert.match(fn, /title="\$\{relAttr\}"/, "完整值要留在 tooltip 里");

@@ -232,8 +232,15 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   条会话落的账单正确性修复（把被点中那行的 connId 一路传下去，否则用户点便宜那行、
  *   账单按贵的线路出）。它落的时候没跟着抬线，也没人看见红；我在核对「本会话有没有把
  *   别人的提交碾掉」时把它整笔恢复回来，顺手补上这条记录。
+ * · 82_380（2026-08-31，抬 110 行）：实测 82,377 行。买到的是**终端里选中的输出可以拖进
+ *   输入框**（用户点名要的，和编辑器选区那条对齐）。纯逻辑已经抽走了——命中判定、片标签、
+ *   发送时展开的正文全在 src/agent/term-drag.js（有真跑的测试）。留在 main.js 的是
+ *   `_wireTermDragToComposer`：mousedown/mousemove/mouseup 三个监听、拖影的 DOM、
+ *   xterm 实例和 .xterm-screen 的 getBoundingClientRect——判据里那三条（依赖参数 / 没有
+ *   DOM / 没有模块级可变状态）一条都不满足，搬不动；快照仓库 _termPicked 同理，它和
+ *   _previewPicked 是同一种东西，放在一起才看得出这两条路子是一套。
  */
-const MAIN_JS_MAX_LINES = 82_270;
+const MAIN_JS_MAX_LINES = 82_380;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

@@ -221,6 +221,7 @@ import { contextUsageView as _contextUsageView } from "./agent/context-usage.js"
 import { contextPartsView as _contextPartsView } from "./agent/context-parts.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
+import { pointInTermSelection as _pointInTermSelection, termChipLabel as _termChipLabel, termSnippetText as _termSnippetText } from "./agent/term-drag.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
 // Global shared state store for sub-agent collaboration
@@ -22621,15 +22622,21 @@ function _renderMentionsToHtml(text) {
       last = re.lastIndex;
       continue;
     }
-    const pfx = /^(github|gitlab|mcp):(.+)$/.exec(rel);
+    const pfx = /^(github|gitlab|mcp|term):(.+)$/.exec(rel);
     if (pfx) {
       const kind = pfx[1];
       // 每一种片都是同一条规则：**只显示最后一段名字**，完整值收进 tooltip（title 已是
       // 完整的 github:owner/repo、mcp:server/uri）。输入框那边 _makeComposerChip 一直就是
       // 这么干的；早先只给 github/gitlab 截，mcp 在气泡里摊出整条 server/uri，同一枚片在
       // 输入框和气泡里长得不一样（用户：「其他的这种组件囊卡片也要和这个一样的规则」）。
-      const shown = pfx[2].split("/").filter(Boolean).pop() || pfx[2];
-      const ico = kind === "mcp" ? iconSvg("i-mcp", "ic--doc") : iconSvg(`i-brand-${kind}`, "ic--doc");
+      // 终端片的 rel 是内部 id（t3），显示它毫无意义——标签从快照里取，和输入框里那枚一样。
+      const snap = kind === "term" ? _termPicked.get(pfx[2]) : null;
+      const shown = kind === "term"
+        ? (snap ? _termChipLabel(snap.label, snap.text) : "终端输出")
+        : (pfx[2].split("/").filter(Boolean).pop() || pfx[2]);
+      const ico = kind === "mcp" ? iconSvg("i-mcp", "ic--doc")
+        : kind === "term" ? iconSvg("i-terminal", "ic--doc")
+        : iconSvg(`i-brand-${kind}`, "ic--doc");
       out += `<span class="msg-mention msg-mention--${kind}" data-rel="${relAttr}" data-kind="${kind}" title="${relAttr}">`
         + `${ico}<span class="msg-mention__name">${_escHtmlLite(shown)}</span></span>`;
       last = re.lastIndex;
@@ -30514,7 +30521,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // element: 是预览里选中的那个 DOM 元素，详情存在 _previewPicked 里，不是磁盘上的路径。
   // 不加进这张表的话，下面 _mentioned 会拿它去 readTextFile/readDir，两次都抛、被静默
   // 吞掉，还白占一个 @ 名额。
-  const _REMOTE_AT = /^(github|gitlab|gitee|codeberg|model|element|code):/i;
+  const _REMOTE_AT = /^(github|gitlab|gitee|codeberg|model|element|code|term):/i;
   const _mentionedAll = [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
   const _mentioned = _mentionedAll.filter((v) => !_REMOTE_AT.test(v));
 
@@ -30611,6 +30618,14 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     .map((m) => m[1]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 4)) {
     const block = _previewElementContext(id);
     if (block) _atContext += `\n\n用户在实时预览里选中的元素:\n\`\`\`\n${block}\n\`\`\``;
+  }
+
+  // `@term:<id>` → 用户从终端里拖进来的那段输出。和 @element / @code 同一个道理：他已经
+  // 指着这段说话了，正确的工具调用数是 0——否则模型只能去 read_terminal 再抓一遍，而那时
+  // 屏幕上多半已经不是他指的那一段。这一条必须存快照（终端输出是一次性的），上限 24 条。
+  for (const id of [...text.matchAll(/(?:^|\s)@term:([A-Za-z0-9]+)/g)]
+    .map((m) => m[1]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 4)) {
+    _atContext += _termContextFor(id);
   }
 
   if (_mentioned.length && _contextRoot) {
@@ -75496,7 +75511,11 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
   chip.contentEditable = "false";
   chip.dataset.rel = rel;
   chip.dataset.kind = kind;
-  chip.title = kind === "file" ? rel : `${kind}: ${rel}`;
+  // 终端片的 rel 是内部 id（t3），写进 tooltip 毫无信息。改成把选中的原文摆出来——
+  // 片上只写得下一行，用户悬停要能确认自己拖的到底是哪一段。
+  chip.title = kind === "file" ? rel
+    : kind === "term" ? (String(_termPicked.get(rel)?.text || "").slice(0, 400) || "终端输出")
+    : `${kind}: ${rel}`;
   let icon;
   if (kind === "file") {
     const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name);
@@ -75517,6 +75536,10 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
       // 带着行号去查扩展名会落到兜底图标上。
       : kind === "code"
         ? iconImg(fileIconUrl(rel.split("/").filter(Boolean).pop() || rel))
+      // 从终端拖进来的一段输出。同样不能走 `i-brand-<kind>` 那条拼名字的路线——
+      // 没有 i-brand-term 这个符号，找不到会静默渲染成一个空白方块。
+      : kind === "term"
+        ? iconSvg("i-terminal", "ic--doc")
         : iconSvg(`i-brand-${kind}`, "ic--doc");
   }
   const nameEl = document.createElement("span");
@@ -79649,6 +79672,94 @@ function switchTermTab(idx) {
   });
 }
 
+// 终端里选中的输出拖进输入框——和编辑器选区那条同一套（见 _wireSelectionDragToComposer）。
+// 被 xterm 逼出来的两处不同：① 命中判定自己算（WebGL/Canvas 画字，选区不是 DOM 节点，
+// elementFromPoint 只拿得到那张画布；判据在 term-drag.js 里从缓冲区坐标反推）；
+// ② 正文要存快照（终端输出是一次性的，不像 @code: 能凭路径+行号从磁盘再取一遍）。
+const _termPicked = new Map();
+const TERM_PICK_CAP = 24;
+let _termPickSeq = 0;
+
+function _termContextFor(id) {
+  const e = _termPicked.get(id);
+  // 快照没了要**说一句**，不能静默返回空：那样模型看到正文里一个 @term:t3 却没有任何内容，
+  // 只会当成用户打错了字。会没的情形是真实存在的——攒够 24 条把它挤出去、或者编辑一条旧消息
+  // 重发（那条消息里的记号来自上一次会话）。
+  return e ? _termSnippetText(e) : "\n（用户消息里的 @term 引用指向一段已经取不到的终端输出——"
+    + "它只在拖进来的那次会话里留着快照。需要的话用 read_terminal 重新抓。）\n";
+}
+
+function _wireTermDragToComposer(container, term, getLabel, getCwd) {
+  const box = promptEl?.closest(".composer__box") || promptEl?.parentElement;
+  if (!box || !container) return;
+  let cand = null, dragging = false, ghost = null;
+  const over = (x, y) => {
+    const r = box.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
+  const clear = () => {
+    cand = null; dragging = false;
+    if (ghost) { ghost.remove(); ghost = null; }
+    document.body.classList.remove("tree-dragging");
+    box.classList.remove("drop-target");
+  };
+  container.addEventListener("mousedown", (e) => {
+    cand = null;
+    if (e.button !== 0) return;
+    try {
+      if (!term.hasSelection?.()) return;
+      const text = term.getSelection?.() || "";
+      if (!text.trim()) return;
+      const screen = container.querySelector(".xterm-screen") || container;
+      const hit = _pointInTermSelection(e.clientX, e.clientY, {
+        rect: screen.getBoundingClientRect(),
+        cols: term.cols, rows: term.rows,
+        sel: term.getSelectionPosition?.(),
+        viewportY: term.buffer?.active?.viewportY || 0,
+      });
+      if (!hit) return;   // 没按在选中的那几个字上：让 xterm 照常开始新一次框选
+      // 按在选区里就拦下这次 mousedown：不拦的话 xterm 立刻开始新一次框选，拖的全程高亮
+      // 是散的，用户看不出自己拖着什么。代价是「点一下取消选中」要自己补（见下面 mouseup）。
+      e.preventDefault();
+      e.stopPropagation();
+      cand = {
+        sx: e.clientX, sy: e.clientY, text,
+        label: (typeof getLabel === "function" ? getLabel() : "") || "终端",
+        cwd: (typeof getCwd === "function" ? getCwd() : "") || "",
+      };
+    } catch { cand = null; }
+  }, true);
+  document.addEventListener("mousemove", (e) => {
+    if (!cand) return;
+    if (!dragging) {
+      if (Math.abs(e.clientX - cand.sx) + Math.abs(e.clientY - cand.sy) < 6) return;
+      dragging = true;
+      document.body.classList.add("tree-dragging");
+      ghost = document.createElement("div");
+      ghost.className = "row-drag-ghost";
+      ghost.textContent = _termChipLabel(cand.label, cand.text);
+      document.body.appendChild(ghost);
+    }
+    ghost.style.left = `${e.clientX + 12}px`;
+    ghost.style.top = `${e.clientY + 10}px`;
+    box.classList.toggle("drop-target", over(e.clientX, e.clientY));
+  });
+  document.addEventListener("mouseup", (e) => {
+    if (!cand) return;
+    const hit = dragging && over(e.clientX, e.clientY);
+    const c = cand;
+    const wasDragging = dragging;
+    clear();
+    // 没拖成就是一次普通点击：把上面拦下来的那件事补上（点终端里已选中的地方 → 取消选中）。
+    if (!wasDragging) { try { term.clearSelection?.(); } catch {} return; }
+    if (!hit) return;
+    const id = "t" + (++_termPickSeq);
+    _termPicked.set(id, { label: c.label, cwd: c.cwd, text: c.text });
+    while (_termPicked.size > TERM_PICK_CAP) _termPicked.delete(_termPicked.keys().next().value);
+    _insertRefAtCursor(id, "term", _termChipLabel(c.label, c.text));
+  });
+}
+
 async function createTermTab(customLabel, cwdOverride = "") {
   // Opening a terminal takes the panel over from the debug console tab.
   if (_dbgConsoleActive) { if (_dbgConsoleEl) _dbgConsoleEl.hidden = true; _dbgConsoleActive = false; }
@@ -79717,6 +79828,9 @@ async function createTermTab(customLabel, cwdOverride = "") {
   };
   const entry = { term, fit, container, label, cwd, backendId: null, opening: false, closed: false, startError: "", inputLine: "", ghost: "", suggestion: "", webgl: webglAddon, createdAt: now, lastActivityAt: now, lastCommand: "", initTimer: 0 };
   termTabs.push(entry);
+  // 接在 push 之后，闭包直接抓 entry：按 idx 回查会在关掉别的标签页、数组前移之后指错人
+  // （标签名和工作目录会跟着拖进来的那枚片一起发给模型，指错了就是在骗它）。
+  _wireTermDragToComposer(container, term, () => entry.label, () => entry.cwd);
 
   term.onData((d) => {
     if (entry.closed) return;
