@@ -68,32 +68,22 @@
 .cm-card:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px }
 
 /* ---- 头部 ---------------------------------------------------------------- */
+/* 标题水平居中：关掉按钮**绝对定位**在右上角，不再参与排版 —— 否则标题会被它挤得
+   偏左半个按钮宽，那种"差一点"比明显不居中更难看。左右内边距因此对称。 */
 .cm-head {
-  flex: none; display: flex; align-items: center; gap: var(--sp-2, 8px);
-  padding: var(--sp-4, 16px) var(--sp-3, 12px) var(--sp-3, 12px) var(--sp-6, 24px);
+  flex: none; position: relative; display: flex; align-items: center;
+  padding: var(--sp-4, 16px) var(--sp-6, 24px) var(--sp-3, 12px);
   border-bottom: 1px solid var(--line);
 }
 /* 15px 是 refine.css 字阶里「面板标题、对话框标题」那一档。不发明 16/17px：
    这个尺寸上层级靠字重和字距拉，不靠多两个像素。 */
 .cm-title {
-  flex: 1 1 auto; min-width: 0; margin: 0;
+  flex: 1 1 auto; min-width: 0; margin: 0; text-align: center;
   font-size: var(--t-title, 15px); font-weight: 650;
   letter-spacing: -.01em; line-height: 1.3; color: var(--text);
 }
-/* 徽章：从 20px 蓝胶囊改成微标签。三件事让它安静下来 —— 字号降到全屋最小一档、
-   圆角从胶囊收成 6px、颜色用 --sel 这层已有的「强调色淡底」而不是实色块。
-   底是 --sel、字是 --text：实测浅 13.89:1 / 暗 7.57:1，不需要为它新增任何令牌
-   （原来的 #1a73e8 on #e8f0fe 只有 3.93:1，本来就不合格）。 */
-.cm-vip {
-  flex: none; display: inline-flex; align-items: center; gap: 4px;
-  padding: 2px var(--sp-2, 8px);
-  font-size: var(--t-label, 11px); font-weight: 600;
-  letter-spacing: var(--tracking-label, .06em); line-height: 1.6;
-  color: var(--text); background: var(--sel);
-  border-radius: var(--ui-radius-md, 6px);
-}
-/* 关闭键：原来是 <span>，键盘 Tab 不到。现在是 28px 的 ghost 按钮。 */
 .cm-close {
+  position: absolute; top: var(--sp-3, 12px); right: var(--sp-3, 12px);
   flex: none; width: 28px; height: 28px;
   display: grid; place-items: center; padding: 0;
   border: 1px solid transparent; border-radius: var(--ui-radius-md, 6px);
@@ -392,4 +382,59 @@
   .cm-row button:focus-visible, .cm-actions button:focus-visible {
     outline: 2px solid Highlight;
   }
+}
+
+
+/* ── 拉取模型 ──────────────────────────────────────────────────────────────
+   「模型名称」原来排在最上面、要用户手打并记住逗号分隔。挪到地址和密钥**之后**，
+   因为拉取要先有那两样；顺序即前提。 */
+.cm-pull { display: flex; align-items: center; gap: var(--sp-2, 8px); }
+.cm-pull .cm-input-wrap { flex: 1 1 auto; min-width: 0; }
+.cm-pull__btn {
+  flex: none;
+  padding: 0 var(--sp-3, 12px);
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 550;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .13s ease, border-color .13s ease;
+}
+.cm-pull__btn:hover:not(:disabled) { background: var(--hover); border-color: var(--accent); }
+.cm-pull__btn:disabled { opacity: .6; cursor: default; }
+/* 拉回来的名字画成一排可点的胶囊。列表可能有上百条（中转站全家桶），所以封高度、
+   自己滚，不然整个弹窗被撑到屏幕外。 */
+.cm-models {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: var(--sp-2, 8px);
+  max-height: 148px; overflow-y: auto;
+  padding: var(--sp-2, 8px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-solid);
+}
+.cm-model {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-2);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+.cm-model:hover { background: var(--hover); color: var(--text); }
+/* 选中：实心主色。这一格的意思是"它已经进上面的输入框了"，要一眼分得出来。
+   用 --accent-solid / --accent-on 这一对，和同文件里选中的协议段（.cm-seg__opt）同源——
+   写死 #fff 在暗色下是白斑，而且这个文件有测试专门守着不许出现硬编码色。 */
+.cm-model.is-on {
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
+  color: var(--accent-on);
 }

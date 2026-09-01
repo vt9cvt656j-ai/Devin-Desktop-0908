@@ -279,8 +279,15 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   左缘、宽度、上沿三个值改成同源地按 .composer__box 算（原来按文本区算、还封在 380px，
  *   于是它比下面那条窄一截）。多出来的行是那段说明加两行取值。同一笔里还把弹层底色从
  *   --panel-solid 换成 --popover-surface —— 那部分在 CSS 和主题桥里，不占 main.js。
+ * · 82_820（2026-09-01，抬 80 行）：实测 82,803 行。买到的是自定义模型弹窗的**拉取模型**：
+ *   「模型名称」从要用户手打改成从端点拉一份列表点着选，字段也从最上面挪到地址/密钥之后
+ *   （顺序即前提：拉取要先有那两样）。同一笔里删掉了会员徽章和协议地址说明。
+ *   能搬的搬了 —— 拼地址、拼鉴权头、解析各家返回形状（三个函数）都在
+ *   src/agent/wire-protocol.js，测试真跑。留在 main.js 的是 DOM 那半边：胶囊列表的
+ *   增删、选中态回写输入框、走 Rust http_request 发请求（浏览器直连第三方端点撞 CORS，
+ *   本机 Ollama 在 WKWebView 里连协议都不允许）。
  */
-const MAIN_JS_MAX_LINES = 82_740;
+const MAIN_JS_MAX_LINES = 82_820;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

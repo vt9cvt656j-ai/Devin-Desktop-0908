@@ -92,3 +92,62 @@ export function normalizeCustomModel(it) {
     protocol: cmProtocol(it.protocol),
   };
 }
+
+/*
+ * ── 拉取模型列表 ────────────────────────────────────────────────────────────
+ *
+ * 「模型名称」原来要用户手打，还得记住逗号分隔。而这三种协议**都**有列模型的接口，
+ * 地址和鉴权头各不相同 —— 那正是该由代码知道、不该由用户记住的东西。
+ *
+ * 下面三个函数是纯的（拼地址、拼头、解析返回），真正发请求在 main.js 那半边走
+ * Rust 的 http_request：浏览器直连第三方端点会撞 CORS，而用户的本机 Ollama
+ * （http://localhost:11434/v1）在 WKWebView 里连协议都不允许。
+ */
+
+/** 列模型的地址。基址末尾的斜杠要吃掉，否则会拼出 //models。 */
+export function cmModelsUrl(base, protocol) {
+  const b = String(base || "").trim().replace(/\/+$/, "");
+  if (!b) return "";
+  // Anthropic 的基址按约定**不带** /v1（占位符就是 https://api.anthropic.com），
+  // 所以这里补上；已经带了的不重复补。
+  if (cmProtocol(protocol) === "anthropic") return /\/v1$/.test(b) ? `${b}/models` : `${b}/v1/models`;
+  return `${b}/models`;
+}
+
+/** 列模型的鉴权头。空密钥不发头 —— 本机 Ollama / LM Studio 没有密钥。 */
+export function cmModelsHeaders(key, protocol) {
+  const k = String(key || "").trim();
+  const h = { Accept: "application/json" };
+  if (cmProtocol(protocol) === "anthropic") {
+    if (k) h["x-api-key"] = k;
+    h["anthropic-version"] = "2023-06-01";
+    return h;
+  }
+  if (k) h.Authorization = `Bearer ${k}`;
+  return h;
+}
+
+/**
+ * 从返回体里挑出模型名。
+ *
+ * 各家形状不一样，而且中转站尤其乱：OpenAI 是 `{data:[{id}]}`，Anthropic 也是 `data`
+ * 但字段可能叫 `id` 或 `display_name`，Ollama 的 /v1/models 是 OpenAI 形状但有些版本
+ * 直接回 `{models:[{name}]}`，还有的中转站直接回一个字符串数组。
+ * 认不出来时返回空数组，让界面说"没拉到"，**不要**猜一个假的列表出来。
+ */
+export function cmParseModels(payload) {
+  const rows = Array.isArray(payload) ? payload
+    : Array.isArray(payload?.data) ? payload.data
+    : Array.isArray(payload?.models) ? payload.models
+    : [];
+  const out = [];
+  const seen = new Set();
+  for (const r of rows) {
+    const id = typeof r === "string" ? r : String(r?.id ?? r?.name ?? r?.model ?? "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  // 名字排序：中转站回来的顺序常常是入库顺序，同一家的模型会散在列表各处。
+  return out.sort((a, b) => a.localeCompare(b));
+}

@@ -14576,7 +14576,7 @@ const _CUSTOM_MODEL_PREFIX = "custom:";
 
 // 上游线协议：取值、归一化、界面文案。取值必须是 Rust 侧 crate::protocol::PROTOCOLS 的
 // 逐字子集 —— 对不上时不会报错，只会静默退回 openai 打错端点。
-import { CM_PROTOCOLS, CM_PROTOCOL_DEFAULT, CM_PROTOCOL_UI, cmProtocol, normalizeCustomModel } from "./agent/wire-protocol.js";
+import { CM_PROTOCOLS, CM_PROTOCOL_DEFAULT, CM_PROTOCOL_UI, cmProtocol, normalizeCustomModel, cmModelsUrl, cmModelsHeaders, cmParseModels } from "./agent/wire-protocol.js";
 // 协议缺口清单只从 Rust 拉一次（见 syncProto 上方说明）。
 let _protoGapsSynced = false;
 
@@ -16274,8 +16274,11 @@ async function showCustomModelsDialog() {
   // 四处结构改动，每一处都有原因：
   //   ① .cm-close 从 <span> 变成 <button type="button" aria-label>：span 不可聚焦、
   //      不响应回车/空格，键盘用户根本关不掉这个弹窗，读屏还把 &times; 念成「乘号」。
-  //   ② .cm-vip 从 .cm-title 的**子节点**挪成**兄弟节点**：这样 <h2> 里只剩纯文字，
-  //      aria-labelledby 报出来的是「自定义模型」而不是「自定义模型 ★ 会员专属」。
+  //   ② 「★ 会员专属」徽章已删（2026-09-01，用户点名）。它本来就是过期信息 ——
+  //      上面几行自己写着「配置自定义端点不再要求会员：用自己的 key 打自己的端点，
+  //      钱是用户自己的」，而徽章还在宣称相反的事。删掉之后 <h2> 里只剩纯文字，
+  //      aria-labelledby 报出来的正好是「自定义模型」。顶部说明里「会员到期后自定义模型
+  //      将暂停可用」是同一条过期声明，一起删了。
   //   ③ label 从包裹式改成显式 for/id。包裹式本身**是合法关联、不是缺陷** —— 改的
   //      原因是要在 label 与 input 之间插常驻说明、在 input 里侧插「显示密钥」按钮，
   //      这两样包裹式做不到（按钮嵌在 label 里，点它会连带激活 label）。
@@ -16292,11 +16295,10 @@ async function showCustomModelsDialog() {
   ov.innerHTML = `<div class="cm-card" role="dialog" aria-modal="true" aria-labelledby="cmDlgTitle" tabindex="-1">
     <div class="cm-head">
       <h2 class="cm-title" id="cmDlgTitle">自定义模型</h2>
-      <span class="cm-vip"><span aria-hidden="true">★</span>会员专属</span>
       <button class="cm-close" type="button" aria-label="关闭自定义模型"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="cm-body">
-      <p class="cm-hint">接入 OpenAI 兼容接口、Anthropic 协议或 xAI Responses（在下面选）；地址与密钥仅保存在本机，不会上传。<b>走自己的端点时智能体会弱一些</b>：工具描述和完整系统提示词由服务端按需下发，这条路上拿不到；长上下文压缩也会关闭。会员到期后自定义模型将暂停可用。</p>
+      <p class="cm-hint">接入 OpenAI 兼容接口、Anthropic 协议或 xAI Responses（在下面选）；地址与密钥仅保存在本机，不会上传。<b>走自己的端点时智能体会弱一些</b>：工具描述和完整系统提示词由服务端按需下发，这条路上拿不到；长上下文压缩也会关闭。</p>
       <div class="cm-list" role="list" aria-label="已添加的自定义模型"></div>
       <div class="cm-form" role="group" aria-labelledby="cmFormTitle">
         <h3 class="cm-form-title" id="cmFormTitle">新增自定义模型</h3>
@@ -16305,19 +16307,12 @@ async function showCustomModelsDialog() {
           <span class="cm-input-wrap"><input class="cm-in-group" id="cmInGroup" type="text" placeholder="例如：我的中转站" maxlength="40" autocomplete="off" spellcheck="false"></span>
         </div>
         <div class="cm-field">
-          <label for="cmInName">模型名称</label>
-          <span class="cm-input-wrap"><input class="cm-in-name" id="cmInName" type="text" placeholder="例如：gpt-4o-mini" maxlength="600" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" aria-describedby="cmHintName cmErrName" data-err="cmErrName"></span>
-          <p class="cm-field__hint" id="cmHintName">可用逗号或分号一次填多个，每个名称会建成一条。</p>
-          <p class="cm-field__err" id="cmErrName"></p>
-        </div>
-        <div class="cm-field">
           <span class="cm-field__label" id="cmProtoLabel">接口协议</span>
           <div class="cm-seg" role="radiogroup" aria-labelledby="cmProtoLabel" aria-describedby="cmHintProto cmGapsProto">
             <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="openai" checked><span>OpenAI 兼容</span></label>
             <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="anthropic"><span>Anthropic 协议</span></label>
             <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="xai_responses"><span>xAI Responses</span></label>
           </div>
-          <p class="cm-field__hint" id="cmHintProto"></p>
           <ul class="cm-gaps" id="cmGapsProto"></ul>
         </div>
         <div class="cm-field">
@@ -16330,6 +16325,16 @@ async function showCustomModelsDialog() {
           <span class="cm-input-wrap"><input class="cm-in-key" id="cmInKey" type="password" placeholder="sk-…" maxlength="500" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" aria-describedby="cmHintKey"><button class="cm-reveal" type="button" aria-label="显示密钥" aria-pressed="false" aria-controls="cmInKey"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg></button></span>
           <p class="cm-field__hint" id="cmHintKey">部分本地服务可留空。</p>
           <p class="cm-field__err" id="cmErrKey"></p>
+        </div>
+        <div class="cm-field">
+          <label for="cmInName">模型名称</label>
+          <div class="cm-pull">
+            <span class="cm-input-wrap"><input class="cm-in-name" id="cmInName" type="text" placeholder="例如：gpt-4o-mini" maxlength="600" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" aria-describedby="cmHintName cmErrName" data-err="cmErrName"></span>
+            <button class="cm-pull__btn" type="button" aria-controls="cmModelList">拉取模型</button>
+          </div>
+          <p class="cm-field__hint" id="cmHintName">填上面的地址和密钥后可以直接拉取；也能自己打，逗号或分号分隔一次填多个。</p>
+          <p class="cm-field__err" id="cmErrName"></p>
+          <div class="cm-models" id="cmModelList" role="group" aria-label="拉到的模型" hidden></div>
         </div>
         <div class="cm-actions"><button class="cm-cancel" type="button" hidden>取消编辑</button><button class="cm-save" type="button">添加</button></div>
         <p class="cm-sr" role="status" aria-live="polite"></p>
@@ -16348,8 +16353,9 @@ async function showCustomModelsDialog() {
   const cancelBtn = ov.querySelector(".cm-cancel");
   const formTitle = ov.querySelector(".cm-form-title");
   const protoRadios = [...ov.querySelectorAll(".cm-in-proto")];
-  const hintProto = ov.querySelector("#cmHintProto");
   const gapsProto = ov.querySelector("#cmGapsProto");
+  const pullBtn = ov.querySelector(".cm-pull__btn");
+  const modelList = ov.querySelector("#cmModelList");
   const revealBtn = ov.querySelector(".cm-reveal");
   const errName = ov.querySelector("#cmErrName");
   const errBase = ov.querySelector("#cmErrBase");
@@ -16425,7 +16431,8 @@ async function showCustomModelsDialog() {
   const syncProto = () => {
     const ui = CM_PROTOCOL_UI[readProto()];
     inBase.placeholder = ui.ph;
-    hintProto.textContent = ui.hint;
+    // 地址写法原来单独占一段说明文字，用户说没用（占位符里本来就写着形状）。
+    // 删的只是那一段；下面的能力缺口留着——它是「不许假装支持」在界面上的唯一落点。
     gapsProto.replaceChildren(...(ui.gaps || []).map((g) => {
       const li = document.createElement("li");
       li.textContent = g;
@@ -16438,6 +16445,77 @@ async function showCustomModelsDialog() {
     for (const r of protoRadios) r.checked = (r.value === want);
     syncProto();
   };
+
+  /*
+   * 「拉取模型」。
+   *
+   * 请求走 Rust 的 http_request，不走 fetch：浏览器直连第三方端点会撞 CORS，而用户的
+   * 本机 Ollama（http://localhost:11434/v1）在 WKWebView 里连协议都不被允许。
+   * 网页构建没有这条通道，那儿就只留手打（按钮直接不显示）。
+   *
+   * 拉到的名字画成一排可点的胶囊：点一个进输入框、再点一下拿掉。**不覆盖已经打好的字**
+   * ——用户可能先手打了一个再去拉，直接替换掉是把他的输入吃了。
+   */
+  const _selectedModels = () => inName.value.split(/[,;，；]/).map((x) => x.trim()).filter(Boolean);
+  const _writeModels = (list) => {
+    inName.value = list.join(", ");
+    _fieldErr(errName, inName, "");
+    modelList.querySelectorAll(".cm-model").forEach((el) => {
+      el.classList.toggle("is-on", list.includes(el.dataset.model));
+      el.setAttribute("aria-pressed", list.includes(el.dataset.model) ? "true" : "false");
+    });
+  };
+  const _renderModels = (names) => {
+    const picked = _selectedModels();
+    modelList.replaceChildren(...names.map((name) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "cm-model" + (picked.includes(name) ? " is-on" : "");
+      b.dataset.model = name;
+      b.textContent = name;
+      b.setAttribute("aria-pressed", picked.includes(name) ? "true" : "false");
+      b.addEventListener("click", () => {
+        const cur = _selectedModels();
+        const at = cur.indexOf(name);
+        if (at >= 0) cur.splice(at, 1); else cur.push(name);
+        _writeModels(cur);
+      });
+      return b;
+    }));
+    modelList.hidden = !names.length;
+  };
+  if (!inTauri) {
+    pullBtn.hidden = true;   // 没有 http_request 这条通道，按钮点了必然失败——不如不给
+  } else {
+    pullBtn.addEventListener("click", async () => {
+      const url = cmModelsUrl(inBase.value, readProto());
+      if (!url) { _fieldErr(errBase, inBase, "先填对接地址"); inBase.focus(); return; }
+      pullBtn.disabled = true;
+      const was = pullBtn.textContent;
+      pullBtn.textContent = "拉取中…";
+      try {
+        const r = await backend.invoke("http_request", {
+          method: "GET", url, headers: cmModelsHeaders(inKey.value, readProto()), body: null, timeoutSecs: 20,
+        });
+        const status = Number(r?.status) || 0;
+        if (status === 401 || status === 403) throw new Error("密钥不对，或这个密钥没有列模型的权限");
+        if (status >= 400) throw new Error(`端点返回 ${status}`);
+        let payload = null;
+        try { payload = JSON.parse(String(r?.body || "")); } catch { throw new Error("端点返回的不是 JSON"); }
+        const names = cmParseModels(payload);
+        if (!names.length) throw new Error("拉到了，但里面没有模型名——这个端点可能不提供列表，请手动填写");
+        _renderModels(names);
+        srEl.textContent = `拉到 ${names.length} 个模型，点一下加进上面的输入框`;
+        showToast(`拉到 ${names.length} 个模型`);
+      } catch (e) {
+        modelList.hidden = true;
+        _fieldErr(errName, inName, String(e?.message || e).slice(0, 120));
+      } finally {
+        pullBtn.disabled = false;
+        pullBtn.textContent = was;
+      }
+    });
+  }
   for (const r of protoRadios) r.addEventListener("change", syncProto);
   syncProto();
   let editingId = null;
