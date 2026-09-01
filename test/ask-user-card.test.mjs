@@ -86,31 +86,33 @@ test("照原卡的构成：浅灰块、无边框、无圆点方框、序号在�
   assert.match(CSS, /\.au-opt__desc \{[^}]*color: var\(--text-dim\)/, "选项的说明行样式没了");
 });
 
-test("半透明色一律走变量，且先有 rgba 兜底——老引擎认不出 color-mix 会让整条声明作废", () => {
-  // 作废的后果不是"退回默认色"，是那一格干脆**没有底色**：整块浅灰行变白底，卡片散架。
+test("明暗两套走仓库自己的成对变量，不在这一块里现调颜色", () => {
+  // 上一版用 color-mix 现调，还得配 @supports 兜底——那是在重造一份仓库已经有的东西：
+  // --hover / --active / --sel / --text / --panel-solid / --line-strong 在 :root 和
+  // :root[data-theme="dark"] 里本来就一一对应，用它们，明暗自动成立。
   const blk = CSS.slice(CSS.indexOf("/* ── ask_user card ── */"), CSS.indexOf(".au-done {"));
-  // @supports 那一行自己也含 color-mix（它就是探测句），不算声明。
-  const decls = blk.split("\n").filter((l) => /color-mix\(/.test(l) && !/^@supports/.test(l.trim()));
-  assert.ok(decls.length >= 4, "找不到 color-mix 声明，这条判据会变成恒真");
-  const supportsAt = blk.indexOf("@supports (background: color-mix(");
-  assert.ok(supportsAt > 0, "没有 @supports 兜底块");
-  // 判据是「落在 @supports 的花括号**里面**」，不是「排在它后面」——整段卡片样式都排在
-  // 它后面，只比位置的话，把 color-mix 写回任何一条普通规则都验不出来。
-  let depth = 0, supportsEnd = -1;
-  for (let k = blk.indexOf("{", supportsAt); k < blk.length; k++) {
-    if (blk[k] === "{") depth++;
-    else if (blk[k] === "}" && --depth === 0) { supportsEnd = k; break; }
+  assert.doesNotMatch(blk, /color-mix\(/, "又在这一块里现调颜色了——那样还得自己配兜底，而且明暗两套要各写一遍");
+  assert.doesNotMatch(blk, /rgba\(\s*(128|255|0)\s*,/, "写死了 rgba——深色和浅色不可能同时对");
+  assert.match(blk, /\.au-opt \{[\s\S]{0,300}background: var\(--hover\)/, "选项底色不再走主题变量");
+  assert.match(blk, /\.au-opt:hover \{ background: var\(--active\); \}/, "悬停底色不再走主题变量");
+  assert.match(blk, /\.au-submit \{[\s\S]{0,220}background: var\(--text\); color: var\(--panel-solid\)/,
+    "提交按钮没有用会随主题翻转的那一对——深色下会变成白底白字或黑底黑字");
+  // 两份调色板里这几个必须都在，缺一个那条声明整条作废且不报错。
+  // 首个 :root[data-theme="dark"] 出现在**注释里**（第 73 行那段说明），不是调色板本身。
+  // 按「后面紧跟 {」找真正那条规则，再取它的花括号范围。
+  const darkAt = CSS.search(/:root\[data-theme="dark"\]\s*\{/);
+  assert.ok(darkAt > 0, "找不到深色调色板");
+  const dark = CSS.slice(darkAt, CSS.indexOf("\n}", darkAt));
+  for (const v of ["--hover", "--active", "--sel", "--text", "--panel-solid", "--line-strong"]) {
+    assert.match(dark, new RegExp(v.replace(/-/g, "\\-") + ":"), `深色调色板里没有 ${v}`);
   }
-  assert.ok(supportsEnd > supportsAt, "@supports 块没有闭合");
-  for (const d of decls) {
-    const at = blk.indexOf(d);
-    assert.ok(at > supportsAt && at < supportsEnd,
-      `这条 color-mix 在 @supports 之外，老引擎会让它整条作废：${d.trim()}`);
-  }
-  // 兜底那一份必须真的定义了同名变量，否则 @supports 之外什么都没有。
-  for (const v of ["--au-row", "--au-row-hi", "--au-line", "--au-mute", "--au-pick"]) {
-    assert.match(blk.slice(0, supportsAt), new RegExp(`${v}:\\s*(rgba|var\\(--sel)`), `${v} 没有 rgba 兜底`);
-  }
+});
+
+test("跳过 / 提交两个按钮在底部水平居中", () => {
+  const blk = CSS.slice(CSS.indexOf("/* ── ask_user card ── */"), CSS.indexOf(".au-done {"));
+  assert.match(blk, /\.au-foot \{[^}]*justify-content: center;/, "按钮又贴回右下角了");
+  // 未拿到答案时提交退成描边灰，不是实心灰——深色下实心灰会比卡片本身还亮。
+  assert.match(blk, /\.au-submit:disabled \{[\s\S]{0,160}background: transparent;/, "禁用态是实心的，深色下会发亮");
 });
 
 test("「其他」是列表里的最后一块，里面套一个整宽输入框", () => {

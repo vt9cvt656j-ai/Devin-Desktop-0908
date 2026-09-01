@@ -6900,31 +6900,15 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
  *   · 问题一行加粗，字号比正文大一档；
  *   · 选项是**浅灰填充的圆角块**，没有边框、没有标记，块与块之间留 4px 空隙；
  *   · 序号在右边一个描边小方块里，是这一行唯一的装饰；
- *   · 「其他」是同样一块浅灰，里面套一个整宽的白色输入框；
- *   · 底部右下角两个按钮：跳过（无底色）+ 提交（实心，未选时是灰的）；
+ *   · 「其他」是同样一块浅灰，里面套一个整宽的输入框；
+ *   · 底部两个按钮：跳过（无底色）+ 提交（实心，未拿到答案时是灰的）；
  *   · **通篇没有主色**——选中才用一次。
+ *
+ * 明暗两套**不另写一份规则**，全部走仓库已有的成对变量：--hover / --active 是这套界面
+ * 自己的灰阶（浅色是黑的 5%/8.5%，深色是白的 5.5%/9%），--sel / --text / --panel-solid /
+ * --line-strong 也都在 :root 和 :root[data-theme="dark"] 里一一对应。
+ * 上一版我用 color-mix 现调，还得配 @supports 兜底——那是在重造一份仓库已经有的东西。
  */
-/*
- * 所有半透明色收进这几个变量，**先给一次 rgba 兜底**，再在 @supports 里换成 color-mix。
- * 直接写 color-mix 的话，认不出它的引擎会把**整条声明作废**——后果不是"退回默认色"，
- * 是那一格干脆没有底色：一整块浅灰行变成白底，卡片当场散架。
- */
-.au-card {
-  --au-row: rgba(128, 128, 128, .10);
-  --au-row-hi: rgba(128, 128, 128, .17);
-  --au-line: rgba(128, 128, 128, .32);
-  --au-mute: rgba(128, 128, 128, .55);
-  --au-pick: var(--sel);
-}
-@supports (background: color-mix(in srgb, red 5%, transparent)) {
-  .au-card {
-    --au-row: color-mix(in srgb, var(--text) 5%, transparent);
-    --au-row-hi: color-mix(in srgb, var(--text) 9%, transparent);
-    --au-line: color-mix(in srgb, var(--text) 16%, transparent);
-    --au-mute: color-mix(in srgb, var(--text) 32%, transparent);
-    --au-pick: color-mix(in srgb, var(--accent) 12%, transparent);
-  }
-}
 .au-card { padding: 16px 18px 12px; }
 .au-q {
   display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
@@ -6936,58 +6920,57 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .au-opt {
   display: flex; align-items: flex-start; gap: 12px; width: 100%; text-align: left;
   padding: 11px 14px; border: 0; border-radius: 8px;
-  background: var(--au-row);
-  color: var(--text); cursor: pointer; font-size: 14px; line-height: 1.45;
+  background: var(--hover); color: var(--text); cursor: pointer; font-size: 14px; line-height: 1.45;
   transition: background .12s ease, box-shadow .12s ease;
 }
-.au-opt:hover { background: var(--au-row-hi); }
+.au-opt:hover { background: var(--active); }
 .au-opt:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
 .au-opt__body { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
 .au-opt__label { display: flex; align-items: center; gap: 7px; font-weight: 600; }
 /* 说明那一行：标签分不出差别时，真正决定用户怎么选的是它（会不会丢数据、要多久）。 */
 .au-opt__desc { font-size: 13px; color: var(--text-dim); line-height: 1.5; }
 .au-rec { flex-shrink: 0; font-size: 11px; font-weight: 600; font-style: normal; color: var(--text-dim); }
-/* 选中：整块上主色的极浅底 + 一圈内描边。这是全卡唯一用到主色的地方。 */
-.au-opt--checked, .au-opt--checked:hover {
-  background: var(--au-pick);
-  box-shadow: inset 0 0 0 1.5px var(--accent);
-}
+/* 选中：整块上主色的浅底 + 一圈内描边。这是全卡唯一用到主色的地方。 */
+.au-opt--checked, .au-opt--checked:hover { background: var(--sel); box-shadow: inset 0 0 0 1.5px var(--accent); }
 /* 序号：右边一个描边小方块，是这一行唯一的装饰。 */
 .au-key {
   flex-shrink: 0; margin-top: 1px; min-width: 24px; height: 22px; padding: 0 6px; border-radius: 6px;
   display: flex; align-items: center; justify-content: center;
-  border: 1px solid var(--au-line);
-  color: var(--text-dim); font-size: 12px; font-variant-numeric: tabular-nums; background: transparent;
+  border: 1px solid var(--line-strong); color: var(--text-dim);
+  font-size: 12px; font-variant-numeric: tabular-nums; background: transparent;
 }
 
 /* 「其他」：同样一块浅灰，里面套一个整宽输入框。 */
 .au-opt--other { flex-direction: column; align-items: stretch; gap: 9px; cursor: default; }
-.au-opt--other:hover { background: var(--au-row); }
+.au-opt--other:hover { background: var(--hover); }
 .au-opt__head { display: flex; align-items: center; gap: 12px; }
 .au-opt__head .au-opt__label { flex: 1; }
 .au-custom {
   width: 100%; height: 36px; padding: 0 12px;
-  border: 1px solid var(--au-line); border-radius: 8px;
+  border: 1px solid var(--line-strong); border-radius: 8px;
   background: var(--panel-solid); color: var(--text); font-size: 14px;
 }
 .au-custom::placeholder { color: var(--text-dim); }
 .au-custom:focus { outline: none; border-color: var(--accent); }
 
-/* 底部：右下角两个按钮，跳过无底色、提交实心（拿不到答案时是灰的）。 */
-.au-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+/* 底部两个按钮**水平居中**（用户点名要的）：右下角靠边时它们像页脚，居中之后是这张卡的
+   收尾动作，视线从问题一路往下落到它们身上。 */
+.au-foot { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 14px; }
 .au-skip {
-  height: 34px; padding: 0 16px; border: 0; border-radius: 8px; background: transparent;
-  color: var(--text); cursor: pointer; font-size: 14px; transition: background .12s ease;
+  height: 34px; padding: 0 18px; border: 1px solid var(--line-strong); border-radius: 8px;
+  background: transparent; color: var(--text); cursor: pointer; font-size: 14px;
+  transition: background .12s ease, border-color .12s ease;
 }
-.au-skip:hover { background: var(--au-row-hi); }
+.au-skip:hover { background: var(--hover); border-color: var(--text-dim); }
 .au-submit {
-  height: 34px; padding: 0 18px; border: 0; border-radius: 8px;
+  height: 34px; padding: 0 22px; border: 1px solid transparent; border-radius: 8px;
   background: var(--text); color: var(--panel-solid); cursor: pointer; font-size: 14px; font-weight: 500;
   transition: opacity .12s ease;
 }
 .au-submit:hover { opacity: .85; }
+/* 未拿到答案时：退成描边的灰按钮，而不是一块糊住的实心灰——深色下实心灰会比卡片还亮。 */
 .au-submit:disabled {
-  background: var(--au-mute); color: var(--panel-solid); cursor: default; opacity: 1;
+  background: transparent; border-color: var(--line-strong); color: var(--text-dim); cursor: default; opacity: 1;
 }
 
 /* 危险确认那一支单独保留：它要的正是"看起来不一样、别顺手点过去"。 */
@@ -7002,7 +6985,7 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 }
 .au-send--danger { background: #d93025; }
 .au-send--danger:hover { opacity: .88; }
-.au-send--danger:disabled { background: var(--au-mute); cursor: default; }
+.au-send--danger:disabled { background: var(--line-strong); cursor: default; }
 .au-done { padding: 12px 16px; font-size: 13px; color: #34a853; font-weight: 500; }
 
 /* ===== Clarification Request Card ===== */
