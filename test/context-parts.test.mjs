@@ -286,5 +286,9 @@ test("「约」只在抬头标一次，每行不再挂「估」字角标", () =>
   assert.match(html, /ctx-panel__tot">~49\.1K/, "抬头的总数上没标「约」");
   // 是 0 的那行要压暗，别跟真有数的行抢眼睛。
   assert.match(html, /ctx-panel__row ctx-panel__row--zero[\s\S]*用户规则/, "0 的那行没被压暗");
+  // 条子上不许出现 0 的那几段：.ctx-panel__seg 有 min-width:2px，
+  // 画出来就是几道 2px 的彩色细条，看着像"这里还有别的来源"。
+  const segs = [...html.matchAll(/ctx-panel__seg--(\w+)/g)].map((m) => m[1]);
+  assert.deepEqual(segs, ["system"], "条子上画了 0 的那几段（或漏了有数的那段）");
   assert.ok(!/ctx-panel__row--zero[^>]*>[\s\S]{0,120}系统提示词/.test(html), "有数的行被当成 0 压暗了");
 });

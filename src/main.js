@@ -21461,7 +21461,9 @@ function _ctxPanelHtml(kind) {
     // 原来每行挂一个「估」字角标：七行就是七个小方块，把真正要看的数挤成了配角。
     ? `<div class="ctx-panel__sum"><span class="ctx-panel__pct">本轮输入</span>`
       + `<span class="ctx-panel__tot">~${esc(_tokenShort(of))}</span></div>`
-      + `<div class="ctx-panel__bar">${src.rows.map((r) =>
+      // 条子上只画有数的那几段。.ctx-panel__seg 有 min-width:2px（让真的很小的一项也看得见），
+      // 于是 0 的那几行会各画出一道 2px 彩色细条——看着像"这里还有四个来源"，正好是骗人的。
+      + `<div class="ctx-panel__bar">${src.rows.filter((r) => r.tokens > 0).map((r) =>
           `<i class="ctx-panel__seg ctx-panel__seg--${r.key}" style="flex:${r.tokens}"></i>`).join("")}</div>`
       + `<div class="ctx-panel__rows">${src.rows.map((r) =>
           `<div class="ctx-panel__row${r.tokens ? "" : " ctx-panel__row--zero"}"><i class="ctx-panel__dot ctx-panel__dot--${r.key}"></i>`
