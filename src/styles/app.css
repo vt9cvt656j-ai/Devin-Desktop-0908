@@ -8629,6 +8629,35 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 
 /* ---- model picker + dropdown ---- */
+/* 自定义分组的标题行：名字在左，齿轮在右。齿轮只在悬停这一组时显形 —— 常显会让
+   分组标题看起来像一个可点的条目，而它不是。 */
+.menu__group--custom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.menu__group-edit {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s ease, background .12s ease, color .12s ease;
+}
+.menu__group--custom:hover .menu__group-edit,
+.menu__group-edit:focus-visible { opacity: 1; }
+.menu__group-edit:hover { background: var(--hover); color: var(--text); }
+.menu__group-edit .ic { width: 13px; height: 13px; }
+
 .model-picker {
   position: relative;
 }
@@ -8935,6 +8964,17 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   font-size: 12px;
   line-height: 1.5;
   color: var(--text);
+}
+/* 自定义模型的那句披露。夹在模型 id 和描述之间：它是关于**这个端点**的事实，
+   不是关于模型的描述，所以自成一格、字更小、颜色更弱。 */
+.mic-note {
+  margin: 6px 0 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--hover);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
 }
 .model-info-card .mic-prices {
   margin-top: 10px;

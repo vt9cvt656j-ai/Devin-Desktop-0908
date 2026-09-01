@@ -82,12 +82,17 @@ test("必须如实告诉用户「走自己的端点会变弱」，否则这就�
   // 一次），**但披露本身不能跟着消失** —— 那样就真成了「悄悄变弱」。它搬进了弹窗顶部的
   // 说明里：那是**填之前**就看得到的位置，比切完之后飘一条更早、也更该在那儿。
   //
-  // 判据跟着搬到弹窗 markup 上。这里不验 _warnCustomEndpointOnce 了：它现在是个空壳。
-  const dlg = extractFn("showCustomModelsDialog", { code: true });
-  assert.match(dlg, /工具描述/, "弹窗里没说工具描述这件事");
-  assert.match(dlg, /系统提示词/, "弹窗里没说系统提示词这件事");
-  assert.match(dlg, /长上下文压缩/, "弹窗里没说长上下文压缩会关闭");
-  assert.match(dlg, /弱一些/, "没说清「会变弱」这件事本身");
+  // 【2026-09-01 第二次搬家】用户说弹窗顶部那段说明也删掉。**披露仍然不能跟着消失** ——
+  // 于是它搬到了自定义模型的悬浮卡（showModelInfoCard 的 .mic-note）：按模型、在**选用
+  // 之前**就看得到，而且不占配置表单的地方。判据跟着搬，四句话一句不少。
+  const card = extractFn("showModelInfoCard", { code: true });
+  assert.match(card, /工具描述/, "悬浮卡里没说工具描述这件事");
+  assert.match(card, /系统提示词/, "悬浮卡里没说系统提示词这件事");
+  assert.match(card, /长上下文压缩/, "悬浮卡里没说长上下文压缩会关闭");
+  assert.match(card, /弱一些/, "没说清「会变弱」这件事本身");
+  // 而且必须**只对自定义模型**显示：网关模型没有这个问题，给它们挂一句会是假话。
+  assert.match(card, /startsWith\(_CUSTOM_MODEL_PREFIX\)/, "没有按自定义模型分流，网关模型也会被挂上这句");
+  assert.match(card, /noteEl\.remove\(\)/, "非自定义模型没有把这一格摘掉，会留一个空盒子");
 });
 
 // ---- 线协议：六条真实调用链上的门 -----------------------------------------

@@ -15,22 +15,15 @@ export const CM_PROTOCOL_DEFAULT = "openai";
 /**
  * 每条协议的界面文案。
  *
- * `gaps` 是「不许假装支持」的落点：弹窗必须把它原样显示在下拉旁边，让用户在填之前就知道
- * 哪几个旋钮在这条路上不起作用，而不是发出去之后表现成「设了没用」。
+ * `label` 会被 Rust 那边覆盖：出错文案要按协议报名字，而权威名字在 protocol.rs。
+ * `ph` / `desktopOnly` 是纯 UI 字段，留在前端。
  *
- * `desktopOnly`：网页构建（/app/）没有 Rust 那条协议分叉 —— _realAiFetch 自己拼 OpenAI
- * 形状的请求体、端点和鉴权头。而且浏览器直连 api.anthropic.com 还会被 CORS 挡。所以网页上
- * 这两条协议**不可选**，且要说清为什么，而不是让它变成一个看不懂的网络错误。
+ * 【2026-09-01 删掉了 gaps】原来每个协议还带一列「不支持什么」的文案（温度/top_p 不发、
+ * 思考开关按模型名猜、max_tokens 默认 32000…），渲染在协议选择器下面。用户两次点名说
+ * 这些提示字没用要删，所以文案、渲染、以及从 Rust 同步 gaps 的那一行一起摘干净了 ——
+ * 留着不渲染只会变成又一处「攒了一路没人消费」的死数据。
+ * 那些限制**本身仍然成立**，权威描述在 protocol.rs 的 Wire::unsupported()。
  */
-// ⚠️ 这份里的 `gaps` 是**兜底副本**，不是权威。权威在 Rust：protocol.rs 的
-// `Wire::unsupported()`，经 `ai_protocols` 命令下发；main.js 打开自定义模型面板时会拉一次
-// 并覆盖这里的 gaps/label（拉不到——比如网页版没有 Tauri——才用这份）。
-//
-// 为什么要这样：手抄必漂，而且已经漂过。这里 anthropic 那条一度把中间整句
-//「3.7/4.x 收 thinking.budget_tokens，4.7 之后只收 adaptive + output_config.effort，
-// 两套互不兼容、发错是硬 400」丢掉，只剩后半截，旁边却还写着「protocol.rs 的 anthropic 臂
-// 逐字如此」——那句话在它被写下之后就不成立了。改这里的 gaps 之前先问：Rust 那边改了吗。
-// ph / hint / desktopOnly 是纯 UI 字段，本来就该住在前端，不跟 Rust 走。
 export const CM_PROTOCOL_UI = {
   openai: {
     label: "OpenAI 兼容",

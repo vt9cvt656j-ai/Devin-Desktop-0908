@@ -111,6 +111,9 @@
  * 「去下面添加」是复读）。原来那条 .cm-empty 是**死规则**，一并删掉。
  * 多的时候列表自己滚，不让外层滚 —— 上限 64 条，外层滚会把表单推到天边。
  * ------------------------------------------------------------------------- */
+/* 已添加的那一列本来没有标题，两行模型悬在说明和「新增」之间，用户看不出那就是
+   编辑/删除的地方。给它一个和「新增自定义模型」同一档的小标题。 */
+.cm-list-title { margin-top: 0; }
 .cm-list {
   display: flex; flex-direction: column; gap: var(--sp-2, 8px);
   max-height: 268px; overflow-y: auto;
@@ -260,12 +263,6 @@
 .cm-seg__opt--off span { opacity: .42; cursor: not-allowed; text-decoration: line-through; }
 
 /* 能力缺口：不许假装支持的唯一界面落点。灰但不能灰到看不见。 */
-.cm-gaps {
-  margin: 6px 0 0; padding: 0 0 0 16px; list-style: disc;
-  font-size: var(--t-small, 12px); line-height: 1.5; color: var(--text-dim);
-}
-.cm-gaps:empty, .cm-gaps[hidden] { display: none; }
-.cm-gaps li { margin: 2px 0; }
 
 /* 只给读屏的播报位。没有这条规则它就是一段普通可见文字，会在弹窗底部凭空多出一行
  * 「已添加 3 个自定义模型」——上一版就是这样：markup 写了、样式没写、JS 也没写。
@@ -438,3 +435,36 @@
   border-color: var(--accent-solid);
   color: var(--accent-on);
 }
+
+/* 协议限制：默认折叠，展开前只占一行。 */
+.cm-gapsbox { margin-top: var(--sp-2, 8px); }
+.cm-gapsbox[hidden] { display: none; }
+.cm-gapsbox__sum {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--t-small, 12px);
+  color: var(--text-dim);
+  user-select: none;
+}
+.cm-gapsbox__sum::-webkit-details-marker { display: none; }
+.cm-gapsbox__sum::before {
+  content: "";
+  width: 0; height: 0;
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform .13s ease;
+}
+.cm-gapsbox[open] .cm-gapsbox__sum::before { transform: rotate(90deg); }
+.cm-gapsbox__sum:hover { color: var(--text); }
+.cm-gaps {
+  margin: var(--sp-2, 8px) 0 0;
+  padding-left: 18px;
+  font-size: var(--t-small, 12px);
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.cm-gaps li { margin: 2px 0; }

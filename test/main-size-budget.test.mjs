@@ -286,8 +286,15 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   src/agent/wire-protocol.js，测试真跑。留在 main.js 的是 DOM 那半边：胶囊列表的
  *   增删、选中态回写输入框、走 Rust http_request 发请求（浏览器直连第三方端点撞 CORS，
  *   本机 Ollama 在 WKWebView 里连协议都不允许）。
+ * · 82_880（2026-09-01，抬 60 行）：实测 82,854 行。买到的是**把两处披露搬走而不是删掉**：
+ *   用户要求删掉弹窗顶部那段说明和协议下面的缺口清单。两样都不能直接删 —— 前者是
+ *   「走自己的端点会弱一些」（它已经从 toast 搬进弹窗一次了，再删就真成了悄悄变弱），
+ *   后者是「这个协议不支持什么」。所以：前者搬进自定义模型的悬浮卡（按模型、选用之前
+ *   就看得到、不占表单），后者收进默认折叠的 <details>（合上时只有一行字）。
+ *   多出来的行是这两段来龙去脉 + 悬浮卡那一格的分流。同一笔里还给模型选择器的自定义
+ *   分组标题加了直达管理的齿轮（用户问「以后怎么找到编辑/删除」）。
  */
-const MAIN_JS_MAX_LINES = 82_820;
+const MAIN_JS_MAX_LINES = 82_880;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

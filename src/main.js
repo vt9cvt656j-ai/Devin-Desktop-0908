@@ -16298,7 +16298,7 @@ async function showCustomModelsDialog() {
       <button class="cm-close" type="button" aria-label="关闭自定义模型"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="cm-body">
-      <p class="cm-hint">接入 OpenAI 兼容接口、Anthropic 协议或 xAI Responses（在下面选）；地址与密钥仅保存在本机，不会上传。<b>走自己的端点时智能体会弱一些</b>：工具描述和完整系统提示词由服务端按需下发，这条路上拿不到；长上下文压缩也会关闭。</p>
+      <h3 class="cm-form-title cm-list-title">已添加</h3>
       <div class="cm-list" role="list" aria-label="已添加的自定义模型"></div>
       <div class="cm-form" role="group" aria-labelledby="cmFormTitle">
         <h3 class="cm-form-title" id="cmFormTitle">新增自定义模型</h3>
@@ -16308,12 +16308,18 @@ async function showCustomModelsDialog() {
         </div>
         <div class="cm-field">
           <span class="cm-field__label" id="cmProtoLabel">接口协议</span>
-          <div class="cm-seg" role="radiogroup" aria-labelledby="cmProtoLabel" aria-describedby="cmHintProto cmGapsProto">
+          <div class="cm-seg" role="radiogroup" aria-labelledby="cmProtoLabel">
             <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="openai" checked><span>OpenAI 兼容</span></label>
             <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="anthropic"><span>Anthropic 协议</span></label>
             <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="xai_responses"><span>xAI Responses</span></label>
           </div>
-          <ul class="cm-gaps" id="cmGapsProto"></ul>
+          <!-- 缺口收进折叠行：展开前只占一行字。用户两次说这些提示字占地方要删，
+               而这些限制**本身成立**（温度不发、思考开关按模型名猜、max_tokens 默认值），
+               直接删掉就是「悄悄不支持」。折叠是这两件事的交点。 -->
+          <details class="cm-gapsbox" hidden>
+            <summary class="cm-gapsbox__sum"></summary>
+            <ul class="cm-gaps" id="cmGapsProto"></ul>
+          </details>
         </div>
         <div class="cm-field">
           <label for="cmInBase">对接地址</label>
@@ -16354,6 +16360,7 @@ async function showCustomModelsDialog() {
   const formTitle = ov.querySelector(".cm-form-title");
   const protoRadios = [...ov.querySelectorAll(".cm-in-proto")];
   const gapsProto = ov.querySelector("#cmGapsProto");
+  const gapsBox = ov.querySelector(".cm-gapsbox");
   const pullBtn = ov.querySelector(".cm-pull__btn");
   const modelList = ov.querySelector("#cmModelList");
   const revealBtn = ov.querySelector(".cm-reveal");
@@ -16403,16 +16410,19 @@ async function showCustomModelsDialog() {
     }
   }
   const readProto = () => cmProtocol(protoRadios.find((r) => r.checked)?.value);
-  // 选了协议之后地址写法和能力缺口都要跟着变。**这不是装饰**：Anthropic 的地址是
-  // https://api.anthropic.com（不带 /v1），OpenAI 兼容的是 .../v1，用户最容易在这里填错；
-  // 而 gaps 那几句是「不许假装支持」在界面上的唯一落点。
-  // gaps 的**权威来源是 Rust**（protocol.rs 的 Wire::unsupported()，经 ai_protocols 命令出来）。
-  // 前端 CM_PROTOCOL_UI 里那份是手抄的，而且已经漂了：实测 anthropic 那条把中间
-  // 「3.7/4.x 收 thinking.budget_tokens、4.7 之后只收 adaptive+output_config.effort，
-  //  两套互不兼容、发错是硬 400」整句丢了，只剩后半截；旁边还写着一句「protocol.rs 的
-  //  anthropic 臂逐字如此」——那句话本身就不成立了。
-  // 拉到就用真的，拉不到（网页版没有 Tauri）退回本地那份：ph/hint/desktopOnly 是纯 UI
-  // 字段，本来就该留在前端，只有 gaps/label 跟着 Rust 走。
+  /*
+   * 选了协议之后地址写法要跟着变 —— Anthropic 的地址是 https://api.anthropic.com
+   * （不带 /v1），OpenAI 兼容的是 .../v1，用户最容易在这里填错。占位符按协议换，
+   * 是这一条现在唯一的落点（说明文字 2026-09-01 按用户要求删了）。
+   *
+   * 【删掉的那份能力缺口】原来这里还渲染一列 gaps（「温度/top_p 不会发送」「思考开关的
+   * 形状按模型名猜」…），权威来源是 Rust 的 protocol.rs::Wire::unsupported()。用户两次
+   * 点名说这些提示字没用、要删，所以整条链一起摘干净了：渲染、CM_PROTOCOL_UI.gaps 里
+   * 那三十来行文案、以及下面这段同步里赋值 gaps 的那一行。留着不渲染只会变成又一处
+   * 「攒了一路没人消费」的死数据。
+   *
+   * 同步本身还在，但现在只为 label 一件事：出错文案里要按协议报名字（搜 CM_PROTOCOL_UI[_proto].label）。
+   */
   if (inTauri && !_protoGapsSynced) {
     _protoGapsSynced = true;
     (async () => {
@@ -16431,14 +16441,17 @@ async function showCustomModelsDialog() {
   const syncProto = () => {
     const ui = CM_PROTOCOL_UI[readProto()];
     inBase.placeholder = ui.ph;
-    // 地址写法原来单独占一段说明文字，用户说没用（占位符里本来就写着形状）。
-    // 删的只是那一段；下面的能力缺口留着——它是「不许假装支持」在界面上的唯一落点。
-    gapsProto.replaceChildren(...(ui.gaps || []).map((g) => {
+    const gaps = ui.gaps || [];
+    gapsBox.hidden = !gaps.length;
+    gapsBox.open = false;   // 换协议后重新收起来，否则上一个协议展开过它就一直是开的
+    gapsBox.querySelector(".cm-gapsbox__sum").textContent = `这个协议有 ${gaps.length} 处限制`;
+    gapsProto.replaceChildren(...gaps.map((g) => {
       const li = document.createElement("li");
       li.textContent = g;
       return li;
     }));
-    gapsProto.hidden = !(ui.gaps || []).length;
+    // 地址写法原来单独占一段说明文字，用户说没用（占位符里本来就写着形状）。
+    // 删的只是那一段；下面的能力缺口留着——它是「不许假装支持」在界面上的唯一落点。
   };
   const writeProto = (p) => {
     const want = cmProtocol(p);
@@ -17500,6 +17513,7 @@ function showModelInfoCard(m, anchorEl) {
     `<div class="mic-htxt"><div class="mic-name"></div><div class="mic-group"></div></div>` +
     _modelPowerToggleHtml(m) + `</div>` +
     `<div class="mic-id"></div>` +
+    `<div class="mic-note"></div>` +
     `<div class="mic-desc"></div>` +
     `<div class="mic-ctx">${_modelContextRows(m)}</div>` +
     `<div class="mic-think"></div>` +
@@ -17512,6 +17526,22 @@ function showModelInfoCard(m, anchorEl) {
   if (m.group && m.group !== (m.name || m.id)) gEl.textContent = m.group;
   else gEl.remove();
   card.querySelector(".mic-id").textContent = m.id;
+  /*
+   * 自定义模型要如实说清「走自己的端点会弱一些」。
+   *
+   * 这句披露搬过两次家，两次都是因为用户嫌它占地方，两次都**没有删掉**：
+   * 最早是切端点时弹的 toast（九秒横幅、切一次弹一次）→ 搬进自定义模型弹窗顶部 →
+   * 2026-09-01 用户说弹窗里那段也删掉，于是搬到这里。悬浮卡是它现在最该在的位置：
+   * 按模型、在**选用之前**就看得到，而且不占配置表单的地方。
+   * 事实本身不变：工具描述和完整系统提示词由服务端按需下发，第三方端点两头落空；
+   * 长上下文压缩也会关闭。不说清楚，放开这个开关等于交付一个坏功能。
+   */
+  const noteEl = card.querySelector(".mic-note");
+  if (String(m.id || "").startsWith(_CUSTOM_MODEL_PREFIX)) {
+    noteEl.textContent = "走自己的端点时智能体会弱一些：工具描述和完整系统提示词由服务端按需下发，这条路上拿不到；长上下文压缩也会关闭。";
+  } else {
+    noteEl.remove();
+  }
   const desc = (m.desc && m.desc.trim()) || officialModelDesc(m.id);
   const dEl = card.querySelector(".mic-desc");
   if (desc) dEl.textContent = desc;
@@ -17682,9 +17712,30 @@ function buildModelMenu() {
     const byGroup = new Map();
     for (const cm of _customs) { if (!byGroup.has(cm.group)) byGroup.set(cm.group, []); byGroup.get(cm.group).push(cm); }
     for (const [label, models] of byGroup) {
+      /*
+       * 分组标题上挂一个齿轮，直接进管理弹窗。
+       *
+       * 入口本来只有一个：模型菜单**最底下**那条「⚙ 自定义模型」。它是对的，但用户找
+       * 「我加的那个模型怎么改」时，眼睛在的是自己那个分组标题上，不是菜单底部 ——
+       * 于是「加完之后怎么编辑/删除」成了一个要靠记忆的问题。就近再给一个入口，
+       * 底部那条保留（没有自定义模型时，那条是唯一的入口）。
+       */
       const g = document.createElement("div");
-      g.className = "menu__group";
-      g.textContent = label;
+      g.className = "menu__group menu__group--custom";
+      const gname = document.createElement("span");
+      gname.textContent = label;
+      const gedit = document.createElement("button");
+      gedit.type = "button";
+      gedit.className = "menu__group-edit";
+      gedit.title = t("model.custom");
+      gedit.setAttribute("aria-label", t("model.custom"));
+      gedit.innerHTML = `<svg class="ic"><use href="#i-gear" /></svg>`;
+      gedit.addEventListener("click", (e) => {
+        e.stopPropagation();
+        closeModelMenu();
+        showCustomModelsDialog();
+      });
+      g.append(gname, gedit);
       modelMenu.appendChild(g);
       for (const cm of models) {
         const active = cm.id === current;

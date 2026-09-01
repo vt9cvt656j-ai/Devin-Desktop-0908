@@ -61,8 +61,40 @@ test("删掉的两处不许回来：会员徽章、协议地址说明", () => {
   assert.doesNotMatch(d, /会员到期后/, "同一条过期声明在顶部说明里又回来了");
   assert.doesNotMatch(CSS, /\.cm-vip/, "徽章的死样式还留着");
   assert.doesNotMatch(d, /id="cmHintProto"/, "协议那段地址说明又回来了");
-  // 但能力缺口必须留着——它是「不许假装支持」在界面上的唯一落点。
-  assert.match(d, /id="cmGapsProto"/, "能力缺口被一起删了：那是唯一告诉用户「这个协议不支持什么」的地方");
+});
+
+test("协议限制收进折叠行：表单里只占一行，信息不丢", () => {
+  // 用户两次说这些提示字占地方要删。但这些限制**本身成立**（温度/top_p 不发、
+  // 思考开关按模型名猜、max_tokens 默认 32000），直接删掉就是「悄悄不支持」——
+  // 这个仓库为「只删显示」付过账。折叠是两件事的交点：合上时只有一行字。
+  const d = dialog();
+  assert.match(d, /<details class="cm-gapsbox" hidden>/, "缺口不再是折叠的了：要么占一屏，要么就该没了");
+  assert.match(d, /id="cmGapsProto"/, "缺口列表没了");
+  assert.match(CODE, /gapsBox\.open = false/, "换协议后不收起来：上一个协议展开过它就一直是开的");
+  assert.match(CODE, /ui\.gaps = r\.unsupported\.map\(String\)/, "不再从 Rust 同步缺口：前端那份会漂");
+  // 数据也必须还在，否则折叠框永远是空的。
+  const wire = readFileSync(new URL("../src/agent/wire-protocol.js", import.meta.url), "utf8");
+  assert.match(wire, /^\s*gaps: \[$/m, "CM_PROTOCOL_UI 里的缺口文案被删空了");
+});
+
+test("已添加的那一列有标题，用户才知道去哪里编辑/删除", () => {
+  const d = dialog();
+  assert.match(d, /class="cm-form-title cm-list-title"[^>]*>已添加</, "「已添加」标题没了：两行模型悬在中间，看不出那是编辑入口");
+  assert.match(d, /class="cm-list"/, "列表容器没了");
+});
+
+test("模型选择器里，自定义分组标题上有直达管理的入口", () => {
+  // 底部那条「⚙ 自定义模型」是对的，但用户找"我加的那个怎么改"时，眼睛在自己那个
+  // 分组标题上，不在菜单底部。就近再给一个。
+  assert.match(CODE, /menu__group menu__group--custom/, "自定义分组的标题行没有单独的类");
+  assert.match(CODE, /menu__group-edit[\s\S]{0,400}showCustomModelsDialog\(\)/,
+    "分组标题上的齿轮没接上管理弹窗");
+  // 光有类名和监听器不算数——它得**真的挂到标题行上**。少了这一句，把 append 删掉
+  // 上面两条照样绿：类名还在、监听器还在，只是那个按钮永远不进 DOM。
+  assert.match(CODE, /g\.append\(gname, gedit\)/, "齿轮建出来了却没挂进分组标题行");
+  // 底部那条也必须还在：一个自定义模型都没有时，它是唯一的入口。
+  assert.match(CODE, /cfg\.addEventListener\("click"[\s\S]{0,120}showCustomModelsDialog\(\)/,
+    "菜单底部那条入口被删了：没有自定义模型时就完全进不去了");
 });
 
 test("标题水平居中，关闭按钮不参与排版", () => {
