@@ -35,6 +35,8 @@ const catalog = (active = []) => load("_skillCatalogBlock", {
   _isSkillActive: (s) => new Set(active).has(typeof s === "string" ? s : s?.id),
 })();
 
+const TOOL_ICONS_SRC = fs.readFileSync(new URL("../src/agent/tool-icons.js", import.meta.url), "utf8");
+
 test("模型不用任何手动操作就能看到全部技能——这是缺的那一半", () => {
   const out = catalog();
   for (const s of SKILLS) assert.ok(out.includes(s.name), `目录里少了 ${s.name}`);
@@ -473,7 +475,8 @@ test("技能卡不拿技能自述去顶「模型声明的选用理由」那一�
 });
 
 test("技能卡在行上有专属图标和中文标签，不再和「读文件」长一个样", () => {
-  assert.match(SRC, /^\s{4}skill: `<svg/m, "typeIcons 没有 skill 键，会回落成读文件那张纸");
+  // 图标表已搬进 src/agent/tool-icons.js（整套换成描边图形）。判据不变：技能得有自己的图形。
+  assert.match(TOOL_ICONS_SRC, /\n  skill: '/, "图标表里没有 skill —— 会回落成兜底的文件图");
   assert.match(SRC, /skill: "读取技能"/, "labels 表没有 skill，行里会直接显示 skill");
   assert.match(SRC, /: call\.type === "skill"\s*\n\s*\/\/[^\n]*\n\s*\? String\(call\.name \|\| ""\)/,
     "技能名没进路径位——行里显示的还是那一长串 sourcePath");

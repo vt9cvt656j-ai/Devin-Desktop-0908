@@ -261,18 +261,21 @@ test("调用点：一个域只建一张卡，且思考卡出现时会挪", () =>
   for (const bad of [null, {}]) assert.doesNotThrow(() => attachFacetLine(bad, "x", null));
 });
 
-test("知识检索有自己的图标，不再退回「读文件」那张纸", () => {
-  // typeIcons 里原来**没有 knowledge 这个键** → 走兜底 typeIcons.read，卡面上画的是一张
-  // 普通文档，和「读文件」一模一样（用户实拍）。这里把那张表真求值出来比，不比源码文本。
-  const icons = new Function(`return ${blockFrom("const typeIcons = {")}`)();
-  assert.ok(icons.knowledge, "typeIcons 里没有 knowledge —— 会退回兜底的 read 图标");
-  assert.notEqual(icons.knowledge, icons.read, "知识检索又和「读文件」共用一张图了");
-  assert.notEqual(icons.knowledge, icons._ksearch, "内置语料和外部检索工具该是两张图");
-  // 放大镜是从右页上挖空出来的，不是叠一层白：图标用 currentColor，底色随主题变，
-  // 叠白在深色下会露出一圈白边。
-  assert.match(icons.knowledge, /fill-rule="evenodd"/, "没有用挖空——深色下会露白边");
-  assert.doesNotMatch(icons.knowledge, /fill="#|fill="white"/, "图标写死了颜色，跟不了主题和状态");
-  assert.match(icons.knowledge, /viewBox="0 0 16 16"/, "和其余工具图标不同栅格");
+test("知识检索有自己的图标，不再退回「读文件」那张纸", async () => {
+  // 图标表原来内联在 main.js 里（50 个 GitHub Octicons 的实心图形）。2026-09-01 整套换成
+  // 24 网格的描边图形并搬进 src/agent/tool-icons.js——实心图在 15px 上糊成色块，形状差别
+  // 读不出来，而这个产品指望图标承担"这一步在干什么"的第一眼判断。判据不变：知识检索
+  // 必须有自己的图形，且不和「读文件」「外部检索」共用。
+  const { TOOL_ICONS, toolIconSvg, toolIconFamily } = await import("../src/agent/tool-icons.js");
+  assert.ok(TOOL_ICONS.knowledge, "没有 knowledge 的图形 —— 会退回兜底的文件图");
+  assert.notEqual(TOOL_ICONS.knowledge, TOOL_ICONS.read, "知识检索又和「读文件」共用一张图了");
+  assert.notEqual(TOOL_ICONS.knowledge, TOOL_ICONS._ksearch, "内置语料和外部检索工具该是两张图");
+  // 描边、跟随 currentColor：写死颜色就跟不了主题，也跟不了族色。
+  const svg = toolIconSvg("knowledge");
+  assert.match(svg, /stroke="currentColor"/, "图标不是描边、或者没跟 currentColor");
+  assert.doesNotMatch(svg, /fill="#|fill="white"/, "图标写死了颜色，跟不了主题和状态");
+  assert.match(svg, /viewBox="0 0 24 24"/, "和其余工具图标不同栅格");
+  assert.equal(toolIconFamily("knowledge"), "read", "知识检索该归到「读」这一族");
 });
 
 test("展开正文的样式真在 CSS 里，且行内代码盖得住上面那条清零", () => {

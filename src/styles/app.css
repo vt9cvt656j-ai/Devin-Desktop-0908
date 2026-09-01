@@ -6433,13 +6433,38 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
  * svg），再给每种配一个底色是把同一件事说两遍，而且说得很吵。
  * 颜色只留给**状态**（成功/失败在 .atc-result 上），类型一律走同一档灰。
  */
+/*
+ * 图标：**描边图形 + 按族上色**，不是填色底块。
+ *
+ * 三版才落到这儿，两次的教训都写在这里：
+ *  · 最早是 43 种按类型的粉彩**底块**——一屏下来一条彩虹，用户说"杂乱"。
+ *  · 于是全部改成灰——用户说"不要走现在这种色，每个卡片类型要不一样的"。他要的是
+ *    **能分辨**，不是回到彩虹。
+ * 所以现在：颜色按"这一步在动什么"分**七族**（读/写/跑/连网/想/生成/危险），同族共用
+ * 一个色、族内靠**图形**区分；颜色只上在描边上，不做填色底块——底块正是被判"杂乱"的
+ * 那个东西。族的归属在 src/agent/tool-icons.js，不在这里手工维护第二份。
+ */
 .atc-type-icon {
   width: 22px; height: 22px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
-  border-radius: 6px;
   background: transparent; color: var(--atc-dim);
 }
-.agent-tool-step:hover .atc-type-icon { color: var(--atc-text); }
+.atc-type-icon svg { width: 16px; height: 16px; }
+.atc-type-icon[data-fam="read"]   { color: #3b82f6; }
+.atc-type-icon[data-fam="write"]  { color: #d97706; }
+.atc-type-icon[data-fam="run"]    { color: #7c5cff; }
+.atc-type-icon[data-fam="net"]    { color: #0d9488; }
+.atc-type-icon[data-fam="think"]  { color: #6366f1; }
+.atc-type-icon[data-fam="make"]   { color: #db2777; }
+.atc-type-icon[data-fam="danger"] { color: #dc2626; }
+/* 深色下把同一族提亮一档：同一个十六进制在深底上会掉进背景里。 */
+[data-theme="dark"] .atc-type-icon[data-fam="read"]   { color: #60a5fa; }
+[data-theme="dark"] .atc-type-icon[data-fam="write"]  { color: #f0a742; }
+[data-theme="dark"] .atc-type-icon[data-fam="run"]    { color: #a78bfa; }
+[data-theme="dark"] .atc-type-icon[data-fam="net"]    { color: #2dd4bf; }
+[data-theme="dark"] .atc-type-icon[data-fam="think"]  { color: #8b8cf8; }
+[data-theme="dark"] .atc-type-icon[data-fam="make"]   { color: #f472b6; }
+[data-theme="dark"] .atc-type-icon[data-fam="danger"] { color: #f87171; }
 /* 技能：紫色，和 read 的蓝、write 的绿都不撞——它以前就是回落成 read 那张纸的。 */
 /* MCP 用服务自己的真实头像（复用市场卡那套 .mcpfp-icon）。图标位是 27px，而 .mcpfp-icon
    本身按 38px 写的，这里缩到位并去掉底色——头像自己就是底色，再叠一层会出现一圈边。 */
@@ -6451,7 +6476,7 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 }
 /* 没有头像时回落成首字母，字号要跟着缩，否则 27px 里那个字会顶出来。 */
 .agent-tool-step--mcp .atc-type-icon--avatar .mcpfp-icon__letter { font-size: 12px; }
-.atc-type-icon svg { width: 13px; height: 13px; }
+
 
 /* Language badge (used inside viewport) */
 .atc-lang-badge {
@@ -6512,7 +6537,7 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 
 /* Diff stats */
 .atc-diffstat {
-  font-family: var(--font); font-size: 11px; font-weight: 600;
+  font-family: var(--font); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums;
   flex-shrink: 0; display: inline-flex; align-items: center; gap: 2px;
   line-height: 1;
 }
@@ -6520,7 +6545,11 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .atc-diffstat .d { color: var(--atc-danger); margin-left: 2px; }
 
 .atc-result {
-  font-family: var(--font); font-size: 11px; font-weight: 600; color: var(--atc-dim);
+  /* 右侧这一列是每张卡唯一的"结果"，原来 11px 比左边的路径（12px）还小，扫一屏时它是
+     最后被看到的东西。提到 12px，并上等宽数字——十几张卡叠起来，右边缘的数字才对得齐，
+     那一列读起来是一栏数据，不是一堆碎字。 */
+  font-family: var(--font); font-size: 12px; font-weight: 600; color: var(--atc-dim);
+  font-variant-numeric: tabular-nums;
   /* Was flex-shrink:0 → the meta badge kept its full width and SQUEEZED the filename/title
      (even wrapping "读取"). Now it shrinks + caps at ~half the row so the title always wins. */
   flex-shrink: 1; min-width: 0; max-width: 40%; overflow: hidden;
@@ -6645,9 +6674,12 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 }
 
 /* Content area */
+/* 展开区：和上面那一行之间要有一条明确的分界，内容也不能贴着卡边。
+   原来它只有一个背景色，各类面板各自带 padding，于是同一张卡展开后的留白宽窄不一。 */
 .atc-viewport {
   display: none;
   background: var(--atc-bg);
+  border-top: 1px solid var(--atc-border);
 }
 /* 抓回来的网页/搜索正文。
    原来是裸 <pre>：等宽字体读散文本来就别扭，段落之间没有间距，而且继承来的换行规则
@@ -6684,37 +6716,38 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
    原来是 textContent 塞进 .atc-viewport —— 而这一层没有 pre-wrap，换行全被折叠，四个面六条
    要点在屏幕上是一整坨（用户：「知识检索里面的内容显示ui好好优化」）。文本里本来就有结构，
    这里只是把它画出来：面成段带小标题和条数，条成行，来源当行首标签。 */
-.kpf { padding: 2px 14px 12px; }
-.kpf__sec { padding: 11px 0; }
-.kpf__sec + .kpf__sec { border-top: 1px solid rgba(128, 128, 128, .1); }
-.kpf__head { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
-.kpf__facet { font-size: 11.5px; font-weight: 650; letter-spacing: .01em; color: var(--atc-text, #1d1d1f); }
-.kpf__n {
-  font-size: 10.5px; font-weight: 600; line-height: 16px; padding: 0 6px;
-  border-radius: 999px; font-variant-numeric: tabular-nums;
-  color: var(--atc-dim, #86868b); background: rgba(128, 128, 128, .13);
+/*
+ * 知识检索的展开区。用户：「右边的内容也需要好好优化打磨，包括展开的内容」。
+ * 原来一节的抬头是「粗体标题 + 填色计数小块 + 一条渐变横线」——三样东西争同一行，
+ * 而真正要读的是下面那几条。现在：标题走小号大写间距、计数只是它后面的一个灰数字、
+ * 横线拉通整行做分节，条目的项目符号收成一个小圆点，源标记不再是刺眼的主色。
+ */
+.kpf { padding: 4px 13px 12px; }
+.kpf__sec { padding: 12px 0 10px; }
+.kpf__sec + .kpf__sec { border-top: 1px solid var(--atc-border); }
+.kpf__head { display: flex; align-items: baseline; gap: 6px; margin-bottom: 8px; }
+.kpf__facet {
+  font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--atc-dim);
 }
-.kpf__n--fail { color: var(--atc-danger, #d93025); background: color-mix(in srgb, var(--atc-danger, #d93025) 11%, transparent); }
-/* 标题右边那道渐隐的线：把面和面分开，又不像实线那样在窄卡里显得压抑。 */
-.kpf__rule { flex: 1 1 auto; height: 1px; background: linear-gradient(90deg, rgba(128, 128, 128, .2), transparent); }
-/* 一条要点一行。来源标签是**行内**的，正文接着它排、折行后占满整宽——
-   早先试过两栏网格（来源一栏、正文一栏），最长的那个小节名会把正文挤成窄条，
-   而小节名本身还得截断成「Common Amateur Mis…」。 */
+/* 计数不再是填色小块：它是个补充数字，不该和标题抢。 */
+.kpf__n { font-size: 11px; font-weight: 600; color: var(--atc-dim); font-variant-numeric: tabular-nums; background: none; padding: 0; }
+.kpf__n--fail { color: var(--atc-danger); }
+.kpf__rule { display: none; }
 .kpf__item {
-  position: relative; padding-left: 13px;
-  font-size: 12.5px; line-height: 1.62;
-  color: var(--atc-text, #1d1d1f); overflow-wrap: break-word;
+  position: relative; padding-left: 14px;
+  font-size: 13px; line-height: 1.65; color: var(--atc-text);
 }
-.kpf__item + .kpf__item { margin-top: 6px; }
+.kpf__item + .kpf__item { margin-top: 7px; }
 .kpf__item::before {
-  content: ""; position: absolute; left: 3px; top: .66em;
-  width: 3.5px; height: 3.5px; border-radius: 50%;
-  background: var(--atc-accent, #1a73e8); opacity: .45;
+  content: ""; position: absolute; left: 3px; top: .62em;
+  width: 4px; height: 4px; border-radius: 50%; background: var(--atc-dim); opacity: .55;
 }
-.kpf__src { font-weight: 650; color: var(--atc-accent, #1a73e8); margin-right: .42em; }
-.kpf__empty { font-size: 11.5px; color: var(--atc-dim, #86868b); }
-.kpf__empty--fail { color: var(--atc-danger, #d93025); }
-.kpf__cut { padding: 8px 0 0; font-size: 11px; color: var(--atc-dim, #86868b); }
+/* 源标记：加粗 + 略深即可分辨，不必用主色喊——一屏十几条蓝字比正文还抢眼。 */
+.kpf__src { font-weight: 700; color: var(--atc-text); margin-right: .45em; }
+.kpf__empty { font-size: 12px; color: var(--atc-dim); }
+.kpf__empty--fail { color: var(--atc-danger); }
+.kpf__cut { padding: 9px 0 0; font-size: 11px; color: var(--atc-dim); }
 /* 必须写成 .atc-viewport .kpf code（0,2,1）：上面那条 .atc-viewport code 把行内代码的
    底色和内边距全清了，同特异度靠源码顺序决定，写窄一点才盖得住。 */
 .atc-viewport .kpf code {
@@ -7703,7 +7736,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .dark .atc-diff-row--del .atc-diff-code { color: #e6edf3; opacity: .7; }
 [data-theme="dark"] .atc-diff-ln,
 .dark .atc-diff-ln { border-right-color: #30363d; }
-[data-theme="dark"] .atc-diffstat, .dark .atc-diffstat { background: #21262d; }
+/* diffstat 的底色删了：+18 / -3 用绿红**文字**表达就够，那是 diff 的通用约定；
+   再套一个灰底块，右侧那一列就又多出一个色块。 */
 [data-theme="dark"] .atc-diffstat .a, .dark .atc-diffstat .a { color: #3fb950; }
 [data-theme="dark"] .atc-diffstat .d, .dark .atc-diffstat .d { color: #f85149; }
 [data-theme="dark"] .atc-result--ok, .dark .atc-result--ok {  }

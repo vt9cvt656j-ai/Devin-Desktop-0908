@@ -192,3 +192,64 @@ test("状态只在需要回头看时才上色：成功走灰，失败才红", ()
   const base = CSS.slice(CSS.indexOf("\n.atc-result {"), CSS.indexOf(".atc-result svg"));
   assert.match(base, /padding: 0; border-radius: 0; background: transparent;/, "状态又变回填色药丸");
 });
+
+// ── 图标：描边图形 + 按族上色 ─────────────────────────────────────────────
+//
+// 走到这一版用了三轮，两次的判断都被用户否掉，值得把结论钉住：
+//   ① 43 种按类型的粉彩**底块** → 「展示的内容很杂乱」
+//   ② 全部改成灰            → 「不要走现在这种色，每个卡片类型要不一样的」
+// 他要的是**能分辨**，不是回到彩虹。所以：图形每类都不同（这是分辨的主要载体），
+// 颜色按七个**族**分（读/写/跑/网/想/生成/危险），只上在描边上、不做填色底块。
+test("每个工具类型都有自己的图形，一个都不许共用", async () => {
+  const { TOOL_ICONS } = await import("../src/agent/tool-icons.js");
+  const seen = new Map();
+  for (const [type, geo] of Object.entries(TOOL_ICONS)) {
+    const prev = seen.get(geo);
+    assert.equal(prev, undefined, `「${type}」和「${prev}」共用同一张图——那就没法一眼分辨了`);
+    seen.set(geo, type);
+  }
+  assert.ok(Object.keys(TOOL_ICONS).length >= 45, "图标表缩水了，会有类型退回兜底的文件图");
+});
+
+test("整套图标是 24 网格的描边，不是实心", async () => {
+  const { TOOL_ICON_ATTRS, toolIconSvg } = await import("../src/agent/tool-icons.js");
+  // 实心图在 15px 上糊成一个色块，形状之间的差别读不出来——那正是换掉 Octicons 的理由。
+  assert.match(TOOL_ICON_ATTRS, /viewBox="0 0 24 24"/);
+  assert.match(TOOL_ICON_ATTRS, /fill="none"/, "又变回实心了");
+  assert.match(TOOL_ICON_ATTRS, /stroke="currentColor"/, "不跟 currentColor 就跟不了族色和主题");
+  assert.match(TOOL_ICON_ATTRS, /stroke-linecap="round"/, "圆头圆角是这套画法的一半");
+  // 认不出的类型要回落到一张普通文件，不能是空方块。
+  assert.match(toolIconSvg("这个类型不存在"), /<path/, "未知类型渲染成了空方块");
+});
+
+test("颜色按族分，只有七族，而且只上在描边上", async () => {
+  const { TOOL_FAMILY, toolIconFamily } = await import("../src/agent/tool-icons.js");
+  const fams = new Set(Object.values(TOOL_FAMILY));
+  assert.ok(fams.size <= 7, `族变多了（${fams.size} 个）——再往上加就是回到彩虹`);
+  assert.equal(toolIconFamily("delete"), "danger");
+  assert.equal(toolIconFamily("没这个类型"), "neutral", "认不出的类型该走中性灰，不该乱猜一个族");
+  // 样式那一侧：族色只能落在 color 上；一旦有人给它加回 background，就是上一版被判"杂乱"的那个东西。
+  const famRules = [...CSS.matchAll(/\.atc-type-icon\[data-fam="\w+"\][^{]*\{([^}]*)\}/g)].map((m) => m[1]);
+  assert.ok(famRules.length >= 7, "族色规则没了");
+  for (const body of famRules) {
+    assert.doesNotMatch(body, /background/, `族色又做成填色底块了：${body.trim()}`);
+  }
+  // 族的归属只有一份（在模块里），CSS 不许再按工具类型手工列第二份。
+  assert.doesNotMatch(CSS, /\.agent-tool-step--\w+ \.atc-type-icon[^{]*\{[^}]*color:/,
+    "又在 CSS 里按工具类型手工分配颜色了——两份名单必然漂移");
+});
+
+test("右边那一列和展开区：数字对齐、diff 用绿红文字、展开有分界", () => {
+  const base = CSS.slice(CSS.indexOf("\n.atc-result {"), CSS.indexOf(".atc-result svg"));
+  assert.match(base, /font-variant-numeric: tabular-nums/, "右侧数字不等宽——十几张卡叠起来右边缘对不齐");
+  assert.match(base, /font-size: 12px/, "右侧比左边的路径还小，扫一屏时最后才被看到");
+  // +18 / -3 是 diff 的通用约定，保留绿红**文字**，但不要底块。
+  assert.match(CSS, /\.atc-diffstat \.a \{ color: var\(--atc-success\); \}/);
+  assert.doesNotMatch(CSS, /\.atc-diffstat[^{]*\{[^}]*background:/, "diffstat 又套回灰底块了");
+  // 展开区要和上面那一行有明确分界。
+  assert.match(CSS, /\.atc-viewport \{[^}]*border-top: 1px solid var\(--atc-border\)/s, "展开区没有和行分开");
+  // 知识检索的分节抬头：小号大写 + 灰计数，不再是「粗标题 + 填色小块 + 渐变横线」三样争一行。
+  assert.match(CSS, /\.kpf__facet \{[^}]*text-transform: uppercase/s, "分节抬头没有降到辅助层级");
+  assert.match(CSS, /\.kpf__n \{[^}]*background: none/s, "计数又变回填色小块");
+  assert.match(CSS, /\.kpf__rule \{ display: none; \}/, "那条渐变横线又回来了");
+});

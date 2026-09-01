@@ -1217,7 +1217,7 @@ test("头像信息存进 serverMeta，否则卡片渲染时根本拿不到", () 
 test("头像是建好卡片之后再换的，不动那个被钉住的图标选择表达式", () => {
   // 那个表达式保证「三机器人只走 _awaitAll 一条路」，包一层就会把这条保证弄坏。
   const cardSrc = SRC.slice(SRC.indexOf("function _createToolStep(call)"), SRC.indexOf("function _settleToolStep"));
-  assert.ok(cardSrc.includes('${_awaitAll ? _SVG_TRIO_BOTS : (typeIcons[call.type] || (_isKSearch ? typeIcons._ksearch : typeIcons.read))}'),
+  assert.ok(cardSrc.includes('${_awaitAll ? _SVG_TRIO_BOTS : _toolIconSvg(_isKSearch ? "_ksearch" : call.type)}'),
     "模板里那个表达式被改动了");
   assert.match(cardSrc, /_ic\.classList\.add\("atc-type-icon--avatar"\); _ic\.innerHTML = _av;/,
     "头像没有作为后置装饰换上去");

@@ -20999,7 +20999,7 @@ test("#49-3 卡片文案+三机器人图标：all/空不显示 all 且用 _SVG_T
   assert.equal((def.match(/<rect /g) || []).length, 3, "三个圆角方头");
   assert.equal((def.match(/<path d="M[\d.]+ [\d.]+V[\d.]+"\/>/g) || []).length, 3, "三根天线");
   assert.equal(SRC.split("_SVG_TRIO_BOTS").length - 1, 2, "仅定义与 all 路径两处使用，不泄漏到其他卡片");
-  assert.ok(cardSrc.includes('${_awaitAll ? _SVG_TRIO_BOTS : (typeIcons[call.type] || (_isKSearch ? typeIcons._ksearch : typeIcons.read))}'), "仅 _awaitAll（等待全部）路径用三机器人，单个 job#N 保持原图标");
+  assert.ok(cardSrc.includes('${_awaitAll ? _SVG_TRIO_BOTS : _toolIconSvg(_isKSearch ? "_ksearch" : call.type)}'), "仅 _awaitAll（等待全部）路径用三机器人，单个 job#N 保持原图标");
 });
 
 // ---- #47 四大主线程热点根治（RAFGAP 取证实锤） --------------------------------
