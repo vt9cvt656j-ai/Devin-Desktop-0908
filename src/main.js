@@ -19309,7 +19309,7 @@ function _restoreClosedChatSession(closedIndex) {
     .filter((t) => t.summary).slice(-6);
   if (sData.intentState && typeof sData.intentState === "object") session._intentState = sData.intentState;
   if (Array.isArray(sData.semanticFlags)) session._semanticProfileFlags = sData.semanticFlags.slice();
-  { const _ctxRead = _ctxReadingFromStorage(sData.ctxFloor); if (_ctxRead) session._ctxRealFloor = _ctxRead; }
+  { const _ctxRead = _ctxReadingFromStorage(sData.ctxFloor); if (_ctxRead) { session._ctxRealFloor = _ctxRead; if (_ctxRead.parts) session._ctxParts = _ctxRead.parts; } }
   if (sData.lastRun && typeof sData.lastRun === "object") session._lastRunState = sData.lastRun;
   if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
   if (sData.memory) {
@@ -19699,6 +19699,10 @@ function _sessionPersistFingerprint(s) {
       // ctxFloor。读写点各有两个、四条路都是通的，漏的是它们上面这层缓存：重启之后仪表回到
       // 空白，而那个数是重算不出来的。
       Number(s?._ctxRealFloor?.total) || 0, String(s?._ctxRealFloor?.requestId || ""),
+      // 来源分项同理：它也是本地重算不出来的（只有发送那一刻算得出），而且它变了、
+      // 会话内容没变时指纹不变 → 快照走缓存 → 落盘的对象里根本没有它。
+      // 上面那段注释记的就是这个坑，别让新字段再踩一次。
+      Number(s?._ctxParts?.history) || 0, Number(s?._ctxParts?.at) || 0,
       String(last.role || "") + ":" + (typeof last.content === "string" ? last.content.length : 0),
       _intentJson, _lastRunJson,
     ].join("\u0001");
@@ -20075,7 +20079,7 @@ async function restoreChatHistory() {
         if (sData.anchorRoot) session._anchorRoot = sData.anchorRoot; // 恢复工作区锚点：重开后换文件夹能触发"忘掉旧路径"提示
         if (sData.intentState && typeof sData.intentState === "object") session._intentState = sData.intentState;
         if (Array.isArray(sData.semanticFlags)) session._semanticProfileFlags = sData.semanticFlags.slice();
-        { const _ctxRead = _ctxReadingFromStorage(sData.ctxFloor); if (_ctxRead) session._ctxRealFloor = _ctxRead; }
+        { const _ctxRead = _ctxReadingFromStorage(sData.ctxFloor); if (_ctxRead) { session._ctxRealFloor = _ctxRead; if (_ctxRead.parts) session._ctxParts = _ctxRead.parts; } }
         if (sData.lastRun && typeof sData.lastRun === "object") session._lastRunState = sData.lastRun;
         // Rendered-transcript snapshot (disk store only) — consumed lazily by
         // _renderSessionHistory when this tab is first shown, restoring the full
@@ -20550,7 +20554,26 @@ function _ctxReadingForStorage(session) {
     model: String(real.model || ""),
     requestId: String(real.requestId || ""),
     at: Number(real.at) || 0,
+    /*
+     * 来源分项跟着读数一起存。
+     *
+     * 它是**发送那一刻**才算得出来的（用户规则、技能、语言块、工具 schema、对话历史都在
+     * 那一步成形），重启之后本地重算不出来——和上下文读数同一个性质，所以搭同一班车：
+     * ctxFloor 的写点和读点各有两个、四条路都是通的，塞进它就不必再开一份白名单。
+     * 读数为 0 时这个函数本来就返回 undefined，而没有读数的分项也没有分母可分，正好一致。
+     */
+    parts: _ctxPartsForStorage(session),
   };
+}
+/// 来源分项的存储形状。只留数，不留任何文本——它要跟着会话进 SQLite/localStorage。
+function _ctxPartsForStorage(session) {
+  const p = session?._ctxParts || session?.ctxFloor?.parts;
+  if (!p || typeof p !== "object") return undefined;
+  const n = (v) => Math.max(0, Math.round(Number(v) || 0));
+  const out = { l0: !!p.l0, at: Number(p.at) || 0 };
+  for (const k of ["system", "rules", "skills", "blocks", "tools", "history"]) out[k] = n(p[k]);
+  // 一项都没有就别写：空对象存进去只会让"还拆不出来源"变成"全是 0"，后者更像坏了。
+  return ["system", "rules", "skills", "blocks", "tools", "history"].some((k) => out[k] > 0) ? out : undefined;
 }
 function _ctxReadingFromStorage(stored) {
   const total = Math.max(0, Number(stored?.total) || 0);
@@ -20564,6 +20587,7 @@ function _ctxReadingFromStorage(stored) {
     output,
     cacheRead: stored.cacheRead == null ? null : Math.max(0, Number(stored.cacheRead) || 0),
     cacheWrite: Math.max(0, Number(stored.cacheWrite) || 0),
+    parts: _ctxPartsForStorage({ ctxFloor: stored }),
     model: String(stored.model || ""),
     requestId: String(stored.requestId || ""),
     at: Number(stored.at) || 0,

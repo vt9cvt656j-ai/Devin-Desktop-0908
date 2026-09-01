@@ -59,8 +59,8 @@ export function contextUsageView(state = {}, totals = {}) {
   if (s.windowReported === false && total > 0) notes.push(`窗口未上报 · ${short(limit)} 是按模型名推的，百分比仅供参考`);
   if (s.estimated) notes.push("本地估算 · 供应商尚未上报本轮用量");
   if (cached == null && prompt > 0) notes.push("上游没报缓存字段，无法拆出命中/新写");
-  // 报了、但这一轮是 0：说清楚它是真数，不是"没做"。
-  if (cached === 0 && prompt > 0) notes.push("本轮缓存命中 0 —— 这是上游报回来的真数，同一段前缀要连着用才会命中");
+  // 命中 0 那一行本身已经把话说完了（它摆在那儿，值就是 0）——不必再补一句解释。
+  // 用户点名删的：面板下面每多一句，真正要看的三个数就被往上顶一截。
   const t = totals || {};
   if (t.anyReal) {
     const hit = Number(t.inWithCacheInfo) > 0 ? Math.round((Number(t.cached) || 0) / Number(t.inWithCacheInfo) * 100) : null;

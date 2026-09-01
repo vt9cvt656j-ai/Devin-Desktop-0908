@@ -33,6 +33,12 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 82_180（2026-08-31 第十四次）：实测 82,122 行。买到的是「上下文来源」活过重启——分项是
+ *   发送那一刻才算得出来的（规则/技能/语言块/工具 schema/对话历史都在那步成形），本地重算
+ *   不出来，和上下文读数同一个性质，所以搭同一班车塞进 ctxFloor（写点读点各两个、四条路
+ *   都是通的）。留在 main.js 的是序列化那一小段和两处回灌，它们必须待在读写现场；另外
+ *   分项还得进落盘指纹，否则快照走缓存、它永远落不了盘（那段注释里已为 ctxFloor 记过这个坑）。
+ *
  * · 82_100（2026-08-31 第十三次）：实测 82,048 行。买到的是两件事：
  *   ① 上下文环**真的点得开**——上一版把接线写进了 `if (!el)`，而 #tokenMeter 是 Shell.jsx
  *      静态渲染的，那个分支一次都不会进；连 role=button 和 cursor:pointer 都没生效。
@@ -206,7 +212,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 82_100;
+const MAIN_JS_MAX_LINES = 82_180;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

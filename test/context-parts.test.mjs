@@ -8,6 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { contextPartsView } from "../src/agent/context-parts.js";
+import { contextUsageView as contextUsageViewForNotes } from "../src/agent/context-usage.js";
 import { fnSource, load, SRC } from "./helpers/source.mjs";
 
 const shell = () => readFileSync(new URL("../src/app/Shell.jsx", import.meta.url), "utf8");
@@ -163,4 +164,46 @@ test("语音按钮的底样式还在——它是上次删提示时被误伤的�
   ]) {
     assert.ok(rule.includes(prop), `.voice-btn 少了 ${prop}——${why}`);
   }
+});
+
+test("重启之后来源分项还在——它和上下文读数搭同一班车落盘", () => {
+  // 用户实拍：重启软件后点开「上下文来源」，只剩一句「还拆不出来源」。
+  // 分项是**发送那一刻**才算得出来的（规则/技能/语言块/工具 schema/对话历史都在那步成形），
+  // 本地重算不出来——和上下文读数同一个性质，所以塞进 ctxFloor：它的写点和读点各有两个、
+  // 四条路都是通的，不必再开一份白名单。
+  const forStorage = load("_ctxPartsForStorage", {});
+  const live = { _ctxParts: { l0: true, at: 1234, system: 0, rules: 1400, skills: 2800, blocks: 900, tools: 2000, history: 63000 } };
+  const stored = forStorage(live);
+  assert.deepEqual(stored, { l0: true, at: 1234, system: 0, rules: 1400, skills: 2800, blocks: 900, tools: 2000, history: 63000 },
+    "落盘形状丢了字段——重启后那几行就少了");
+  // 从存储形状再跑一遍要等价（读点就是这么调的）：形状同构，才经得起归档→恢复→再归档。
+  assert.deepEqual(forStorage({ ctxFloor: { parts: stored } }), stored, "存储形状回不去，归档一次就丢");
+  // 一项都没有就别写：空对象存进去会把「还拆不出来源」变成「全是 0」，后者更像坏了。
+  assert.equal(forStorage({ _ctxParts: { l0: true, at: 1 } }), undefined);
+  assert.equal(forStorage({}), undefined);
+  assert.equal(forStorage(null), undefined);
+  // 脏值不许穿过去。
+  assert.deepEqual(forStorage({ _ctxParts: { rules: "x", history: -5, skills: 1.7, l0: 0, at: "z" } }),
+    { l0: false, at: 0, system: 0, rules: 0, skills: 2, blocks: 0, tools: 0, history: 0 });
+});
+
+test("落盘和回灌四条路都带上它，且它进了持久化指纹", () => {
+  // 读写点各两个，漏一处就是"某种情况下丢"。
+  assert.match(SRC, /parts: _ctxPartsForStorage\(session\)/, "写盘形状里没有分项");
+  assert.match(SRC, /parts: _ctxPartsForStorage\(\{ ctxFloor: stored \}\)/, "回灌形状里没有分项");
+  assert.equal((SRC.match(/if \(_ctxRead\.parts\) session\._ctxParts = _ctxRead\.parts;/g) || []).length, 2,
+    "两个恢复点没有都把分项装回 session——某一条路径下重启后仍然是空的");
+  // **指纹**这条最容易漏：分项变了、会话内容没变时指纹不变 → 快照走缓存 → 落盘对象里根本
+  // 没有它。同一段注释里已经为 ctxFloor 记过这个坑。
+  const fp = fnSource("_sessionPersistFingerprint");
+  assert.match(fp, /_ctxParts\?\.history/, "分项没进持久化指纹——快照走缓存时它永远落不了盘");
+});
+
+test("面板下面不再多那一句解释", () => {
+  // 用户点名删的：命中 0 那一行摆在那儿，值就是 0，话已经说完了。
+  const v = contextUsageViewForNotes({ prompt: 31000, completion: 213, total: 31213, limit: 1000000, pct: 3, cached: 0 }, {});
+  assert.deepEqual(v.notes, [], "面板下面又多出解释文字了");
+  // 但「上游根本没报」那条必须还在——那是另一件事，不能一起删掉。
+  const none = contextUsageViewForNotes({ prompt: 1000, completion: 0, total: 1000, limit: 8000, pct: 12, cached: null }, {});
+  assert.ok(none.notes.some((n) => n.includes("没报缓存字段")), "把「上游没报缓存字段」也一起删了");
 });

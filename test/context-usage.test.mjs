@@ -35,7 +35,10 @@ test("上游没报缓存字段时，不拆、也不写成 0", () => {
   assert.deepEqual(z.rows.map((r) => r.key), ["cached", "uncached"], "命中 0 那一行被藏起来了");
   assert.equal(z.rows[0].value, 0);
   assert.ok(!z.notes.some((n) => n.includes("没报缓存字段")), "报了 0 却说成「没报」");
-  assert.ok(z.notes.some((n) => n.includes("本轮缓存命中 0")), "没说清楚这个 0 是上游报回来的真数");
+  // 那句解释后来被点名删了：命中 0 那一行摆在那儿、值就是 0，话已经说完；面板下面每多
+  // 一句，真正要看的三个数就被往上顶一截。要守的性质还在——它和「上游根本没报」分得开，
+  // 靠的是这一行在不在，而不是靠一句解释。
+  assert.ok(!z.notes.some((n) => n.includes("本轮缓存命中")), "解释文字又加回面板了");
 });
 
 test("分母是猜的、数是估的，都要当面说出来", () => {

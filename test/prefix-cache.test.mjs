@@ -689,8 +689,10 @@ const ctxInput = load("_contextInputTokens", ["_contextInputTokens"]);
 // 这一族测试只关心读数本身，把落盘那一步桩掉。
 const applyReading = new Function("_noteCtxSeen",
   `${grab("_applyContextReading")}\nreturn _applyContextReading;`)(() => {});
-const readingForStorage = load("_ctxReadingForStorage", ["_ctxReadingForStorage"]);
-const readingFromStorage = load("_ctxReadingFromStorage", ["_ctxReadingFromStorage"]);
+// 两个序列化器现在都会调 _ctxPartsForStorage（来源分项搭同一班车落盘），所以一起抽进来——
+// 少了它这里会抛 ReferenceError，而那种红是"测试自己坏了"，不是被守的性质坏了。
+const readingForStorage = load("_ctxReadingForStorage", ["_ctxPartsForStorage", "_ctxReadingForStorage"]);
+const readingFromStorage = load("_ctxReadingFromStorage", ["_ctxPartsForStorage", "_ctxReadingFromStorage"]);
 // 单窗口模型：目录里就一条、且不带 beta，所以够得着的上限 = 默认窗口。
 const meterLimit = (native, choice) => new Function(
   "_modelContextLimit", "_ctxChoiceFor", "_nativeWindowsFor", "_modelCatalogEntry", "_ctxSeenMax",
@@ -786,6 +788,17 @@ test("the reading survives a restart, including records written before the break
   // a field to a divergent copy twice already.
   assert.equal((SRC.match(/ctxFloor: _ctxReadingForStorage\(/g) || []).length, 2);
   assert.equal((SRC.match(/_ctxReadingFromStorage\(sData\.ctxFloor\)/g) || []).length, 2);
+
+  // 来源分项搭的是同一班车：它也是本地重算不出来的（只有发送那一刻算得出），
+  // 所以必须和读数一起活过重启。
+  const withParts = { _ctxRealFloor: null, _ctxParts: { l0: true, at: 7, rules: 1400, skills: 2800, blocks: 0, tools: 2000, history: 63000, system: 0 } };
+  applyReading(withParts, { input: 69_200, output: 100, cacheRead: 0, cacheWrite: 0, model: "m", requestId: "r2" });
+  const back = readingFromStorage(JSON.parse(JSON.stringify(readingForStorage(withParts))));
+  assert.equal(back.parts?.history, 63_000, "来源分项没活过重启——面板会退回「还拆不出来源」");
+  assert.equal(back.parts?.rules, 1_400);
+  assert.equal(back.parts?.l0, true);
+  // 没有分项的会话照旧不写这个键（旧记录、以及还没发过话的会话）。
+  assert.equal(readingFromStorage(JSON.parse(JSON.stringify(readingForStorage(session))))?.parts, undefined);
 });
 
 test("once the provider has reported, the local estimate is out of the loop", () => {
