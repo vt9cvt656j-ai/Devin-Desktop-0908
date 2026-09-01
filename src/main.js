@@ -59069,7 +59069,10 @@ function _createReadBatchGroup(total) {
   card.innerHTML =
     `<div class="agent-tool-row">` +
       `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
-      `<div class="atc-type-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 1.75C5 .784 5.784 0 6.75 0h4.6a.75.75 0 01.53.22l2.9 2.9a.75.75 0 01.22.53v8.6A1.75 1.75 0 0113.25 14h-.75v-1.5h.75a.25.25 0 00.25-.25V4.06L10.94 1.5H6.75a.25.25 0 00-.25.25V3H5V1.75z"/><path d="M1 4.75C1 3.784 1.784 3 2.75 3h5.6a.75.75 0 01.53.22l2.9 2.9a.75.75 0 01.22.53v7.6A1.75 1.75 0 0110.25 16h-7.5A1.75 1.75 0 011 14.25v-9.5zm1.75-.25a.25.25 0 00-.25.25v9.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25V7.06L7.44 4.5H2.75z"/></svg></div>` +
+      // 图标走统一那张表（src/agent/tool-icons.js），不再在这里内联一份。
+      // 内联的那份是旧的实心 Octicon：整套图标换成描边之后它没跟上，成了一屏卡片里
+      // 唯一一个实心的、灰的（用户实拍：「批量读取怎么没国外风格大厂图标」）。
+      `<div class="atc-type-icon" data-fam="${_toolIconFamily("readbatch")}">${_toolIconSvg("readbatch")}</div>` +
       `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">批量读取</span><span class="atc-path">${total} 个文件</span></div></div>` +
       `<span class="atc-result"><span class="atc-spin"></span><span class="atc-batch-count">0/${total}</span></span>` +
     `</div>` +

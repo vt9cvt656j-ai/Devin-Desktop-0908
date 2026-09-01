@@ -176,13 +176,46 @@ test("工具卡不再浮起来：没有阴影、不上浮、不滑入", () => {
 
 test("配色从主题变量推导，不再手工同步两份调色板", () => {
   const card = cardBlock();
-  for (const [name, token] of [["--atc-bg", "--panel-solid"], ["--atc-border", "--line"],
-                               ["--atc-text", "--text"], ["--atc-dim", "--text-dim"], ["--atc-accent", "--accent"]]) {
+  for (const [name, token] of [["--atc-border", "--line"], ["--atc-text", "--text"],
+                               ["--atc-dim", "--text-dim"], ["--atc-accent", "--accent"]]) {
     assert.match(card, new RegExp(`${name}: var\\(${token}\\)`), `${name} 没有从 ${token} 推导`);
   }
-  // 深色那份手工同步的覆盖删掉了：留着会把亮色下刚统一好的灰阶按住。
-  assert.doesNotMatch(CSS, /\[data-theme="dark"\] \.agent-tool-step,\s*\n\.dark \.agent-tool-step \{[^}]*--atc-bg/,
-    "深色那份 --atc-* 覆盖又回来了——两份手工同步的调色板必然漂移");
+});
+
+test("卡片底和它背后的面板必须是两个颜色——明暗都要", () => {
+  // 这条以前写的是「--atc-bg 从 --panel-solid 推导」，而助手栏本身就是 .panel、底色正是
+  // --panel-solid ——那条断言是真的，却守错了东西：它守出来的正是"卡片和背景同色、只剩
+  // 一圈边框"，用户实拍「卡片不是浅色的」。所以判据换成能证伪的那个：**把两套主题下的
+  // --atc-bg 和 --panel-solid 都解析成具体颜色，比它们相不相等。**
+  const varsIn = (block) => {
+    const m = {};
+    for (const [, k, v] of block.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)) m[k] = v.trim();
+    return m;
+  };
+  const blockOf = (sel) => {
+    const i = CSS.indexOf(sel);
+    assert.notStrictEqual(i, -1, `找不到 ${sel}`);
+    return CSS.slice(CSS.indexOf("{", i) + 1, CSS.indexOf("}", i));
+  };
+  const light = varsIn(blockOf(":root {"));
+  const dark = varsIn(blockOf('[data-theme="dark"] {'));
+  const card = varsIn(cardBlock());
+  const darkCard = varsIn(blockOf('[data-theme="dark"] .agent-tool-step,'));
+
+  // var(--x) 一层解引用就够——这几个变量都直接指向字面色值。
+  const solve = (val, pal) => {
+    const m = /^var\(\s*(--[\w-]+)\s*\)$/.exec(String(val || ""));
+    return (m ? pal[m[1]] : val) || "";
+  };
+
+  for (const [theme, pal, bgRaw] of [["浅色", light, card["--atc-bg"]],
+                                     ["深色", dark, darkCard["--atc-bg"]]]) {
+    const bg = solve(bgRaw, pal).toLowerCase();
+    const panel = solve(pal["--panel-solid"], pal).toLowerCase();
+    assert.ok(bg, `${theme}下没有定义 --atc-bg`);
+    assert.notStrictEqual(bg, panel,
+      `${theme}下卡片底 ${bg} 和面板 ${panel} 同色——卡片会整个融进背景，只剩一圈边框`);
+  }
 });
 
 test("右边那一列：不画框，靠颜色说话", () => {
