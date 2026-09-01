@@ -75198,11 +75198,31 @@ function _escHtmlLite(s) { return String(s).replace(/&/g, "&amp;").replace(/</g,
 // these shims serialize the DOM ⇄ text (a chip → "@rel"), so send / @-menu / slash-menu / arrow-nav /
 // paste all keep working UNCHANGED. Chips are contenteditable=false → the browser makes them atomic
 // (arrows skip them, Backspace deletes the whole chip). Chinese IME works natively. ----
+/*
+ * **分片进数组，末字符单独记住——不许 `out += …` 配 `out.endsWith("\n")`。**
+ *
+ * 那个写法是**二次**的：每遇到一个块级元素就对一个正在生长的字符串调一次 endsWith，
+ * 而 endsWith 会把 V8 的绳索字符串摊平，于是每一次都重新拷贝已经攒出来的全部内容。
+ * 在真浏览器里量过（输入框里塞进 N 行）：
+ *
+ *     1000 行 / 55K 字   9.3ms → 1.1ms
+ *     3000 行 / 169K 字  70.7ms → 2.0ms
+ *     6000 行 / 340K 字  299.4ms → 3.8ms      （79 倍）
+ *
+ * 这一段每次按键要跑好几遍（占位符、@ 菜单、/ 菜单、幽灵预测各要一次全文），所以它
+ * 直接就是用户报的「输入框内容一多就卡顿很久」——3000 行时每敲一个字要 528ms。
+ */
 function _ceSerialize(root) {
-  let out = "";
+  const parts = [];
+  let last = "";                                     // 已产出内容的最后一个字符
+  const push = (s) => { if (!s) return; parts.push(s); last = s[s.length - 1]; };
   const walk = (node) => {
     for (const c of node.childNodes) {
-      if (c.nodeType === 3) out += c.nodeValue.replace(/\u200b/g, ""); // strip zero-width caret pads
+      if (c.nodeType === 3) {
+        const v = c.nodeValue;
+        // 绝大多数文本节点里没有零宽垫片，先问一句比无条件跑一遍正则便宜。
+        push(v.includes("\u200b") ? v.replace(/\u200b/g, "") : v); // strip zero-width caret pads
+      }
       else if (c.nodeType === 1) {
         if (c.classList && c.classList.contains("composer-chip")) {
           // Chips carry NO editable spacer node in the DOM (so caret nav past a chip is one keypress).
@@ -75210,15 +75230,15 @@ function _ceSerialize(root) {
           // space-delimited — even two chips back-to-back ([chip][chip] → " @a  @b ") or a chip
           // dropped straight after a word ("看这个[chip]" → "看这个 @rel "). Unconditional (not
           // context-dependent) so _ceSetCaret can mirror the exact length below and stay in sync.
-          out += _chipText(c);
+          push(_chipText(c));
         }
-        else if (c.tagName === "BR") out += "\n";
-        else { if ((c.tagName === "DIV" || c.tagName === "P") && out && !out.endsWith("\n")) out += "\n"; walk(c); }
+        else if (c.tagName === "BR") push("\n");
+        else { if ((c.tagName === "DIV" || c.tagName === "P") && parts.length && last !== "\n") push("\n"); walk(c); }
       }
     }
   };
   walk(root);
-  return out;
+  return parts.join("");
 }
 function _ceCaretOffset() {
   try {

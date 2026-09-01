@@ -245,8 +245,14 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   （冻结滚动 + 松手时还原选区）全在 _wireSelectionDragToComposer 的闭包里，读的是
  *   monacoEditor 实例和 getBoundingClientRect，判据三条一条都不满足，搬不进 src/agent/。
  *   行为由 test/selection-drag.test.mjs 里那个假编辑器**真跑**出来，四条变异验过。
+ * · 82_440（2026-08-31，抬 20 行）：实测 82,437 行。买到的是**输入框内容一多就卡顿**那条
+ *   的修复：_ceSerialize 原本 `out += …` 配 `out.endsWith("\n")`，每遇到一个块级元素就把
+ *   正在生长的绳索字符串摊平一次——二次复杂度。在真浏览器里量的每次按键耗时：
+ *   500 行 14ms / 1000 行 31ms / 2000 行 181ms / 3000 行 528ms，改完是 4/4.6/10.7/12ms。
+ *   多出来的 20 行几乎全是那段注释（把三档实测数字钉在代码旁边，免得有人"顺手简化"回去）；
+ *   函数体本身只多了一个 push 辅助和一个 last 变量。它读 DOM，搬不进 src/agent/。
  */
-const MAIN_JS_MAX_LINES = 82_420;
+const MAIN_JS_MAX_LINES = 82_440;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
