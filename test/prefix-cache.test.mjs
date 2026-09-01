@@ -1233,7 +1233,18 @@ test("the paint optimization that blanks WebKit is granted, not assumed", () => 
   }
   // Earned, not assumed: nothing sets the class until the engine has been identified, so a blank
   // page is never what happens while that line is still loading.
-  assert.match(SRC, /if \(\/AppleWebKit\/\.test\(ua\) && !\/Chrome\|Chromium\|Edg\\\/\/\.test\(ua\)\) document\.body\.classList\.add\("is-webkit"\);\s*\n\s*else document\.body\.classList\.add\("cv-safe"\);/);
+  //
+  // 2026-08-31：判据从「是不是 WebKit」换成「**这个 WebKit 新到修过那个缺陷没有**」。
+  // 原来那条把优化关在了本应用最需要它的平台上——mac 上只能是 WKWebView，于是
+  // 「长对话跑着跑着就卡」在 mac 上从来没被治过（用户实拍：内容一多就卡死好多秒）。
+  // 探测用的是和 content-visibility 直接相关的那个 API（Safari 17.4 才有，而那批渲染
+  // 缺陷正是 17.x 修掉的）；探不到就照旧保守，老引擎行为一个字不变。
+  assert.match(SRC, /const canSkipOffscreen = typeof document\.body\.checkVisibility === "function";/,
+    "能力探测没了——判据又变回按引擎名一刀切");
+  assert.match(SRC, /if \(!isWebKit \|\| canSkipOffscreen\) out\.push\("cv-safe"\);/,
+    "grant 的判据被改了");
+  assert.match(SRC, /for \(const c of _engineRenderClasses\(navigator\.userAgent, canSkipOffscreen\)\) document\.body\.classList\.add\(c\);/,
+    "判定结果没有真的加到 body 上——类不加，样式那一侧等于不存在");
   assert.match(SRC, /catch \{ \/\* no navigator \(tests\) → stay on the safe side and skip the optimization \*\/ \}/);
 });
 

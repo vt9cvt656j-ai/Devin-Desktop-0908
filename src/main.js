@@ -290,17 +290,39 @@ if (/Mac/i.test(navigator.platform || navigator.userAgent)) {
   //    Windows 上整体偏粗偏糊——只有拿到这个钩子才补得回来。
   document.body.classList.add("is-win");
 }
-// `content-visibility: auto` is what keeps a long conversation from getting heavy — it skips
-// layout and paint for everything off-screen. It is also, in WebKit, what leaves BLANK REGIONS
-// behind when you scroll: the element is skipped for rendering and its placeholder is painted
-// empty, so a scroll can land on a white page. On macOS this app runs in WKWebView and cannot
-// avoid that engine; on Windows it runs in WebView2, which is Chromium and does not have the
-// defect. So the optimization is granted rather than assumed — a class the engine has to earn,
-// which also means a blank page is never the default while this line is loading.
+/*
+ * `content-visibility: auto` is what keeps a long conversation from getting heavy — it skips
+ * layout and paint for everything off-screen. It also used to, in WebKit, leave BLANK REGIONS
+ * behind when you scroll: the element was skipped for rendering and its placeholder painted
+ * empty, so a scroll could land on a white page. So the optimization is granted rather than
+ * assumed — a class the engine has to earn.
+ *
+ * **但那道排除是照着老 WebKit 写的，而它把优化关在了本应用最需要它的那个平台上。**
+ * macOS 上跑的是 WKWebView，于是「长对话跑着跑着就卡」——这段注释自己写着那是根因——
+ * 在 mac 上从来没有被治过。用户报的「内容一多就卡死好多秒」正是这个。
+ *
+ * 判据从「是不是 WebKit」换成「**这个 WebKit 新到修过那个缺陷没有**」，用一个语义相关的
+ * 能力探测：`Element.prototype.checkVisibility`（带 contentVisibilityAuto 选项）——它就是
+ * 为 content-visibility 加的 API，Safari 17.4 才有，而那批渲染缺陷正是 17.x 修掉的。
+ * 老引擎探不到这个方法，照旧走保守路径，一个字都不变。
+ *
+ * 这条判据是**可当场推翻的**：万一还是出现滚动白屏，去掉 canSkipOffscreen 那一段即可，
+ * 代价只是回到今天的性能。
+ */
+function _engineRenderClasses(ua, canSkipOffscreen) {
+  const s = String(ua || "");
+  const isWebKit = /AppleWebKit/.test(s) && !/Chrome|Chromium|Edg\//.test(s);
+  const out = [];
+  if (isWebKit) out.push("is-webkit");
+  if (!isWebKit || canSkipOffscreen) out.push("cv-safe");
+  return out;
+}
 try {
-  const ua = navigator.userAgent || "";
-  if (/AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua)) document.body.classList.add("is-webkit");
-  else document.body.classList.add("cv-safe");
+  // 探 document.body 而不是 Element.prototype：仓库有一条「客户端模块不许有未声明标识符」
+  // 的守卫，它按名单认全局，Element 不在名单里——写它会被判成 ReferenceError 风险。
+  // body 此刻必然存在（下一行就要往它身上加类）。
+  const canSkipOffscreen = typeof document.body.checkVisibility === "function";
+  for (const c of _engineRenderClasses(navigator.userAgent, canSkipOffscreen)) document.body.classList.add(c);
 } catch { /* no navigator (tests) → stay on the safe side and skip the optimization */ }
 const backend = inTauri ? await tauriBackend() : mockBackend();
 

@@ -251,8 +251,15 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   500 行 14ms / 1000 行 31ms / 2000 行 181ms / 3000 行 528ms，改完是 4/4.6/10.7/12ms。
  *   多出来的 20 行几乎全是那段注释（把三档实测数字钉在代码旁边，免得有人"顺手简化"回去）；
  *   函数体本身只多了一个 push 辅助和一个 last 变量。它读 DOM，搬不进 src/agent/。
+ * · 82_460（2026-08-31，抬 20 行）：实测 82,458 行。买到的是**把长对话那道优化放回 mac**：
+ *   content-visibility: auto（跳过视口外消息的布局与绘制）此前按「是不是 WebKit」一刀切地
+ *   关掉，而 macOS 上这个应用只能跑 WKWebView——app.css 自己写着它是「长对话跑着跑着就卡
+ *   的根因」的解药，而 mac 用户从来没拿到过。判据换成能力探测（和 content-visibility 直接
+ *   相关的那个 API，Safari 17.4 才有，那批渲染缺陷正是 17.x 修掉的），老引擎行为不变。
+ *   多出来的 20 行是那段判据的来龙去脉 + 一个可直接跑的小函数（_engineRenderClasses，
+ *   它就是为了让这道判据能被测试真跑而拆出来的）。
  */
-const MAIN_JS_MAX_LINES = 82_440;
+const MAIN_JS_MAX_LINES = 82_460;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
