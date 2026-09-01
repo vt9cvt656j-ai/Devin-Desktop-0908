@@ -20571,7 +20571,7 @@ function _ctxPartsForStorage(session) {
   if (!p || typeof p !== "object") return undefined;
   const n = (v) => Math.max(0, Math.round(Number(v) || 0));
   const out = { l0: !!p.l0, at: Number(p.at) || 0 };
-  const KEYS = ["system", "rules", "skills", "tools", "mcp", "history"];
+  const KEYS = ["system", "rules", "skills", "tools", "mcp", "subagent", "history"];
   for (const k of KEYS) out[k] = n(p[k]);
   // 一项都没有就别写：空对象存进去只会让"还拆不出来源"变成"全是 0"，后者更像坏了。
   return KEYS.some((k) => out[k] > 0) ? out : undefined;
@@ -21414,6 +21414,7 @@ function _ctxPartsRows() {
       { key: "rules", label: "用户规则", tokens: p.rules },
       { key: "skills", label: "技能", tokens: p.skills },
       { key: "mcp", label: "MCP 与动态工具", tokens: p.mcp },
+      { key: "subagent", label: "子智能体定义", tokens: p.subagent },
       { key: "history", label: "对话", tokens: p.history },
     ];
     const v = _contextPartsView({ parts, total: Number(_ctxMeter?.prompt) || 0, l0: !!p.l0 });
@@ -30369,19 +30370,29 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       rules: _estimateTokens(userRulesBlock),
       skills: _estimateTokens(skillsBlock),
       /*
-       * 「系统提示词」= **这一轮客户端真发出去的那份**，两条线路各是一半：
-       *  · 走网关：客户端拼的那份被 _l0MessagesWithSkills 整条丢掉，活下来的只有
-       *    clientBlocks（语言 / 自适应 / 模型族微调 / 鉴权）——那就是客户端这一侧的系统提示词；
-       *  · 自定义端点：客户端自己拼的整份原样发出。
-       * 分类名跟 Claude Code 那套走（系统提示词 / 工具定义 / 用户规则 / 技能 /
-       * MCP 与动态工具 / 对话），不再自造「语言 / 自适应 / 鉴权块」这种只有我自己看得懂的名字。
+       * 「系统提示词」——**两条线路都量得到**，这一点我先前判错过。
+       *
+       * 走网关时客户端拼的那条 system 消息确实被 _l0MessagesWithSkills 整条丢掉、由网关注入
+       * 自己那份；但**网关那份的正文，客户端手里就有**：_P() 取的是 _remotePrompts，
+       * 而 _remotePrompts 正是启动时从网关 /api/ide-prompts 拉下来的同一份文本
+       * （拉不到才退回打包的兜底版）。所以量它不是"拿本地的东西冒充网关的"，
+       * 而是量同一份文本。
+       *
+       * 于是这一项 = 提示词正文 + 这一轮真发出去的客户端块，两条线路同一个算法。
+       * 唯一量不到的只剩**内置工具定义**（发布版把 141 条描述剥空了），它由下面的
+       * 「工具定义」按差额补齐。
        */
-      system: _l0
-        ? _estimateTokens(languageBlock + adaptiveBlock + _modelFamilyTuning(config.model) + _authContextBlock())
-        : _estimateTokens(sysPrompt + _modelStyleTuning(config.model) + (_ipSafeRoute(config) ? _toolHint : "")),
+      system: _estimateTokens(
+        sysPrompt + _modelStyleTuning(config.model)
+        + languageBlock + adaptiveBlock + _modelFamilyTuning(config.model) + _authContextBlock()
+        + (_ipSafeRoute(config) ? _toolHint : ""),
+      ),
+      // 子智能体定义：声明了角色时才有正文进这一轮（没声明就是 0，那一行自然不显示）。
+      subagent: _estimateTokens(_agentRoleBlock(effectiveMode) || ""),
       // 对话：这一轮真正带上去的那些消息（不含最前面那条 system）。
       history: 0,
       // 工具定义 / MCP 与动态工具：请求体里真带的那些 schema，发送前分开量（见下面的 useTools 处）。
+      // 走网关时内置工具只发名字，「工具定义」那一格由面板按差额补齐（见 context-parts.js）。
       tools: 0,
       mcp: 0,
     };

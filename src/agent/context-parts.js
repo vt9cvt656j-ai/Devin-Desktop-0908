@@ -51,22 +51,22 @@ export function contextPartsView(opts) {
   const rows = list.map((p) => ({ ...p, text: short(p.tokens), estimated: true }));
   const residual = real - known;
   /*
-   * 走网关时，客户端拼的系统提示词会被整条替换、内置工具只发名字——那两样的**体积**
-   * 客户端量不到。所以按「上游真实读数 − 客户端各块」倒推，并把这件事写进**标签本身**
-   * （「· 网关组装」），而不是在面板下面另起一段说明：用户点名删掉了那几行注解，
-   * 而出处不能跟着一起消失。
+   * 走网关时，客户端唯一量不到的是**内置工具定义**的体积：发布版把 141 条工具描述剥空了，
+   * 网关按名回填。系统提示词那一项已经量得到（客户端手里就是网关那份文本，见 main.js 里
+   * _ctxParts.system 的说明），所以剩下的差额就是它——按「上游真实读数 − 客户端各块」补齐，
+   * 不打「估」字：它是从真数减出来的，不是估的。
    *
-   * 倒推为负说明客户端估大了，那就不画这一行——一个负数或者一个抹平成 0 的数，
-   * 比没有这一行更糟。
+   * 补出来 ≤ 0 说明估算偏大，就不画这一行：一个负数、或者抹平成 0 的数，都比没有更糟。
    */
   if (l0 && residual > 0) {
-    rows.push({
-      key: "gateway",
-      label: "系统提示词 + 工具定义 · 网关组装",
-      tokens: residual,
-      text: short(residual),
-      estimated: false,
-    });
+    const at = rows.findIndex((r) => r.key === "tools");
+    const row = { key: "tools", label: "工具定义", tokens: residual, text: short(residual), estimated: false };
+    // 客户端那边量到的「工具定义」只是随请求体发出的那几条（MCP 已单列），
+    // 网关注入的内置工具不在其中——两者是同一类，合成一行，按真数为准。
+    if (at >= 0) { row.tokens += rows[at].tokens; row.text = short(row.tokens); rows.splice(at, 1); }
+    // 位置跟 Claude Code 一致：系统提示词之后就是工具定义。
+    const after = rows.findIndex((r) => r.key === "system");
+    rows.splice(after >= 0 ? after + 1 : 0, 0, row);
   }
   return { pending: false, rows, known, real };
 }

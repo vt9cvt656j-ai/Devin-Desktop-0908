@@ -16773,7 +16773,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .ctx-panel__seg--mcp,      .ctx-panel__dot--mcp      { background: #4bb3c4; }
 .ctx-panel__seg--tools,    .ctx-panel__dot--tools    { background: #7c6cf0; }
 .ctx-panel__seg--history,  .ctx-panel__dot--history  { background: #e5687a; }
-.ctx-panel__seg--gateway,  .ctx-panel__dot--gateway  { background: #b28ce8; }
+.ctx-panel__seg--subagent, .ctx-panel__dot--subagent { background: #6aa9f0; }
 .ctx-panel__notes {
   margin-top: 10px; padding-top: 9px;
   border-top: 1px solid rgba(128, 128, 128, .14);
