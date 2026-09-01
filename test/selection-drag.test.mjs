@@ -145,3 +145,115 @@ test("⌘/Ctrl + 单击直接跳过去，不弹 Peek", () => {
   assert.match(SRC, /monaco\.editor\.registerEditorOpener\(\{/,
     "跨文件跳转的 opener 没了——跳到别的文件会静默什么都不发生");
 });
+
+// ── 拖的过程里编辑器不许自己滚 ─────────────────────────────────────────────
+//
+// 用户实拍：「将文件内容选中后拖拽对话框时候，不应该滚轮往上和往下，可能一下滑到底下的
+// 代码或者顶上代码」。真凶在 Monaco：指针一离开内容区，mouseHandler 里
+// `position.type === OUTSIDE_EDITOR` 那条分支就启动 TopBottom/LeftRight DragScrolling，
+// 每 10ms 一次，一边滚一边用 _dispatchMouse 把选区**朝指针方向拉长**。
+//
+// 这一份**真跑**那段接线：造一个假编辑器，按下、拖出去、发一次滚动事件，看它拨不拨回去。
+function runSelectionDrag({ scrollMax = Infinity } = {}) {
+  const calls = { setTop: [], setLeft: [], setSel: [], chips: [], disposed: 0 };
+  const listeners = {};
+  const rect = (l, t, w, h) => () => ({ left: l, top: t, right: l + w, bottom: t + h, width: w, height: h });
+  const cls = () => ({ add() {}, remove() {}, toggle() {} });
+  const box = { getBoundingClientRect: rect(900, 700, 300, 80), classList: cls() };
+  const promptEl = { closest: () => box };
+  const editorEl = {
+    getBoundingClientRect: rect(100, 100, 700, 500),
+    addEventListener: (t, fn) => { listeners["editor:" + t] = fn; },
+  };
+  let scrollTop = 4200, scrollLeft = 0, scrollCb = null;
+  const SEL = { startLineNumber: 22, endLineNumber: 39, isEmpty: () => false, containsPosition: () => true };
+  const monacoEditor = {
+    getSelection: () => SEL,
+    getModel: () => ({ getLanguageId: () => "markdown", getValueInRange: () => "code" }),
+    getTargetAtClientPoint: () => ({ position: { lineNumber: 30, column: 1 } }),
+    getScrollTop: () => scrollTop,
+    getScrollLeft: () => scrollLeft,
+    // 照 Monaco 的真实语义来：**setScrollTop 自己会再发一次滚动事件**。少了这一条，
+    // 「自激」那条测试就是恒真的——回拨代码不管写没写防护都只会被调一次。
+    setScrollTop: (v) => {
+      calls.setTop.push(v);
+      if (calls.setTop.length > 40) throw new Error("回拨自激了：一次滚动引出了停不下来的来回");
+      // 夹取是真实存在的：文档变短之后，Monaco 会把 setScrollTop 夹到当前最大值。
+      // 于是"拨回去"永远拨不到目标值——没有自激防护的话这里就是一个停不下来的来回。
+      scrollTop = Math.min(v, scrollMax); scrollCb?.();
+    },
+    setScrollLeft: (v) => { calls.setLeft.push(v); scrollLeft = v; scrollCb?.(); },
+    onDidScrollChange: (cb) => { scrollCb = cb; return { dispose: () => { calls.disposed++; scrollCb = null; } }; },
+    setSelection: (s) => calls.setSel.push(s),
+  };
+  const body = blockFrom("(function _wireSelectionDragToComposer() {");
+  new Function(
+    "promptEl", "editorEl", "monacoEditor", "document", "window", "activePath",
+    "_pathToRel", "_selectionLabel", "_selectionToken", "_insertRefAtCursor",
+    `(function()${body})();`,
+  )(
+    promptEl, editorEl, monacoEditor,
+    {
+      addEventListener: (t, fn) => { listeners["doc:" + t] = fn; },
+      body: { classList: cls(), appendChild() {} },
+      createElement: () => ({ className: "", textContent: "", style: {}, remove() {} }),
+    },
+    { getSelection: () => ({ removeAllRanges() {} }) },
+    "/w/README.md", () => "README.md", () => "README.md:22-39", () => "@code:README.md#22-39",
+    (...a) => calls.chips.push(a),
+  );
+  return {
+    calls,
+    down: (x, y) => listeners["editor:mousedown"]({ button: 0, clientX: x, clientY: y }),
+    move: (x, y) => listeners["doc:mousemove"]({ clientX: x, clientY: y }),
+    up: (x, y) => listeners["doc:mouseup"]({ clientX: x, clientY: y }),
+    scrollTo: (v) => { scrollTop = v; scrollCb?.(); },
+    top: () => scrollTop,
+  };
+}
+
+test("拖的过程里 Monaco 自己滚了，要被拨回去", () => {
+  const h = runSelectionDrag();
+  h.down(300, 300);              // 按在选区里
+  h.move(320, 305);              // 走够阈值 → 开始拖，此刻记下 4200
+  h.scrollTo(0);                 // Monaco 的 DragScrolling 把它滚到了顶上
+  assert.deepEqual(h.calls.setTop, [4200], "滚上去了却没拨回来——用户拖到一半代码就飞走了");
+  assert.equal(h.top(), 4200);
+  h.scrollTo(9999);              // 再滚到底
+  assert.deepEqual(h.calls.setTop, [4200, 4200], "只拨得回第一次");
+});
+
+test("拨回去不许自激：目标值被夹住时也只拨一次", () => {
+  // setScrollTop 自己会再发一次滚动事件，而**它不保证落到你给的那个值**——文档变短之后
+  // Monaco 会把它夹到当前最大值。于是 `拨到的值 !== 想要的值` 永远成立：没有自激防护，
+  // 这里就是一个停不下来的来回（真机上是主线程直接卡死）。
+  const h = runSelectionDrag({ scrollMax: 1000 });   // 想拨回 4200，最多只能到 1000
+  h.down(300, 300); h.move(320, 305);
+  assert.doesNotThrow(() => h.scrollTo(0), "回拨自激了——一次滚动引出停不下来的来回");
+  assert.equal(h.calls.setTop.length, 1, "一次滚动引出了不止一次回拨");
+});
+
+test("松手落在编辑器外：被拉长的选区还原；落在里面不碰它", () => {
+  const out = runSelectionDrag();
+  out.down(300, 300); out.move(320, 305);
+  out.up(1000, 730);             // 落在输入框上（编辑器外）
+  assert.equal(out.calls.setSel.length, 1, "落在编辑器外却没还原选区——它已经被 Monaco 拉长了");
+  assert.equal(out.calls.chips.length, 1, "落到输入框上没插片");
+  assert.ok(out.calls.disposed >= 1, "滚动监听没退订——拖完之后编辑器就再也滚不动了");
+
+  const inside = runSelectionDrag();
+  inside.down(300, 300); inside.move(320, 305);
+  inside.up(400, 300);           // 落在编辑器里 = Monaco 自己的「拖动选中文字来移动它」
+  assert.equal(inside.calls.setSel.length, 0, "落在编辑器里还去还原选区，会跟 Monaco 的移动打架");
+  assert.equal(inside.calls.chips.length, 0, "没落到输入框上却插了片");
+  assert.ok(inside.calls.disposed >= 1, "滚动监听没退订");
+});
+
+test("没拖起来（只是点了一下）就不冻结、也不还原", () => {
+  const h = runSelectionDrag();
+  h.down(300, 300);
+  h.up(300, 300);                // 没走够阈值
+  assert.deepEqual(h.calls.setTop, []);
+  assert.equal(h.calls.setSel.length, 0, "点一下就把选区改了");
+  assert.equal(h.calls.chips.length, 0);
+});

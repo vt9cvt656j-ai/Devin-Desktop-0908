@@ -76019,8 +76019,44 @@ async function _moveIntoDir(paths, destDir) {
     const r = box.getBoundingClientRect();
     return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
   };
+  const inEditor = (x, y) => {
+    const r = editorEl.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
+  /*
+   * **拖的过程里编辑器不许自己滚，选区也不许自己长。**
+   *
+   * 用户实拍：往输入框拖的时候代码"一下滑到最底下或者最顶上"。真凶是 Monaco：指针一离开
+   * 内容区，mouseHandler 里 `position.type === OUTSIDE_EDITOR` 那条分支就启动 DragScrolling
+   * ——每 10ms 一次，一边滚一边用 _dispatchMouse 把选区**朝指针方向拉长**。它本该只在框选时
+   * 发生（按在选区上走的是 isDragAndDrop，那条既不滚也不改选区），但那道门有六个条件，其中
+   * `e.detail < 2` 很容易不成立：选完文字紧接着按下去，这一下常被算作双击的第二下。
+   *
+   * 与其猜是哪个条件没过，不如把后果摁住：拖起来时记下滚动位置和原选区，期间任何滚动都拨
+   * 回去；松手时若落点在编辑器外，把被拉长的选区也还原（落在里面不还原——那是 Monaco 自己
+   * 的「拖动选中文字来移动它」，还原会跟它打架）。
+   */
+  let frozen = null, origSel = null, unfreeze = null;
+  const freeze = () => {
+    try {
+      frozen = { top: monacoEditor.getScrollTop(), left: monacoEditor.getScrollLeft() };
+      origSel = monacoEditor.getSelection();
+      let bouncing = false;
+      const sub = monacoEditor.onDidScrollChange(() => {
+        if (!dragging || !frozen || bouncing) return;
+        bouncing = true;   // setScrollTop 自己会再发一次事件，不挡就是一次自激
+        try {
+          if (monacoEditor.getScrollTop() !== frozen.top) monacoEditor.setScrollTop(frozen.top);
+          if (monacoEditor.getScrollLeft() !== frozen.left) monacoEditor.setScrollLeft(frozen.left);
+        } finally { bouncing = false; }
+      });
+      unfreeze = () => { try { sub.dispose(); } catch {} };
+    } catch { frozen = null; origSel = null; unfreeze = null; }
+  };
   const clear = () => {
     cand = null; dragging = false;
+    if (unfreeze) { unfreeze(); unfreeze = null; }
+    frozen = null; origSel = null;
     if (ghost) { ghost.remove(); ghost = null; }
     document.body.classList.remove("tree-dragging");
     box.classList.remove("drop-target");
@@ -76049,6 +76085,7 @@ async function _moveIntoDir(paths, destDir) {
     if (!dragging) {
       if (Math.abs(e.clientX - cand.sx) + Math.abs(e.clientY - cand.sy) < 6) return;
       dragging = true;
+      freeze();
       document.body.classList.add("tree-dragging");
       ghost = document.createElement("div");
       ghost.className = "row-drag-ghost";
@@ -76063,7 +76100,10 @@ async function _moveIntoDir(paths, destDir) {
     if (!cand) return;
     const hit = dragging && over(e.clientX, e.clientY);
     const c = cand;
+    // 落在编辑器外：把 Monaco 拖动途中拉长的选区还原成按下去时的那一段。
+    const restore = dragging && origSel && !inEditor(e.clientX, e.clientY) ? origSel : null;
     clear();
+    if (restore) { try { monacoEditor.setSelection(restore); } catch {} }
     if (!hit) return;
     try { window.getSelection().removeAllRanges(); } catch {}
     // 片带的是**短记号**（@code:路径#起-止），不是整段代码：这样发出去的气泡里也是一枚片，

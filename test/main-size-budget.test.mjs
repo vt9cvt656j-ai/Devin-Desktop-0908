@@ -239,8 +239,14 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   xterm 实例和 .xterm-screen 的 getBoundingClientRect——判据里那三条（依赖参数 / 没有
  *   DOM / 没有模块级可变状态）一条都不满足，搬不动；快照仓库 _termPicked 同理，它和
  *   _previewPicked 是同一种东西，放在一起才看得出这两条路子是一套。
+ * · 82_420（2026-08-31，抬 40 行）：实测 82,415 行。买到的是**拖选区的时候编辑器不再自己
+ *   滚**（用户实拍：往输入框拖，代码一下滑到最底或最顶）。真凶在 Monaco 的 mouseHandler：
+ *   指针一离开内容区就启动 DragScrolling，边滚边把选区朝指针方向拉长。摁住后果的那一段
+ *   （冻结滚动 + 松手时还原选区）全在 _wireSelectionDragToComposer 的闭包里，读的是
+ *   monacoEditor 实例和 getBoundingClientRect，判据三条一条都不满足，搬不进 src/agent/。
+ *   行为由 test/selection-drag.test.mjs 里那个假编辑器**真跑**出来，四条变异验过。
  */
-const MAIN_JS_MAX_LINES = 82_380;
+const MAIN_JS_MAX_LINES = 82_420;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
