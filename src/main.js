@@ -62419,8 +62419,7 @@ async function _executeToolStepInner(step, call, root, run) {
         if (!_runInteractionLive(run)) { finish("cancel"); return; }
         const _auSubmitMulti = () => {
           const labels = [..._auSelected].sort((a, b) => a - b).map((i) => opts[i].label);
-          if (labels.length) finish("multi", { labels });
-        };
+          if (labels.length) finish("multi", { labels }); };
         const _auSyncMulti = () => {
           vp.querySelectorAll("._auOpt").forEach((b) => {
             const on = _auSelected.has(+b.dataset.i);
@@ -62452,37 +62451,36 @@ async function _executeToolStepInner(step, call, root, run) {
           const isRec = _auRecommended === i;
           return `<button type="button" class="au-opt _auOpt${isRec ? " au-opt--rec" : ""}" data-i="${i}"`
             + ` role="${_auMulti ? "checkbox" : "radio"}" aria-checked="false">`
-            + (_auMulti ? `<span class="au-check"></span>` : `<span class="au-badge">${i + 1}</span>`)
+            + `<span class="au-mark"></span>`
             + `<span class="au-opt__body"><span class="au-opt__label">${_escHtml(o.label)}`
             + (isRec ? `<em class="au-rec">推荐</em>` : "") + `</span>`
-            + (o.description ? `<span class="au-opt__desc">${_escHtml(o.description)}</span>` : "")
-            + `</span></button>`;
+            + (o.description ? `<span class="au-opt__desc">${_escHtml(o.description)}</span>` : "") + `</span>`
+            + `<span class="au-key">${i + 1}</span></button>`;
         }).join("");
         // 抬头写明**这是哪一种选择**：多选卡片长得和单选一样时，用户点了第一项就走。
         const kindHint = _auConfirm ? "危险操作 · 需要输入确认文本"
           : _auMulti ? "多选 · 可以勾多项，选好后提交"
           : opts.length ? "单选 · 点一项即可，也可以自己写"
           : "自己写一句就行";
-        const confirmRow = _auConfirm
-          ? `<div class="au-confirm-row"><span class="au-confirm-warn">请输入 <b>${_escHtml(_auConfirm)}</b> 以确认</span><div class="au-row"><input class="au-custom _auConfirmInput" placeholder="输入确认文本…"><button type="button" class="au-send au-send--danger _auConfirmBtn" disabled>确认执行</button></div></div>`
-          : `<div class="au-row"><input class="au-custom _auCustom" placeholder="${opts.length ? "或者，自己输入你的需求…" : "把你想要的写在这里…"}"><button type="button" class="au-send _auSend">发送</button></div>`;
+        // 「其他」是列表里的最后一行，不在底下另起一块：自己写和选一项是同一层的选择。
+        const otherRow = `<div class="au-opt au-opt--other"><span class="au-mark"></span>`
+          + `<span class="au-opt__body"><input class="au-custom _auCustom" placeholder="${opts.length ? "其他……自己写一句" : "把你想要的写在这里…"}"></span>`
+          + `<button type="button" class="au-key au-key--go _auSend" title="发送">↩</button></div>`;
+        const confirmRow = `<div class="au-confirm-row"><span class="au-confirm-warn">请输入 <b>${_escHtml(_auConfirm || "")}</b> 以确认</span>`
+          + `<div class="au-row"><input class="au-custom au-custom--boxed _auConfirmInput" placeholder="输入确认文本…"><button type="button" class="au-send au-send--danger _auConfirmBtn" disabled>确认执行</button></div></div>`;
         vp.innerHTML =
           `<div class="au-card">`
-          + `<div class="au-head"><span class="au-kind">${_escHtml(kindHint)}</span></div>`
+          + `<div class="au-kind">${_escHtml(kindHint)}</div>`
           + `<div class="au-q">${_escHtml(q)}</div>`
-          + (btns ? `<div class="au-opts" role="${_auMulti ? "group" : "radiogroup"}">${btns}</div>` : "")
-          + (_auMulti ? `<div class="au-multibar"><button type="button" class="au-send _auMultiSubmit" disabled>提交所选</button></div>` : "")
-          + confirmRow
-          + (_auConfirm ? "" : `<div class="au-foot"><button type="button" class="au-auto _auAuto">让 AI 自行判断</button></div>`)
+          + (_auConfirm ? confirmRow : `<div class="au-opts" role="${_auMulti ? "group" : "radiogroup"}">${btns}${otherRow}</div>`)
+          + (_auConfirm ? "" : `<div class="au-foot"><button type="button" class="au-auto _auAuto">让 AI 自行判断</button>`
+            + (_auMulti ? `<button type="button" class="au-submit _auMultiSubmit" disabled>提交所选</button>` : "") + `</div>`)
           + `</div>`;
         vp.querySelectorAll("._auOpt").forEach((b) => b.addEventListener("click", () => {
           const i = +b.dataset.i;
           if (_auMulti) _auToggle(i); else finish("single", { label: opts[i].label });
         }));
-        if (_auMulti) {
-          _auSyncMulti();
-          vp.querySelector("._auMultiSubmit")?.addEventListener("click", _auSubmitMulti);
-        }
+        if (_auMulti) { _auSyncMulti(); vp.querySelector("._auMultiSubmit")?.addEventListener("click", _auSubmitMulti); }
         if (_auConfirm) {
           const cInput = vp.querySelector("._auConfirmInput");
           const cBtn = vp.querySelector("._auConfirmBtn");

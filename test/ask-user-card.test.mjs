@@ -74,10 +74,22 @@ test("抬头要写明这是单选还是多选", () => {
 });
 
 test("多选的选中态在样式上要一眼看得出来", () => {
-  assert.match(CSS, /\.au-opt--checked \{[^}]*border-color: var\(--accent\)/, "勾选的行没有强调边框");
-  assert.match(CSS, /\.au-opt--checked \.au-check::after \{[^}]*scale\(1\)/, "复选框里没有勾");
+  // 选项列表是一整块（行间只有发丝线），所以选中态靠**底色 + 标记上色**，不是给单行加边框。
+  assert.match(CSS, /\.au-opt--checked \{ background: var\(--sel\); \}/, "勾选的行没有底色");
+  assert.match(CSS, /\.au-opt--checked \.au-mark \{[^}]*background: var\(--accent\)/, "标记选中了却不上色");
+  assert.match(CSS, /\.au-opt\[role="checkbox"\]\.au-opt--checked \.au-mark::after \{[^}]*scale\(1\)/, "多选方框里没有勾");
   assert.match(CSS, /\.au-opt__desc \{[^}]*color: var\(--text-dim\)/, "选项的说明行样式没了");
-  assert.match(CSS, /\.au-send:disabled/, "提交按钮没有禁用态——一项没勾也能点");
+  assert.match(CSS, /\.au-submit:disabled/, "提交按钮没有禁用态——一项没勾也能点");
+  // Claude Code 那张卡的关键长相：选项是**一整块列表**，不是各自带边框、互相隔开的胶囊。
+  assert.match(CSS, /\.au-opts \{[^}]*border: 1px solid var\(--line\)[^}]*overflow: hidden/, "选项列表不再是一整块");
+  assert.match(CSS, /\.au-opt \+ \.au-opt \{ border-top: 1px solid var\(--line\); \}/, "行与行之间的发丝线没了");
+  assert.doesNotMatch(CSS, /\.au-badge/, "蓝色号码块又回来了——序号该退到右边当键盘提示");
+});
+
+test("「其他」是选项列表里的一行，不在底下另起一块", () => {
+  // 自己写和选一项是同一层的选择。摆成两块，用户会以为得先选一项、再顺便写点什么。
+  assert.match(CARD, /class="au-opt au-opt--other"/, "「其他」不在列表里了");
+  assert.match(CARD, /\$\{btns\}\$\{otherRow\}/, "「其他」没有接在选项后面");
 });
 
 test("提交所选要显示已选了几项，且一项没勾时点不动", () => {

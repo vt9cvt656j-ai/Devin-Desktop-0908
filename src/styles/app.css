@@ -6894,81 +6894,104 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .agent-tool-step--askuser > .atc-viewport { display: block !important; background: transparent; }
 /* ── ask_user card ── */
 /*
- * 照 Claude Code 那张问答卡做：一行说明**这是哪一种选择**，问题一行，选项是带序号（或复选
- * 框）的整行按钮、标签下面可以再挂一行小字，最后是自由输入。**没有倒计时**——原来那句
- * 「109s 后自动继续」是在催用户，而它催的那件事（超时替他决定）恰恰是这张卡片要避免的。
+ * 照 Claude Code 那张问答卡做，克制是它的全部要点：
+ *  · 选项是**一整块列表**，行与行之间只有一条发丝线——不是一堆各自带边框、互相隔开的胶囊。
+ *  · 标记是单选圆点 / 多选方框，**不是**蓝色圆角号码块；序号退到右侧当键盘提示。
+ *  · 「其他」是列表里的**最后一行**，和选项同一层；不在底下另起一块输入区。
+ *  · 主色只用在选中态和那一个提交动作上，别处一律灰阶。
+ *  · 没有倒计时。
  */
-.au-card { padding: 14px 16px 12px; }
-.au-head { display: flex; align-items: center; margin: 0 0 8px; }
-.au-kind {
-  font-size: 11px; font-weight: 600; letter-spacing: .02em; color: var(--text-dim);
-  padding: 2px 8px; border-radius: 999px; background: var(--sel);
-}
-.au-q { font-size: 14px; font-weight: 600; color: var(--text); margin: 0 0 12px; line-height: 1.55; }
-.au-opts { display: flex; flex-direction: column; gap: 6px; }
+.au-card { padding: 13px 14px 11px; }
+.au-kind { font-size: 11px; color: var(--text-dim); letter-spacing: .02em; margin-bottom: 6px; }
+.au-q { font-size: 14px; font-weight: 600; color: var(--text); margin: 0 0 11px; line-height: 1.55; }
+
+.au-opts { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel-solid); }
 .au-opt {
-  display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left; padding: 10px 13px;
-  border: 1px solid var(--line); border-radius: 10px;
-  background: var(--panel); color: var(--text); cursor: pointer;
-  font-size: 13px; line-height: 1.45;
-  transition: background .13s ease, border-color .13s ease, box-shadow .13s ease;
+  display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left;
+  padding: 10px 12px; border: 0; border-radius: 0; background: transparent; color: var(--text);
+  cursor: pointer; font-size: 13px; line-height: 1.45; transition: background .12s ease;
 }
-.au-opt:hover { background: var(--sel); border-color: var(--accent); box-shadow: 0 1px 4px rgba(10,132,255,.1); }
-.au-opt:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.au-opt + .au-opt { border-top: 1px solid var(--line); }
+.au-opt:hover { background: var(--sel); }
+.au-opt:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .au-opt__body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
 .au-opt__label { display: flex; align-items: center; gap: 6px; font-weight: 500; }
 /* 说明那一行：标签分不出差别时，真正决定用户怎么选的是它（会不会丢数据、要多久）。 */
 .au-opt__desc { font-size: 12px; color: var(--text-dim); line-height: 1.5; }
-.au-badge {
-  flex-shrink: 0; margin-top: 1px; width: 20px; height: 20px; border-radius: 6px;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--sel); color: var(--accent); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums;
+
+/* 标记：单选是圆点，多选是方框。默认灰阶，选中才上色。 */
+.au-mark {
+  position: relative; flex-shrink: 0; margin-top: 2px; width: 15px; height: 15px;
+  border: 1.5px solid var(--line-strong); border-radius: 50%;
+  transition: border-color .12s ease, background .12s ease;
 }
-.au-opt:hover .au-badge { background: var(--accent); color: #fff; }
-.au-opt--rec { border-color: var(--accent); background: var(--sel); }
-.au-rec {
-  flex-shrink: 0; padding: 1px 6px; border-radius: 4px;
-  background: var(--accent); color: #fff; font-size: 10px; font-weight: 700; letter-spacing: .03em;
+.au-opt[role="checkbox"] .au-mark { border-radius: 4px; }
+.au-mark::after {
+  content: ""; position: absolute; inset: 0; margin: auto; width: 7px; height: 7px; border-radius: 50%;
+  background: #fff; transform: scale(0); transition: transform .12s ease;
 }
-/* 多选：复选框 + 勾。选中态要一眼看得出来——多选卡片长得和单选一样，是用户点了第一项
-   就走的直接原因。 */
-.au-check {
-  position: relative; flex-shrink: 0; margin-top: 1px; width: 18px; height: 18px; border-radius: 5px;
-  border: 1.5px solid var(--line-strong); background: var(--panel-solid);
-  transition: background .12s, border-color .12s;
-}
-.au-check::after {
-  content: ""; position: absolute; left: 5px; top: 1px; width: 5px; height: 10px;
+.au-opt[role="checkbox"] .au-mark::after {
+  inset: auto; left: 4px; top: 0px; width: 4px; height: 8px; border-radius: 0; background: none;
   border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg) scale(0);
-  transition: transform .12s ease;
 }
-.au-opt--checked { border-color: var(--accent); background: var(--sel); }
-.au-opt--checked .au-check { background: var(--accent); border-color: var(--accent); }
-.au-opt--checked .au-check::after { transform: rotate(45deg) scale(1); }
-.au-multibar { display: flex; justify-content: flex-end; margin-top: 10px; }
-.au-row { display: flex; gap: 8px; margin-top: 12px; }
+.au-opt:hover .au-mark { border-color: var(--accent); }
+.au-opt--checked .au-mark { background: var(--accent); border-color: var(--accent); }
+.au-opt--checked .au-mark::after { transform: scale(1); }
+.au-opt[role="checkbox"].au-opt--checked .au-mark::after { transform: rotate(45deg) scale(1); }
+.au-opt--checked { background: var(--sel); }
+/* 「推荐」跟着标签走，是一句提示不是一枚徽章——填色的胶囊会盖过选项本身。 */
+.au-rec { flex-shrink: 0; font-size: 11px; font-weight: 600; font-style: normal; color: var(--accent); }
+/* 序号退到右侧当键盘提示：它是快捷键，不是这一行的主角。 */
+.au-key {
+  flex-shrink: 0; margin-top: 1px; min-width: 17px; height: 17px; padding: 0 4px; border-radius: 4px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line); color: var(--text-dim);
+  font-size: 10px; font-variant-numeric: tabular-nums; background: transparent;
+}
+.au-opt:hover .au-key { border-color: var(--line-strong); color: var(--text); }
+
+/* 「其他」那一行：输入框长得像行内文字，不像另一块表单。 */
+.au-opt--other { cursor: text; align-items: center; }
+
 .au-custom {
-  flex: 1; min-width: 0; height: 38px; padding: 0 14px;
-  border: 1px solid var(--line-strong); border-radius: 19px;
-  background: var(--panel-solid); color: var(--text); font-size: 13px;
+  width: 100%; min-width: 0; border: 0; background: transparent; color: var(--text);
+  font-size: 13px; line-height: 1.45; padding: 0;
 }
 .au-custom::placeholder { color: var(--text-dim); }
-.au-custom:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--sel); }
-.au-send {
-  height: 38px; padding: 0 20px; border: none; border-radius: 19px;
-  background: var(--accent); color: #fff; cursor: pointer; font-size: 13px; font-weight: 500; white-space: nowrap;
-  transition: opacity .13s ease;
+.au-custom:focus { outline: none; }
+.au-opt--other:focus-within { background: var(--sel); }
+.au-opt--other:focus-within .au-mark { border-color: var(--accent); }
+.au-key--go { cursor: pointer; }
+.au-key--go:hover { border-color: var(--accent); color: var(--accent); }
+
+.au-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 9px; min-height: 26px; }
+.au-auto { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12px; padding: 2px 0; }
+.au-auto:hover { color: var(--accent); }
+/* 提交是这张卡上唯一的主动作，也是唯一填色的东西——但保持小而低调。 */
+.au-submit {
+  height: 26px; padding: 0 12px; border: 1px solid var(--accent); border-radius: 7px;
+  background: var(--accent); color: #fff; cursor: pointer; font-size: 12px; font-weight: 500;
+  transition: opacity .12s ease;
 }
-.au-send:hover { opacity: .88; }
-.au-send:disabled { background: var(--line-strong); opacity: .55; cursor: default; }
-.au-confirm-row { margin-top: 14px; }
+.au-submit:hover { opacity: .88; }
+.au-submit:disabled { background: transparent; border-color: var(--line); color: var(--text-dim); cursor: default; }
+
+/* 危险确认那一支单独保留：它要的正是"看起来不一样、别顺手点过去"。 */
+.au-confirm-row { margin-top: 4px; }
 .au-confirm-warn { display: block; font-size: 12px; color: #d93025; font-weight: 600; margin-bottom: 6px; }
+.au-row { display: flex; gap: 8px; }
+.au-custom--boxed {
+  flex: 1; height: 34px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px;
+  background: var(--panel-solid);
+}
+.au-custom--boxed:focus { border-color: #d93025; }
+.au-send {
+  height: 34px; padding: 0 16px; border: none; border-radius: 8px;
+  background: var(--accent); color: #fff; cursor: pointer; font-size: 13px; font-weight: 500; white-space: nowrap;
+}
 .au-send--danger { background: #d93025; }
 .au-send--danger:hover { opacity: .88; }
-.au-send--danger:disabled { background: var(--line-strong); opacity: .5; }
-.au-foot { display: flex; align-items: center; margin-top: 8px; }
-.au-auto { display: inline-block; background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12px; padding: 4px 0; }
-.au-auto:hover { color: var(--accent); }
+.au-send--danger:disabled { background: var(--line-strong); opacity: .5; cursor: default; }
 .au-done { padding: 12px 16px; font-size: 13px; color: #34a853; font-weight: 500; }
 
 /* ===== Clarification Request Card ===== */
