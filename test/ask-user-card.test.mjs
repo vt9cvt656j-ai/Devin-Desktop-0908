@@ -183,15 +183,52 @@ test("配色从主题变量推导，不再手工同步两份调色板", () => {
     "深色那份 --atc-* 覆盖又回来了——两份手工同步的调色板必然漂移");
 });
 
-test("状态只在需要回头看时才上色：成功走灰，失败才红", () => {
-  assert.match(CSS, /\.atc-result--ok \{ color: var\(--atc-dim\); background: transparent; \}/,
-    "成功又变回绿色药丸了——一屏十个绿药丸，成功被喊得比失败还响");
-  assert.match(CSS, /\.atc-result--err \{ color: var\(--atc-danger\); background: transparent; \}/,
-    "失败要么没上色、要么又加回了填色底");
-  // 药丸本身也不要：padding/圆角都归零，剩下的是一行字。
+test("右边那一列：不画框，靠颜色说话", () => {
+  // 这一列走过四版，前三版的结论都写在样式注释里：填色药丸 → 裸灰字 → 发丝胶囊 →
+  // 用户：「不用画圆形框圈里面，比如 1.2k 可以把颜色弄成那种黄色的，然后 exit 0 绿色、红色」。
+  // 现在一个框都不画，只让这个值自己有颜色。
   const base = CSS.slice(CSS.indexOf("\n.atc-result {"), CSS.indexOf(".atc-result svg"));
-  assert.match(base, /padding: 0; border-radius: 0; background: transparent;/, "状态又变回填色药丸");
+  assert.match(base, /border: 0;/, "又把框画回来了");
+  assert.match(base, /padding: 0; border-radius: 0; background: transparent;/, "又套上了胶囊或底色");
+  assert.match(base, /color: var\(--atc-metric\)/, "度量值没有走琥珀——它会退回和路径同色，读成那句话的续写");
+  assert.match(base, /font-variant-numeric: tabular-nums/, "右侧数字不等宽——十几张卡叠起来右边缘对不齐");
+  // 语义色：多少=琥珀、成功=绿、失败=红、告警=橙；不表态的（标题/纯信息）走灰。
+  assert.match(CSS, /\.atc-result--ok \{ color: var\(--atc-success\); background: transparent; \}/);
+  assert.match(CSS, /\.atc-result--err \{ color: var\(--atc-danger\); background: transparent; \}/);
+  assert.match(CSS, /\.atc-result--timeout,\s*\n\.atc-result--warn \{ color: var\(--atc-warning\); background: transparent; \}/);
+  assert.match(CSS, /\.atc-result--info \{ color: var\(--atc-dim\); background: transparent;/, "纯信息不该表态，该走灰");
+  // 一个都不许填底——填底就又回到第一版那堆药丸。
+  for (const v of ["ok", "err", "timeout", "warn", "pending", "info"]) {
+    const rule = CSS.match(new RegExp(`\\.atc-result--${v}[^{]*\\{([^}]*)\\}`));
+    assert.ok(rule, `.atc-result--${v} 的规则没了`);
+    // 负向前瞻不能这么写：`\\s*` 会退成零宽，前瞻落在空格上就恒真——照样匹配到
+    // `background: transparent`。取出值本身再比，别在前瞻里绕。
+    const bg = (rule[1].match(/background:\s*([^;]+)/) || [])[1];
+    assert.ok(!bg || bg.trim() === "transparent", `.atc-result--${v} 又填底色了：${bg}`);
+    assert.doesNotMatch(rule[1], /border(-color)?:\s*var\(--atc-(danger|warning)/, `.atc-result--${v} 又画框了`);
+  }
+  // +18 / -3 是 diff 的通用约定，绿红**文字**，不要底块。
+  assert.match(CSS, /\.atc-diffstat \.a \{ color: var\(--atc-success\); \}/);
+  assert.doesNotMatch(CSS, /\.atc-diffstat[^{]*\{[^}]*background:/, "diffstat 又套回灰底块了");
 });
+
+test("四个语义色在深色下各提一档——不然会掉进深底里", () => {
+  assert.match(CSS, /\[data-theme="dark"\] \.agent-tool-step, \.dark \.agent-tool-step \{[^}]*--atc-metric:/s,
+    "深色下没有单独一档度量色");
+  const dark = CSS.match(/\[data-theme="dark"\] \.agent-tool-step, \.dark \.agent-tool-step \{([^}]*)\}/)[1];
+  for (const v of ["--atc-success", "--atc-warning", "--atc-danger", "--atc-metric"]) {
+    assert.match(dark, new RegExp(v.replace(/-/g, "\\-") + ":"), `深色下缺 ${v}`);
+  }
+});
+
+test("展开区：和行有分界，知识检索那一块降到辅助层级", () => {
+  assert.match(CSS, /\.atc-viewport \{[^}]*border-top: 1px solid var\(--atc-border\)/s, "展开区没有和行分开");
+  // 分节抬头原来是「粗标题 + 填色计数小块 + 渐变横线」三样争一行，而要读的是下面那几条。
+  assert.match(CSS, /\.kpf__facet \{[^}]*text-transform: uppercase/s, "分节抬头没有降到辅助层级");
+  assert.match(CSS, /\.kpf__n \{[^}]*background: none/s, "计数又变回填色小块");
+  assert.match(CSS, /\.kpf__rule \{ display: none; \}/, "那条渐变横线又回来了");
+});
+
 
 // ── 图标：描边图形 + 按族上色 ─────────────────────────────────────────────
 //
@@ -239,17 +276,4 @@ test("颜色按族分，只有七族，而且只上在描边上", async () => {
     "又在 CSS 里按工具类型手工分配颜色了——两份名单必然漂移");
 });
 
-test("右边那一列和展开区：数字对齐、diff 用绿红文字、展开有分界", () => {
-  const base = CSS.slice(CSS.indexOf("\n.atc-result {"), CSS.indexOf(".atc-result svg"));
-  assert.match(base, /font-variant-numeric: tabular-nums/, "右侧数字不等宽——十几张卡叠起来右边缘对不齐");
-  assert.match(base, /font-size: 12px/, "右侧比左边的路径还小，扫一屏时最后才被看到");
-  // +18 / -3 是 diff 的通用约定，保留绿红**文字**，但不要底块。
-  assert.match(CSS, /\.atc-diffstat \.a \{ color: var\(--atc-success\); \}/);
-  assert.doesNotMatch(CSS, /\.atc-diffstat[^{]*\{[^}]*background:/, "diffstat 又套回灰底块了");
-  // 展开区要和上面那一行有明确分界。
-  assert.match(CSS, /\.atc-viewport \{[^}]*border-top: 1px solid var\(--atc-border\)/s, "展开区没有和行分开");
-  // 知识检索的分节抬头：小号大写 + 灰计数，不再是「粗标题 + 填色小块 + 渐变横线」三样争一行。
-  assert.match(CSS, /\.kpf__facet \{[^}]*text-transform: uppercase/s, "分节抬头没有降到辅助层级");
-  assert.match(CSS, /\.kpf__n \{[^}]*background: none/s, "计数又变回填色小块");
-  assert.match(CSS, /\.kpf__rule \{ display: none; \}/, "那条渐变横线又回来了");
-});
+

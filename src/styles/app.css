@@ -6394,9 +6394,11 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   --atc-text: var(--text);
   --atc-dim: var(--text-dim);
   --atc-accent: var(--accent);
-  --atc-success: #2a9d5c;
-  --atc-warning: #d98324;
-  --atc-danger: #e05252;
+  --atc-success: #1a9350;
+  --atc-warning: #c2600c;
+  --atc-danger: #d63b3b;
+  /* 右侧那一列"多少"的颜色：1.2k / 7 命中 / 200 / 4 步 都走它。 */
+  --atc-metric: #b3730a;
   border-radius: 10px; overflow: hidden;
   border: 1px solid var(--atc-border);
   background: var(--atc-bg);
@@ -6404,6 +6406,10 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   transition: border-color .15s ease, background .15s ease;
 }
 .agent-tool-step:hover { border-color: var(--line-strong); }
+/* 深色下这四个要各提一档，否则压在深底上会掉进背景里。 */
+[data-theme="dark"] .agent-tool-step, .dark .agent-tool-step {
+  --atc-success: #4ade80; --atc-warning: #fb923c; --atc-danger: #f87171; --atc-metric: #e0b25e;
+}
 
 .agent-tool-row {
   display: flex; align-items: center; gap: 8px;
@@ -6544,18 +6550,25 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .atc-diffstat .a { color: var(--atc-success); }
 .atc-diffstat .d { color: var(--atc-danger); margin-left: 2px; }
 
+/*
+ * 右侧这一列是每张卡唯一的"结果"，前后走过三版：
+ *  ① **填色药丸**（成功绿底、失败红底）—— 一屏十个绿药丸，"成功"喊得比"失败"还响；
+ *  ② **裸灰字** —— 和左边的路径同字体同颜色，读起来像那句话的续写，不像一个"值"；
+ *  ③ **发丝描边的胶囊** —— 用户：「不用画圆形框圈里面」。
+ * 现在是第四版，也是最省的一版：**不画任何框，只让这个值自己有颜色**。
+ *   · 度量（1.2k / 7 命中 / 200 / 4 步）走琥珀 —— 它是"多少"，不是好坏；
+ *   · 成功（exit 0 / +18）走绿，失败走红，告警走橙；
+ *   · 纯信息和标题仍走灰，它们不表态。
+ * 一个字都不多画，颜色本身就把这一列和左边的路径分开了。
+ */
 .atc-result {
-  /* 右侧这一列是每张卡唯一的"结果"，原来 11px 比左边的路径（12px）还小，扫一屏时它是
-     最后被看到的东西。提到 12px，并上等宽数字——十几张卡叠起来，右边缘的数字才对得齐，
-     那一列读起来是一栏数据，不是一堆碎字。 */
-  font-family: var(--font); font-size: 12px; font-weight: 600; color: var(--atc-dim);
-  font-variant-numeric: tabular-nums;
+  font-family: var(--font); font-size: 12px; font-weight: 600; color: var(--atc-metric);
+  font-variant-numeric: tabular-nums; letter-spacing: .01em;
+  border: 0;
   /* Was flex-shrink:0 → the meta badge kept its full width and SQUEEZED the filename/title
      (even wrapping "读取"). Now it shrinks + caps at ~half the row so the title always wins. */
   flex-shrink: 1; min-width: 0; max-width: 40%; overflow: hidden;
   display: flex; align-items: center; gap: 4px;
-  /* 从「填色药丸」改成裸文字：一屏十个工具、十个绿药丸，成功这件事被喊得比失败还响。
-     颜色只留给需要用户回头看的那两种（失败 / 超时告警），其余一律走灰。 */
   padding: 0; border-radius: 0; background: transparent;
   /* text-overflow 在 display:flex 上是**死规则**——它只作用于块容器，而这里的裸文本是
      匿名 flex 项，规则套不上去。实测：405px 的文案塞进 202px，硬切、没有省略号、没有
@@ -6580,8 +6593,8 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .atc-ls__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .atc-ls__warn { flex: none; font-size: 11px; opacity: .85; }
 .atc-ls__empty { padding: 8px; color: var(--atc-dim); font-size: 12px; font-family: var(--font); }
-/* 成功不上底色也不上绿字：它是常态，常态不该占视觉预算。 */
-.atc-result--ok { color: var(--atc-dim); background: transparent; }
+.atc-result--ok { color: var(--atc-success); background: transparent; }
+/* 标题和纯信息不表态，走灰。 */
 .atc-result--title {
   color: var(--atc-text, #1d1d1f);
   background: transparent;
@@ -6589,13 +6602,11 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   font-size: 12px; font-weight: 600;
   padding: 0 4px;
 }
-/* 失败是全卡唯一需要"喊"的状态：只上色、不上底，靠字重和颜色就够。 */
 .atc-result--err { color: var(--atc-danger); background: transparent; }
 .atc-result--pending { color: var(--atc-dim); background: transparent; }
 /* 子体超时被强杀 / 浏览器撞上人机验证——这两个是最需要用户一眼看见的异常，此前
    全表一条规则都没有：渲染成透明底 + 暗灰字，比表示「12 行」的中性 chip 还淡，
    扫一屏卡片时会直接漏掉，以为那个子体正常跑完了。用和 --ok/--err 同族的暖色。 */
-/* 告警和失败同一档：只上色不上底。 */
 .atc-result--timeout,
 .atc-result--warn { color: var(--atc-warning); background: transparent; }
 /* Telegram-style link preview card below browser screenshots */
