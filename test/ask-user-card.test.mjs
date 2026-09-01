@@ -63,38 +63,76 @@ test("卡片上没有倒计时，一个字都不许剩", () => {
     "停止任务时不再收掉这张卡——那会让整轮永远挂着");
 });
 
-test("抬头要写明这是单选还是多选", () => {
-  // 用户实测：多选卡片长得和单选一模一样，于是点了第一项就走，多选的语义完全没被读出来。
-  assert.match(CARD, /多选 · 可以勾多项，选好后提交/);
-  assert.match(CARD, /单选 · 点一项即可/);
-  assert.match(CARD, /危险操作 · 需要输入确认文本/);
-  // 算出来还不够，得**画出来**：只断言那几句文案存在，把渲染那一行删掉照样绿。
-  assert.match(CARD, /class="au-kind">\$\{_escHtml\(kindHint\)\}/,
-    "抬头那一行没有真的渲染 kindHint——文案算了却没画出来");
+test("多选要在问题旁写一句「可多选」——不然它和单选长得一模一样", () => {
+  // 原卡没有「单选/多选」那种说明胶囊，所以只在多选时挂一句轻提示，跟在问题后面。
+  assert.match(CARD, /_auMulti \? `<span class="au-multi-hint">可多选<\/span>` : ""/,
+    "多选没有任何提示——用户会当成单选，点一项就走");
+  assert.doesNotMatch(CARD, /class="au-kind"/, "又加回了原卡没有的说明胶囊");
 });
 
-test("多选的选中态在样式上要一眼看得出来", () => {
-  // 选项列表是一整块（行间只有发丝线），所以选中态靠**底色 + 标记上色**，不是给单行加边框。
-  assert.match(CSS, /\.au-opt--checked \{ background: var\(--sel\); \}/, "勾选的行没有底色");
-  assert.match(CSS, /\.au-opt--checked \.au-mark \{[^}]*background: var\(--accent\)/, "标记选中了却不上色");
-  assert.match(CSS, /\.au-opt\[role="checkbox"\]\.au-opt--checked \.au-mark::after \{[^}]*scale\(1\)/, "多选方框里没有勾");
+test("照原卡的构成：浅灰块、无边框、无圆点方框、序号在右", () => {
+  // 前两版错在同一个地方——加了原卡**根本没有**的东西。这条守的就是"别再加回来"。
+  assert.doesNotMatch(CSS, /\.au-mark\b/, "又加回了原卡没有的单选圆点 / 复选方框");
+  assert.doesNotMatch(CSS, /\.au-badge\b/, "又加回了蓝色号码块");
+  assert.doesNotMatch(CSS, /\.au-opt \+ \.au-opt \{ border-top/, "又把选项串成带分隔线的列表了");
+  assert.doesNotMatch(CARD, /class="au-mark"/, "标记元素还在渲染");
+  // 行是浅灰填充 + 圆角，没有边框。
+  assert.match(CSS, /\.au-opt \{[\s\S]{0,400}border: 0; border-radius: 8px;/, "选项行不再是无边框的圆角块");
+  assert.match(CSS, /\.au-opts \{ display: flex; flex-direction: column; gap: 4px; \}/, "选项之间的 4px 间距没了");
+  // 序号在右边一个描边小方块里。
+  assert.match(CSS, /\.au-key \{[\s\S]{0,300}border: 1px solid/, "序号不再是描边小方块");
+  // 选中态：这是全卡唯一用到主色的地方。
+  assert.match(CSS, /\.au-opt--checked[^{]*\{[\s\S]{0,220}inset 0 0 0 1\.5px var\(--accent\)/, "选中态没有主色内描边");
   assert.match(CSS, /\.au-opt__desc \{[^}]*color: var\(--text-dim\)/, "选项的说明行样式没了");
-  assert.match(CSS, /\.au-submit:disabled/, "提交按钮没有禁用态——一项没勾也能点");
-  // Claude Code 那张卡的关键长相：选项是**一整块列表**，不是各自带边框、互相隔开的胶囊。
-  assert.match(CSS, /\.au-opts \{[^}]*border: 1px solid var\(--line\)[^}]*overflow: hidden/, "选项列表不再是一整块");
-  assert.match(CSS, /\.au-opt \+ \.au-opt \{ border-top: 1px solid var\(--line\); \}/, "行与行之间的发丝线没了");
-  assert.doesNotMatch(CSS, /\.au-badge/, "蓝色号码块又回来了——序号该退到右边当键盘提示");
 });
 
-test("「其他」是选项列表里的一行，不在底下另起一块", () => {
-  // 自己写和选一项是同一层的选择。摆成两块，用户会以为得先选一项、再顺便写点什么。
+test("半透明色一律走变量，且先有 rgba 兜底——老引擎认不出 color-mix 会让整条声明作废", () => {
+  // 作废的后果不是"退回默认色"，是那一格干脆**没有底色**：整块浅灰行变白底，卡片散架。
+  const blk = CSS.slice(CSS.indexOf("/* ── ask_user card ── */"), CSS.indexOf(".au-done {"));
+  // @supports 那一行自己也含 color-mix（它就是探测句），不算声明。
+  const decls = blk.split("\n").filter((l) => /color-mix\(/.test(l) && !/^@supports/.test(l.trim()));
+  assert.ok(decls.length >= 4, "找不到 color-mix 声明，这条判据会变成恒真");
+  const supportsAt = blk.indexOf("@supports (background: color-mix(");
+  assert.ok(supportsAt > 0, "没有 @supports 兜底块");
+  // 判据是「落在 @supports 的花括号**里面**」，不是「排在它后面」——整段卡片样式都排在
+  // 它后面，只比位置的话，把 color-mix 写回任何一条普通规则都验不出来。
+  let depth = 0, supportsEnd = -1;
+  for (let k = blk.indexOf("{", supportsAt); k < blk.length; k++) {
+    if (blk[k] === "{") depth++;
+    else if (blk[k] === "}" && --depth === 0) { supportsEnd = k; break; }
+  }
+  assert.ok(supportsEnd > supportsAt, "@supports 块没有闭合");
+  for (const d of decls) {
+    const at = blk.indexOf(d);
+    assert.ok(at > supportsAt && at < supportsEnd,
+      `这条 color-mix 在 @supports 之外，老引擎会让它整条作废：${d.trim()}`);
+  }
+  // 兜底那一份必须真的定义了同名变量，否则 @supports 之外什么都没有。
+  for (const v of ["--au-row", "--au-row-hi", "--au-line", "--au-mute", "--au-pick"]) {
+    assert.match(blk.slice(0, supportsAt), new RegExp(`${v}:\\s*(rgba|var\\(--sel)`), `${v} 没有 rgba 兜底`);
+  }
+});
+
+test("「其他」是列表里的最后一块，里面套一个整宽输入框", () => {
   assert.match(CARD, /class="au-opt au-opt--other"/, "「其他」不在列表里了");
   assert.match(CARD, /\$\{btns\}\$\{otherRow\}/, "「其他」没有接在选项后面");
+  assert.match(CARD, /class="au-opt__head"[\s\S]{0,160}class="au-custom _auCustom"/,
+    "「其他」里不再是「一行标题 + 下面一个输入框」的构成");
+  assert.match(CSS, /\.au-opt--other \{ flex-direction: column;/, "「其他」那块没有竖排");
 });
 
-test("提交所选要显示已选了几项，且一项没勾时点不动", () => {
-  assert.match(CARD, /sub\.disabled = _auSelected\.size === 0;/, "一项没勾也能提交");
-  assert.match(CARD, /提交所选（\$\{_auSelected\.size\}）/, "按钮上没显示已选几项");
+test("点一下是选中，按提交才交——单选多选同一套，和原卡一致", () => {
+  assert.match(CARD, /vp\.querySelectorAll\("\._auOpt"\)\.forEach\(\(b\) => b\.addEventListener\("click", \(\) => _auPick\(/,
+    "点选项不再是「选中」");
+  assert.doesNotMatch(CARD, /addEventListener\("click", \(\) => \{ const i = \+b\.dataset\.i; finish\("single"/,
+    "点一下就直接提交了——原卡是选完再按提交");
+  // 提交按钮的可用性只有一个判据：有没有拿到答案（勾了选项，或者「其他」里写了字）。
+  assert.match(CARD, /_auSubmitEl\.disabled = _auSelected\.size === 0 && !\(_auCustomEl && _auCustomEl\.value\.trim\(\)\)/,
+    "提交按钮的可用判据不对——没答案也能点，或者写了字却点不动");
+  // 单选要真的只留一个。
+  assert.match(CARD, /else \{ const had = _auSelected\.has\(i\); _auSelected\.clear\(\); if \(!had\) _auSelected\.add\(i\); \}/,
+    "单选没有互斥——点第二项会变成两项都选中");
+  assert.match(CSS, /\.au-submit:disabled/, "提交按钮没有禁用态");
 });
 
 test("单选/多选的判据也要写给模型看——两份目录都要有", () => {

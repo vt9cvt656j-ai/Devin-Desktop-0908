@@ -6894,104 +6894,115 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .agent-tool-step--askuser > .atc-viewport { display: block !important; background: transparent; }
 /* ── ask_user card ── */
 /*
- * 照 Claude Code 那张问答卡做，克制是它的全部要点：
- *  · 选项是**一整块列表**，行与行之间只有一条发丝线——不是一堆各自带边框、互相隔开的胶囊。
- *  · 标记是单选圆点 / 多选方框，**不是**蓝色圆角号码块；序号退到右侧当键盘提示。
- *  · 「其他」是列表里的**最后一行**，和选项同一层；不在底下另起一块输入区。
- *  · 主色只用在选中态和那一个提交动作上，别处一律灰阶。
- *  · 没有倒计时。
+ * 照用户给的 Claude Code 原卡截图做的。第三版才对上，前两版错在同一个地方：
+ * 我加了原卡**根本没有**的东西（单选圆点、复选方框、蓝色主色、行与行之间的分隔线）。
+ * 原卡的构成其实很少：
+ *   · 问题一行加粗，字号比正文大一档；
+ *   · 选项是**浅灰填充的圆角块**，没有边框、没有标记，块与块之间留 4px 空隙；
+ *   · 序号在右边一个描边小方块里，是这一行唯一的装饰；
+ *   · 「其他」是同样一块浅灰，里面套一个整宽的白色输入框；
+ *   · 底部右下角两个按钮：跳过（无底色）+ 提交（实心，未选时是灰的）；
+ *   · **通篇没有主色**——选中才用一次。
  */
-.au-card { padding: 13px 14px 11px; }
-.au-kind { font-size: 11px; color: var(--text-dim); letter-spacing: .02em; margin-bottom: 6px; }
-.au-q { font-size: 14px; font-weight: 600; color: var(--text); margin: 0 0 11px; line-height: 1.55; }
+/*
+ * 所有半透明色收进这几个变量，**先给一次 rgba 兜底**，再在 @supports 里换成 color-mix。
+ * 直接写 color-mix 的话，认不出它的引擎会把**整条声明作废**——后果不是"退回默认色"，
+ * 是那一格干脆没有底色：一整块浅灰行变成白底，卡片当场散架。
+ */
+.au-card {
+  --au-row: rgba(128, 128, 128, .10);
+  --au-row-hi: rgba(128, 128, 128, .17);
+  --au-line: rgba(128, 128, 128, .32);
+  --au-mute: rgba(128, 128, 128, .55);
+  --au-pick: var(--sel);
+}
+@supports (background: color-mix(in srgb, red 5%, transparent)) {
+  .au-card {
+    --au-row: color-mix(in srgb, var(--text) 5%, transparent);
+    --au-row-hi: color-mix(in srgb, var(--text) 9%, transparent);
+    --au-line: color-mix(in srgb, var(--text) 16%, transparent);
+    --au-mute: color-mix(in srgb, var(--text) 32%, transparent);
+    --au-pick: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+}
+.au-card { padding: 16px 18px 12px; }
+.au-q {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: 15px; font-weight: 700; color: var(--text); line-height: 1.5; margin: 0 0 12px;
+}
+.au-multi-hint { font-size: 12px; font-weight: 500; color: var(--text-dim); }
 
-.au-opts { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel-solid); }
+.au-opts { display: flex; flex-direction: column; gap: 4px; }
 .au-opt {
-  display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left;
-  padding: 10px 12px; border: 0; border-radius: 0; background: transparent; color: var(--text);
-  cursor: pointer; font-size: 13px; line-height: 1.45; transition: background .12s ease;
+  display: flex; align-items: flex-start; gap: 12px; width: 100%; text-align: left;
+  padding: 11px 14px; border: 0; border-radius: 8px;
+  background: var(--au-row);
+  color: var(--text); cursor: pointer; font-size: 14px; line-height: 1.45;
+  transition: background .12s ease, box-shadow .12s ease;
 }
-.au-opt + .au-opt { border-top: 1px solid var(--line); }
-.au-opt:hover { background: var(--sel); }
-.au-opt:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.au-opt__body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
-.au-opt__label { display: flex; align-items: center; gap: 6px; font-weight: 500; }
+.au-opt:hover { background: var(--au-row-hi); }
+.au-opt:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
+.au-opt__body { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.au-opt__label { display: flex; align-items: center; gap: 7px; font-weight: 600; }
 /* 说明那一行：标签分不出差别时，真正决定用户怎么选的是它（会不会丢数据、要多久）。 */
-.au-opt__desc { font-size: 12px; color: var(--text-dim); line-height: 1.5; }
-
-/* 标记：单选是圆点，多选是方框。默认灰阶，选中才上色。 */
-.au-mark {
-  position: relative; flex-shrink: 0; margin-top: 2px; width: 15px; height: 15px;
-  border: 1.5px solid var(--line-strong); border-radius: 50%;
-  transition: border-color .12s ease, background .12s ease;
+.au-opt__desc { font-size: 13px; color: var(--text-dim); line-height: 1.5; }
+.au-rec { flex-shrink: 0; font-size: 11px; font-weight: 600; font-style: normal; color: var(--text-dim); }
+/* 选中：整块上主色的极浅底 + 一圈内描边。这是全卡唯一用到主色的地方。 */
+.au-opt--checked, .au-opt--checked:hover {
+  background: var(--au-pick);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
 }
-.au-opt[role="checkbox"] .au-mark { border-radius: 4px; }
-.au-mark::after {
-  content: ""; position: absolute; inset: 0; margin: auto; width: 7px; height: 7px; border-radius: 50%;
-  background: #fff; transform: scale(0); transition: transform .12s ease;
-}
-.au-opt[role="checkbox"] .au-mark::after {
-  inset: auto; left: 4px; top: 0px; width: 4px; height: 8px; border-radius: 0; background: none;
-  border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg) scale(0);
-}
-.au-opt:hover .au-mark { border-color: var(--accent); }
-.au-opt--checked .au-mark { background: var(--accent); border-color: var(--accent); }
-.au-opt--checked .au-mark::after { transform: scale(1); }
-.au-opt[role="checkbox"].au-opt--checked .au-mark::after { transform: rotate(45deg) scale(1); }
-.au-opt--checked { background: var(--sel); }
-/* 「推荐」跟着标签走，是一句提示不是一枚徽章——填色的胶囊会盖过选项本身。 */
-.au-rec { flex-shrink: 0; font-size: 11px; font-weight: 600; font-style: normal; color: var(--accent); }
-/* 序号退到右侧当键盘提示：它是快捷键，不是这一行的主角。 */
+/* 序号：右边一个描边小方块，是这一行唯一的装饰。 */
 .au-key {
-  flex-shrink: 0; margin-top: 1px; min-width: 17px; height: 17px; padding: 0 4px; border-radius: 4px;
+  flex-shrink: 0; margin-top: 1px; min-width: 24px; height: 22px; padding: 0 6px; border-radius: 6px;
   display: flex; align-items: center; justify-content: center;
-  border: 1px solid var(--line); color: var(--text-dim);
-  font-size: 10px; font-variant-numeric: tabular-nums; background: transparent;
+  border: 1px solid var(--au-line);
+  color: var(--text-dim); font-size: 12px; font-variant-numeric: tabular-nums; background: transparent;
 }
-.au-opt:hover .au-key { border-color: var(--line-strong); color: var(--text); }
 
-/* 「其他」那一行：输入框长得像行内文字，不像另一块表单。 */
-.au-opt--other { cursor: text; align-items: center; }
-
+/* 「其他」：同样一块浅灰，里面套一个整宽输入框。 */
+.au-opt--other { flex-direction: column; align-items: stretch; gap: 9px; cursor: default; }
+.au-opt--other:hover { background: var(--au-row); }
+.au-opt__head { display: flex; align-items: center; gap: 12px; }
+.au-opt__head .au-opt__label { flex: 1; }
 .au-custom {
-  width: 100%; min-width: 0; border: 0; background: transparent; color: var(--text);
-  font-size: 13px; line-height: 1.45; padding: 0;
+  width: 100%; height: 36px; padding: 0 12px;
+  border: 1px solid var(--au-line); border-radius: 8px;
+  background: var(--panel-solid); color: var(--text); font-size: 14px;
 }
 .au-custom::placeholder { color: var(--text-dim); }
-.au-custom:focus { outline: none; }
-.au-opt--other:focus-within { background: var(--sel); }
-.au-opt--other:focus-within .au-mark { border-color: var(--accent); }
-.au-key--go { cursor: pointer; }
-.au-key--go:hover { border-color: var(--accent); color: var(--accent); }
+.au-custom:focus { outline: none; border-color: var(--accent); }
 
-.au-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 9px; min-height: 26px; }
-.au-auto { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12px; padding: 2px 0; }
-.au-auto:hover { color: var(--accent); }
-/* 提交是这张卡上唯一的主动作，也是唯一填色的东西——但保持小而低调。 */
+/* 底部：右下角两个按钮，跳过无底色、提交实心（拿不到答案时是灰的）。 */
+.au-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.au-skip {
+  height: 34px; padding: 0 16px; border: 0; border-radius: 8px; background: transparent;
+  color: var(--text); cursor: pointer; font-size: 14px; transition: background .12s ease;
+}
+.au-skip:hover { background: var(--au-row-hi); }
 .au-submit {
-  height: 26px; padding: 0 12px; border: 1px solid var(--accent); border-radius: 7px;
-  background: var(--accent); color: #fff; cursor: pointer; font-size: 12px; font-weight: 500;
+  height: 34px; padding: 0 18px; border: 0; border-radius: 8px;
+  background: var(--text); color: var(--panel-solid); cursor: pointer; font-size: 14px; font-weight: 500;
   transition: opacity .12s ease;
 }
-.au-submit:hover { opacity: .88; }
-.au-submit:disabled { background: transparent; border-color: var(--line); color: var(--text-dim); cursor: default; }
+.au-submit:hover { opacity: .85; }
+.au-submit:disabled {
+  background: var(--au-mute); color: var(--panel-solid); cursor: default; opacity: 1;
+}
 
 /* 危险确认那一支单独保留：它要的正是"看起来不一样、别顺手点过去"。 */
 .au-confirm-row { margin-top: 4px; }
 .au-confirm-warn { display: block; font-size: 12px; color: #d93025; font-weight: 600; margin-bottom: 6px; }
 .au-row { display: flex; gap: 8px; }
-.au-custom--boxed {
-  flex: 1; height: 34px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px;
-  background: var(--panel-solid);
-}
+.au-custom--boxed { flex: 1; }
 .au-custom--boxed:focus { border-color: #d93025; }
 .au-send {
-  height: 34px; padding: 0 16px; border: none; border-radius: 8px;
-  background: var(--accent); color: #fff; cursor: pointer; font-size: 13px; font-weight: 500; white-space: nowrap;
+  height: 36px; padding: 0 16px; border: none; border-radius: 8px;
+  background: var(--accent); color: #fff; cursor: pointer; font-size: 14px; font-weight: 500; white-space: nowrap;
 }
 .au-send--danger { background: #d93025; }
 .au-send--danger:hover { opacity: .88; }
-.au-send--danger:disabled { background: var(--line-strong); opacity: .5; cursor: default; }
+.au-send--danger:disabled { background: var(--au-mute); cursor: default; }
 .au-done { padding: 12px 16px; font-size: 13px; color: #34a853; font-weight: 500; }
 
 /* ===== Clarification Request Card ===== */

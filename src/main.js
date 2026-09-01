@@ -62417,70 +62417,63 @@ async function _executeToolStepInner(step, call, root, run) {
         };
         _releaseInteraction = _registerRunInteraction(run, () => finish("cancel"));
         if (!_runInteractionLive(run)) { finish("cancel"); return; }
-        const _auSubmitMulti = () => {
-          const labels = [..._auSelected].sort((a, b) => a - b).map((i) => opts[i].label);
-          if (labels.length) finish("multi", { labels }); };
-        const _auSyncMulti = () => {
+        const _auKeyHandler = (e) => {
+          if (done) return;
+          const focused = document.activeElement;
+          if (focused && focused.classList?.contains("au-custom")) return;   // 输入框自己有回车
+          if (_auConfirm) return;
+          const n = +e.key;
+          // 数字键**选中**，不直接提交——和原卡一致：选完再按提交，单选多选同一套手感。
+          if (n >= 1 && n <= opts.length) { e.preventDefault(); vp.querySelector(`._auOpt[data-i="${n - 1}"]`)?.click(); }
+          else if (e.key === "Enter") { e.preventDefault(); vp.querySelector("._auSubmit")?.click(); }
+        };
+        document.addEventListener("keydown", _auKeyHandler);
+        // 照用户给的 Claude Code 原卡截图逐项对齐：**没有任何单选圆点/复选方框**，行是浅灰
+        // 填充、无边框、圆角 8px，序号在右边一个明显的方框里；底部 跳过 / 提交 两个按钮；
+        // 通篇不用主色。点一下是"选中"，按提交才交——单选多选同一套手感，和原卡一致。
+        const btns = opts.map((o, i) => `<button type="button" class="au-opt _auOpt" data-i="${i}"`
+          + ` role="${_auMulti ? "checkbox" : "radio"}" aria-checked="false">`
+          + `<span class="au-opt__body"><span class="au-opt__label">${_escHtml(o.label)}`
+          + (_auRecommended === i ? `<em class="au-rec">推荐</em>` : "") + `</span>`
+          + (o.description ? `<span class="au-opt__desc">${_escHtml(o.description)}</span>` : "")
+          + `</span><span class="au-key">${i + 1}</span></button>`).join("");
+        // 「其他」和原卡一样：一行标题 + 序号，下面一个整宽输入框，同在一块浅灰底里。
+        const otherRow = `<div class="au-opt au-opt--other">`
+          + `<span class="au-opt__head"><span class="au-opt__label">其他</span><span class="au-key">${opts.length + 1}</span></span>`
+          + `<input class="au-custom _auCustom" placeholder="${opts.length ? "在这里写你自己的答案" : "把你想要的写在这里"}"></div>`;
+        const confirmRow = `<div class="au-confirm-row"><span class="au-confirm-warn">请输入 <b>${_escHtml(_auConfirm || "")}</b> 以确认</span>`
+          + `<div class="au-row"><input class="au-custom au-custom--boxed _auConfirmInput" placeholder="输入确认文本…"><button type="button" class="au-send au-send--danger _auConfirmBtn" disabled>确认执行</button></div></div>`;
+        vp.innerHTML =
+          `<div class="au-card">`
+          + `<div class="au-q">${_escHtml(q)}${_auMulti ? `<span class="au-multi-hint">可多选</span>` : ""}</div>`
+          + (_auConfirm ? confirmRow : `<div class="au-opts" role="${_auMulti ? "group" : "radiogroup"}">${btns}${otherRow}</div>`)
+          + (_auConfirm ? "" : `<div class="au-foot"><button type="button" class="au-skip _auAuto" title="不选，让 AI 自己定">跳过</button>`
+            + `<button type="button" class="au-submit _auSubmit" disabled>提交</button></div>`)
+          + `</div>`;
+        const _auCustomEl = vp.querySelector("._auCustom");
+        const _auSubmitEl = vp.querySelector("._auSubmit");
+        // 提交按钮的可用性只有一个判据：**有没有拿到答案**——勾了选项，或者「其他」里写了字。
+        const _auSync = () => {
           vp.querySelectorAll("._auOpt").forEach((b) => {
             const on = _auSelected.has(+b.dataset.i);
             b.classList.toggle("au-opt--checked", on);
             b.setAttribute("aria-checked", on ? "true" : "false");
           });
-          const sub = vp.querySelector("._auMultiSubmit");
-          if (sub) { sub.disabled = _auSelected.size === 0; sub.textContent = _auSelected.size ? `提交所选（${_auSelected.size}）` : "提交所选"; }
+          if (_auSubmitEl) _auSubmitEl.disabled = _auSelected.size === 0 && !(_auCustomEl && _auCustomEl.value.trim());
         };
-        const _auToggle = (i) => { if (_auSelected.has(i)) _auSelected.delete(i); else _auSelected.add(i); _auSyncMulti(); };
-        const _auKeyHandler = (e) => {
-          if (done) return;
-          const focused = document.activeElement;
-          if (focused && focused.classList?.contains("au-custom")) {
-            // 输入框里 ⌘/Ctrl+Enter 直接提交所选，省得再去够那个按钮。
-            if (_auMulti && e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); _auSubmitMulti(); }
-            return;
-          }
-          if (_auConfirm) return;
-          const n = +e.key;
-          if (n >= 1 && n <= opts.length) {
-            e.preventDefault();
-            if (_auMulti) _auToggle(n - 1);
-            else finish("single", { label: opts[n - 1].label });
-          } else if (_auMulti && e.key === "Enter") { e.preventDefault(); _auSubmitMulti(); }
+        const _auPick = (i) => {
+          if (_auMulti) { if (_auSelected.has(i)) _auSelected.delete(i); else _auSelected.add(i); }
+          else { const had = _auSelected.has(i); _auSelected.clear(); if (!had) _auSelected.add(i); }
+          if (_auCustomEl && _auSelected.size) _auCustomEl.value = "";
+          _auSync();
         };
-        document.addEventListener("keydown", _auKeyHandler);
-        const btns = opts.map((o, i) => {
-          const isRec = _auRecommended === i;
-          return `<button type="button" class="au-opt _auOpt${isRec ? " au-opt--rec" : ""}" data-i="${i}"`
-            + ` role="${_auMulti ? "checkbox" : "radio"}" aria-checked="false">`
-            + `<span class="au-mark"></span>`
-            + `<span class="au-opt__body"><span class="au-opt__label">${_escHtml(o.label)}`
-            + (isRec ? `<em class="au-rec">推荐</em>` : "") + `</span>`
-            + (o.description ? `<span class="au-opt__desc">${_escHtml(o.description)}</span>` : "") + `</span>`
-            + `<span class="au-key">${i + 1}</span></button>`;
-        }).join("");
-        // 抬头写明**这是哪一种选择**：多选卡片长得和单选一样时，用户点了第一项就走。
-        const kindHint = _auConfirm ? "危险操作 · 需要输入确认文本"
-          : _auMulti ? "多选 · 可以勾多项，选好后提交"
-          : opts.length ? "单选 · 点一项即可，也可以自己写"
-          : "自己写一句就行";
-        // 「其他」是列表里的最后一行，不在底下另起一块：自己写和选一项是同一层的选择。
-        const otherRow = `<div class="au-opt au-opt--other"><span class="au-mark"></span>`
-          + `<span class="au-opt__body"><input class="au-custom _auCustom" placeholder="${opts.length ? "其他……自己写一句" : "把你想要的写在这里…"}"></span>`
-          + `<button type="button" class="au-key au-key--go _auSend" title="发送">↩</button></div>`;
-        const confirmRow = `<div class="au-confirm-row"><span class="au-confirm-warn">请输入 <b>${_escHtml(_auConfirm || "")}</b> 以确认</span>`
-          + `<div class="au-row"><input class="au-custom au-custom--boxed _auConfirmInput" placeholder="输入确认文本…"><button type="button" class="au-send au-send--danger _auConfirmBtn" disabled>确认执行</button></div></div>`;
-        vp.innerHTML =
-          `<div class="au-card">`
-          + `<div class="au-kind">${_escHtml(kindHint)}</div>`
-          + `<div class="au-q">${_escHtml(q)}</div>`
-          + (_auConfirm ? confirmRow : `<div class="au-opts" role="${_auMulti ? "group" : "radiogroup"}">${btns}${otherRow}</div>`)
-          + (_auConfirm ? "" : `<div class="au-foot"><button type="button" class="au-auto _auAuto">让 AI 自行判断</button>`
-            + (_auMulti ? `<button type="button" class="au-submit _auMultiSubmit" disabled>提交所选</button>` : "") + `</div>`)
-          + `</div>`;
-        vp.querySelectorAll("._auOpt").forEach((b) => b.addEventListener("click", () => {
-          const i = +b.dataset.i;
-          if (_auMulti) _auToggle(i); else finish("single", { label: opts[i].label });
-        }));
-        if (_auMulti) { _auSyncMulti(); vp.querySelector("._auMultiSubmit")?.addEventListener("click", _auSubmitMulti); }
+        const _auSubmit = () => {
+          const typed = _auCustomEl ? _auCustomEl.value.trim() : "";
+          if (typed) return finish("custom", { text: typed });
+          const labels = [..._auSelected].sort((a, b) => a - b).map((i) => opts[i].label);
+          if (labels.length) finish(_auMulti ? "multi" : "single", _auMulti ? { labels } : { label: labels[0] });
+        };
+        vp.querySelectorAll("._auOpt").forEach((b) => b.addEventListener("click", () => _auPick(+b.dataset.i)));
         if (_auConfirm) {
           const cInput = vp.querySelector("._auConfirmInput");
           const cBtn = vp.querySelector("._auConfirmBtn");
@@ -62490,10 +62483,9 @@ async function _executeToolStepInner(step, call, root, run) {
             cInput.addEventListener("keydown", (e) => { if (e.key === "Enter" && cInput.value.trim() === _auConfirm) { e.preventDefault(); cBtn.click(); } });
           }
         } else {
-          const custom = vp.querySelector("._auCustom");
-          const send = () => { const t = custom.value.trim(); if (t) finish("custom", { text: t }); };
-          vp.querySelector("._auSend").addEventListener("click", send);
-          custom.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) { e.preventDefault(); send(); } });
+          _auCustomEl.addEventListener("input", () => { if (_auCustomEl.value.trim()) _auSelected.clear(); _auSync(); });
+          _auCustomEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); _auSubmit(); } });
+          _auSubmitEl.addEventListener("click", _auSubmit);
           vp.querySelector("._auAuto").addEventListener("click", () => finish("auto"));
         }
         setTimeout(() => { try { (vp.querySelector("._auCustom") || vp.querySelector("._auConfirmInput"))?.focus(); } catch {} }, 0);
