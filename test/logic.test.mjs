@@ -13760,7 +13760,11 @@ test("write_file streams replace once then append every received Monaco delta", 
   entry._editorPreview = preview;
   const previews = new Map([[preview.path, preview]]);
   const positions = [];
+  const revealed = [];
   const flush = load("_flushLiveEditorWritePreview", {
+    // 跟随现在按动作分级：滚动可以，动光标不行。桩要把这两件事分开记，
+    // 否则"改成只滚不移光标"这件事在测试里看不出来。
+    _followOk: (action) => action !== "moveCursor",
     // 诊断埋点在测试里是无操作：它只写文件，不参与流式语义。
     _wpDiag: () => {},
     _perfPhase: () => {},
@@ -13772,7 +13776,7 @@ test("write_file streams replace once then append every received Monaco delta", 
     monacoEditor: {
       getModel: () => model,
       setPosition: (position) => positions.push(position),
-      revealLine: () => {},
+      revealLine: (line) => revealed.push(line),
     },
     _setModelValueProgrammatically: (_model, next) => { value = next; replacements++; return true; },
     _appendModelTextProgrammatically: (_model, text) => { appended.push(text); value += text; return true; },
@@ -13785,7 +13789,12 @@ test("write_file streams replace once then append every received Monaco delta", 
   assert.equal(value, "const a = 1;\nconst b = 2;");
   assert.equal(replacements, 1, "the old file should be replaced only for the first streamed snapshot");
   assert.deepEqual(appended, ["\nconst b = 2;"], "later chunks should append instead of resetting the whole model");
-  assert.ok(positions.length >= 2, "the visible editor should follow the streamed tail");
+  // 跟随＝**滚过去**，不是**把光标拽过去**。
+  // 这一条以前断言的是 setPosition 被调用过（positions.length >= 2）—— 而那正是
+  // 用户实拍的「光标不要被乱移动走」：他在别处写字，光标每次刷新都被拽到写入末尾，
+  // 下一个字就打错地方。滚走了能滚回来，打错的字回不来。
+  assert.ok(revealed.length >= 2, "the visible editor should still scroll to follow the streamed tail");
+  assert.deepEqual(positions, [], "streaming must never move the user's caret");
 });
 
 test("large streaming writes stay out of Monaco while the bounded tool card keeps rendering", () => {

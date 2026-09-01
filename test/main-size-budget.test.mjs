@@ -293,8 +293,14 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   就看得到、不占表单），后者收进默认折叠的 <details>（合上时只有一行字）。
  *   多出来的行是这两段来龙去脉 + 悬浮卡那一格的分流。同一笔里还给模型选择器的自定义
  *   分组标题加了直达管理的齿轮（用户问「以后怎么找到编辑/删除」）。
+ * · 82_920（2026-09-01，抬 40 行）：实测 82,882 行。买到的是「实时跟随」那个开关**真的
+ *   管住了它该管的东西**，以及开着时不再抢用户的光标和标签。开关原来只管住 _stageForTool
+ *   一条路，而编辑器里的流式写入预览是另一条：它自己读盘、建模型、开标签、activate() 切走
+ *   当前标签，全程没看过开关。判据抽进 src/agent/live-follow.js（纯函数，测试真跑）：
+ *   关掉什么都不做、光标永远不动、人在打字时不抢标签也不滚视口。留在 main.js 的是
+ *   _followOk 那个取上下文的壳（要问 Monaco 的 hasTextFocus）和八个接入点。
  */
-const MAIN_JS_MAX_LINES = 82_880;
+const MAIN_JS_MAX_LINES = 82_920;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

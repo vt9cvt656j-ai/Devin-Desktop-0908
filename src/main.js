@@ -224,6 +224,7 @@ import { selectionLabel as _selectionLabel, selectionText as _selectionText, sel
 import { pointInTermSelection as _pointInTermSelection, termChipLabel as _termChipLabel, termSnippetText as _termSnippetText } from "./agent/term-drag.js";
 import { normalizeAskOptions as _normalizeAskOptions, askMode as _askMode, askAnswerText as _askAnswerText, askAnswerLabel as _askAnswerLabel } from "./agent/ask-user.js";
 import { normalizeAppSkin, clampSkinOpacity, skinPanelAlpha, SKIN_ENCODE_LADDER } from "./agent/app-skin.js";
+import { followAllows } from "./agent/live-follow.js";
 import { toolIconSvg as _toolIconSvg, toolIconFamily as _toolIconFamily } from "./agent/tool-icons.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
@@ -50641,9 +50642,21 @@ async function _buildImageFeedback(imgs, config, leadText, perImageHint) {
 function _liveStageOn() { try { return localStorage.getItem("michael-ide.live-stage") !== "off"; } catch { return true; } }
 function _setLiveStage(on) { try { localStorage.setItem("michael-ide.live-stage", on ? "on" : "off"); } catch {} }
 let _lastStagedPath = "";
+/**
+ * 「实时跟随」现在能不能做某个动作。判据在 src/agent/live-follow.js（纯函数，测试真跑）。
+ *
+ * `editorFocused` 用 Monaco 自己的 hasTextFocus()：它答的是「文本区里有没有插入符」，
+ * 比 document.activeElement 准 —— 编辑器是一堆嵌套元素，activeElement 常常落在某个
+ * 内部节点上，而用户点在小地图或滚动条上时它也算"在编辑器里"，那时抢标签并不打扰人。
+ */
+function _followOk(action) {
+  let editorFocused = false;
+  try { editorFocused = !!(monacoEditor && monacoEditor.hasTextFocus && monacoEditor.hasTextFocus()); } catch {}
+  return followAllows(action, { on: _liveStageOn(), editorFocused });
+}
 async function _stageForTool(call, root, session, run = null) {
   try {
-    if (!call || !_liveStageOn()) return;
+    if (!call) return;
     if (session && typeof _currentSession === "function" && session !== _currentSession()) return; // don't hijack another tab
     const t = call.type;
     // Only run_in_terminal (termtask) actually runs in a VISIBLE terminal tab. run_cmd (cmd) is
@@ -50651,7 +50664,7 @@ async function _stageForTool(call, root, session, run = null) {
     // popping the panel open for it showed an empty/unrelated terminal "even when it isn't using
     // it." Stage the terminal only for the tool that genuinely uses it.
     if (t === "termtask") {
-      if (typeof termIsOpen === "function" && !termIsOpen() && typeof openTerminal === "function") await openTerminal();
+      if (_followOk("openTerminal") && typeof termIsOpen === "function" && !termIsOpen() && typeof openTerminal === "function") await openTerminal();
       return;
     }
     if (t === "cmd") return; // captured, not shown in a terminal tab — don't surface the panel
@@ -50668,11 +50681,11 @@ async function _stageForTool(call, root, session, run = null) {
       // 创建了。用户看到的是"写成功了却报文件不存在"，纯噪音。
       // 路径真写错时模型仍会从工具结果里收到报错（那条带"新建文件请用 write_file"
       // 的提示），那是给模型的通道；这个 toast 是给人看的，人不该被预备动作打扰。
-      try { await openFile(fp, String(rel).split("/").pop(), true, { silentMissing: true }); } catch {}
-      try { revealInTree(fp); } catch {}
+      if (_followOk("openFile")) { try { await openFile(fp, String(rel).split("/").pop(), true, { silentMissing: true }); } catch {} }
+      if (_followOk("revealInTree")) { try { revealInTree(fp); } catch {} }
     } else if (t === "read") {
       _lastStagedPath = fp;
-      try { revealInTree(fp); } catch {} // lightweight: highlight in the tree, don't tab-spam on big sweeps
+      if (_followOk("revealInTree")) { try { revealInTree(fp); } catch {} } // lightweight: highlight in the tree, don't tab-spam on big sweeps
     }
   } catch { /* staging is cosmetic — never break the run */ }
 }
@@ -58254,7 +58267,9 @@ function _installLiveEditorWritePreview(entry, path, file, options = {}) {
   };
   entry._editorPreview = preview;
   _liveEditorWritePreviews.set(path, preview);
-  if (activePath !== path) activate(path);
+  // 人正在编辑器里打字时不抢标签（followAllows 的 activateTab）。预览照样装上：
+  // 用户自己切回这个文件时就看得到，只是不在他打字的时候把他拽走。
+  if (activePath !== path && _followOk("activateTab")) activate(path);
   return preview;
 }
 
@@ -58324,6 +58339,15 @@ function _ensureLiveEditorWritePreview(entry, root) {
   if (!entry || !previewable
       || entry._editorPreviewOutcome === "rollback"
       || entry._editorPreviewOutcome === "card-only") return null;
+  /*
+   * 关掉「实时跟随」就整条不走。
+   *
+   * 这条路自己读盘、建模型、开标签、切走当前标签，全程和 _stageForTool 无关 —— 于是
+   * 开关关着，用户照样看到智能体在他的编辑器里一行行写字、标签被切走。用户实拍：
+   * 「这里按钮关闭的话，这个功能也还是生效的」。
+   * 关掉之后聊天卡里的写入预览照旧（那是在对话里，不动他的编辑器），信息一点不少。
+   */
+  if (!_followOk("openFile")) { entry._editorPreviewOutcome = "card-only"; return null; }
   // The chat card already shows a bounded tail for large writes. Opening a Monaco
   // model for the same large, still-uncommitted payload makes WebKit synchronously
   // tokenize/layout it and wakes the TS worker; the perf log recorded a 23KB preview
@@ -58625,14 +58649,18 @@ function _flushLiveEditorWritePreview(entry, followTail = false) {
   preview.shownContent = target;
   preview.target = target;
 
+  /*
+   * 只滚动，**不动光标**。
+   *
+   * 这里原来还有一句 `monacoEditor.setPosition(...)`，每次流式刷新都把光标拽到写入末尾。
+   * 光标是用户的：他在别处写字，光标被拽走，下一个字就打错地方 —— 用户实拍
+   * 「光标不要被乱移动走」。滚走了可以滚回来，打错的字回不来，两者代价不对称。
+   *
+   * 滚动本身也让路：人正在这个编辑器里打字时连滚都不滚（followAllows 的 revealLine）。
+   */
   if ((followTail || activePath === preview.path) && monacoEditor.getModel() === preview.model
-      && typeof preview.model.getLineCount === "function") {
-    const lineNumber = preview.model.getLineCount();
-    const column = typeof preview.model.getLineMaxColumn === "function" ? preview.model.getLineMaxColumn(lineNumber) : 1;
-    try {
-      monacoEditor.setPosition({ lineNumber, column });
-      monacoEditor.revealLine(lineNumber);
-    } catch {}
+      && typeof preview.model.getLineCount === "function" && _followOk("revealLine")) {
+    try { monacoEditor.revealLine(preview.model.getLineCount()); } catch {}
   }
   return true;
 }
