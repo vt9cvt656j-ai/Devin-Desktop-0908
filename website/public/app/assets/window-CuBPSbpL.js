@@ -1,0 +1,1 @@
+import{Y as e}from"./vendor-B1PKHrRq.js";export{e as getCurrentWindow};

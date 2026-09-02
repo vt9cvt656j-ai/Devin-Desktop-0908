@@ -1,0 +1,1 @@
+import{n as e,t}from"./typescript-BO_qD-MT.js";export{t as conf,e as language};

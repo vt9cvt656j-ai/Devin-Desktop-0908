@@ -1,0 +1,1 @@
+import{V as e,z as t}from"./vendor-B1PKHrRq.js";export{t as WebviewWindow,e as getCurrentWebviewWindow};
