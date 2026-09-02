@@ -310,8 +310,15 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   留在 main.js 的是选路判据 `_byoViaGateway`、覆写那一支、两道闸的让开、以及三处文案
  *   （「密钥仅保存在本机」对远程端点不再成立，不改就是骗人）。SSRF 校验、合成线路、
  *   钉 IP 的连接全在 server/src/byo_upstream.rs（11 条 Rust 测试）。
+ * · 82_996（2026-09-01，抬 6 行）：实测 82,996 行。买到的是**开场消息折叠的幂等标记**。
+ *   那道折叠原本永不收敛：替换文案自己含「项目上下文」四个字，判据折完仍为真；抽保留块时
+ *   最后一段又会切到 `_head.length`，把上一轮那句文案吞成"要保留的内容"，于是开场消息
+ *   每轮被就地重写、每轮长 66 个字。它是系统消息之后的第一条，一变就让 OpenAI/xAI 的
+ *   严格前缀缓存从第 1 条起全部作废 —— 线上表现是"缓存量恒定、不随请求增长"
+ *   （56k→24k / 105k→42k / 165k→36k）。五行注释解释的就是这个非局部后果。
+ *   守卫在 test/opener-fold-idempotent.test.mjs：按 AST 取真源码跑，两条变异都测红。
  */
-const MAIN_JS_MAX_LINES = 82_990;
+const MAIN_JS_MAX_LINES = 82_996;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

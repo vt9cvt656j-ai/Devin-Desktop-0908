@@ -43445,7 +43445,12 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
       // 提示块逐轮增删（缓存与行为双重抖动）。
       const bk = m.content.search(/━{8,}\s*\n\s*📌/);
       const mk = bk >= 0 ? bk : m.content.indexOf("📌");
-      if (mk > 400 && m.content.includes("项目上下文")) {
+      // `!_raw._ideMeta?.openerFolded` 是**幂等标记**，缺了它这道折叠永不收敛：替换文案
+      // 自己含「项目上下文」四个字，判据折完仍为真；抽保留块时最后一段又会切到 `_head.length`
+      // 把上一轮那句文案吞进去。开场消息是系统消息后第一条，每轮重写 = 严格前缀缓存从第 1 条
+      // 起全丢（线上：缓存量恒定不随请求增长）。先例见 43381 的 `_ideMeta?.compressed`；
+      // `_ideMeta` 在出线口 3152 被剥掉，不改发出去的字节。守着它的是 opener-fold-idempotent。
+      if (mk > 400 && m.content.includes("项目上下文") && !_raw._ideMeta?.openerFolded) {
         const request = m.content.slice(mk);
         // 折叠前先把「用户自己写下的规矩」原样捞出来带走。
         //
@@ -43487,9 +43492,10 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
         const _kept = _keepBlocks.length ? _keepBlocks.join("\n") + "\n\n" : "";
         const before = _msgSize(_raw);
         const _folded = { ...m, content: _kept + "[较早的项目上下文 / 当前文件已折叠省上下文——需要项目结构或某文件内容就用 list_dir / read_file 取回]\n\n" + request };
+        const _foldMeta = { ...(_raw._ideMeta || {}), openerFolded: true };
         messages[i] = typeof _raw.content === "string"
-          ? _folded
-          : { ..._raw, content: [{ ..._raw.content[0], text: _folded.content }, ..._raw.content.slice(1)] };
+          ? { ..._folded, _ideMeta: _foldMeta }
+          : { ..._raw, _ideMeta: _foldMeta, content: [{ ..._raw.content[0], text: _folded.content }, ..._raw.content.slice(1)] };
         if (run?._contextPreambleAvailable) {
           run._contextPreambleAvailable = false;
           readContextChanged = true;
