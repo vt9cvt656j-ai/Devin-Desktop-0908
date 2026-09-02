@@ -317,8 +317,15 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   严格前缀缓存从第 1 条起全部作废 —— 线上表现是"缓存量恒定、不随请求增长"
  *   （56k→24k / 105k→42k / 165k→36k）。五行注释解释的就是这个非局部后果。
  *   守卫在 test/opener-fold-idempotent.test.mjs：按 AST 取真源码跑，两条变异都测红。
+ * · 83_002（2026-09-01，抬 6 行）：实测 83,002 行。同一类病的第二处 —— 读取去重的桩
+ *   每轮被重刷。桩文本里带着「覆盖它的那次读取的行号段」，每来一次范围更大的覆盖读取
+ *   行号就变；原来只有 `content.length > 90` 这条长度启发式挡着，而桩自己的长度取决于
+ *   路径长短，monorepo 的深路径打出来正好 100 字 > 90，闸形同虚设。实测同一文件读四次，
+ *   最早那条消息四轮里三轮内容不同，而它躺在历史很靠前的位置。
+ *   改成显式的 `prevMeta?.contextAvailable !== false`。守卫在
+ *   test/read-stub-idempotent.test.mjs：把长度闸放到 0 它仍绿，说明幂等判据独立顶住。
  */
-const MAIN_JS_MAX_LINES = 82_996;
+const MAIN_JS_MAX_LINES = 83_002;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

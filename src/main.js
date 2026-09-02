@@ -43332,7 +43332,13 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
       const prior = readsByPath.get(meta.canonicalPath) || [];
       for (const prev of prior) {
         const prevMeta = messages[prev]?._ideMeta;
-        if (_readEvidenceCovers(meta, prevMeta) && String(messages[prev].content || "").length > 90) {
+        // `contextAvailable !== false` 是幂等判据。原来只有 `.length > 90` 这条长度启发式，
+        // 而桩文本自己的长度取决于路径长短：`packages/web/src/features/billing/components/
+        // InvoiceTable/index.tsx` 这种深路径打出来的桩正好 100 字 > 90，于是**每有一次新的
+        // 覆盖读取就把它重刷一遍**（行号段变了，文本就变了）。实测同一文件读四次，那条最早的
+        // 读取消息四轮里三轮内容都不同。它躺在历史很靠前的位置，一变，后面整段退出前缀缓存。
+        if (_readEvidenceCovers(meta, prevMeta) && prevMeta?.contextAvailable !== false
+            && String(messages[prev].content || "").length > 90) {
           messages[prev] = { ...messages[prev], _ideMeta: { ...prevMeta, contextAvailable: false }, content: `[同版本 ${meta.canonicalPath} 的较早读取已由后面的 ${meta.from}-${meta.to}/${meta.total} 行完整覆盖]` };
           readContextChanged = true;
         }
