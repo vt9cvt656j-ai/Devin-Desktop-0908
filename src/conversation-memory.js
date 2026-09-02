@@ -8,9 +8,38 @@
  * last compaction). LLM compaction is driven by main.js.
  */
 
-const RECENT_WINDOW = 100;
+/*
+ * 压缩的**高低水位**（条数一套、token 一套）。
+ *
+ * # 为什么要低水位
+ *
+ * 原来只有单条线：超过就砍最老的 10 条。一个真实 agent 回合结束时往 memory 批量写回
+ * 约 19 条、约 1.7 万 token，而砍一批只腾出约 1 万 —— 于是**从第 3 轮起每一轮都会压缩**。
+ * 压缩把 recent 头部切掉，而模型看到的历史是 `prefixMessages() + recent`，
+ * 头部一动，位置 1 往后全部错位：OpenAI / xAI 那一族的严格前缀缓存整段作废。
+ *
+ * 线上实测（2026-09-02，gpt-5.6-luna 的 >40k 真回合）：请求 56k→缓存 24k、105k→42k、
+ * 165k→36k —— **缓存量恒定、不随请求增长**，命中率也与请求间隔无关（<1分 26.9%）。
+ * 就是"只有静态头进了缓存、几万 token 的历史一条没进"。
+ *
+ * # 参数是量出来的，不是拍的
+ *
+ * 用 10 个真实尺寸的回合跑「相邻两轮历史前缀的公共部分占比」：
+ *   原始（100 条 / 48k，每次一批）        复用  7.4%
+ *   128→80 / 72k→36k                      复用 54.6%   ← 采用
+ *   160→100 / 96k→48k                     复用 67.2%
+ *   200→120 / 110k→55k                    复用 83.3%（但 recent 会到 108k，小窗口模型有风险）
+ * 选 128/72k 这组：复用提升七倍，而 recent 封顶 72k、加上网关静态头约 20k 仍在 128k 窗口内。
+ *
+ * 压缩的**总量不变**，变的只是频次——同样的历史照样被折叠，只是攒够一批再做，
+ * 中间那些轮次里前缀逐字节不动。
+ */
+export const RECENT_WINDOW = 128;
+export const RECENT_WINDOW_LOW = 80;
+const COMPRESS_HIGH_TOKENS = 72000;
+const COMPRESS_LOW_TOKENS = 36000;
 const MAX_SUMMARIES = 8;
-const SUMMARY_BATCH = 10;
+export const SUMMARY_BATCH = 10;
 const PERSISTED_MEDIA_BUDGET = 3_200_000;
 const MAX_ARCHIVE = 400;          // archived (compacted-away) turns kept for recall
 const ARCHIVE_ENTRY_MAX = 1600;   // chars per archived turn
@@ -365,10 +394,37 @@ export class ConversationMemory {
     // pressure (few turns but huge tool outputs). Threshold sits ABOVE the LLM
     // auto-compact trigger (~28k in main.js) so the smart compactor gets first
     // shot; this is the mechanical safety net.
-    if (!this._externalCompression && (this.recent.length > RECENT_WINDOW
-        || (this.recent.length >= SUMMARY_BATCH + 6 && this.estimateRecentTokens() > 48000))) {
-      this._compressOldestBatch();
+    if (this._externalCompression) return;
+    // 触发只算一次 token（estimateRecentTokens 是 O(全部字符) 的，不能放进循环里反复调）。
+    const overCount = this.recent.length > RECENT_WINDOW;
+    let est = null;
+    if (!overCount && this.recent.length >= SUMMARY_BATCH + 6) {
+      est = this.estimateRecentTokens();
     }
+    if (!overCount && !(est != null && est > COMPRESS_HIGH_TOKENS)) return;
+    if (est == null) est = this.estimateRecentTokens();
+    // 一次压到**低水位以下**，别让下一条消息又触发一次（见上面那段说明）。
+    // 循环里不再重算全量估值，按被砍掉那一批的实际用量增量扣减。
+    let guard = RECENT_WINDOW * 2; // 防呆：任何情况下都不许在这里转圈
+    while (guard-- > 0
+           && this.recent.length >= SUMMARY_BATCH + 6
+           && (this.recent.length > RECENT_WINDOW_LOW || est > COMPRESS_LOW_TOKENS)) {
+      const dropped = this.recent.slice(0, SUMMARY_BATCH);
+      const before = this.recent.length;
+      this._compressOldestBatch();
+      if (this.recent.length === before) break; // 没压动就别空转
+      est -= ConversationMemory._estimateMessagesTokens(dropped);
+    }
+  }
+
+  /** 一批消息的估算 token。和 estimateRecentTokens 用同一把尺子（CJK 1，其余 0.25）。 */
+  static _estimateMessagesTokens(list) {
+    let t = 0;
+    for (const m of list || []) {
+      const c = typeof m?.content === 'string' ? m.content : '';
+      for (let i = 0; i < c.length; i++) t += c.charCodeAt(i) > 0x2E7F ? 1 : 0.25;
+    }
+    return t;
   }
 
   // Display/recovery deliberately reads this durable record, whereas assemble()

@@ -69,7 +69,7 @@ import {
   USER_TOOL_PREFIX, buildHttpCall, compileToolSchema, userToolShortName,
 } from "../src/agent/capabilities.js";
 import { ansiToText } from "../src/agent/ansi.js";
-import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "../src/conversation-memory.js";
+import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence, RECENT_WINDOW, RECENT_WINDOW_LOW, SUMMARY_BATCH } from "../src/conversation-memory.js";
 import { GLOBAL_LANGUAGE_TAGS, buildLanguageOptions, coerceSupportedLocale, isSupportedLocale, localeLanguageCode, normalizeLocaleTag, systemPreferredLocale } from "../src/locales.js";
 import { compactToolExampleArgs, compactToolGuide, enrichedCatalogLine, toolCapabilityIndex, TOOL_METADATA } from "../src/tool-guides.js";
 import * as toolPolicy from "../src/agent/tool-policy.js";
@@ -5087,19 +5087,20 @@ test("conversation memory slices large histories without assembling a full copy"
 
 test("durable transcript survives prompt compaction and historical editing", () => {
   const memory = new ConversationMemory();
-  for (let index = 0; index < 125; index++) {
+  const N = RECENT_WINDOW + 25;   // 必须真的越过窗口，否则这条测的是"没压缩"
+  for (let index = 0; index < N; index++) {
     memory.push({ role: index % 2 ? "assistant" : "user", content: `original-turn-${index}` });
   }
   assert.ok(memory.recent.length < memory.transcript.length,
     "the prompt projection should compact without deleting the durable transcript");
   const saved = memory.toJSON();
-  assert.equal(saved.transcript.length, 125);
+  assert.equal(saved.transcript.length, N);
   assert.equal(saved.transcript[0].content, "original-turn-0");
-  assert.equal(saved.transcript[124].content, "original-turn-124");
+  assert.equal(saved.transcript[N - 1].content, `original-turn-${N - 1}`);
 
   const restored = ConversationMemory.fromJSON(saved);
-  assert.equal(restored.transcriptLength(), 125);
-  assert.equal(restored.transcriptSlice(120, 125)[0].content, "original-turn-120");
+  assert.equal(restored.transcriptLength(), N);
+  assert.equal(restored.transcriptSlice(N - 5, N)[0].content, `original-turn-${N - 5}`);
   restored.truncateTranscript(80);
   assert.equal(restored.transcriptLength(), 80);
   assert.equal(restored.transcriptSlice(79, 80)[0].content, "original-turn-79");
@@ -5416,11 +5417,14 @@ test("conversation compaction reports removed media for object URL cleanup", () 
   const memory = new ConversationMemory();
   const removed = [];
   memory.setRemovalHandler((messages) => removed.push(...messages));
-  for (let index = 0; index < 101; index++) {
+  // 跟着常量走，别写死窗口大小：调 RECENT_WINDOW 时这条不该无声地不再触发压缩。
+  for (let index = 0; index < RECENT_WINDOW + 1; index++) {
     memory.push({ role: "user", content: `turn ${index}`, attachments: index === 0 ? [{ kind: "video", objectUrl: "blob:test-video" }] : [] });
   }
-  assert.equal(memory.recent.length, 91);
-  assert.equal(removed.length, 10);
+  // 滞回：一旦触发就一路排到低水位，所以砍掉的是若干整批，不是一批。
+  assert.ok(memory.recent.length <= RECENT_WINDOW_LOW, `压完还有 ${memory.recent.length} 条`);
+  assert.equal(removed.length % SUMMARY_BATCH, 0, "砍的必须是整批");
+  assert.equal(memory.recent.length + removed.length, RECENT_WINDOW + 1);
   assert.equal(removed[0].attachments[0].objectUrl, "blob:test-video");
   assert.equal(memory.summaries[0].range, "turns 1-10",
     "automatic compaction must label the real historical turn range");
@@ -5429,9 +5433,10 @@ test("conversation compaction reports removed media for object URL cleanup", () 
   assert.match(memory.assemble().map((m) => m.content || "").join("\n"), /\[对话上下文摘要\][\s\S]*turn 0/,
     "older turns should remain available to the model through the summary block");
 
+  const removedBefore = removed.length;
   const compacted = memory.compactRecent(2, "summary");
   assert.equal(compacted.length, 2);
-  assert.equal(removed.length, 12);
+  assert.equal(removed.length, removedBefore + 2, "手动压缩这两条也要上报给对象 URL 清理");
 });
 
 test("session picker shows true memory stats and searches historical summaries", () => {
@@ -31320,7 +31325,7 @@ test("崩溃恢复补上的那批消息，溢出的头部要归档而不是凭�
   const mem = new ConversationMemory();
   const msg = (i) => ({ role: i % 2 ? "assistant" : "user", content: `第 ${i} 条消息，内容要够长才看得出被归档到哪里去了。` });
   // 先把 recent 填到接近上限
-  for (let i = 0; i < 96; i++) mem.push(msg(i));
+  for (let i = 0; i < RECENT_WINDOW - 4; i++) mem.push(msg(i));
   const archivedBefore = mem.archive.length;
   const before = mem.totalTurns;
 
@@ -31328,7 +31333,7 @@ test("崩溃恢复补上的那批消息，溢出的头部要归档而不是凭�
   const journal = Array.from({ length: 20 }, (_, i) => msg(100 + i));
   const added = mem.adoptJournalTail(journal, before + 20);
   assert.equal(added, 20, "该补的都补上了");
-  assert.ok(mem.recent.length <= 100, "recent 仍然有界");
+  assert.ok(mem.recent.length <= RECENT_WINDOW, "recent 仍然有界");
   assert.ok(mem.archive.length > archivedBefore,
     "溢出的头部被直接扔了——它同时从模型上下文和 recall_conversation 里消失了");
 
