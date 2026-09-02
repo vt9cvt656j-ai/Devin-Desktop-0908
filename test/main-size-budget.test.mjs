@@ -324,8 +324,14 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   最早那条消息四轮里三轮内容不同，而它躺在历史很靠前的位置。
  *   改成显式的 `prevMeta?.contextAvailable !== false`。守卫在
  *   test/read-stub-idempotent.test.mjs：把长度闸放到 0 它仍绿，说明幂等判据独立顶住。
+ * · 83_007（2026-09-02，抬 4 行）：实测    83006 行。买到的是**修掉模型悬浮卡一渲染就崩**。
+ *   自定义端点那段披露搬过两次家、CSS 也删过一次，落点元素 `.mic-note` 忘了加进
+ *   showModelInfoCard 的 innerHTML 模板；`querySelector(".mic-note")` 回 null，三个分支
+ *   每一个都是 `null.remove()`/`null.textContent=`，hover 任意模型名就 TypeError。
+ *   补上模板元素（4 行含注释）。守卫在 test/model-info-card-elements.test.mjs：函数里每个
+ *   querySelector(".X") 的目标，模板都必须真的建了那个元素——挡的是整整一类 bug。
  */
-const MAIN_JS_MAX_LINES = 83_002;
+const MAIN_JS_MAX_LINES = 83_007;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

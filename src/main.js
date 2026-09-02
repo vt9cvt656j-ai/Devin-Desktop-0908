@@ -17555,6 +17555,11 @@ function showModelInfoCard(m, anchorEl) {
     `<div class="mic-htxt"><div class="mic-name"></div><div class="mic-group"></div></div>` +
     _modelPowerToggleHtml(m) + `</div>` +
     `<div class="mic-id"></div>` +
+    // .mic-note 是自定义端点那段披露的落点。下面 17590 起的分支会 querySelector(".mic-note")
+    // 然后 remove()/设 textContent —— 模板里**必须**有这个元素，否则 querySelector 回 null，
+    // 三个分支每一个都是 `null.remove()` / `null.textContent=`，整张模型悬浮卡一渲染就崩。
+    // 披露搬过两次家（见下方注释），CSS 规则也被删过一次；这个元素当时漏加了。
+    `<div class="mic-note"></div>` +
     `<div class="mic-desc"></div>` +
     `<div class="mic-ctx">${_modelContextRows(m)}${_ctxRetentionHtml()}</div>` +
     `<div class="mic-think"></div>` +
