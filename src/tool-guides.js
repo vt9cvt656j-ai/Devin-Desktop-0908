@@ -817,15 +817,53 @@ function _capabilityNote(name, meta) {
   if (_SELF_EVIDENT.has(String(name))) return '';
   const usage = String(meta?.usage_note || '');
   const raw = (usage.match(/【何时用】([^【]*)/) || [])[1] || (meta?.use_cases || [])[0] || '';
-  const clean = String(raw).replace(/\s+/g, '').split(/[；;。，,]/)[0];
-  let note = clean.slice(0, 16);
-  if (clean.length > note.length) {
-    // 别停在半截上：去掉尾部残缺的 ASCII 串、悬空的左括号和标点。
-    note = note.replace(/[A-Za-z0-9./-]+$/, '').replace(/[（(【\[/、]+$/, '');
-  }
-  // 括号成对：截断可能把右半边切走了。
-  if ((note.match(/（/g) || []).length !== (note.match(/）/g) || []).length) {
-    note = note.slice(0, note.lastIndexOf('（'));
+  // 破折号也是分句符：web_fetch 的「抓取公网网页正文——读 web_search 找到的页面」
+  // 不切在这儿的话，16 字会落在「——读」上，读成"抓取网页正文、读"。
+  const firstClause = (t) => String(t).replace(/\s+/g, '').split(/[；;。，,——｜|]/)[0];
+  const clean = firstClause(raw);
+
+  const IDENT = /[A-Za-z0-9._/-]/;
+  const cut = (n) => {
+    let end = Math.min(n, clean.length);
+    if (end < clean.length && IDENT.test(clean[end]) && IDENT.test(clean[end - 1] || '')) {
+      // 切点落在一个 ASCII 词**中间**：往前补全它，而不是往回把它整个删掉。
+      // 往回删会把「改package.json/pom.xml…」削成一个「改」字。补全封顶 12 字，
+      // 再长就是一串路径，那时才回退。
+      let ext = end;
+      while (ext < clean.length && ext - end < 12 && IDENT.test(clean[ext])) ext++;
+      if (!(ext < clean.length && IDENT.test(clean[ext]))) end = ext;
+    }
+    let t = clean.slice(0, end);
+    if (clean.length > t.length) {
+      // 别停在半截上：去掉尾部残缺的 ASCII 串、悬空的左括号和连接号。
+      // 字符类里补了 `_`：web_fetch 这类带下划线的标识符原来会留半截在尾巴上。
+      t = t.replace(/[A-Za-z0-9._/-]+$/, '').replace(/[（(【\[/、—－\-]+$/, '');
+    }
+    // 括号成对：截断可能把右半边切走了。
+    if ((t.match(/（/g) || []).length !== (t.match(/）/g) || []).length) {
+      t = t.slice(0, t.lastIndexOf('（'));
+    }
+    return t;
+  };
+
+  /*
+   * **短不等于坏，坏的是「被截断成短」。**
+   *
+   * 原实现无条件 `slice(0, 16)` 再剥尾部 ASCII，于是 8 条注解被削成语义相反的三两个字：
+   * read_terminal 的「启动 dev server/watch 等持续任务**后看日志**」剩下「启动」——一个
+   * 读日志的工具被标成启动用的；而 run_in_terminal 剥出来**逐字一样**是「启动」，两个
+   * 语义相反的工具拿到同一条注解，模型没有任何线索分辨。
+   *
+   * 判据因此分三层：整句本来就短的原样留（「技术调研」「生成图片」是完整的，不是残句）；
+   * 需要截断的先按 16 切，切坏了放宽到 28；还是坏就退回 use_cases[0]（那是人写的短语，
+   * 天然完整）；最后还坏就干脆不给——没有比错的强。
+   */
+  if (clean && clean.length <= 16) return `(${clean})`;
+  let note = cut(16);
+  if (note.length < 5) note = cut(28);
+  if (note.length < 5) {
+    const fallback = firstClause((meta?.use_cases || [])[0] || '').slice(0, 20);
+    note = fallback.length >= 3 ? fallback : '';
   }
   return note ? `(${note})` : '';
 }

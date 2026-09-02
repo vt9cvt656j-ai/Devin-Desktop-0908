@@ -363,7 +363,7 @@ test("plan_first / tech_research / command_batch 各有确定的下一步", () =
   for (const [code, want] of [
     ["plan_first", /update_plan/],
     ["tech_research", /package_search/],
-    ["command_batch", /一次只发一条/],
+    ["command_batch", /前提/],
   ]) {
     const r = recover("[BLOCKED] x", { type: "write", path: "a.ts" }, { failure: { code } });
     assert.ok(r, `${code} 没有恢复指令`);

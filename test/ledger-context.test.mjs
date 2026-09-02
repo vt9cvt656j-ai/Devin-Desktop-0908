@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 // 按名字取真源码 / 取顶层常量的值，只有一份实现：test/helpers/source.mjs。
 // 这个文件的源码断言历来跑在**原文**上（下面自己剥注释），所以 SRC 绑定 main.js 原文。
 import { SRC, fnSource as extractFn, loadConst, load } from "./helpers/source.mjs";
+import { repairToolPairing } from "../src/agent/tool-pairing.js";
 
 // 注释里会引用被修掉的旧代码，所以凡是对源码文本的断言都先剥注释。按上下文逐字符扫，
 // 认得字符串 / 模板串 / 正则字面量（两条正则式的剥法会把 `/\//` 当成行注释吃掉真代码）。
@@ -475,6 +476,9 @@ test("_ideMeta 只在本机用，绝不发给上游", async () => {
     _withoutLegacyReasoningSummary: (c) => c,
     _wellFormedContent: (c) => c,
     _stripLoneSurrogates: (s) => s,
+    // 出线口第一句就做 tool_call ↔ tool_result 的配对修复。用**真实现**不用桩：
+    // 桩掉它就等于这条测试不再经过出线口真正会跑的那条路。
+    repairToolPairing,
   });
   const out = san([{ role: "assistant", content: "完成了", model: "claude",
     _ideMeta: { files: ["src/auth/session.ts"], filesTotal: 1 } }]);

@@ -145,9 +145,16 @@ test("发布产物里不许出现面向模型的散文（判据在解码后的�
   // 在那之前：这条红了先重跑一次构建再下结论，别急着抬上限——泄漏的语料一条都没变，
   // 变的只是这次捞到了几条。
   //
-  // 内容：tool-guides.js 的 TOOL_METADATA（143 个工具 ×
-  // usage_note/example_call/triggers/use_cases）整份还在客户端。
-  const LEAK_BUDGET = 369;
+  // 【2026-09-01：369 → 20】这上限原来锁的是一个**从来没被修过的洞**——
+  // build/strip-tool-guides-plugin.mjs 2026-08-27 就写好了，但引入它的那笔提交里没有
+  // vite.config.js，插件从未接进构建，于是 143 个工具的完整使用说明整份跟着发布包出门。
+  // 接上之后同一条判据实测从 369 掉到 8（【何时用】93→0、「vs 替代」61→0）。
+  //
+  // 上限取 20 而不是 8：上面那段说的混淆器随机抽样（无 seed，实测抖动 ±7）仍在，
+  // 钉死 8 会让这道门在**没有任何回归**时偶发假红。20 = 8 + 抖动余量，
+  // 而离真正的回归（几十上百条）还有足够距离。
+  // 剩下那几条是 ALLOWED_REGIONS 显式豁免的、以及 _buildToolHint 里刻意留在客户端的一句。
+  const LEAK_BUDGET = 20;
   assert.ok(leaks.length <= LEAK_BUDGET,
     `发布包里查到 ${leaks.length} 条工具说明文本，比上限 ${LEAK_BUDGET} 多了 `
     + `${leaks.length - LEAK_BUDGET} 条 —— 有人往客户端加了新的工具说明。\n`
@@ -156,7 +163,7 @@ test("发布产物里不许出现面向模型的散文（判据在解码后的�
   // 搬完一批却忘了收紧上限，等于把门重新放松。降下来就要当场钉住。
   // 窗口下沿 -25：既能兜住「本地开发构建比发布构建少数十几条」这个已知差值，
   // 又能在真的搬走一批之后逼人收紧上限。
-  assert.ok(leaks.length >= LEAK_BUDGET - 25,
+  assert.ok(leaks.length >= LEAK_BUDGET - 18,
     `实际只剩 ${leaks.length} 条，远低于上限 ${LEAK_BUDGET} —— 搬迁推进了，`
     + `请把 LEAK_BUDGET 改成 ${leaks.length}（目标 0），否则这道门会一直松着。`);
 });

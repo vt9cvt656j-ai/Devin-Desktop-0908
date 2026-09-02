@@ -135,7 +135,10 @@ test("声明的模型查不到时继承父体，并且说出来", () => {
 test("上下文上限跟着实际跑的那个模型，不是父体的", () => {
   // 角色声明成小窗口模型时，按父模型的上限裁剪 = 本地以为还装得下、上游直接截断。
   const src = extractFn("_runSubAgent");
-  assert.match(src, /_effectiveContextLimit\(_subConfig\?\.model\)/,
+  // 键是 `customModelId || model`：自定义线路上 config.model 已被改写成上游真名，
+  // 只传 model 就查不到用户在卡片上选的窗口（见 logic.test.mjs 那条自定义端点的往返）。
+  // 角色声明了自己的模型时 customModelId 为空，回落到 _roleModel，这条的原意不变。
+  assert.match(src, /_effectiveContextLimit\(_subConfig\?\.customModelId \|\| _subConfig\?\.model\)/,
     "裁剪用的还是父体的模型");
 });
 

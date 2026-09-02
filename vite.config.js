@@ -4,6 +4,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import JavaScriptObfuscator from "javascript-obfuscator";
 import { stripToolIp } from "./build/strip-tool-ip.mjs";
+import { stripToolGuidesPlugin } from "./build/strip-tool-guides-plugin.mjs";
 
 // Build-time IP strip: blank tool DESCRIPTION text in `_buildAgentToolSchemas` so the
 // shipped bundle carries no tool-library prose. Runtime-neutral (L0 sends only tool
@@ -246,6 +247,16 @@ export default defineConfig({
   plugins: [
     // enforce:"pre" → tool-IP strip runs before bundling.
     stripToolIpPlugin(),
+    // 同上，剥 src/tool-guides.js 的 TOOL_METADATA / TOOL_EXAMPLES 散文。
+    //
+    // **这个插件 2026-08-27 就写好了，但一直没接进来**（引入它的那笔提交里没有
+    // vite.config.js），于是 143 个工具的完整使用说明整份跟着发布包出门。用仓里自己的
+    // 解码器（build/bundle-strings.mjs）读 dist/assets/main-*.js 实测：16,782 条字符串里，
+    // 两个探针各命中 93 条和 61 条；接上之后同样的探针是 0 和 0。
+    // 明文 grep 只看得到 44 和 0 —— 混淆器把约四分之三的字面量搬进了编码字符串表，
+    // 以明文为判据的泄漏检查对大部分泄漏面**结构性失明**，而且是安静地失明。
+    // 两者都是 enforce:"pre"，顺序无关（见 build/strip-tool-guides-plugin.mjs 文件头）。
+    stripToolGuidesPlugin(),
     // React islands: shadcn components mounted into the existing vanilla shell.
     // Only touches .jsx/.tsx — src/main.js has no JSX, so the 59k-line shell is not
     // transformed and its 907 source-text test assertions keep matching.

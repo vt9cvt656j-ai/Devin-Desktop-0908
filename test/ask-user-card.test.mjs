@@ -10,6 +10,20 @@ import { normalizeAskOptions, askMode, askAnswerText, askAnswerLabel, ASK_MAX_OP
 import { blockFrom, fnSource, CODE } from "./helpers/source.mjs";
 
 const CSS = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
+/**
+ * 同一份样式表，**剥掉注释**。
+ *
+ * 给那些"扫全文找违规"的反向断言用。不剥的话它们会吃到注释：app.css 里有一段解释
+ * MCP 头像层叠的注释，正文逐字写着「浅色的 .agent-tool-step--mcp .atc-type-icon
+ * 和深色的…」，而 `[^{]*\{[^}]*color:` 这种跨行模式会从那段**注释文字**一路匹配到
+ * 它后面第一个带 color 的规则块，红在一个根本不存在的违规上。
+ *
+ * 它此前只是**恰好**被中间夹着的一条一行规则（`.mic-head { position: relative; }`）
+ * 挡住——那行 2026-09-01 因为别的原因删掉，这条守卫就当场翻车。靠一条无关规则站着的
+ * 判据本来就不算判据。只给需要的那几条用，正向断言仍然读原文（注释里的关键词不该
+ * 替代码作证，但这里的两条断言量的是排版数值，剥不剥都一样）。
+ */
+const CSS_CODE = CSS.replace(/\/\*[\s\S]*?\*\//g, "");
 const CATALOG = readFileSync(new URL("../src/agent/tool-catalog.js", import.meta.url), "utf8");
 const GATEWAY = readFileSync(new URL("../../server/prompts/tools.json", import.meta.url), "utf8");
 const CARD = blockFrom('} else if (call.type === "askuser") {');
@@ -307,7 +321,7 @@ test("颜色按族分，只有七族，而且只上在描边上", async () => {
     assert.doesNotMatch(body, /background/, `族色又做成填色底块了：${body.trim()}`);
   }
   // 族的归属只有一份（在模块里），CSS 不许再按工具类型手工列第二份。
-  assert.doesNotMatch(CSS, /\.agent-tool-step--\w+ \.atc-type-icon[^{]*\{[^}]*color:/,
+  assert.doesNotMatch(CSS_CODE, /\.agent-tool-step--\w+ \.atc-type-icon[^{]*\{[^}]*color:/,
     "又在 CSS 里按工具类型手工分配颜色了——两份名单必然漂移");
 });
 

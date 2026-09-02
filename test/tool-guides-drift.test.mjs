@@ -25,6 +25,23 @@ const KNOWN_META_FIELDS = new Set(["category", "priority", "use_cases", "trigger
 // 允许留下的**非散文**字段。加进这张表的每一条都要能回答「它凭什么不是 IP」。
 const NON_PROSE_FIELDS = new Set(["category", "priority"]);
 
+
+// _capabilityNote 没有导出（它是名录内部的），按 AST 从真源码里抠出来跑——
+// 抠的是产品真正用的那一份，不是测试台自己写一个形状。
+function loadCapabilityNote() {
+  const src = readFileSync(new URL("../src/tool-guides.js", import.meta.url), "utf8");
+  const at = src.indexOf("function _capabilityNote(name, meta) {");
+  assert.ok(at > 0, "_capabilityNote 改名了，这几条守卫要跟着改");
+  let d = 0, i = src.indexOf("{", at);
+  for (; i < src.length; i++) {
+    if (src[i] === "{") d++;
+    else if (src[i] === "}" && --d === 0) break;
+  }
+  const fn = src.slice(at, i + 1);
+  const se = src.match(/const _SELF_EVIDENT\s*=\s*new Set\(\[[\s\S]*?\]\);/);
+  return new Function(`${se ? se[0] : "const _SELF_EVIDENT=new Set();"}\n${fn}\n;return _capabilityNote;`)();
+}
+
 test("TOOL_METADATA 没有出现剥离器不认识的字段", async () => {
   const mod = await import(pathToFileURL(GUIDES).href);
   const seen = new Set();
@@ -176,4 +193,71 @@ test("自查：剥离器坏掉时这些断言真的会红", () => {
   const tricky = stripToolGuides(RAW.replace(ANCHOR, "usage_note: '【何时用】决策前'+SUFFIX"));
   assert.equal(tricky.changed, tricky.expected,
     "这一种本来就骗得过计数器；如果它现在不相等了，说明计数逻辑变了，上面那条 residual 断言的意义要重估");
+});
+
+// ---- 能力名录的注解：短不等于坏，坏的是「被截断成短」 ----------------------
+//
+// 这一组**真跑** _capabilityNote，喂真实的 TOOL_METADATA。原实现无条件 slice(0,16)
+// 再剥尾部 ASCII，把 8 条注解削成语义相反的三两个字，其中两条还削成了逐字相同的
+// 「启动」——read_terminal（读日志）和 run_in_terminal（起进程）在模型眼里没有区别。
+// 名录每个 agent 轮都在上下文里，这类注解不是「信息量不足」，是把模型往反方向推。
+test("能力注解：没有一条被截成语义相反的残句", async () => {
+  const note = loadCapabilityNote();
+  const { TOOL_METADATA } = await import(pathToFileURL(GUIDES).href);
+  const bad = [];
+  for (const [name, meta] of Object.entries(TOOL_METADATA)) {
+    const out = note(name, meta);
+    if (!out) continue;                       // 不给注解是允许的：没有比错的强
+    const inner = out.slice(1, -1);
+    // 被截断的残句才是问题。判据：注解比原句短（说明截过），却只剩三两个字。
+    const raw = String(meta?.usage_note || "");
+    const src = (raw.match(/【何时用】([^【]*)/) || [])[1] || (meta?.use_cases || [])[0] || "";
+    const full = String(src).replace(/\s+/g, "").split(/[；;。，,——｜|]/)[0];
+    if (inner.length < 5 && full.length > inner.length) bad.push(`${name}: 「${inner}」← ${full.slice(0, 40)}`);
+  }
+  assert.deepEqual(bad, [],
+    `这些注解被截成了残句（原句更长，剩下的三两个字已经改变了语义）：\n  ${bad.join("\n  ")}`);
+});
+
+test("能力注解：两个工具不许拿到逐字相同的注解", async () => {
+  // read_terminal 和 run_in_terminal 曾经都是「(启动)」。同一条注解挂在语义相反的两个
+  // 工具上，比没有注解更糟：它给了模型一个错误的区分依据。
+  const note = loadCapabilityNote();
+  const { TOOL_METADATA } = await import(pathToFileURL(GUIDES).href);
+  const seen = new Map();
+  for (const [name, meta] of Object.entries(TOOL_METADATA)) {
+    const out = note(name, meta);
+    if (!out) continue;
+    (seen.get(out) || seen.set(out, []).get(out)).push(name);
+  }
+  const dup = [...seen].filter(([, names]) => names.length > 1)
+    .map(([n, names]) => `${n} ← ${names.join(" / ")}`);
+  assert.deepEqual(dup, [], `这些工具共用了同一条注解：\n  ${dup.join("\n  ")}`);
+});
+
+test("能力注解：尾巴不许悬空（半个标识符、孤零零的括号或破折号）", async () => {
+  const note = loadCapabilityNote();
+  const { TOOL_METADATA } = await import(pathToFileURL(GUIDES).href);
+  const bad = [];
+  for (const [name, meta] of Object.entries(TOOL_METADATA)) {
+    const inner = (note(name, meta) || "").slice(1, -1);
+    if (!inner) continue;
+    if (/[（(【[/、\-—－_]$/.test(inner)) bad.push(`${name}: 「${inner}」`);
+    if ((inner.match(/（/g) || []).length !== (inner.match(/）/g) || []).length) bad.push(`${name}: 括号不成对「${inner}」`);
+  }
+  assert.deepEqual(bad, [], `尾巴悬空：\n  ${bad.join("\n  ")}`);
+});
+
+test("能力注解：整块的字节数没有失控（它每轮都在上下文里）", async () => {
+  const note = loadCapabilityNote();
+  const { TOOL_METADATA } = await import(pathToFileURL(GUIDES).href);
+  let chars = 0, n = 0;
+  for (const [name, meta] of Object.entries(TOOL_METADATA)) {
+    const out = note(name, meta);
+    if (out) { chars += out.length; n++; }
+  }
+  assert.ok(n >= 100, `只生成了 ${n} 条注解 —— 判据本身坏了，任何"通过"都不作数`);
+  assert.ok(chars <= 2600,
+    `注解总长 ${chars} 字符。修截断的代价应当是几十字符量级；`
+    + "涨到这个程度说明放宽档位失控了，而这块每个 agent 轮都在上下文里。");
 });

@@ -8908,7 +8908,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .model-info-card {
   position: fixed;
   z-index: 70; /* above the menu (60) */
-  width: 264px;
+  width: 280px;
   max-width: calc(100vw - 16px);
   padding: 12px 13px;
   background: var(--panel-2);
@@ -8924,8 +8924,13 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .model-info-card[hidden] {
   display: none;
 }
+/* 三列 grid：图标 / 文字 / 强力版按钮。
+   原来按钮是 position:absolute right:0，而 .mic-name 是 nowrap+ellipsis 却不给它让位
+   —— 长模型名（claude-sonnet-5-20260514-thinking 这类）会从按钮**底下穿过去**，
+   连省略号都被盖住。进流之后 minmax(0,1fr) 负责收缩，省略号落在按钮左边。 */
 .model-info-card .mic-head {
-  display: flex;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
   align-items: center;
   gap: 9px;
 }
@@ -8938,8 +8943,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   min-width: 0;
 }
 .model-info-card .mic-name {
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 650;
+  letter-spacing: -0.005em;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -8952,21 +8958,21 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 单行省略，全文挂 title。break-all 会把 custom: 那种 uuid 折成两三行乱码块，
+   占掉 40 多个像素，而它只是个标识符、没人需要逐字读。 */
 .model-info-card .mic-id {
-  margin-top: 8px;
+  margin-top: 6px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 10.5px;
+  letter-spacing: -0.01em;
   color: var(--text-dim);
-  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.model-info-card .mic-desc {
-  margin-top: 8px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text);
-}
-/* 自定义模型的那句披露。夹在模型 id 和描述之间：它是关于**这个端点**的事实，
-   不是关于模型的描述，所以自成一格、字更小、颜色更弱。 */
+/* 自定义端点那段披露（main.js showModelInfoCard 的 .mic-note）。
+   这条规则一度随「删掉披露」那轮一起删了，而披露后来被另一条线路的改动带了回来 ——
+   规则不在的话它就是一段没有底色、没有内边距的裸文字。 */
 .mic-note {
   margin: 6px 0 2px;
   padding: 6px 8px;
@@ -8976,13 +8982,11 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   line-height: 1.55;
   color: var(--text-dim);
 }
-.model-info-card .mic-prices {
-  margin-top: 10px;
-  padding-top: 9px;
-  border-top: 1px solid var(--line);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+.model-info-card .mic-desc {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
 }
 .model-info-card .mic-row {
   display: flex;
@@ -9003,27 +9007,25 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   font-size: 11px;
   color: var(--text-dim);
 }
+/* 不用斜体：中文没有真斜体字形，引擎伪斜出来是糊的。用字色和透明度分层。 */
 .model-info-card .mic-row--hint .mic-u {
-  font-style: italic;
-  opacity: 0.8;
+  opacity: 0.85;
 }
+/* 标签行。**不给 CJK 加字间距**：.05em 在拉丁小字上是"标签感"，在汉字上只是把字拉散。
+   和滑杆的标题行（.mic-sl__label）统一成同一种：11px / 600 / .02em / dim，
+   整张卡只有一种"标题行"的长相。 */
 .model-info-card .mic-plabel {
   margin-bottom: 3px;
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.05em;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
   color: var(--text-dim);
 }
-.model-info-card .mic-plabel--sub {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--line);
-  opacity: .82;
-}
+/* 上下文和思考深度之间**不画线**：它们是同一类东西（两个真旋钮），中间横一条线是把
+   同类控件割成两个不相干的区块——那正是这张卡原来最像"自制后台面板"的地方。
+   整张卡只在**语义换挡处**留一条线：能改的 → 只读的（.mic-prices 那条）。 */
 .model-info-card .mic-think {
-  margin-top: 10px;
-  padding-top: 9px;
-  border-top: 1px solid var(--line);
+  margin-top: 12px;
 }
 .model-info-card .mic-think .mic-plabel {
   display: flex;
@@ -9032,65 +9034,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   gap: 6px;
   margin-bottom: 6px;
 }
-.model-info-card .mic-think-status {
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0;
-  padding: 1px 7px;
-  border-radius: 9px;
-  text-transform: none;
-}
-.model-info-card .mic-think-status--on {
-  background: rgba(26, 115, 232, 0.12);
-  color: #1a73e8;
-}
-.model-info-card .mic-think-status--off {
-  background: rgba(120, 120, 120, 0.14);
-  color: var(--text-dim);
-}
-.model-info-card .mic-think-row {
-  display: flex;
-  gap: 4px;
-  margin-top: 4px;
-}
-.model-info-card .mic-think-btn {
-  flex: 1;
-  padding: 6px 4px;
-  font-size: 11px;
-  font-weight: 500;
-  font-family: inherit;
-  background: var(--bg, #fff);
-  color: var(--text-dim);
-  border: 1px solid var(--line, #e5e7eb);
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
-  user-select: none;
-  min-height: 26px;
-}
-.model-info-card .mic-think-btn:hover {
-  background: var(--bg-elevated, #f6f8fa);
-  color: var(--text);
-}
-.model-info-card .mic-think-btn.is-active {
-  background: #1a73e8;
-  color: #fff;
-  border-color: #1a73e8;
-}
-/* "关闭" button gets a slightly muted active style — visually says "off". */
-.model-info-card .mic-think-btn--off.is-active {
-  background: #6b7280;
-  border-color: #6b7280;
-  color: #fff;
-}
-.model-info-card .mic-think-hint {
-  margin-top: 7px;
-  font-size: 10.5px;
-  line-height: 1.45;
-  color: var(--text-dim);
-  opacity: 0.9;
-}
-
 /* ---- buttons ---- */
 .btn {
   display: inline-flex;
@@ -16007,11 +15950,6 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .mi-live-preview__shot { display: block; width: 100%; }
 @keyframes miLivePulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 
-/* Context-window tier above the current membership: visible but inert, with the unlock
-   condition in the tooltip. Dimming instead of hiding — the user asked to see all tiers. */
-.model-info-card .mic-ctx-btn--locked { opacity: .42; cursor: not-allowed; }
-.model-info-card .mic-ctx-btn--locked:hover { transform: none; box-shadow: none; }
-
 /* MCP 头像：明暗两套底板都要让开。写成 (0,3,0) 且放在文件末尾，才能同时压过
    浅色的 .agent-tool-step--mcp .atc-type-icon 和深色的 [data-theme="dark"] 版本
    ——头像自己就是底色，底下再垫一层会从 .mcpfp-icon 的半透明边框里透出来。 */
@@ -16019,9 +15957,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 /* 模型卡片右上角的「强力版」开关（只有 Claude 一族会渲染出来）。
    关闭时压成低对比的描边按钮，打开时点亮 —— 它切的是线路，属于会改变这一轮
    请求去向的状态，得让人一眼看出现在是开是关。 */
-.model-info-card .mic-head { position: relative; }
 .mic-power {
-  position: absolute; top: -2px; right: 0;
   display: inline-flex; align-items: center; justify-content: center;
   width: 24px; height: 24px; padding: 0;
   border: 1px solid var(--line-strong); border-radius: 6px;
@@ -16039,6 +15975,9 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
    颜色一律走这套 UI 自己的 token（--text / --text-dim / --line / --accent）。
    第一版写的是 --fg / --muted-fg / --border —— 这三个变量在本文件里根本不存在，
    于是每一条都落到兜底的浅灰上，在白底卡片上糊成一片。 */
+/* 上下文这一块：滑杆（或只读事实行）+ 紧跟其后的会员留存行。间距归它管，
+   否则节奏散落在 .mic-sl 和 .mic-fact 各自的 margin 里，谁也说不清块和块隔多远。 */
+.model-info-card .mic-ctx { margin-top: 11px; }
 .model-info-card .mic-sl { margin: 2px 0 4px; }
 .model-info-card .mic-sl__head {
   display: flex; align-items: baseline; justify-content: space-between;
@@ -16048,28 +15987,27 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   font-size: 11px; font-weight: 600; letter-spacing: .02em; color: var(--text-dim);
 }
 .model-info-card .mic-sl__val {
-  font-size: 14px; font-weight: 640; font-variant-numeric: tabular-nums;
+  font-size: 13px; font-weight: 650; font-variant-numeric: tabular-nums;
   color: var(--text); margin-left: auto;
 }
 .model-info-card .mic-sl__track { position: relative; height: 18px; }
 .model-info-card .mic-sl__rail,
-.model-info-card .mic-sl__lock,
 .model-info-card .mic-sl__fill {
   position: absolute; top: 50%; transform: translateY(-50%);
   height: 5px; border-radius: 999px; pointer-events: none;
 }
 .model-info-card .mic-sl__rail { left: 0; right: 0; background: var(--line-strong); }
-/* 买不到的档位那一段。比轨道再浅一点点即可——这张卡片只有 264px 宽，
-   斜纹之类的花样在这个尺寸下只会变成噪点。 */
-.model-info-card .mic-sl__lock { right: 0; background: var(--line); }
 .model-info-card .mic-sl__fill { left: 0; background: var(--accent); }
 .model-info-card .mic-sl__tick {
   position: absolute; top: 50%; width: 3px; height: 3px; margin-left: -1.5px;
   transform: translateY(-50%); border-radius: 50%;
   background: var(--text); opacity: .22; pointer-events: none;
 }
-.model-info-card .mic-sl__tick.is-done { opacity: 0; }
-.model-info-card .mic-sl__tick.is-locked { opacity: .3; }
+/* 走过的刻度**反白**，不是消失。原来是 opacity:0：拖到最右端整条轨变成一根光板，
+   "这条轴一共有几档"的唯一视觉线索跟着没了，用户不知道自己还能往回拖几格。 */
+.model-info-card .mic-sl__tick.is-done {
+  background: var(--panel-2); opacity: .9;
+}
 /* 原生轨道整个透明，看得见的是上面那三层；这里只留下拇指。 */
 .model-info-card .mic-sl__input {
   position: absolute; inset: 0; width: 100%; height: 100%;
@@ -16096,38 +16034,75 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .model-info-card .mic-sl__input:focus-visible::-webkit-slider-thumb {
   box-shadow: 0 0 0 3px var(--sel);
 }
+/* 只读的一行事实：上下文只有一个窗口时的读数、以及会员留存。
+   **刻意长得不像控件**——没有轨道、没有底色、没有 hover 态。这张卡片上
+   「有轨道的一定会改这一轮请求，没轨道的一定改不了」是唯一一条视觉承诺。
+   会员留存档位曾经是一张收据却被做成可拖的样子（外观、手感、吸附、持久化和真旋钮
+   一模一样），那正是用户说的"假修改"。 */
+.model-info-card .mic-fact {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin: 2px 0 5px; min-height: 18px;
+}
+.model-info-card .mic-fact__k {
+  font-size: 11px; font-weight: 600; letter-spacing: .02em; color: var(--text-dim);
+}
+/* 只读的值：等宽 + 次要色。**必须和 .mic-sl__val 长得不一样**——两者曾经逐字相同
+   （14px/640/--text），于是"有轨道的一定改得了、没轨道的一定改不了"这条承诺，
+   在唯一一个只读读数上自己破了功：单窗口模型的上下文看起来和可拖的读数一模一样。 */
+.model-info-card .mic-fact__v {
+  margin-left: auto; font-family: var(--mono); font-size: 12px; font-weight: 600;
+  font-variant-numeric: tabular-nums; color: var(--text-dim);
+}
+/* 留存那一行：值压成次要色，后面缀一句「已自动生效」。撤掉滑轨上那三格之后，
+   产品里只剩这一行在说档位存在，而它最该说的恰恰是"你不用选、也没得选"。 */
+.model-info-card .mic-fact--keep { margin: 7px 0 2px; }
+.model-info-card .mic-fact--keep .mic-fact__v {
+  font-size: 12px; font-weight: 600; color: var(--text-dim);
+}
+.model-info-card .mic-fact--keep em {
+  margin-left: 6px; font-style: normal; font-weight: 600; font-size: 10px;
+  letter-spacing: .02em; color: var(--accent); opacity: .85;
+}
+
 .model-info-card .mic-sl__ends {
   display: flex; justify-content: space-between; margin-top: 4px;
   font-size: 10.5px; font-variant-numeric: tabular-nums; color: var(--text-dim);
 }
 
-/* 价格块：四格网格、整体水平居中，垫在卡片最底下。
-   原来是「键 …… 值 单位」三段式的左右对齐行，四项（输入/输出/缓存写/缓存读）排下来
-   会拉出很长一列；网格把它们压成两行两列，单位只在最下面说一次。 */
-.model-info-card .mic-plabel--center { text-align: center; }
+/* 价格块：一张两列的对账表，不是四个灰方块。
+   原来每一项是「标签在上、数值在下」的居中色块，四项排下来占掉卡片下半张，而且
+   四个数**一个单位都没有**——"$0.29" 到底是每百万 token、每千 token 还是每次调用，
+   卡片上任何地方都没说（model.price.perMillionTokens 那条译文在 i18n.js 里躺着没人用）。
+   现在单位写在标题行右侧说一次，四项压成「标签左 / 数值右」的行，两列并排。 */
 .model-info-card .mic-prices {
-  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line);
+  margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--line);
+}
+.model-info-card .mic-phead {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  margin-bottom: 7px;
+}
+.model-info-card .mic-phead .mic-plabel { margin: 0; }
+.model-info-card .mic-punit {
+  font-family: var(--mono); font-size: 10px; color: var(--text-dim); opacity: .85;
 }
 .model-info-card .mic-prices__grid {
   display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px 8px; margin-top: 2px;
+  gap: 5px 14px;
 }
 /* 单数个格子时最后一格跨满，免得孤零零地贴在左边 */
 .model-info-card .mic-prices__grid > .mic-price:last-child:nth-child(odd) { grid-column: 1 / -1; }
 .model-info-card .mic-price {
-  text-align: center; padding: 5px 4px 6px;
-  background: var(--hover); border-radius: 7px;
+  display: flex; align-items: baseline; gap: 6px; min-width: 0;
 }
 .model-info-card .mic-price__k {
-  font-size: 10.5px; color: var(--text-dim); margin-bottom: 1px; white-space: nowrap;
+  font-size: 11px; color: var(--text-dim); white-space: nowrap;
 }
 .model-info-card .mic-price__v {
-  font-size: 13px; font-weight: 640; color: var(--text); font-variant-numeric: tabular-nums;
+  margin-left: auto; font-size: 12.5px; font-weight: 640;
+  color: var(--text); font-variant-numeric: tabular-nums;
 }
 /* 思考深度整块往上收。标题现在和读数同一行（由滑块自己渲染），不再单独占一行，
    原来那截空白就是这么来的。 */
-.model-info-card .mic-think { margin-top: 8px; }
-
 /* 关掉时图标压成次要色，和 .layout.hide-assistant 的实际状态对齐。 */
 .tbtn.is-off .ic { color: var(--text-dim); opacity: .6; }
 

@@ -18,11 +18,17 @@ export const CM_PROTOCOL_DEFAULT = "openai";
  * `label` 会被 Rust 那边覆盖：出错文案要按协议报名字，而权威名字在 protocol.rs。
  * `ph` / `desktopOnly` 是纯 UI 字段，留在前端。
  *
- * 【2026-09-01 删掉了 gaps】原来每个协议还带一列「不支持什么」的文案（温度/top_p 不发、
- * 思考开关按模型名猜、max_tokens 默认 32000…），渲染在协议选择器下面。用户两次点名说
- * 这些提示字没用要删，所以文案、渲染、以及从 Rust 同步 gaps 的那一行一起摘干净了 ——
- * 留着不渲染只会变成又一处「攒了一路没人消费」的死数据。
- * 那些限制**本身仍然成立**，权威描述在 protocol.rs 的 Wire::unsupported()。
+ * 【关于 gaps —— 这段注释此前是假的，已订正】每个协议带一列「不支持什么」的文案
+ * （温度/top_p 不发、思考开关按模型名猜、max_tokens 默认 32000…）。这里曾经写着
+ * 「2026-09-01 已把文案、渲染、以及从 Rust 同步的那一行一起摘干净」——**三样都还在**：
+ * 数组在下面，同步在 main.js 的 syncProto 里，渲染在弹窗的 .cm-gapsbox（一个默认收起的
+ * details）。当初删掉的只是协议选择器下面那段**地址写法**说明，不是能力缺口。
+ * 照着那段假注释去"清理死数据"，会删掉「不许假装支持」在界面上唯一的落点。
+ *
+ * 注意 openai 那条的 gaps 是空数组，而 .cm-gapsbox 在 gaps 为空时整块隐藏 ——
+ * OpenRouter / one-api / Ollama / DeepSeek / GLM / Kimi 全走这条，也就是绝大多数
+ * 自建端点的用户在这里什么都看不到。
+ * 限制的权威描述在 protocol.rs 的 Wire::unsupported()。
  */
 export const CM_PROTOCOL_UI = {
   openai: {

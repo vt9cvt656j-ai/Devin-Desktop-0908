@@ -227,6 +227,8 @@ import { normalizeAppSkin, clampSkinOpacity, skinPanelAlpha, SKIN_ENCODE_LADDER 
 import { followAllows } from "./agent/live-follow.js";
 import { toolIconSvg as _toolIconSvg, toolIconFamily as _toolIconFamily } from "./agent/tool-icons.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
+import { capTurnToolResults } from "./agent/tool-output.js";
+import { repairToolPairing } from "./agent/tool-pairing.js";
 
 // Global shared state store for sub-agent collaboration
 const _globalSharedStore = getSharedStore();
@@ -1103,6 +1105,10 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       // 用户点的是哪一组。网关只在**它已经算出来的候选**里认这个 id，
       // 所以它至多让用户在自己本来就能从列表里点到的那几条线路之间选一条。
       if (_routeId) _h["x-ide-route"] = _routeId;
+      // **直连第三方端点时一个 x-ide-* 都不发**：它们是发给我们网关的遥测，对方用不上，而浏览器
+      // 对非标准头要预检、对方必须逐个回显才放行。实测 api.moonshot.cn 只带标准头 204 且回显、
+      // 带上 x-ide-* 就不回显 → 整条请求发不出去。代发线路 _isGatewayConfig 为真，照发。
+      if (!_isGatewayConfig(config)) for (const k of Object.keys(_h)) if (k.startsWith("x-ide-")) delete _h[k];
       let timer = null;
       if (activeAttemptController) timer = setTimeout(() => activeAttemptController.abort(), _AI_RESPONSE_HEADERS_DEADLINE_MS);
       try {
@@ -3135,7 +3141,8 @@ function _wellFormedContent(content) {
 }
 
 function _sanitizeProviderMessages(messages) {
-  const source = Array.isArray(messages) ? messages : [];
+  // 补 tool_call ↔ tool_result 的空洞：chat/agent 共同的出线口，逐条 break 漏的一次覆盖。
+  const source = repairToolPairing(Array.isArray(messages) ? messages : []);
   return source.map((message) => {
     if (!message || typeof message !== "object" || Array.isArray(message)) return message;
     // `model`（这条历史当初是哪个模型答的）和 `feedback`（用户点的赞/踩）都是**展示用**
@@ -14234,6 +14241,9 @@ function _formatAiHttpError(status, statusText, body) {
  * 所以两边都要有，各司其职。
  */
 function _byoViaGateway(custom) {
+  // **只有桌面端走得通**：x-ide-byo-* 只有 Rust 在发，网页版走 _realAiFetch 的装配、一个都没有；
+  // 少了头网关 from_headers 返回 None → 拿上游真名查我们自己的 models 表 → 按我们的价钱计费。
+  if (!inTauri) return false;
   const raw = String(custom?.baseUrl || "").trim();
   if (!raw) return false;
   let u;
@@ -14925,24 +14935,24 @@ function _modelPowerToggleHtml(m) {
  *
  * 用原生 <input type="range"> 而不是自己拿 div 拼一个：键盘（左右箭头/Home/End）、
  * 触控板、读屏器全都是白送的，自己拼一律要重写一遍，而且多半重写不全。
- * 轨道自己画（rail/lock/fill 三层绝对定位），因为 range 的原生轨道在
- * 各引擎里能改的东西不一样，而这里要的是「已选段渐变 + 未解锁段另一种颜色」。
+ * 轨道自己画（rail/fill 两层绝对定位），因为 range 的原生轨道在各引擎里能改的东西
+ * 不一样，而这里要的是「已选段一种颜色、走过的刻度反白」。
  *
- * `locked`：档位存在但当前会员档买不到。它照样占一个刻度（藏起来会让人以为没有
- * 这个档），拖到那儿会弹回最高可选档并给一句提示。
+ * **每一格都是能选的。** 曾经还有个 `locked` 维度（档位存在但会员档买不到，占一个刻度、
+ * 拖过去弹回最高可选档并给提示），随会员留存档位一起撤了 —— 那几格拖了不算数，
+ * 而一个拖得动、松手弹回、还配一句解释的控件，比不画更容易让人以为它是真的。
+ *
+ * 只有一档时**不要调用这个函数**，改用 `_ctxFactHtml` 画一行只读事实：
+ * 下面 `last = Math.max(1, n - 1)` 会让单格滑块的拇指真的拖得动、松手再弹回来。
  */
 function _micSliderHtml(cfg) {
   const opts = cfg.options || [];
   if (!opts.length) return "";
   const idx = Math.max(0, Math.min(opts.length - 1, Number(cfg.index) || 0));
   const last = Math.max(1, opts.length - 1);
-  // 最后一个可选档的位置：它右边那段轨道画成"买不到"的颜色。
-  let lastOpen = -1;
-  opts.forEach((o, i) => { if (!o.locked) lastOpen = i; });
   const pct = (i) => `${(i / last) * 100}%`;
   const ticks = opts
-    .map((o, i) => `<i class="mic-sl__tick${o.locked ? " is-locked" : ""}${i <= idx ? " is-done" : ""}"`
-      + ` style="left:${pct(i)}"></i>`)
+    .map((o, i) => `<i class="mic-sl__tick${i <= idx ? " is-done" : ""}" style="left:${pct(i)}"></i>`)
     .join("");
   const cur = opts[idx] || {};
   return `<div class="mic-sl" data-sl="${_escAttr(cfg.kind || "")}">`
@@ -14950,14 +14960,11 @@ function _micSliderHtml(cfg) {
     + `<span class="mic-sl__val">${_escHtml(cur.valueLabel || cur.label || "")}</span></div>`
     + `<div class="mic-sl__track">`
     + `<i class="mic-sl__rail"></i>`
-    + (lastOpen >= 0 && lastOpen < last
-        ? `<i class="mic-sl__lock" style="left:${pct(lastOpen)}"></i>` : "")
     + `<i class="mic-sl__fill" style="width:${pct(idx)}"></i>`
     + ticks
     + `<input type="range" class="mic-sl__input" min="0" max="${last}" step="1" value="${idx}"`
     + ` aria-label="${_escAttr(cfg.title || "")}"`
-    + ` aria-valuetext="${_escAttr(cur.valueLabel || cur.label || "")}"`
-    + ` data-sl-max-open="${lastOpen}">`
+    + ` aria-valuetext="${_escAttr(cur.valueLabel || cur.label || "")}">`
     + `</div>`
     + `<div class="mic-sl__ends"><span>${_escHtml(opts[0].label || "")}</span>`
     + `<span>${_escHtml(opts[opts.length - 1].label || "")}</span></div>`
@@ -15014,45 +15021,49 @@ function _bindMicSlider(root, onPick) {
  */
 function _modelContextChoices(id) {
   if (!_modelContextLimit(id)) return [];
+  // 从窄到宽。滑轨左边是省钱的窗口、右边是能读最多的窗口，方向和"往右拖 = 给更多"一致。
   return _ctxChoiceOptions(id)
     .slice()
-    // 先按"是不是窗口"分组：窗口那段在左、档位那段在右。原来纯按数值排，档位 1M 会插进
-    // 原生 512k 和 1.0M 中间，滑轨上两条轴交错在一起，谁也看不出自己拖的是哪个量。
-    .sort((a, b) => (a.kind === "native" ? 0 : 1) - (b.kind === "native" ? 0 : 1) || a.value - b.value)
-    // 标签就是**运维在卖的那套档位名**，不是算出来的合计。
-    //
-    // 档位在网关侧是叠加的（compression.rs: capacity_for_native = native + tier），
-    // 所以 1M 原生配 2M 档真实容量是 3M —— 数字没错，但那不是后台卖的名字，卡片上冒出
-    // 3M / 6M 会让人以为自己买的档位对不上。原生显示它真实的数字，加档原样用档位名。
-    .map((o) => {
-      // 两条轴在同一条滑轨上，标签必须一眼分得开：原生「1.0M」和档位「1M」几乎长一样。
-      // 档位统一带个"档"字 —— 它不是窗口，是网关替你留多少历史。
-      const label = o.kind === "native" ? _tokenShort(o.value) : `${o.tier || ""} 档`;
-      return { ...o, label, valueLabel: label };
-    });
+    .sort((x, y) => x.value - y.value)
+    .map((o) => ({ ...o, label: _tokenShort(o.value), valueLabel: _tokenShort(o.value) }));
 }
 
 function _modelContextRows(m) {
   const id = m?.id || "";
-  const native = _modelContextLimit(id);
-  if (!native) return "";
+  if (!_modelContextLimit(id)) return "";
   const opts = _modelContextChoices(id);
   if (!opts.length) return "";
-  // 高亮位要按**用户存的那条轴和那个值**找，不能按 _effectiveContextLimit 找。
-  //
-  // 两条轴拆开之后（窗口 / 留存档位），effective 是它们的**和**：128.0k + 1M 档 = 1,128,000，
-  // 而档位选项的 value 是档位本身（1,000,000）。用和去选项表里找当然一个都对不上，
-  // 于是回落到 `idx = 0` —— 用户选了 1M 档，卡片一重画就跳回最左边的 128.0k。
-  // 这就是用户实拍的"我选择 1M 档次后还会自动退回去"。
-  const tier = _ctxTierChoice(id);
+  // 只有一个窗口的模型（大多数模型都是这样）画一条拖不动的滑轨，等于又交付一个坏控件：
+  // 用户拖它没反应，观感和"假修改"是同一种。这时改成只读的一行事实。
+  if (opts.length < 2) return _ctxFactHtml(opts[0].label);
+  // 高亮位按**用户存的那个窗口**找。没选过就停在这个模型的默认窗口上——不是第 0 格，
+  // 目录里最窄的那个未必是默认（glm-5.2 默认 202.8k，最窄也是它；grok 就不是）。
   const win = _ctxChoiceFor(id);
-  let idx = -1;
-  if (tier > 0) idx = opts.findIndex((o) => o.kind === "tier" && o.value === tier && !o.locked);
-  if (idx < 0 && win > 0) idx = opts.findIndex((o) => o.kind === "native" && o.value === win && !o.locked);
-  // 没选过：停在这个模型的默认窗口上（不是第 0 格——目录里最窄的那个未必是默认）。
-  if (idx < 0) idx = opts.findIndex((o) => o.kind === "native" && o.value === _ctxNativeDefault(id) && !o.locked);
+  let idx = win > 0 ? opts.findIndex((o) => o.value === win) : -1;
+  if (idx < 0) idx = opts.findIndex((o) => o.value === _ctxNativeDefault(id));
   if (idx < 0) idx = 0;
   return _micSliderHtml({ kind: "ctx", title: "上下文", options: opts, index: idx });
+}
+
+/** 只读的一行「键 —— 值」。拖不动的东西一律长这样，和有轨道的控件在视觉上分开。 */
+function _ctxFactHtml(label, value) {
+  return `<div class="mic-fact"><span class="mic-fact__k">${_escHtml(value === undefined ? "上下文" : label)}</span>`
+    + `<span class="mic-fact__v">${_escHtml(value === undefined ? label : value)}</span></div>`;
+}
+
+/**
+ * 会员留存那一行的 HTML。**不占滑轨上的格子**，因为它不是这张卡片上能选的东西：
+ * 它是套餐给的（网关替你留多少历史），压缩后仍送进模型自己的窗口。混进滑轨的那一版
+ * 就是用户说的"假修改"——拖过去请求里一个字节都不变。
+ */
+function _ctxRetentionHtml() {
+  const keep = _ctxRetentionNote();
+  if (!keep) return "";
+  // 措辞要把话说全。撤掉那三格之后，产品里**只剩这一行**告诉用户档位存在，而它此前
+  // 从没说过最要紧的那句：你买的档位对所有模型自动生效，不用选、也没得选。
+  return `<div class="mic-fact mic-fact--keep" title="${_escAttr(`michael-compression ${String(keep.tier).toUpperCase()} 档已自动生效：网关在模型自己的窗口之外，再替你留存约 ${_tokenShort(keep.tokens)} token 的历史，压缩后仍送进这个窗口。按套餐给定，无需选择。`)}">`
+    + `<span class="mic-fact__k">会员留存</span>`
+    + `<span class="mic-fact__v">+${_escHtml(_tokenShort(keep.tokens))}<em>已自动生效</em></span></div>`;
 }
 
 function _modelCatalogEntry(id = "", group = "", connId = "") {
@@ -15149,11 +15160,22 @@ function _fallbackModelContextLimit(id = "") {
 }
 
 function _modelContextLimit(id = "") {
-  // 自定义模型：按真实模型名推断窗口（id 是 custom: 前缀的内部键，匹配不到任何启发式）。
-  const _cm = _customModelById(id || loadConfig().model || "");
-  if (_cm) return _fallbackModelContextLimit(_cm.name);
-  const model = _modelCatalogEntry(id || loadConfig().model || loadConfig().gatewayModel || "");
-  return Math.max(1, Number(model?.contextLimit) || _fallbackModelContextLimit(id || model?.id || loadConfig().model || ""));
+  const key = id || loadConfig().model || loadConfig().gatewayModel || "";
+  // **自定义模型也先查目录。**
+  //
+  // 这里原来第一行就短路：`if (_customModelById(...)) return _fallbackModelContextLimit(name)`
+  // —— 自己配端点的模型**永远走按名猜的正则表**，哪怕目录里就有这个模型的真实窗口。
+  // 而 _modelCatalogEntry 开头那段专门做了「把 custom:<key> 换成真实模型名再查」，
+  // 短路等于把那个修复绕了过去：内置的 glm-5.2 拿到 202.8k 四档，用户自己配的同一个
+  // glm-5.2 只有一格猜出来的 128k，卡片上还看不出那是猜的。
+  //
+  // 目录按名查 严格优于 正则按名猜：两者的输入是同一个模型名，前者是后台填的真值。
+  // 目录里确实没有（用户自建的私有模型）时才落回正则表。
+  const model = _modelCatalogEntry(key);
+  const listed = Math.max(0, Math.round(Number(model?.contextLimit) || 0));
+  if (listed > 0) return listed;
+  const _cm = _customModelById(key);
+  return Math.max(1, _fallbackModelContextLimit(_cm?.name || key || model?.id || ""));
 }
 
 /** Pull the admin-curated model list from the central backend into the picker. */
@@ -15638,8 +15660,8 @@ function _nativeWindowsFor(modelId) {
   const all = listed.length ? listed : (fallback ? [fallback] : []);
   return [...new Set(all)].sort((a, b) => b - a);
 }
-// （_ctxSnapToOpenChoice 已删除：窗口和留存档位拆成两条轴之后，窗口那侧改成"目录还列着
-//   就照用、不列了退回默认"，档位那侧在 _ctxTierChoice 里按会员自己归位——它没有消费者了。
+// （_ctxSnapToOpenChoice 和 _ctxTierChoice 都已删除。前者在窗口/档位拆成两条轴时失去消费者；
+//   后者在 2026-09-01 档位撤出滑轨时失去消费者——档位回归纯会员驱动，见 _effectiveContextLimit。
 //   留着的死代码 + 还在直接测它的测试，正是本仓库反复出现的"测试全绿、功能是死的"那个模式。）
 
 function _ctxChoiceFor(modelId) {
@@ -15650,7 +15672,7 @@ function _ctxChoiceFor(modelId) {
   if (rec.kind === "tier") return 0;             // 选的是档位，窗口保持默认
   if (rec.kind === "modified") {
     // 老格式：可能是"收窄窗口"（<= 默认），也可能是"原生 + 档位"（> 默认）。
-    // 后者的窗口部分就是默认窗口，档位那一半由 _ctxTierChoice 还原。
+    // 后者的窗口部分就是默认窗口，档位那一半直接丢掉——档位现在只看会员套餐。
     return stored <= _ctxNativeDefault(modelId) ? stored : 0;
   }
   // 目录还列着就照用；不列了（换了线路/模型改了）就退回默认，别钉死一个交付不了的数。
@@ -15682,66 +15704,38 @@ function _setCtxChoice(modelId, tokens, kind = "native") {
   } catch {}
 }
 
-/**
- * 用户选中的留存档位（token）。0 = 没单独选过，按会员自身的档位走。
- *
- * 老记录（`modified`，存的是"原生 + 档位"）在这里就地还原成档位本身：减掉默认窗口再吸附到
- * 最近的档。不还原的话，那条记录会被下面的窗口解析当成一个巨大的窗口选择。
- */
-function _ctxTierChoice(modelId) {
-  const rec = _ctxChoiceRecord(modelId);
-  if (!rec) return 0;
-  const stored = Math.max(0, Math.round(Number(rec.tokens) || 0));
-  if (!stored) return 0;
-  let want = 0;
-  if (rec.kind === "tier") want = stored;
-  else if (rec.kind === "modified") {
-    const dflt = _ctxNativeDefault(modelId);
-    want = stored > dflt ? stored - dflt : 0;   // 老格式：减掉原生那一半
-  }
-  if (want <= 0) return 0;
+/** 会员额外留存多少历史。**只读**——它由套餐决定，不是这张卡片上能选的东西。 */
+function _ctxRetentionNote() {
   const tierMax = Number(_michaelUser?.michael_compression?.max_input_tokens) || 0;
-  const open = _MC_TIER_OPTIONS.map(([, t]) => t).filter((t) => _gatewayHandlesCompression() && t <= tierMax);
-  if (!open.length) return 0;                    // 会员没了 / 没开压缩 → 档位不生效
-  const fits = open.filter((t) => t <= want);
-  return fits.length ? Math.max(...fits) : Math.min(...open);
+  if (!tierMax || !_gatewayHandlesCompression()) return null;
+  return { tier: _compressionTier() || "", tokens: tierMax };
 }
-const _MC_TIER_OPTIONS = [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]];
+/**
+ * 这条滑轨上的每一格 = 这个模型**真实存在**的一个上下文窗口。
+ *
+ * 曾经这里还塞进 michael-compression 的 1M/2M/5M 档位，于是两条语义完全不同的轴挤在一条
+ * 轨上：窗口是"模型这一轮能读多少"，档位是"网关替你留多少历史"。更要命的是档位那几格
+ * **拖了不算数** —— 发出去的 `x-michael-compression` 取的是会员自身的档位
+ * （`_compressionTier()`，发送侧两处），从来不是滑块上选的那一格；`_ctxChoiceFor` 里也明写着
+ * "选的是档位 → 窗口保持默认"。用户拖过去，请求里一个字节都不变。
+ *
+ * 现在滑轨只剩窗口这一条轴：**能拖的每一格都会随 `x-ide-context-window` 发给网关**，
+ * 压缩按它切（server/src/models.rs 的 client_context_window）。会员档位不是用户在这里
+ * 选的东西，改成卡片上的一行只读事实（`_ctxRetentionNote`）。
+ */
 function _ctxChoiceOptions(modelId) {
   const native = _modelContextLimit(modelId);
-  const tierMax = Number(_michaelUser?.michael_compression?.max_input_tokens) || 0;
-  const compress = _gatewayHandlesCompression() && tierMax > 0;
-  // Show EVERY native window the model genuinely offers, not just the default. One entry for
-  // most models; two for Sonnet 4/4.5 (200K default + 1M behind the context-1m beta) and for
-  // Gemini 1.5 Pro (1M/2M). Falls back to the single resolved value when the gateway sent no
-  // list — an older gateway, or a third-party direct connection with no catalogue at all.
+  // 目录列出的**每一个**原生窗口都算一格，不只是默认那个（glm-5.2 有 202.8k/262.1k/512k/1.0M
+  // 四档，Sonnet 4/4.5 有 200K + 1M）。目录没给列表时——老网关，或者第三方直连本来就没有
+  // 目录——退回这个模型解析出来的那一个值。
   const listed = (_modelCatalogEntry(modelId)?.contextWindows || []).filter((w) => w.tokens > 0);
   const natives = listed.length ? listed : [{ tokens: native, beta: null }];
   // 原生档一律可选。上一版按 beta 标记锁掉"够不着的"，而那个判据是错的（见 _ctxNativeCeiling）：
   // 线上目录一条 beta 都没有，于是除默认档外全被锁死，滑块只剩一格 —— 用户报的"拖不动"。
-  const opts = natives.map((w) => ({
-    value: w.tokens, label: _tokenShort(w.tokens), locked: false, native: true, kind: "native",
+  return natives.map((w) => ({
+    value: w.tokens, label: _tokenShort(w.tokens), native: true, kind: "native",
     beta: w.beta || null,
   }));
-  // Every tier is DISPLAYED regardless of membership; only those the membership grants are
-  // selectable. Locked tiers say what would unlock them instead of silently hiding.
-  for (const [name, tokens] of _MC_TIER_OPTIONS) {
-    // 档位的值就是档位本身（2M 就是 2,000,000），**不再存"原生 + 档位"**。
-    //
-    // 原来存的是 native + tokens：标签写着 2M，实际值是 2,096,890。上一轮我把"用户选的原样
-    // 生效"接通之后，这个怪数就直接成了仪表分母 —— 用户看到的是"我选 2M，它给我一个
-    // 2,096,890"。加法本身没错（网关的 capacity_for_native 确实是原生+档位），错在把加法的
-    // 结果当成"用户选了什么"存起来：用户选的是**档位**，加法是**结算时**的事。
-    // 现在加法只发生在 _effectiveContextLimit 里，存的和显示的都是档位本身。
-    const locked = !(compress && tokens <= tierMax);
-    opts.push({
-      value: tokens, label: name, locked, tier: name, kind: "tier",
-      lockHint: locked
-        ? (tierMax > 0 ? `需 ${name} 及以上会员档位（当前 ${_tokenShort(tierMax)}）` : "需开通 michael-compression 会员")
-        : `michael-compression ${name} 档：可留存的历史，网关压缩后仍送进模型自己的 ${_tokenShort(native)} 窗口`,
-    });
-  }
-  return opts;
 }
 
 /**
@@ -15786,6 +15780,12 @@ function _ctxSeenMax(modelId) {
     return Math.max(0, Math.round(Number(map[String(modelId || "")]) || 0));
   } catch { return 0; }
 }
+/**
+ * 记下这个模型实测被喂进去过多少 token。
+ *
+ * **键必须和 _ctxSeenMax 的读取键同源**（选择器 id）。这里曾经按上游真名写、按选择器 id 读，
+ * 于是自定义模型的实测下限从来没有被读到过——那正是"目录查不到窗口时唯一不用猜的事实来源"。
+ */
 function _noteCtxSeen(modelId, tokens) {
   const id = String(modelId || "").trim();
   const n = Math.max(0, Math.round(Number(tokens) || 0));
@@ -15813,11 +15813,14 @@ function _effectiveContextLimit(modelId) {
   // what native-or-membership actually delivers — budgeting against a fictional window is how
   // requests die upstream as context-length 400s.
   // **加法只发生在这里**：留存容量 = 窗口 + 档位（与网关 capacity_for_native 一致）。
-  // 窗口那一半来自用户选的窗口（没选就是目录默认，再取实测下限）；档位那一半优先用用户
-  // 单独选的档，没选就用会员自身的档。两个数各自都认得出来，没有"原生+档位"那种合成值。
+  // 窗口那一半来自用户选的窗口（没选就是目录默认，再取实测下限）；档位那一半**只看会员**
+  // ——2026-09-01 起用户不再能单独选档，滑轨上只有窗口。
+  //
+  // 这一改同时拆掉一个存量陷阱：老盘里 {kind:"tier", tokens:1000000} 的记录曾让一个持
+  // 5M 会员、以前手点过「1M 档」的用户永远按 窗口+1M 记账（比网关早 5 倍开始裁历史），
+  // 而 UI 上再也没有那一格能改回去。现在这类记录在两条读取器里都等于"没选过"。
   const window = choice > 0 ? choice : Math.max(_ctxNativeDefault(modelId), _ctxSeenMax(modelId));
-  const picked = _ctxTierChoice(modelId);
-  return Math.max(1, window + (picked > 0 ? picked : tier));
+  return Math.max(1, window + tier);
 }
 
 // 上下文注入预算随档位适度伸缩，封顶 2 倍。档位（1M/2M/5M）的真正价值是**历史容量**：
@@ -15959,15 +15962,6 @@ function openLoginDialog() {
  * 每个端点只提醒一次（按 id 记在 localStorage），不打扰。
  */
 const _CUSTOM_WARNED_KEY = "michael-ide.custom-endpoint.warned.v1";
-function _warnCustomEndpointOnce(custom) {
-  // 这条提醒**已经去掉**（用户要求）。原先每个端点弹一次，说的是「工具描述和完整系统
-  // 提示词由服务端下发，这条路上拿不到」—— 那件事仍然成立，但它写在弹窗里的协议说明
-  // 和能力缺口清单上更合适：那里是**填之前**看到，而不是切完之后飘一条九秒的横幅。
-  //
-  // 保留这个函数壳子和它的 localStorage 记号：调用点在 _readyAiConfig 里，删函数要连着
-  // 改调用点，而这个位置以后如果要放别的一次性提示，记号是现成的。
-  void custom;
-}
 
 async function michaelAccessGate() {
   const token = localStorage.getItem("michael_token");
@@ -16447,13 +16441,14 @@ async function showCustomModelsDialog() {
    * （不带 /v1），OpenAI 兼容的是 .../v1，用户最容易在这里填错。占位符按协议换，
    * 是这一条现在唯一的落点（说明文字 2026-09-01 按用户要求删了）。
    *
-   * 【删掉的那份能力缺口】原来这里还渲染一列 gaps（「温度/top_p 不会发送」「思考开关的
-   * 形状按模型名猜」…），权威来源是 Rust 的 protocol.rs::Wire::unsupported()。用户两次
-   * 点名说这些提示字没用、要删，所以整条链一起摘干净了：渲染、CM_PROTOCOL_UI.gaps 里
-   * 那三十来行文案、以及下面这段同步里赋值 gaps 的那一行。留着不渲染只会变成又一处
-   * 「攒了一路没人消费」的死数据。
+   * 【能力缺口那份 —— 这段注释此前是假的，已订正】这里写过「渲染、CM_PROTOCOL_UI.gaps
+   * 的文案、以及下面同步里赋值 gaps 的那一行，整条链一起摘干净了」。**三样都还在**：
+   * 数组在 wire-protocol.js，赋值在下面那句 `ui.gaps = r.unsupported.map(String)`，
+   * 渲染在 syncProto 里的 .cm-gapsbox。同一个函数末尾另一条注释说的才是对的
+   * （「能力缺口留着——它是『不许假装支持』在界面上的唯一落点」）。
+   * 当初删掉的是协议选择器下面那段**地址写法**说明，不是能力缺口。
    *
-   * 同步本身还在，但现在只为 label 一件事：出错文案里要按协议报名字（搜 CM_PROTOCOL_UI[_proto].label）。
+   * 同步除了 gaps 也带 label：出错文案里要按协议报名字（搜 CM_PROTOCOL_UI[_proto].label）。
    */
   if (inTauri && !_protoGapsSynced) {
     _protoGapsSynced = true;
@@ -17464,11 +17459,18 @@ function _applyThinkingToConfig(cfg, opts = {}) {
   return out;
 }
 /** Format a USD-per-1M-tokens price compactly ($3, $0.27, $2.5). */
+/**
+ * 价格表里的一格。**小数位固定**，不去尾零。
+ *
+ * 原来会把尾零剥掉：3 → "$3"、0.30 → "$0.3"、0.29 → "$0.29"。四个数并排在一张两列表里
+ * 时，小数位一格两位一格一位，tabular-nums 的对齐就白做了，看着像随手写的。
+ * 一律两位；只有小于一分的价（$0.006 这种缓存读价确实存在）才给三位，否则它会被
+ * 四舍五入成 $0.01，那是**把价格显示错**，不是排版问题。
+ */
 function _fmtTokPrice(p) {
   const n = +p || 0;
-  if (n <= 0) return "$0";
-  const s = n >= 1 ? n.toFixed(2) : n.toFixed(3);
-  return "$" + s.replace(/\.?0+$/, "");
+  if (n <= 0) return "$0.00";
+  return "$" + (n >= 0.01 ? n.toFixed(2) : n.toFixed(3));
 }
 /** Official-style built-in description per model family (used when the admin hasn't
  *  written a custom one). Admin's own description always wins. */
@@ -17503,12 +17505,17 @@ function officialModelDesc(id = "") {
 // 现在只认网关下发的价，没有就走 model.price.missing 如实留白。
 function _modelPriceRows(m) {
   const title = _escHtml(t("model.price.title"));
-  // 四格：输入 / 输出 / 缓存写 / 缓存读。缓存两项来自网关，走的是和报价接口同一条
+  // **单位必须写出来。** 这四个数一直是光秃秃的 "$0.29"，卡片上任何地方都没说它是每
+  // 百万 token 还是每千 token 还是每次调用 —— 而 model.price.perMillionTokens 这条译文
+  // 三种语言都躺在 i18n.js 里（348/1035/1514），从来没有人引用过。
+  const head = (unit) => `<div class="mic-phead"><span class="mic-plabel">${title}</span>`
+    + (unit ? `<span class="mic-punit">${_escHtml(unit)}</span>` : "") + `</div>`;
+  // 四行：输入 / 输出 / 缓存写 / 缓存读。缓存两项来自网关，走的是和报价接口同一条
   // 三级规则（管理员手填 > 实时目录 > 按输入价推算），所以这里显示的价和账单上扣的
   // 价不会分叉。网关没给就不画那一格——缓存价不该由客户端自己编一个出来。
   const cell = (k, v) =>
-    `<div class="mic-price"><div class="mic-price__k">${_escHtml(k)}</div>`
-    + `<div class="mic-price__v">${_fmtTokPrice(v)}</div></div>`;
+    `<div class="mic-price"><span class="mic-price__k">${_escHtml(k)}</span>`
+    + `<span class="mic-price__v">${_fmtTokPrice(v)}</span></div>`;
   // 只认网关下发的价。客户端那张写死的厂商标价表已删（见上面那段说明）：网关说没价
   // 就如实留白，不自己编一个填进「模型价格」——那个格子里的数必须和账单同源。
   const inP = Number(m.inPrice) || 0;
@@ -17516,7 +17523,9 @@ function _modelPriceRows(m) {
   const cw = Number(m.cacheWritePrice) || 0;
   const cr = Number(m.cacheReadPrice) || 0;
   const cells = [];
+  let perToken = false;
   if (inP > 0 || outP > 0) {
+    perToken = true;
     cells.push(cell(t("model.price.input"), inP), cell(t("model.price.output"), outP));
     if (cw > 0) cells.push(cell("缓存输入", cw));
     if (cr > 0) cells.push(cell("缓存读取", cr));
@@ -17524,13 +17533,14 @@ function _modelPriceRows(m) {
     cells.push(cell(t("model.price.flat"), Number(m.flatPrice)));
   }
   if (cells.length) {
-    return `<div class="mic-plabel mic-plabel--center">${title}</div>`
-      + `<div class="mic-prices__grid">${cells.join("")}</div>`;
+    // 按次计费的模型不该挂「每百万 token」——那是另一种计价单位。
+    const unit = perToken ? t("model.price.perMillionTokens") : "";
+    return head(unit) + `<div class="mic-prices__grid">${cells.join("")}</div>`;
   }
   if (/image|生图|图像/i.test(String(m.id))) {
     return `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.imageBilling"))}</span></div>`;
   }
-  return `<div class="mic-plabel mic-plabel--center">${title}</div>`
+  return head("")
     + `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.missing"))}</span></div>`;
 }
 
@@ -17545,9 +17555,8 @@ function showModelInfoCard(m, anchorEl) {
     `<div class="mic-htxt"><div class="mic-name"></div><div class="mic-group"></div></div>` +
     _modelPowerToggleHtml(m) + `</div>` +
     `<div class="mic-id"></div>` +
-    `<div class="mic-note"></div>` +
     `<div class="mic-desc"></div>` +
-    `<div class="mic-ctx">${_modelContextRows(m)}</div>` +
+    `<div class="mic-ctx">${_modelContextRows(m)}${_ctxRetentionHtml()}</div>` +
     `<div class="mic-think"></div>` +
     // 价格放最后：上下文和思考深度是**能动的**，价格是只读事实。可操作的控件排在
     // 上面，一眼就能拖；只读信息垫底。
@@ -17557,7 +17566,10 @@ function showModelInfoCard(m, anchorEl) {
   const gEl = card.querySelector(".mic-group");
   if (m.group && m.group !== (m.name || m.id)) gEl.textContent = m.group;
   else gEl.remove();
-  card.querySelector(".mic-id").textContent = m.id;
+  // id 收成单行省略（custom: 那种 uuid 会折成两三行乱码块），全文进 title。
+  const idEl = card.querySelector(".mic-id");
+  idEl.textContent = m.id;
+  idEl.title = m.id;
   /*
    * 自定义模型要如实说清「走自己的端点会弱一些」。
    *
@@ -17578,8 +17590,8 @@ function showModelInfoCard(m, anchorEl) {
     // 「地址与密钥仅保存在本机，不会上传」。那句话对这条路不再成立，不说就是骗人。
     noteEl.textContent = "完整能力：提示词、工具和长上下文压缩都由服务端装配，和内置模型一样。请求经我们的服务器转发到你填的地址（用你自己的密钥计费，我们不收费）。";
   } else {
-    // 本机端点只能直连（服务器够不着你的 localhost），所以仍然是精简的那条路。
-    noteEl.textContent = "本机端点直连，不经过我们的服务器 —— 因此工具描述和完整系统提示词拿不到，长上下文压缩也会关闭，智能体会弱一些。";
+    // **不能写「本机端点」**：网页版上远程端点也落进这个分支，那时这句是假话。只说「直连」。
+    noteEl.textContent = "直连你填的地址，不经过我们的服务器 —— 因此工具描述和完整系统提示词拿不到，长上下文压缩也会关闭，智能体会弱一些。";
   }
   const desc = (m.desc && m.desc.trim()) || officialModelDesc(m.id);
   const dEl = card.querySelector(".mic-desc");
@@ -17612,13 +17624,20 @@ function showModelInfoCard(m, anchorEl) {
     // 中间那截空白就是「思考深度」离滑块老远的原因。上下文那条本来就是一行的写法。
     const thinkTitle = t(_boolToggle ? "model.thinkingToggle" : "model.thinkingDepth");
     const think = levels.map((lvl) => ({ lvl, label: labels[lvl] || lvl, valueLabel: labels[lvl] || lvl }));
-    thinkEl.innerHTML = _micSliderHtml({
-      kind: "think",
-      title: thinkTitle,
-      options: think,
-      index: Math.max(0, levels.indexOf(current)),
-    });
-    // 思考深度滑块。
+    // 只有一档时不画滑轨——和上下文那边同一条规矩：拖不动的轨道是个坏控件，
+    // 用户拖它没反应，观感和"假修改"是同一种。_micSliderHtml 的 last = max(1, n-1)
+    // 会让单格滑块的拇指真的拖得动、松手再弹回来，比不画还糟。
+    if (think.length < 2) {
+      thinkEl.innerHTML = _ctxFactHtml(thinkTitle, think[0]?.valueLabel || "");
+    } else {
+      thinkEl.innerHTML = _micSliderHtml({
+        kind: "think",
+        title: thinkTitle,
+        options: think,
+        index: Math.max(0, levels.indexOf(current)),
+      });
+    }
+    // 思考深度滑块。单档时上面走了只读行，这里 querySelector 拿不到东西、自然跳过。
     const thinkSl = thinkEl.querySelector('.mic-sl[data-sl="think"]');
     if (thinkSl) {
       _bindMicSlider(thinkSl, (want, commit) => {
@@ -17628,7 +17647,10 @@ function showModelInfoCard(m, anchorEl) {
       });
     }
   } else {
-    thinkEl.innerHTML = `<div class="mic-plabel">${_escHtml(t("model.thinkingDepth"))}</div><div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(profile.disabledReason || profile.hint || t("model.thinking.unsupported"))}</span></div>`;
+    // 不支持思考深度：也走只读事实行那一套排版（键在左、值在右），原因垫在下面一行。
+    // 原来它自成一格（.mic-plabel 单独一行 + 斜体提示），是这张卡上第三种排版语法。
+    thinkEl.innerHTML = _ctxFactHtml(t("model.thinkingDepth"), t("model.thinking.na"))
+      + `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(profile.disabledReason || profile.hint || t("model.thinking.unsupported"))}</span></div>`;
   }
   // 上下文滑块。**必须在 if (supports) 之外**：.mic-ctx 是无条件渲染的，而这段绑定原来
   // 关在"这个模型支持思考深度"的分支里——于是画图模型、以及任何没有公开推理旋钮的模型，
@@ -17640,24 +17662,14 @@ function showModelInfoCard(m, anchorEl) {
   if (ctxSl) {
     const ctxOpts = _modelContextChoices(m.id);
     _bindMicSlider(ctxSl, (want, commit) => {
-      let at = want;
-      if (ctxOpts[at]?.locked) {
-        // 弹到**最近**的未锁档。上一版取的是最后一个未锁下标（也就是最大的那一档）：
-        // 用户想在 glm-5.2 上选 202,752，手一滑碰到锁住的刻度，写进去的却是 5,096,890
-        // ——25 倍，而且方向正好相反。
-        let nearest = -1;
-        ctxOpts.forEach((o, i) => {
-          if (o.locked) return;
-          if (nearest < 0 || Math.abs(i - want) < Math.abs(nearest - want)) nearest = i;
-        });
-        at = Math.max(0, nearest);
-        showToast(ctxOpts[want]?.lockHint || "该档位需更高会员");
-      }
+      // 每一格都是这个模型真实存在的窗口，没有"买不到的档"要弹回——档位那条轴已经不在
+      // 滑轨上了（它拖了不算数，见 _ctxChoiceOptions 的注释）。
+      const at = Math.max(0, Math.min(ctxOpts.length - 1, want));
       const o = ctxOpts[at];
       // commit=false 是拖动途中，只回读数不落盘——每像素写一次 localStorage 会把
       // 界面顿住好几秒。
       if (o && commit) {
-        _setCtxChoice(m.id, o.value, o.kind === "tier" ? "tier" : "native");
+        _setCtxChoice(m.id, o.value, "native");
         // 选完立刻重画仪表。少了这一步，分母已经变了而圆环要等到下一次按键或切标签页
         // 才跟上 —— 用户拖完看不到任何变化，只会认为"滑动切换没用"。
         try { _refreshContextMeterFromDraft({ force: true }); } catch {}
@@ -30103,7 +30115,6 @@ async function _readyAiConfig(overrideConfig = null) {
     // 本轮走哪种线协议。Rust 侧按它分叉 URL / 请求体 / 鉴权头；缺省或不认识 → openai，
     // 与今天逐字相同（存量条目根本没有这个字段，走的就是这条路）。
     config.protocol = cmProtocol(_custom.protocol);
-    _warnCustomEndpointOnce(_custom);
   }
   // key 的必填性**按线路分**。网关必须有 token；自定义端点不一定 —— 本机跑的
   // Ollama / LM Studio / vLLM 根本不校验鉴权头。弹窗那句「部分本地服务可留空」
@@ -31641,7 +31652,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
           clientBlocks,
         );
       }
-      const _mcTierPlain = requestConfig.customModelId ? null : _compressionTier();
+      // `&& !byoBase`：代发线路是网关请求，档位得发否则网关不压；而本地三层已因 byoBase 让位。
+      const _mcTierPlain = (requestConfig.customModelId && !requestConfig.byoBase) ? null : _compressionTier();
       if (_mcTierPlain && !requestConfig.customModelId) {
         requestConfig.michaelCompression = _mcTierPlain;
         delete requestConfig.mcPrefix;
@@ -31714,7 +31726,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       // anyway — i.e. Stop didn't actually stop ("停不掉"). 代际校验防新回合把旧回调救活。
       // Usage is read before the Stop gate: stopping does not un-spend what the model read.
       if (ev && ev.kind === "usage") {
-        _recordStreamUsage(ev, { session: sess, model: config?.model || "", requestId: sess._reqId });
+        _recordStreamUsage(ev, { session: sess, model: config?.customModelId || config?.model || "", requestId: sess._reqId });
         return false;
       }
       if (!_turnLive()) return false;
@@ -41470,7 +41482,7 @@ function _commandBatchBlockResult(run, items, index) {
         + "本轮这些命令是在看到任何结果之前一次性决定的，所以后面每一条都建立在一个刚刚被证伪的"
         + "前提上——继续跑只会把一个错误变成一排错误。\n"
         + "先读上面那条失败的真实输出，判断：是要修掉它再跑，还是这条本来就和它无关、可以单独重发。"
-        + "无论哪种，都请**一次只发一条**，拿到结果再决定下一条。",
+        + "停的是这一条的**前提**，不是这一轮的发送量——修正之后，互不依赖的那些照常一起发。",
   };
 }
 
@@ -43928,7 +43940,10 @@ function _toolResultToStringRaw(call, result) {
   // 命令输出、README 里的代码块，随便哪个都带这四个字；攻击者要故意脱掉这层标记，只需要
   // 在网页里写一句 `[error]`。标记本身正是为这种内容存在的，不该被这种内容关掉。
   if (c && /\[(ERROR|BLOCKED|DENIED|失败|不可用|error)\]/i.test(c)) {
-    return tag ? `${tag}\n${c}` : c;
+    // 提前返回是为了保住失败正文不被套壳，**不是**为了跳过脱色——而它恰好跳过了：命中它的
+    // 主力是 run_cmd/termtask 的失败结果（成功的走 case "cmd" 会脱色）。实测 31.8% 是转义码。
+    const plain = _stripAnsi(c);
+    return tag ? `${tag}\n${plain}` : plain;
   }
   switch (kind) {
     case "read": return `文件 ${result.path}${tag}:\n${c}`;
@@ -45615,8 +45630,8 @@ function _blockedToolRecoveryInstruction(content, call = null, result = null) {
       `这次调用没有执行，磁盘一个字节都没改——不要在总结里说这个文件已保存/已更新。下一步只做一件事：用 update_plan 写出步骤（做哪几步、每步产出什么、怎么验证），然后把这次被拦的调用**原样重发**（同一个 path、同一份内容/old_string）。不要改用 run_cmd / sed / 重定向绕过，也不要为此去问用户。`),
     tech_research: () => mk("tech_research", "RESEARCH_NEW_TECH",
       `这次调用没有执行，磁盘一个字节都没改——不要在总结里说这个文件已保存/已更新。下一步查你正在加的那几个包本身：package_search / package_source 确认它真的存在、名字拼对；github_repo 看它还有没有人维护、最新版本是多少；developer_community_search / web_search 看这件事主流是怎么做的。查完把这次被拦的调用**原样重发**，不要绕过去，也不要为此去问用户。`),
-    command_batch: () => mk("command_batch", "ONE_COMMAND_AT_A_TIME",
-      `这条命令没有执行。同一轮里更早的一条已经出局——先看清它到底是**跑过并失败**（读它的 exit code 和 stderr 第一条根因，修掉再跑）还是**被门在运行前拦下**（那就没有任何失败输出可读，先按那道门的要求做完那一步）。无论哪种，接下来**一次只发一条**命令，拿到结果再决定下一条。`),
+    command_batch: () => mk("command_batch", "FIX_THE_FAILED_PREMISE",
+      `这条命令没有执行。同一轮里更早的一条已经出局——先看清它到底是**跑过并失败**（读它的 exit code 和 stderr 第一条根因，修掉再跑）还是**被门在运行前拦下**（那就没有任何失败输出可读，先按那道门的要求做完那一步）。无论哪种，停的是这一条的**前提**，不是这一轮的发送量——修正之后，互不依赖的那些照常一起发。`),
     mutation_batch: () => mk("mutation_batch", "STOP_AFTER_MUTATION_FAILURE",
       `同一补丁的前项失败、尚未落定，或包含命令/worker/脚手架这类落盘范围不明确的动作，因此后续修改已停止。先处理前一项真实结果；下一次可把基于已读证据的多个文件级 edit/write/multi_edit/format 作为一个顺序一致批次提交。`),
     shell_file_rewrite: () => mk("shell_file_rewrite", "USE_FILE_TOOL",
@@ -47515,7 +47530,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       const _turnTime = _currentTimeContext();
       _turnConfig.ideTimezone = _turnTime.timeZone;
       // 带上档位，网关会按会员套餐钳位后回传实际生效值。
-      const _mcTier = _turnConfig.customModelId ? null : _compressionTier();
+      const _mcTier = (_turnConfig.customModelId && !_turnConfig.byoBase) ? null : _compressionTier();
       if (_mcTier) _turnConfig.michaelCompression = _mcTier;
       _turnConfig.ideUtcOffsetMinutes = _turnTime.utcOffsetMinutes;
       _turnConfig.ideRegion = _ideRegionCode();
@@ -47565,7 +47580,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         _turnConfig.ideMode = _isSub ? "subagent" : ideMode;
         // 用户在卡片上选中的窗口要真的发出去。目录查不到窗口的模型在客户端和网关两边都退回
         // 同一个 128k 猜测，不发这个头，滑块就是纯装饰（用户原话："我想调到用哪个就用哪个"）。
-        _turnConfig.ideContextWindow = _contextMeterLimit(_turnConfig.model || config.model || "");
+        // **键必须是选择器 id。** 自定义模型的窗口选择按 m.id（`custom:<key>`）存，而这里的
+        // config.model 在 _readyAiConfig 里已经被改写成**上游真名**（`config.model = _custom.name`）。
+        // 拿真名去查，永远查不到那条记录 —— 实测：用户在 custom:abc（真名 glm-5.2）上拖到 1.0M，
+        // 仪表按 custom:abc 读出 1,000,000 跟着动了，这里按 glm-5.2 读出 202,752 原样发出去。
+        // 仪表动了、请求没变，就是用户说的"假修改"，而且正好命中最常被自建端点代理的那批多窗口模型。
+        _turnConfig.ideContextWindow = _contextMeterLimit(_turnConfig.customModelId || _turnConfig.model || config.model || "");
         _turnConfig.ideTools = _names.join(",");
         _l0Tools = _keep;
         // Model-family tuning, user language/adaptive preferences, and the authorization
@@ -47756,7 +47776,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         // Ahead of the Stop gate below on purpose: stopping the run does not un-spend the
         // tokens the model already read, and the meter has to keep saying what is in there.
         if (ev && ev.kind === "usage") {
-          _recordStreamUsage(ev, { session, aux: meterScope !== "main", model: _turnConfig?.model || "", requestId: _turnReqId });
+          _recordStreamUsage(ev, { session, aux: meterScope !== "main", model: _turnConfig?.customModelId || _turnConfig?.model || "", requestId: _turnReqId });
           return false;
         }
         // User hit Stop: drop every further streamed event so output halts at once
@@ -50023,7 +50043,8 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
           ));
         } catch { /* 看不到图不该让整个子任务失败 */ }
       }
-      _trimMessagesIfHuge(messages, execRun, root, _effectiveContextLimit(_subConfig?.model), _subConfig);
+      // 键同上。角色声明了自己的模型时 customModelId 为空，回落到 _roleModel，行为不变。
+      _trimMessagesIfHuge(messages, execRun, root, _effectiveContextLimit(_subConfig?.customModelId || _subConfig?.model), _subConfig);
     }
   } catch (e) { report = report || `[ERROR] ${e?.message || e}`; }
   finally {
@@ -56294,6 +56315,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           if (items[j]._readGroup) _settleReadBatchGroup(items[j]._readGroup, t("tool.stopped"));
         }
         for (const m of toolMsgs) messages.push(m);
+        // 工具途中按停（最常见的那次，三个结算点全在批次之前）：漏掉 → 续跑时整份重写。
+        try {
+          const _eagerNote = await _settleEagerWritesForBreak(run);
+          if (_eagerNote) run._breakWriteFact = _eagerNote;
+          for (const item of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) {
+            if (item?.ok && item.path) _mutatedFiles.add(_normRel(item.path, root));
+          }
+        } catch {}
         break;
       }
 
@@ -56313,7 +56342,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           content: "[未执行] 这次调用没有被执行，没有产生任何结果，也没有改动任何东西。不要把它当成已完成——仍然需要的话，重新发起这次调用。" };
         _settleToolStep(items[j].step, { content: "[未执行]" }, "未执行");
       }
-      for (const m of toolMsgs) messages.push(m);
+      for (const m of capTurnToolResults(toolMsgs)) messages.push(m);
       if (turn._invalidToolRepairInstruction && _live()) {
         _pushNudge("toolRepair", turn._invalidToolRepairInstruction + "\n现在基于上方真实工具结果继续执行，不要再重复同一个残缺工具调用。");
       }
@@ -56601,7 +56630,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // the agent reaches its finish gate. Re-running build/test after every small
       // batch made long tasks spend most of their time proving the same state.
 
-      _trimMessagesIfHuge(messages, run, root, _effectiveContextLimit(config?.model), config);
+      // 键同上：自定义线路上 config.model 是上游真名，查不到用户选的窗口。
+      _trimMessagesIfHuge(messages, run, root, _effectiveContextLimit(config?.customModelId || config?.model), config);
 
       // Running scratchpad (ACON): after compression, inject a compact progress
       // summary at the context tail so the model retains what it did/found even
@@ -57799,6 +57829,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
      * 抛了也不当没事：记一条结局原因，控制台留一行，用户至少知道这轮结局不可信。
      */
     try {
+      // 写盘事实的**兜底收账，覆盖所有退出路径**：逐个 break 点挂结算是在跟一份没人维护得全的
+      // 清单赛跑，而测试断的是「至少三个调用点」数够就绿。已算出的不覆盖；门控同下面那句。
+      if (!run._breakWriteFact
+          && (finalErr || _stoppedEarly || run._incompleteReason)
+          && (Array.isArray(run._writeLedger) ? run._writeLedger.length : 0)) {
+        try {
+          const _lateNote = await _settleEagerWritesForBreak(run);
+          if (_lateNote) run._breakWriteFact = _lateNote;
+        } catch {}
+      }
       planSteps = _settleRunPlan(run);
       // === P2.1 取消传播：run 结束（Stop/换轮/异常/正常收尾）时，仍在跑的后台作业标 cancelled ===
       // 子智能体本体由 _subGenSnap 代际快照在下个检查点自行退出，Rust 侧请求由下方
@@ -66661,7 +66701,9 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // Surface a clear, actionable hint so it FIXES the permission instead of
       // pretending the command worked or silently giving up.
       const _permDenied = (result.code !== 0) && /permission denied|operation not permitted|EACCES|EPERM|access is denied|not permitted|需要权限|拒绝访问|权限不足/i.test(output);
-      let _content = output ? output.slice(0, 2000) : (result.code === 0 ? "(executed)" : `(exit ${result.code}, 无输出)`);
+      // **捕获期不许切**（原 `output.slice(0,2000)`）：投递层预算 8000 且走 _clipPreservingErrors，
+      // 2000 进去原样出来，那套「明说原始字数 + 错误行从中段豁免捞回」的机器一次都没跑过。
+      let _content = output || (result.code === 0 ? "(executed)" : `(exit ${result.code}, 无输出)`);
       if (_retryHistory) _content = _retryHistory + "\n\n[CURRENT_RESULT]\n" + _content;
       if (commandRiskLabel) {
         _content = `[风险提示] IDE 已允许执行「${commandRiskLabel}」，没有再做危险命令拦截；以下是真实命令结果，请基于 exit code/stdout/stderr 判断下一步。\n` + _content;

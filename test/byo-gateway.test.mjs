@@ -11,7 +11,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { CODE, fnSource, load } from "./helpers/source.mjs";
 
-const byoViaGateway = () => load("_byoViaGateway", {});
+// inTauri 是本函数的第一道门（网页版没有那三个 byo 头，见函数注释），所以要注入。
+// 默认注入 true = 桌面端，下面那组地址判据测的就是桌面端的行为。
+const byoViaGateway = (tauri = true) => load("_byoViaGateway", { inTauri: tauri });
 
 test("远程 https 端点走代发；本机和明文一律不走", () => {
   const f = byoViaGateway();
@@ -34,6 +36,37 @@ test("远程 https 端点走代发；本机和明文一律不走", () => {
   // 填得不成样子的一律不走，不抛。
   for (const junk of [undefined, null, {}, { baseUrl: "" }, { baseUrl: "不是地址" }]) {
     assert.equal(f(junk), false);
+  }
+});
+
+test("**网页版一律不走代发**——那三个 byo 头只有 Rust 那侧在发", () => {
+  // 网页版走 main.js 的 _realAiFetch 装配请求头，里面一个 x-ide-byo-* 都没有。
+  // 少了头，网关 byo_upstream::from_headers 直接 return Ok(None)，于是拿着已被改写成
+  // 上游真名的 model 去查**我们自己的** models 表 → 走我们的线路、按我们的价钱计费，
+  // 而卡片上写着「用你自己的密钥计费」。这道门把网页版挡在代发之外，恢复浏览器直连。
+  const web = byoViaGateway(false);
+  for (const good of ["https://api.teamorouter.cn/v1", "https://polly.modelbridge.cc/v1"]) {
+    assert.equal(web({ baseUrl: good }), false,
+      `${good} 在网页版上不该走代发 —— 头发不出去，网关会把它当成我们自己的模型`);
+  }
+  // 桌面端同一个地址必须仍然走：这条反向断言防止有人把门加宽成"谁都不走"。
+  assert.equal(byoViaGateway(true)({ baseUrl: "https://api.teamorouter.cn/v1" }), true,
+    "桌面端也被挡住了 —— 那等于把整个代发功能关掉");
+});
+
+test("要放开网页版，必须先把三个 byo 头补进 _realAiFetch", () => {
+  // 这条守的是「门和头一起动」。哪天有人把 inTauri 那道门去掉，却没补头，
+  // 就会重演今天这个形态：L0 剥了提示词、网关不知道要转发、用户被按我们的价钱计费。
+  // **两处都必须传 {code:true}**：fnSource 默认切的是含注释的源文本，而这个函数里
+  // `x-ide-byo` 今天**只存在于注释**。不剥注释的话有两条假绿：删掉门只留一行
+  // `// if (!inTauri) return false;` → 下面那个 if 认为门还在、整条断言被跳过；
+  // 或者在 _realAiFetch 里写任何提到 x-ide-byo-base 的注释 → sends 为真、断言通过。
+  const gate = fnSource("_byoViaGateway", { code: true });
+  const sends = /x-ide-byo-base/.test(fnSource("_realAiFetch", { code: true }));
+  if (!/if \(!inTauri\) return false;/.test(gate)) {
+    assert.ok(sends,
+      "_byoViaGateway 放开了网页版，但 _realAiFetch 里没有 x-ide-byo-base —— "
+      + "请求会打到网关而网关不知道要转发出去，用户会被按我们的价钱计费");
   }
 });
 
@@ -94,4 +127,25 @@ test("三个字段要真的发出去（桌面走 Rust 侧的头）", () => {
   // 没有 base 就一个头都不发：只发 key 或只发 proto 会让网关走进半配置的状态。
   assert.match(ai, /if let Some\(base\) = config\.byo_base[\s\S]{0,600}x-ide-byo-key/,
     "key 的转发不在 base 的条件里");
+});
+
+test("直连第三方端点时不许发 x-ide-* —— 我们自己的头会把对方的预检打挂", () => {
+  // 实测（2026-09-02，真发 OPTIONS）：
+  //   api.moonshot.cn  只带 authorization,content-type → 204 且回显 → 预检通过
+  //                    再带上 x-ide-run-id/session-id/session-goal → **不回显** → 浏览器拒绝，
+  //                    整条请求发不出去。同一家、同一条路径，差别只在我们多发的头。
+  //   api.deepseek.com 原样回显，放行；open.bigmodel.cn 两种都 405（和我们无关）。
+  // 这些头是发给**我们网关**的遥测，第三方端点一个都用不上。
+  //
+  // 另外它们还带着用户内容：x-ide-session-goal 是会话开场那句的 base64（至多 4000 字），
+  // 在 _readyAiConfig 里无条件设，不走 L0 那道门 —— 直连时会跟着发给第三方。
+  // （工具名清单 x-ide-tools 和模式 x-ide-mode 在 L0 块里设，直连时压根不设，不受影响。）
+  const fetchFn = fnSource("_realAiFetch", { code: true });
+  assert.match(fetchFn, /if \(!_isGatewayConfig\(config\)\)[\s\S]{0,120}startsWith\("x-ide-"\)[\s\S]{0,40}delete/,
+    "直连线路没有清掉 x-ide-* —— Moonshot 那类只回显自己认识的头的端点会整条请求发不出去");
+  // 门必须在**所有** x-ide-* 都写完之后：早了就漏掉后面新加的头。
+  const gateAt = fetchFn.indexOf('startsWith("x-ide-")');
+  const lastHeader = fetchFn.lastIndexOf('_h["x-ide-');
+  assert.ok(gateAt > lastHeader && lastHeader > 0,
+    "清理放在了最后一个 x-ide-* 赋值之前 —— 后面那些仍会发出去");
 });

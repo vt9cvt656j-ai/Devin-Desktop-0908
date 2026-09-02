@@ -491,7 +491,9 @@ test("没跑成的工具调用必须如实回一条结果，不能在转录里�
   const at = RAW_SRC.indexOf("const toolMsgs = new Array(items.length);");
   assert.ok(at > 0, "toolMsgs 还是稀疏数组的话，补齐就仍是必需的");
   // 活路径的推送点（不是 !_live() 那条——它自带 [interrupted] 补齐后 break）
-  const pushAt = RAW_SRC.indexOf("for (const m of toolMsgs) messages.push(m);\n      if (turn._invalidToolRepairInstruction", at);
+  // 活路径的推送点现在还过一道单轮聚合预算（capTurnToolResults）：逐次上限管不住
+  // 并发批次，10 个并行 read 各自贴着自己那 60000 = 一轮 60 万字进上下文。
+  const pushAt = RAW_SRC.indexOf("for (const m of capTurnToolResults(toolMsgs)) messages.push(m);", at);
   assert.ok(pushAt > at, "活路径的推送点没找到——这条断言可能钉错了地方");
   const before = SRC.slice(at, pushAt);
   // 补齐必须紧挨着推送点之前，且覆盖每一个 item
@@ -1500,8 +1502,14 @@ test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不�
   assert.match(SRC.slice(leaveAt, leaveAt + 900), /window\.addEventListener\("pointerup"/,
     "没有在松手时补收卡片");
 
-  // 5) 买不到的档位要弹回并解释，不能静默钉住（那看起来就是滑块坏了）。
-  assert.match(bind, /showToast\(/, "锁定档位没有任何提示，用户只会觉得滑块坏了");
+  // 5) 每一格都是这个模型真实存在的窗口，所以没有"买不到的档"要弹回。
+  //    会员留存档位（1M/2M/5M）2026-09-01 从滑轨上撤了——那三格拖了不算数，
+  //    发出去的 x-michael-compression 取的是会员套餐，不是滑块选的那一格。
+  //    锁档回弹和它的 toast 随之一起没了消费者。
+  assert.doesNotMatch(bind, /lockHint/,
+    "锁档分支又回来了 —— 滑轨上如果真的多出一格锁着的东西，先问它拖了到底算不算数");
+  assert.match(bind, /Math\.min\(ctxOpts\.length - 1, want\)/,
+    "拖动没有夹在真实档位数以内");
 });
 
 test("AI 助手开关：按钮、面板、分隔条、落盘、开机还原，缺一环都不算能用", () => {

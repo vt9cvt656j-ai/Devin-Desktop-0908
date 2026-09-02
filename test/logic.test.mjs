@@ -9,6 +9,7 @@
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { toolLedgerStats } from "../src/agent/tool-ledger.js";
+import { repairToolPairing } from "../src/agent/tool-pairing.js";
 import { _mergeChatArchives as _mergeChatArchivesReal } from "../src/agent/chat-archive.js";
 import { readFileSync as _rfs } from "node:fs";
 const TOOL_LEDGER_SRC = _rfs(new URL("../src/agent/tool-ledger.js", import.meta.url), "utf8");
@@ -362,6 +363,9 @@ AUTO_LOAD_DEPS = {
   // Rust 的 serde_json 直接拒收整个请求）。少了就是 ReferenceError，表现成"这个测试挂了"。
   _stripLoneSurrogates: load("_stripLoneSurrogates", {}),
   _wellFormedContent: load("_wellFormedContent", { _stripLoneSurrogates: load("_stripLoneSurrogates", {}) }),
+  // 出线口的 tool_call ↔ tool_result 配对修复（src/agent/tool-pairing.js）。
+  // 同上：_sanitizeProviderMessages 现在第一句就调它，少了就是 ReferenceError。
+  repairToolPairing,
   // 意图裁决的前台等待窗口。_aiIntentProfile 里那道 Promise.race 用它当超时，发送路径
   // 的第一轮等待也从它推导——两个值同源，才不会漂回「等待 < 窗口」那个恒定失败的组合。
   // 从源码里取真值而不是抄一份常数：抄的那份改不动源码也不会红。
@@ -15588,19 +15592,19 @@ test("加法只发生在结算那一步：留存容量 = 窗口 + 档位", () =>
       _michaelUser: tierMax ? { michael_compression: { max_input_tokens: tierMax } } : null,
       _gatewayHandlesCompression: () => tierMax > 0,
       _tokenShort: (n) => String(n),
-      _MC_TIER_OPTIONS: loadConst("_MC_TIER_OPTIONS"),
       _ctxChoiceRecord: () => rec,
     };
     return load("_effectiveContextLimit", {
       ...base,
       _ctxChoiceFor: load("_ctxChoiceFor", base),
-      _ctxTierChoice: load("_ctxTierChoice", base),
     })("m");
   };
-  assert.equal(eff(5_000_000, null), 5_200_000, "没单独选档位就用会员自身的档：200k + 5M");
-  assert.equal(eff(5_000_000, { kind: "tier", tokens: 1_000_000 }), 1_200_000, "选了 1M 档：200k + 1M");
+  assert.equal(eff(5_000_000, null), 5_200_000, "档位按会员自身的档：200k + 5M");
   assert.equal(eff(5_000_000, { kind: "native", tokens: 200_000 }), 5_200_000, "只选窗口时档位仍按会员走");
   assert.equal(eff(0, null), 200_000, "没会员就只有窗口本身");
+  // 2026-09-01：档位撤出滑轨，回归纯会员驱动。老盘里的档位记录不再压低预算。
+  assert.equal(eff(5_000_000, { kind: "tier", tokens: 1_000_000 }), 5_200_000,
+    "老的档位记录还在压着预算，而 UI 上已经没有那一格能改回去了");
 });
 
 test("前缀续传的校验必须认得网关真正签发的 token", () => {
@@ -15658,19 +15662,19 @@ test("上下文选择存的是意图而不是数字，原生窗口修正后不�
   // 「原生」和「加档」曾经是两行分段按钮、靠 data-ctx-kind 属性把意图带到点击处；
   // 现在合成了一条滑块，意图改由档位表里的 kind 字段一路带到写入处。**不变量没变**：
   // 存进去的必须是意图，不是一个数字。所以断言跟着挪到新位置，而不是跟着删掉。
-  const choices = extractFn("_modelContextChoices");
-  assert.match(choices, /kind === "native"/,
-    "档位表必须把原生档排在数值相同的加档前面，否则原生会被判成加档");
   // 渲染和拖动处理必须读同一份档位表：读两份的话，拖到第 n 格写进去的会是另一张表
   // 的第 n 格——不报错，只是默默存错档位。
   const rows = extractFn("_modelContextRows");
   assert.match(rows, /_modelContextChoices\(/, "渲染没用共用档位表");
   assert.match(SRC.slice(RAW_SRC.indexOf("const ctxSl =")), /_modelContextChoices\(m\.id\)/,
     "拖动处理没用共用档位表，会和渲染错位");
+  // 【2026-09-01】留存档位那条轴从滑轨上撤了（它拖了不算数，见下面那条往返测试），
+  // 所以写入侧不再需要"是哪条轴"这个参数——滑轨上只剩窗口，一律按 native 存。
+  // 但**读取侧的排除必须留着**：老用户盘里还躺着 kind:"tier" / kind:"modified" 的记录，
+  // 不排除的话那些记录会被当成一个巨大的窗口，直接顶成仪表分母。
   assert.match(SRC.slice(RAW_SRC.indexOf("const ctxSl ="), RAW_SRC.indexOf("const ctxSl =") + 1400),
-    /_setCtxChoice\(m\.id, o\.value, o\.kind === "tier" \? "tier" : "native"\)/,
-    "拖到某一档时要连**是哪条轴**一起存下去：窗口和留存档位是两个量，"
-    + "合成一个数存就会出现「选 2M 得到 2,096,890」");
+    /_setCtxChoice\(m\.id, o\.value, "native"\)/,
+    "滑轨上每一格都是这个模型真实的窗口，写入侧不该再分轴");
 });
 
 test("空闲期卡死：点文件不再拖着整段对话过 JSON，重复镜像不再重写", () => {
@@ -18289,20 +18293,43 @@ test("gateway compression makes the local LLM compaction stand down", () => {
   // 加法还在（与网关 capacity_for_native 一致），但它现在只发生在**结算**这一步：
   // 窗口那一半来自窗口那条轴，档位那一半来自档位那条轴，两个数各自都认得出来。
   // 以前是把加法的结果当成"用户选了什么"存起来，于是选 2M 得到 2,096,890。
-  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1800}return Math\.max\(1, window \+ \(picked > 0 \? picked : tier\)\);/,
+  // 真跑，不查源码文本：这个函数在 Node 里跑得起来，源码断言只会守到"它长什么样"。
+  const effLimit = (tierMax, rec, native = 200_000) => {
+    const base = {
+      _modelContextLimit: () => native,
+      _ctxNativeDefault: () => native,
+      _ctxSeenMax: () => 0,
+      _nativeWindowsFor: () => [native],
+      _modelCatalogEntry: () => ({ contextLimit: native, contextWindows: [{ tokens: native, beta: null }] }),
+      _michaelUser: tierMax ? { michael_compression: { max_input_tokens: tierMax } } : null,
+      _gatewayHandlesCompression: () => tierMax > 0,
+      _ctxChoiceRecord: () => rec,
+    };
+    return load("_effectiveContextLimit", { ...base, _ctxChoiceFor: load("_ctxChoiceFor", base) })("m");
+  };
+  assert.equal(effLimit(5_000_000, null), 5_200_000,
     "网关接管时本地按 窗口+档位 裁剪，与 capacity_for_native 一致");
-  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1800}const picked = _ctxTierChoice\(modelId\);/,
-    "档位那一半必须走它自己的解析，不能再从窗口那条轴里读");
-  // 加法一旦退回成 max，两个数在 1M 原生模型上重合，整排档位按钮又变成空操作。
-  assert.doesNotMatch(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1400}Math\.max\(\s*native,\s*tierMax/,
-    "档位又变成取较大值了，付费档位在 1M 原生模型上会整排失效");
+  // 加法一旦退回成 max，两个数在 1M 原生模型上重合，付费档位整排失效。
+  assert.equal(effLimit(1_000_000, null, 1_000_000), 2_000_000,
+    "1M 原生 + 1M 档位必须是 2M。取较大值的话付费用户会严格比免费用户更差");
+  assert.equal(effLimit(0, null), 200_000, "没会员就只有窗口本身");
+  assert.equal(effLimit(5_000_000, { kind: "native", tokens: 200_000 }), 5_200_000,
+    "收窄窗口不该连档位一起收窄");
+  // 存量陷阱：老盘里手点过「1M 档」的记录，在 5M 会员身上必须**不再**把预算压回 1.2M。
+  // 档位那条轴 2026-09-01 撤出滑轨后回归纯会员驱动，UI 上已经没有那一格可以改回去了。
+  assert.equal(effLimit(5_000_000, { kind: "tier", tokens: 1_000_000 }), 5_200_000,
+    "老的档位记录还在压着预算 —— 那 6 个买了 5M 的活跃用户会比网关早 5 倍开始裁历史");
+  assert.equal(effLimit(5_000_000, { kind: "modified", tokens: 1_200_000 }), 5_200_000,
+    "老的「原生+档位」合成记录同上");
   // 配置对象的名字不是判据 —— 子体那个调用点用的是 `_subConfig`（角色可以声明自己的
   // 模型，上下文上限必须跟着**实际**跑的那个模型走，否则声明成小窗口模型的角色会按
   // 父模型的上限裁剪、然后被上游截断）。判据是「走的是有效窗口而不是原生窗口」，
   // 下面那条 doesNotMatch 仍然守着 _modelContextLimit。
   // 第五个参数是本轮 config：棘轮裁剪的让位判据要认线路（自建端点上网关不会压，
   // 让位就等于一层都不剩）。两个调用点都必须传，否则默认 null 会静默退回老行为。
-  const callSites = SRC.match(/_trimMessagesIfHuge\(messages, \w+, root, _effectiveContextLimit\(\w+\?\.model\), \w+\)/g) || [];
+  // 键是 `customModelId || model`：自定义线路上 config.model 已经被改写成上游真名，
+  // 只传 model 就查不到用户选的窗口（详见「自定义端点上拖动也算数」那条）。
+  const callSites = SRC.match(/_trimMessagesIfHuge\(messages, \w+, root, _effectiveContextLimit\(\w+\?\.customModelId \|\| \w+\?\.model\), \w+\)/g) || [];
   assert.equal(callSites.length, 2,
     `两个调用点都要用有效窗口（找到 ${callSites.length} 个）`);
   assert.doesNotMatch(SRC, /_trimMessagesIfHuge\(messages, \w+, root, _modelContextLimit\(/,
@@ -23713,27 +23740,23 @@ test("context-window choice clamps to what is actually deliverable", () => {
       _michaelUser: tierMax ? { michael_compression: { max_input_tokens: tierMax } } : null,
       _gatewayHandlesCompression: () => compress,
       _tokenShort: (n) => String(n),
-      _MC_TIER_OPTIONS: loadConst("_MC_TIER_OPTIONS"),
       _ctxChoiceRecord: () => rec,
     };
     return load("_effectiveContextLimit", {
       ...base,
       _ctxChoiceFor: load("_ctxChoiceFor", base),
-      _ctxTierChoice: load("_ctxTierChoice", base),
     })("m");
   };
   const tier5m = 5_000_000;
 
-  assert.equal(mk(tier5m, null), 5_200_000, "没单独选过 → 窗口 200k + 会员 5M 档");
-  assert.equal(mk(tier5m, { kind: "tier", tokens: 1_000_000 }), 1_200_000, "选 1M 档 → 200k + 1M");
-  assert.equal(mk(tier5m, { kind: "tier", tokens: 5_000_000 }), 5_200_000, "顶档要够得着");
+  assert.equal(mk(tier5m, null), 5_200_000, "窗口 200k + 会员 5M 档");
   assert.equal(mk(tier5m, { kind: "native", tokens: 200_000 }), 5_200_000, "只选窗口时档位仍按会员走");
-  assert.equal(mk(0, { kind: "tier", tokens: 5_000_000 }), 200_000,
+  assert.equal(mk(0, null), 200_000,
     "会员没了 → 档位不生效，只剩窗口本身，绝不产生一个虚构的数");
-  assert.equal(mk(tier5m, { kind: "tier", tokens: 5_000_000 }, false), 200_000,
-    "网关压缩没开 → 档位交付不了");
-  // 老记录（原生 + 档位）读回来仍然等价，不会把那一半当成窗口。
-  assert.equal(mk(tier5m, { kind: "modified", tokens: 1_200_000 }), 1_200_000, "老格式没等价还原");
+  assert.equal(mk(tier5m, null, false), 200_000, "网关压缩没开 → 档位交付不了");
+  // 老记录（档位 / 原生+档位）在**两条**读取器上都等于"没选过"：窗口回默认、档位按会员。
+  assert.equal(mk(tier5m, { kind: "tier", tokens: 1_000_000 }), 5_200_000, "老的档位记录还在压预算");
+  assert.equal(mk(tier5m, { kind: "modified", tokens: 1_200_000 }), 5_200_000, "老的合成记录同上");
 
   const mkOpts = (user, compress, windows = null) => {
     const env = {
@@ -23750,13 +23773,24 @@ test("context-window choice clamps to what is actually deliverable", () => {
     // 真函数，不是桩：原生档要不要上锁全看它，桩掉就测不到"够不着的窗口不许选"。
     return load("_ctxChoiceOptions", { ...env, _ctxNativeCeiling: load("_ctxNativeCeiling", env) });
   };
+  // 【2026-09-01】滑轨上只剩窗口。会员档位曾经也占三格（1M/2M/5M），而那三格**拖了
+  // 不算数**——发出去的 x-michael-compression 取的是会员自身的档位，不是滑块选的那格。
+  // 现在它变成卡片上一行只读事实（_ctxRetentionNote），不再是可拖的格子。
   const opts1m = mkOpts({ michael_compression: { tier: "1m", max_input_tokens: 1_000_000 } }, true)("m");
-  assert.equal(opts1m.length, 4, "native + ALL three tiers are displayed regardless of membership");
+  assert.equal(opts1m.length, 1, "会员档位不许再回到滑轨上——那几格是假的");
   assert.equal(opts1m[0].native, true);
-  assert.equal(opts1m[1].locked, false, "1M tier selectable on a 1M membership");
-  assert.equal(opts1m[2].locked, true, "2M tier locked above membership");
-  assert.equal(opts1m[3].locked, true, "5M tier locked above membership");
-  assert.match(opts1m[2].lockHint, /2M/, "locked tier explains what unlocks it");
+  assert.ok(!opts1m.some((o) => o.locked), "滑轨上不许有拖不动的格子");
+  assert.equal(opts1m.filter((o) => o.kind === "tier").length, 0, "滑轨上不许有留存档位");
+  // 而留存本身仍然看得见，只是换成了只读的一行。
+  const keep = load("_ctxRetentionNote", {
+    _michaelUser: { michael_compression: { tier: "1m", max_input_tokens: 1_000_000 } },
+    _gatewayHandlesCompression: () => true,
+    _compressionTier: () => "1m",
+  })();
+  assert.equal(keep.tokens, 1_000_000, "付费买到的留存必须还在卡片上，删格子不等于删功能");
+  assert.equal(load("_ctxRetentionNote", {
+    _michaelUser: null, _gatewayHandlesCompression: () => false, _compressionTier: () => null,
+  })(), null, "没会员就不该挂这一行");
 
   // 多个原生窗口要全部显示，而不是只留默认那个。Sonnet 4/4.5 真的有两个（200K 默认 +
   // 1M 走 context-1m beta），Gemini 1.5 Pro 有 1M/2M —— 只显示第一个等于把模型真实
@@ -25166,7 +25200,12 @@ test("同一轮里前面的命令失败，后面的命令不许再跑", () => {
   assert.ok(stopped, "构建挂了还去跑测试——用户收到的就是一排错，还得自己分辨哪个是根因");
   assert.match(stopped.content, /这条没有执行/);
   assert.match(stopped.content, /npm run build/, "要指名道姓是哪条挂了");
-  assert.match(stopped.content, /一次只发一条/, "要给出下一步怎么做");
+  assert.match(stopped.content, /前提/, "要说清停的原因是前提被证伪，不是发送量");
+  // **不许再挂常驻节奏令。** 「一次只发一条」写在这条阻断消息里，等于对后续每一轮都下了
+  // 「串行发」的令：而分区并发读段（canRunInReadSegment）只有在模型一轮发多个工具时才会
+  // 被用上。同批失败即阻断这个**机制**是对的、两家都有，要改的只是这句话。
+  assert.doesNotMatch(stopped.content, /一次只发一条/,
+    "常驻节奏令会压掉后续所有轮次的并行度，而那正是分区并发执行器唯一的触发条件");
   assert.equal(stopped.ok, false);
 
   // 第三条同样拦住——一个错误不该滚成三个。
@@ -28844,7 +28883,6 @@ const ctxEnv = (choice) => ({
   // 实测下限：默认没观测过（单独一条测试盖它）。
   _ctxSeenMax: () => 0,
   // 留存档位是另一条轴：这一族测的是窗口，档位一律按"没单独选过"。
-  _ctxTierChoice: () => 0,
 });
 const ctxFn = (name, choice) => load(name, {
   ...ctxEnv(choice),
@@ -28893,14 +28931,17 @@ test("分母是猜的就得说出来——不能让 91% 看上去和真实读数
   assert.match(render, /窗口未上报/);
 });
 
-test("拖滑块要当场重画仪表，并且弹到最近的未锁档", () => {
+test("拖滑块要当场重画仪表", () => {
   const at = RAW_SRC.indexOf("const ctxSl = card.querySelector");
   assert.ok(at > 0, "上下文滑块的绑定改写了");
   const block = SRC.slice(at, at + 1600);
   assert.match(block, /_refreshContextMeterFromDraft\(\{ force: true \}\)/,
     "选完不重画 —— 分母变了而圆环要等下一次按键才跟上，用户只会认为「滑动切换没用」");
-  assert.match(block, /Math\.abs\(i - want\) < Math\.abs\(nearest - want\)/,
-    "又变回「弹到最大的未锁档」了：想选 202,752 会写进 5,096,890，25 倍且方向相反");
+  // "弹到最近的未锁档"那段随留存档位一起撤了：滑轨上现在每一格都是这个模型真实存在的
+  // 窗口，一格都锁不住，也就没有要弹回去的地方。留着那段死代码正是本仓反复出现的
+  // "测试全绿、功能是死的"形状。
+  assert.doesNotMatch(block, /lockHint/,
+    "锁档分支又回来了 —— 滑轨上如果真的多出一格锁着的东西，先问它拖了到底算不算数");
 });
 
 test("后台标签页的回合不许画到你正看着的标签页上", () => {
@@ -29085,12 +29126,12 @@ test("原生档一律可选——滑块不能只剩一格", () => {
     _michaelUser: null,
     _gatewayHandlesCompression: () => false,
     _tokenShort: (n) => String(n),
-    _MC_TIER_OPTIONS: [["1M", 1_000_000]],
   };
   const natives = load("_ctxChoiceOptions", env)("glm-5.2").filter((o) => o.native);
-  assert.equal(natives.length, 3);
-  assert.deepEqual(natives.map((o) => o.locked), [false, false, false],
-    "原生档被锁了 —— 那是按 beta 判的，而线上一条 beta 都没有");
+  assert.equal(natives.length, 3, "目录列的每个窗口都该占一格");
+  // 曾经按 beta 标记锁掉"够不着的"档，而线上目录一条 beta 都没有，于是除默认档外全被
+  // 锁死，滑块只剩一格——用户报的"拖不动"。locked 这个维度 2026-09-01 整个拆了。
+  assert.ok(!natives.some((o) => o.locked), "又有格子被锁上了");
 });
 
 test("收窄永远算数——窗口那条轴直接认目录里列着的值", () => {
@@ -29115,23 +29156,26 @@ test("收窄永远算数——窗口那条轴直接认目录里列着的值", ()
 });
 
 test("选了哪一格就停在哪一格——不许一重画就退回去", () => {
-  // 用户实拍："我选择 1M 档次后还会自动退回去"。两条轴拆开之后 _effectiveContextLimit 是
-  // 二者之**和**（128.0k + 1M 档 = 1,128,000），而档位选项的 value 是档位本身（1,000,000）。
-  // 卡片当时还在用那个和去选项表里找高亮位，一个都对不上 → 回落到 idx = 0 →
-  // 用户选了 1M 档，卡片一重画就跳回最左边的 128.0k。
+  // 用户实拍："我选择 1M 档次后还会自动退回去"。当时卡片用 _effectiveContextLimit（窗口
+  // 与档位之**和**）去选项表里找高亮位，一个都对不上 → 回落到 idx = 0 → 一重画就跳回
+  // 最左边那格。现在只剩窗口一条轴，高亮位按用户存的那个窗口找。
   const box = { rec: null };
+  const WINDOWS = [202_752, 262_144, 512_000, 1_000_000];
   const env = {
-    _modelCatalogEntry: () => ({ contextLimit: 0, contextWindows: [] }),   // 目录没这个模型 → 按名猜 128k
+    _modelCatalogEntry: () => ({ contextLimit: 202_752, contextWindows: WINDOWS.map((tokens) => ({ tokens, beta: null })) }),
     _fallbackModelContextLimit: () => 128_000,
     _customModelById: () => null,
     loadConfig: () => ({}),
     _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } },
     _gatewayHandlesCompression: () => true,
+    _compressionTier: () => "5m",
     _tokenShort: (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${(n / 1000).toFixed(1)}k`),
-    _MC_TIER_OPTIONS: loadConst("_MC_TIER_OPTIONS"),
     _ctxChoiceRecord: () => box.rec,
     _ctxSeenMax: () => 0,
+    _escHtml: (x) => String(x),
+    _escAttr: (x) => String(x),
     _micSliderHtml: (o) => o,
+    _ctxRetentionHtml: () => "",
   };
   // 分层构建：后面的函数要用到前面的，一次性用同一个 env 加载会互相看不见。
   const l1 = { ...env, _modelContextLimit: load("_modelContextLimit", env) };
@@ -29142,74 +29186,274 @@ test("选了哪一格就停在哪一格——不许一重画就退回去", () =>
     ...deps,
     _modelContextChoices: opts,
     _ctxChoiceFor: load("_ctxChoiceFor", deps),
-    _ctxTierChoice: load("_ctxTierChoice", deps),
+    _ctxFactHtml: load("_ctxFactHtml", deps),
   });
-  const list = opts("glm-5.3");
-  assert.deepEqual(list.map((o) => o.label), ["128.0k", "1M 档", "2M 档", "5M 档"]);
+  const list = opts("glm-5.2");
+  assert.deepEqual(list.map((o) => o.label), ["202.8k", "262.1k", "512.0k", "1.0M"],
+    "滑轨上该有这个模型真实拥有的四个窗口，且从窄到宽");
 
   for (const o of list) {
-    box.rec = { kind: o.kind === "tier" ? "tier" : "native", tokens: o.value };
-    const idx = rows({ id: "glm-5.3" }).index;
+    box.rec = { kind: "native", tokens: o.value };
+    const idx = rows({ id: "glm-5.2" }).index;
     assert.equal(list[idx].label, o.label,
       `选了「${o.label}」，重画之后却停在「${list[idx].label}」——这就是用户报的自动退回`);
   }
+  // 老盘里的档位记录不许被读成窗口选择：它在窗口那条轴上等于"没选过"，于是停在默认窗口。
+  box.rec = { kind: "tier", tokens: 5_000_000 };
+  assert.equal(list[rows({ id: "glm-5.2" }).index].label, "202.8k",
+    "老的档位记录被当成窗口读了 —— 那会顶出一个模型根本读不了的分母");
   // 没选过时停在这个模型的**默认窗口**上，而不是无脑第 0 格。
   box.rec = null;
-  assert.equal(list[rows({ id: "glm-5.3" }).index].label, "128.0k");
+  assert.equal(list[rows({ id: "glm-5.2" }).index].label, "202.8k");
+
+  // 只有一个窗口的模型不该画一条拖不动的滑轨——那和"假修改"是同一种观感。
+  // 整条依赖链要**重新构建**：上面那份把 _modelCatalogEntry 按值抓进闭包了，改 env 无效。
+  const one = { ...env, _modelCatalogEntry: () => ({ contextLimit: 500_000, contextWindows: [{ tokens: 500_000, beta: null }] }) };
+  const o1 = { ...one, _modelContextLimit: load("_modelContextLimit", one) };
+  const o2 = { ...o1, _nativeWindowsFor: load("_nativeWindowsFor", o1), _ctxNativeDefault: load("_ctxNativeDefault", o1) };
+  const o3 = { ...o2, _ctxNativeCeiling: load("_ctxNativeCeiling", o2) };
+  const single = load("_modelContextRows", {
+    ...o3,
+    _modelContextChoices: load("_modelContextChoices", { ...o3, _ctxChoiceOptions: load("_ctxChoiceOptions", o3) }),
+    _ctxChoiceFor: load("_ctxChoiceFor", o3),
+    _ctxFactHtml: load("_ctxFactHtml", o3),
+  })({ id: "grok-4.6" });
+  assert.equal(typeof single, "string", "单窗口模型仍然画了滑块");
+  assert.match(single, /mic-fact/, "单窗口模型该渲染成只读的一行事实");
+  assert.match(single, /500\.0k/, "只读那行没把真实窗口写上去");
 });
 
-test("滑轨上两条轴要分得开：窗口在左、档位在右，档位带「档」字", () => {
-  // 原生「1.0M」和档位「1M」在同一条滑轨上几乎长一样，而且纯按数值排的话档位 1M 会插进
-  // 原生 512k 和 1.0M 中间 —— 两条轴交错，谁也看不出自己拖的是哪个量。
+test("自定义端点上拖动也算数——窗口的键必须是选择器 id，不是上游真名", () => {
+  // 实测复现过的"假修改"，而且是最后一处：用户在自建端点 custom:abc（上游真名 glm-5.2）
+  // 上把窗口拖到 1.0M，仪表跟着动了，请求里一个字节没变。
+  //
+  // 原因是同一个选择被两个键查：写入按 `m.id`（选择器 id，_setCtxChoice(m.id, ...)），
+  // 仪表按 loadConfig().model（也是选择器 id，对得上），而**发送侧和裁剪侧**拿到的
+  // config.model 已经在 _readyAiConfig 里被改写成上游真名（`config.model = _custom.name`）
+  // —— 查不到那条记录，于是永远发默认窗口。命中的正好是最常被自建端点代理的那批多窗口模型。
+  const store = { "michael-ide.ctx-choice.v2": JSON.stringify({ "custom:abc": { kind: "native", tokens: 1_000_000 } }) };
+  const base = {
+    localStorage: { getItem: (k) => store[k] ?? null, setItem: (k, v) => { store[k] = String(v); } },
+    _CTX_CHOICE_KEY: "michael-ide.ctx-choice.v2",
+    _CUSTOM_MODEL_PREFIX: "custom:",
+    _customModelById: (id) => (id === "custom:abc" ? { id: "custom:abc", name: "glm-5.2" } : null),
+    loadConfig: () => ({ model: "custom:abc" }),
+    _fallbackModelContextLimit: () => 0,
+    MODEL_GROUPS: [{ label: "智普", models: [{ id: "glm-5.2", contextLimit: 202_752,
+      contextWindows: [202_752, 262_144, 512_000, 1_000_000].map((t) => ({ tokens: t, beta: null })) }] }],
+    _ctxSeenMax: () => 0,
+    _michaelUser: null,
+    _gatewayHandlesCompression: () => false,
+  };
+  const l1 = { ...base, _modelCatalogEntry: load("_modelCatalogEntry", base) };
+  const l2 = { ...l1, _modelContextLimit: load("_modelContextLimit", l1) };
+  const l3 = { ...l2, _nativeWindowsFor: load("_nativeWindowsFor", l2),
+    _ctxNativeDefault: load("_ctxNativeDefault", l2), _ctxChoiceRecord: load("_ctxChoiceRecord", l2) };
+  const env = { ...l3, _ctxChoiceFor: load("_ctxChoiceFor", l3) };
+  const meter = load("_contextMeterLimit", env);
+
+  // 先证明"键选错了确实会静默丢掉用户的选择"——这条是下面那些调用点断言的理由。
+  assert.equal(meter("custom:abc"), 1_000_000, "按选择器 id 查得到用户拖的那一格");
+  assert.equal(meter("glm-5.2"), 202_752,
+    "按上游真名查只会拿到默认窗口 —— 发送侧用这个键，就是仪表动了、请求没变");
+  assert.notEqual(meter("custom:abc"), meter("glm-5.2"), "两个键必须真的不等价，否则这条测试测了个寂寞");
+
+  // 所以每一个消费这个选择的调用点都必须先用 customModelId。它们都在几万行的发送/循环
+  // 函数里，跑不动，只能钉调用点；用整源正则，不按下标切窗口。
+  const sites = [
+    [/_contextMeterLimit\(_turnConfig\.customModelId \|\| _turnConfig\.model/, "发给网关的 x-ide-context-window"],
+    [/_effectiveContextLimit\(config\?\.customModelId \|\| config\?\.model\)/, "主循环的本地裁剪阈值"],
+    [/_effectiveContextLimit\(_subConfig\?\.customModelId \|\| _subConfig\?\.model\)/, "子智能体的本地裁剪阈值"],
+    [/model: config\?\.customModelId \|\| config\?\.model \|\| ""/, "实测窗口下限的写入键（普通聊天）"],
+    [/model: _turnConfig\?\.customModelId \|\| _turnConfig\?\.model \|\| ""/, "实测窗口下限的写入键（智能体回合）"],
+  ];
+  for (const [re, what] of sites) {
+    assert.match(SRC, re,
+      `${what}用的还是上游真名 —— 自定义端点上拖动又变成只动仪表不动请求`);
+  }
+  // 反向：不许再出现"只传 model、不先看 customModelId"的老写法。
+  assert.doesNotMatch(SRC, /_effectiveContextLimit\(config\?\.model\)/, "主循环那处漏了 customModelId");
+  assert.doesNotMatch(SRC, /_effectiveContextLimit\(_subConfig\?\.model\)/, "子智能体那处漏了 customModelId");
+});
+
+test("拖动在每一种线路上都改到了东西——两条机制严格互补，不存在「拖了什么都没变」", () => {
+  // 拖动写进去的那个窗口有**两个**下游，各自在互补的条件下生效：
+  //
+  //   ① 发给网关的 x-ide-context-window。服务端全仓只读它一次
+  //      （server/src/models.rs:10646，client_context_window 的唯一调用点），而那一行在
+  //      `if let Some(requested) = compression_tier_from(...)` 里面 —— 也就是说，**客户端
+  //      没发 x-michael-compression 时，这个头没有任何人读**。
+  //   ② 本地棘轮裁剪 _trimMessagesIfHuge：它按 _effectiveContextLimit 决定这一轮真正
+  //      发多少历史进 body，而它在 _gatewayHandlesCompression 为真时早返回让位。
+  //
+  // 两者的开关是同一个判据的正反两面，所以任何一种配置下**恰好**有一条在起作用。
+  // 这个不变量一破就会冒出一类用户"拖了确实什么都没变"——正是所有者说的假修改。
+  // 真跑判据函数，不查源码文本。
+  //
+  // 【2026-09-01 补第五种情形】远程自定义端点改走网关代发（byoBase）之后，
+  // `_isGatewayConfig` 对它返回 true，于是本地三层**让位**；而发送侧当时仍是
+  // `customModelId ? null : ...`，代发线路的 customModelId 是设了的 → **档位头不发**
+  // → 网关也不压。两层都不压，正是这条测试要防的那个空档，而卡片上写着
+  // 「长上下文压缩……和内置模型一样」。修法是让发送侧也认 byoBase。
+  //
+  // 两条腿**各自独立算**，不再假设「发送条件 == 让位条件」——那个假设正是上面那次
+  // 漏掉的地方。独立算完再断言互补，才真的在验同源。
+  const gate = (tier, customModelId, byoBase) => {
+    const cfg = { ...(customModelId ? { customModelId } : {}), ...(byoBase ? { byoBase } : {}) };
+    const handles = load("_gatewayHandlesCompression", {
+      _compressionTier: () => tier,
+      _isGatewayConfig: load("_isGatewayConfig", {}),
+    })(cfg);
+    // 发送侧的真实条件：(customModelId && !byoBase) ? null : _compressionTier()
+    const headerSent = !!(!(cfg.customModelId && !cfg.byoBase) && tier);
+    return { headerRead: headerSent, localTrim: !handles };
+  };
+  const BYO = "https://api.example.com/v1";
+  const CASES = [
+    ["5m", null, null, "会员 · 网关"],
+    [null, null, null, "非会员 · 网关"],
+    ["5m", "custom:x", null, "会员 · 自定义端点直连"],
+    [null, "custom:x", null, "非会员 · 自定义端点直连"],
+    ["5m", "custom:x", BYO, "会员 · 远程端点走代发"],
+    [null, "custom:x", BYO, "非会员 · 远程端点走代发"],
+  ];
+  for (const [tier, cm, byo, label] of CASES) {
+    const r = gate(tier, cm, byo);
+    assert.ok(r.headerRead || r.localTrim,
+      `${label}：两条路都不生效 —— 这类用户拖了确实什么都没变，就是所有者说的假修改`);
+    assert.ok(!(r.headerRead && r.localTrim),
+      `${label}：两条同时生效 —— 本地先裁一遍、网关再压一遍，前缀缓存全毁`);
+  }
+  // 具体是哪一条，也钉住。代发线路是网关请求，所以归网关。
+  assert.deepEqual(CASES.map(([t, c, b]) => (gate(t, c, b).headerRead ? "网关" : "本地")),
+    ["网关", "本地", "本地", "本地", "网关", "本地"]);
+
+  // 发送侧那两处必须继续认 byoBase。它们在 8 万行的发送函数里跑不动，只能钉调用点；
+  // 用整源正则、不按下标切窗口。
+  assert.equal((SRC.match(/customModelId && !\w+\.byoBase\) \? null : _compressionTier\(\)/g) || []).length, 2,
+    "档位头的发送条件不再认 byoBase —— 代发线路上本地让了位、头又没发，两层都不压，"
+    + "而卡片写着「长上下文压缩和内置模型一样」，那类请求上拖动是纯装饰");
+  // 本地裁剪腿的让位条件同样是它。
+  assert.match(extractFn("_trimMessagesIfHuge", { code: true }), /_gatewayHandlesCompression\(config\)/,
+    "本地裁剪不再按同一个判据让位");
+});
+
+test("滑轨上只剩窗口一条轴，从窄到宽", () => {
+  // 曾经这条轨上混着两条语义完全不同的轴：窗口（模型这一轮能读多少）和会员留存档位
+  // （网关替你留多少历史）。原生「1.0M」和档位「1M」在轨上几乎长一样，而且档位那几格
+  // **拖了不算数**。现在只剩窗口，方向固定：往右拖 = 能读更多。
   const choices = load("_modelContextChoices", {
     _modelContextLimit: () => 96_890,
     _ctxChoiceOptions: () => [
-      // 关键：档位 1M/2M 的数值**夹在**原生 512k 和 2.0M 中间。纯按数值排会把两条轴
-      // 交错成 512k → 1M档 → 1.0M... —— 用这组数据才测得到分组。
       { value: 96_890, kind: "native", locked: false },
       { value: 2_000_000, kind: "native", locked: false },
       { value: 512_000, kind: "native", locked: false },
-      { value: 1_000_000, kind: "tier", tier: "1M", locked: false },
-      { value: 1_500_000, kind: "tier", tier: "1.5M", locked: false },
     ],
     _tokenShort: (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${(n / 1000).toFixed(1)}k`),
   })("m");
-  assert.deepEqual(choices.map((o) => o.label), ["96.9k", "512.0k", "2.0M", "1M 档", "1.5M 档"],
-    "窗口那段必须整段在左、档位整段在右，且档位要看得出是档位");
-  assert.deepEqual(choices.map((o) => o.kind), ["native", "native", "native", "tier", "tier"]);
+  assert.deepEqual(choices.map((o) => o.label), ["96.9k", "512.0k", "2.0M"], "没有按窗口从窄到宽排");
+  assert.deepEqual(choices.map((o) => o.kind), ["native", "native", "native"]);
+  // 每一格的读数就是它的值本身，没有"档"这种第二种量混进来。
+  assert.deepEqual(choices.map((o) => o.valueLabel), choices.map((o) => o.label));
 });
 
-test("档位存的就是档位本身——不再是「原生 + 档位」那个合成数", () => {
-  // 用户实拍："我选择 2m 和 5m 他居然会变成叠加的数字很离谱"。标签写 2M、存的却是
-  // 原生 96,890 + 2M = 2,096,890，而上一轮我把"用户选的原样生效"接通之后，这个怪数
-  // 直接成了仪表分母。加法本身没错（网关 capacity_for_native 就是原生+档位），错在把
-  // **结算时**才该做的加法，提前写进了"用户选了什么"。
+test("滑轨上每一格都真的发得出去——拖到哪一格，网关收到的就是哪一格", () => {
+  // 用户原话："拖动这个修改，是能真正修改上下文的明白吗 不是假修改"。他是对的。
+  //
+  // 曾经滑轨右半段是 michael-compression 的 1M/2M/5M 三格，**那三格拖了不算数**：
+  //   · _ctxChoiceFor 对 kind:"tier" 直接返回 0（"选的是档位，窗口保持默认"）；
+  //   · 而真正发出去的 x-michael-compression 取的是**会员自身**的档位
+  //     （_compressionTier()，发送侧两处），从来不是滑块上选的那一格。
+  // 两头一夹，用户拖过去，请求里一个字节都不变。
+  //
+  // 所以这条测试不查源码文本，它对**每一格**做真往返：写盘 → 读回 → 仪表分母，
+  // 而仪表分母就是赋给 config.ideContextWindow、进 x-ide-context-window 的那个数。
+  const store = {};
+  const ls = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+  };
+  const WINDOWS = [96_890, 202_752, 262_144, 512_000, 1_000_000];
+  const base = {
+    localStorage: ls,
+    _CTX_CHOICE_KEY: "michael-ide.ctx-choice.v2",
+    _modelCatalogEntry: () => ({
+      contextLimit: 202_752,
+      contextWindows: WINDOWS.map((tokens) => ({ tokens, beta: null })),
+    }),
+    _customModelById: () => null,
+    loadConfig: () => ({}),
+    _fallbackModelContextLimit: () => 0,
+    _michaelUser: null,
+    _gatewayHandlesCompression: () => false,
+    _ctxSeenMax: () => 0,
+    _tokenShort: (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${(n / 1000).toFixed(1)}k`),
+  };
+  const l1 = { ...base, _modelContextLimit: load("_modelContextLimit", base) };
+  const env = {
+    ...l1,
+    _nativeWindowsFor: load("_nativeWindowsFor", l1),
+    _ctxNativeDefault: load("_ctxNativeDefault", l1),
+    _ctxChoiceRecord: load("_ctxChoiceRecord", l1),
+  };
+  const setChoice = load("_setCtxChoice", env);
+  const choiceFor = load("_ctxChoiceFor", env);
+  const meter = load("_contextMeterLimit", { ...env, _ctxChoiceFor: choiceFor });
+  const opts = load("_modelContextChoices", { ...env, _ctxChoiceOptions: load("_ctxChoiceOptions", env) })("glm-5.2");
+
+  assert.equal(opts.length, WINDOWS.length,
+    "滑轨上的格子数必须等于这个模型真实拥有的窗口数——多出来的那几格一定不是窗口");
+  const sentValues = [];
+  for (const o of opts) {
+    setChoice("glm-5.2", o.value, "native");        // 拖到这一格，松手
+    assert.equal(choiceFor("glm-5.2"), o.value, `拖到「${o.label}」没存住`);
+    const sent = meter("glm-5.2");                  // 这个数会赋给 config.ideContextWindow
+    assert.equal(sent, o.value,
+      `拖到「${o.label}」，发出去的却是 ${sent} —— 这一格是装饰，不是选择`);
+    assert.ok(sent >= 1000,
+      "低于 1000 会被请求头那道门丢掉（_realAiFetch 里的 >= 1000），等于这一格发不出去");
+    sentValues.push(sent);
+  }
+  assert.equal(new Set(sentValues).size, WINDOWS.length,
+    "有两格发出去的是同一个数，说明其中一格并没有真的生效");
+
+  // 阴性对照：老盘里的档位记录在窗口这条轴上必须等于"没选过"，而不是一个巨大的窗口。
+  setChoice("glm-5.2", 5_000_000, "tier");
+  assert.equal(choiceFor("glm-5.2"), 0, "档位记录被读成窗口了");
+  assert.equal(meter("glm-5.2"), 202_752, "档位记录没退回默认窗口，顶出了一个模型读不了的分母");
+
+  // 最后两跳没法在 Node 里单独跑（一个在发送函数里、一个在 _realAiFetch 内部）。
+  // 用整源正则和 AST 取函数钉调用点，**不按下标切窗口**——那种守卫函数一长就滑出去，
+  // 而且它失效时仍然是绿的（见 test/source-guards.test.mjs 的那道棘轮）。
+  assert.match(SRC, /_turnConfig\.ideContextWindow = _contextMeterLimit\(/,
+    "发送侧不再把用户选的窗口赋给 ideContextWindow —— 滑块就又变回装饰了");
+  const fetchFn = extractFn("_realAiFetch", { code: true });
+  assert.match(fetchFn,
+    /_h\["x-ide-context-window"\] = String\(Math\.round\(Number\(config\.ideContextWindow\)\)\)/,
+    "请求头不再带上用户选的窗口");
+});
+
+test("老盘里的档位记录必须被安全忽略，不能变成一个巨大的窗口", () => {
+  // 用户实拍过："我选择 2m 和 5m 他居然会变成叠加的数字很离谱"——标签写 2M、存的却是
+  // 原生 96,890 + 2M = 2,096,890。档位 2026-09-01 撤出滑轨之后，新记录不会再有 tier /
+  // modified 这两种形状，但**老盘里还躺着**。它们在窗口这条轴上必须等于"没选过"。
   const base = {
     _modelContextLimit: () => 96_890,
     _ctxNativeDefault: () => 96_890,
     _modelCatalogEntry: () => ({ contextLimit: 96_890, contextWindows: [{ tokens: 96_890, beta: null }] }),
     _gatewayHandlesCompression: () => true,
     _tokenShort: (n) => String(n),
-    _MC_TIER_OPTIONS: loadConst("_MC_TIER_OPTIONS"),
   };
   const opts = load("_ctxChoiceOptions", { ...base, _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } }, _ctxNativeCeiling: () => 96_890 })("m");
-  const tiers = opts.filter((o) => o.kind === "tier");
-  assert.deepEqual(tiers.map((o) => o.value), [1_000_000, 2_000_000, 5_000_000],
-    "档位的值必须是档位本身，不是原生+档位");
-  assert.deepEqual(tiers.map((o) => o.label), ["1M", "2M", "5M"]);
+  assert.deepEqual(opts.filter((o) => o.kind === "tier"), [], "档位不许回到滑轨上");
+  assert.deepEqual(opts.map((o) => o.value), [96_890], "滑轨上只该有这个模型真实的窗口");
 
-  // 解析：选中的档位原样还原；会员降档后落回当时买得到的最大档；会员没了就不生效。
-  const tierFor = (rec, tierMax) => load("_ctxTierChoice", {
-    ...base,
-    _michaelUser: tierMax ? { michael_compression: { max_input_tokens: tierMax } } : null,
-    _ctxChoiceRecord: () => rec,
+  const win = (rec) => load("_ctxChoiceFor", {
+    ...base, _nativeWindowsFor: () => [96_890], _ctxChoiceRecord: () => rec,
   })("m");
-  assert.equal(tierFor({ kind: "tier", tokens: 5_000_000 }, 5_000_000), 5_000_000);
-  assert.equal(tierFor({ kind: "tier", tokens: 5_000_000 }, 1_000_000), 1_000_000, "会员降档 → 落回买得到的");
-  assert.equal(tierFor({ kind: "tier", tokens: 5_000_000 }, 0), 0, "会员没了 → 档位不生效");
-  assert.equal(tierFor(null, 5_000_000), 0);
-  // 老记录（原生 + 档位）就地还原成档位本身，不会被当成一个巨大的窗口。
-  assert.equal(tierFor({ kind: "modified", tokens: 2_096_890 }, 5_000_000), 2_000_000, "老格式没还原");
+  assert.equal(win({ kind: "tier", tokens: 5_000_000 }), 0, "档位记录被读成窗口了");
+  assert.equal(win({ kind: "modified", tokens: 2_096_890 }), 0, "合成记录被读成窗口了");
+  assert.equal(win({ kind: "modified", tokens: 50_000 }), 50_000, "老的收窄记录不能丢");
 });
 
 test("窗口那条轴只认窗口——档位混进来就会变成那个合成数", () => {
@@ -29514,6 +29758,23 @@ test("自定义模型的能力判据要按真实模型名查目录，和内置�
 
   // 认不出来的 custom id 不该崩，也不该串到别的模型上。
   assert.equal(entry("custom:不存在"), null, "查不到的自定义模型应当返回 null，而不是别人的条目");
+
+  // 而**窗口那条链必须真的用上它**。_modelContextLimit 曾经第一行就短路：
+  //   const _cm = _customModelById(...); if (_cm) return _fallbackModelContextLimit(_cm.name);
+  // 于是上面这些判据在窗口这一侧全部作废——内置 deepseek-v4-pro 拿到目录里的 512k，
+  // 用户自己配的同一个模型拿一个按名猜出来的数，卡片上还看不出那是猜的。
+  const limit = load("_modelContextLimit", {
+    _modelCatalogEntry: entry,
+    _customModelById: (id) => CUSTOMS.find((c) => c.id === id) || null,
+    _fallbackModelContextLimit: () => 128_000,   // 猜测值，故意和目录真值不同
+    loadConfig: () => ({}),
+  });
+  assert.equal(limit("custom:x"), 512_000,
+    "自定义模型拿到的是猜测值而不是目录真值 —— 「获取模型真实的上下文」在这半边没兑现");
+  assert.equal(limit("custom:x"), limit("deepseek-v4-pro"),
+    "同一个模型走两条路必须拿到同一个窗口");
+  // 目录里确实没有的私有模型才落回按名猜。
+  assert.equal(limit("custom:不存在"), 128_000, "目录查不到时要落回正则表，而不是崩或者给 1");
 });
 
 test("记忆卫生·召回：与当前技术栈无关的笔记不占无条件保底位", () => {

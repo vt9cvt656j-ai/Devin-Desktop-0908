@@ -16,7 +16,7 @@
 // （与 prefix-cache.test.mjs 里那组同源）。锚点尽量挑实现特征，不挑说明词。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { SRC } from "./helpers/source.mjs";
+import { SRC, fnSource } from "./helpers/source.mjs";
 
 test("中断/停止：真实正文仍先入账再 break（完整聊天记录不丢）", () => {
   // 用户点停止那一轮：turn.text 必须在 break **之前**收进 run 摘要。
@@ -38,13 +38,43 @@ test("〔中断前的写入结果〕页脚不再拼进可见消息", () => {
     `有一行把写盘页脚拼进了可见消息 summaryText：${badLine || ""}`);
 });
 
-test("写盘事实改记成状态：run._breakWriteFact（不是可见正文）", () => {
-  // 三处 break/插话结算点都把 note 挂到 run._breakWriteFact 上。
+test("写盘事实的收账不许再靠「枚举 break 点」——finally 里必须有一条兜底", () => {
+  // 【这条测试换过判据。旧版断的是「至少三个调用点」——而**一个数够三个的断言，结构上
+  //   不可能发现缺的是第四条路**。它确实一直绿着，而漏掉的恰恰是最常见的那条：
+  //   用户在**工具批次执行途中**按停（main.js 那句 `for (const m of toolMsgs) messages.push(m);`
+  //   后面的 break）。那条路上 run._breakWriteFact 从没被写过 → 收尾落成空串 →
+  //   下一轮 run._resumeFact 为空 → 「别重写已落盘文件」压根不生成。
+  //   补第四个调用点治标：这个循环的退出路径还有轮间按停、静默轮按停、预算耗尽、异常。
+  //   判据因此改成「finally 里有没有一条覆盖所有路径的兜底」。】
+  const loop = fnSource("_runAgenticLoop");
+  const fin = loop.slice(loop.indexOf("\n  finally {"));
+  assert.ok(fin.length > 200, "_runAgenticLoop 的 finally 段没找到，这条守卫要跟着改");
+  assert.match(fin, /_settleEagerWritesForBreak\(run\)/,
+    "finally 里没有兜底收账 —— 又回到「逐条枚举 break 点」，而那份清单没人维护得全");
+  // 兜底必须只在**真没跑完**时做（和 breakWriteFact 落库那句同源），否则正常收尾也白等一次在途写入。
+  assert.match(fin, /finalErr \|\| _stoppedEarly \|\| run\._incompleteReason/,
+    "兜底没有按「确实没跑完」门控");
+  // 已经算出来的不许被覆盖：那几条更近、带各自的上下文。
+  assert.match(fin, /!run\._breakWriteFact/, "兜底会覆盖掉更近的那条结算结果");
+
+  // 逐条结算点仍然要把 note 记成状态，不拼进可见正文。
   assert.ok((SRC.match(/if \(_eagerNote\) run\._breakWriteFact = _eagerNote;/g) || []).length >= 3,
-    "三处结算点没有都把写盘事实记成 run._breakWriteFact 状态");
-  // 结算调用本身要留着：它得等在途的「流完即写」落定（带 8s 上限），这条不能被顺手删掉。
-  assert.ok((SRC.match(/await _settleEagerWritesForBreak\(run\)/g) || []).length >= 3,
-    "结算在途写入的调用被删了——落了盘的文件会既不入账也等不到落定");
+    "结算点没有把写盘事实记成 run._breakWriteFact 状态");
+});
+
+test("工具批次执行途中按停：那条 break 也要收账", () => {
+  // 用户最常按停的时刻就是这里——界面上工具正在跑。模型吐字的时候没人点停止。
+  // 这条路补 [interrupted] 工具结果、把它们推进 messages、然后 break；
+  // 而流完即写在参数流完那一刻**已经落盘**，磁盘是真变了的。
+  const loop = fnSource("_runAgenticLoop");
+  const at = loop.indexOf("for (const m of toolMsgs) messages.push(m);");
+  assert.ok(at > 0, "工具批次的中断分支改写了，这条守卫要跟着改");
+  // 从那一行到它所属 if 块结束（下一个 `break;`）之间，必须出现结算调用。
+  const tail = loop.slice(at, loop.indexOf("break;", at) + 6);
+  assert.match(tail, /_settleEagerWritesForBreak\(run\)/,
+    "工具批次途中按停这条路没有收账 —— run._breakWriteFact 会是空的，"
+    + "下一轮模型不知道自己已经落过盘，会把同一个文件从头重写一遍");
+  assert.match(tail, /run\._breakWriteFact = /, "算出来了却没记成状态");
 });
 
 test("状态只在真没跑完时留存，正常收尾（哪怕插过话）不留", () => {
