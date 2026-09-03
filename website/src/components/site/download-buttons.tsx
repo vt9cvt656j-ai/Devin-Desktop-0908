@@ -110,7 +110,7 @@ function unmaskedRenderer(): string {
  * 都仍然把自己报成 `Intel Mac OS X`，这是当年为了不打断老站点的兼容性决定，至今没改。
  * 照着 UA 判架构，结论**永远**是 Intel，一台 M 系也认不出来。所以这里一个字都不看 UA。
  *
- * 两条真正能回答的路：
+ * 两条真正能回答的路（**下面的编号不是优先级**，优先级见 mac-arch.js：GPU 先判）：
  *
  * 1. `userAgentData.getHighEntropyValues(["architecture"])` —— 只有 Chromium 系
  *    （Chrome / Edge / Arc / Brave）有，但在那里是权威答案："arm" 或 "x86"。
