@@ -1,7 +1,7 @@
 {
   "name": "michael-ide-ui",
   "private": true,
-  "version": "0.4.14",
+  "version": "0.14.6",
   "type": "module",
   "scripts": {
     "dev": "vite",

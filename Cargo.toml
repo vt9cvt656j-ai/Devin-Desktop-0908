@@ -3,7 +3,7 @@ resolver = "2"
 members = ["src-tauri"]
 
 [workspace.package]
-version = "0.4.14"
+version = "0.14.6"
 edition = "2021"
 license = "MIT"
 authors = ["weiligon"]
