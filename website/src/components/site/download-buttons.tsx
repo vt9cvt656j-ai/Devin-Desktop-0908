@@ -3,6 +3,8 @@ import { useEffect, useState } from "react";
 import { Apple } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { mseFetch } from "@/lib/mse";
+import { pickMacArch } from "@/lib/mac-arch.js";
+import type { MacArch } from "@/lib/mac-arch.js";
 import { cn } from "@/lib/utils";
 
 /*
@@ -40,12 +42,25 @@ function WindowsMark({ className }: { className?: string }) {
 
 type OS = "mac" | "windows";
 
-/** Tauri's updater target keys — how the manifest names each build. */
-const TARGET: Record<OS, string> = { mac: "darwin-aarch64", windows: "windows-x86_64" };
+/**
+ * 一个下载键 = 一个真实存在的安装包。Mac 有两个，因为它就是两个包。
+ *
+ * 之前这里只有 `mac`，指向 x64 那一个 DMG，说明文字写「Intel & Apple Silicon」。
+ * 那句话在**能不能跑**这个意义上是对的（x64 包在 M 系上能靠 Rosetta 跑起来），
+ * 但代价是：占绝大多数的 M 系用户拿到的是翻译执行的包，而且首次打开会被要求装 Rosetta。
+ */
+type DownloadKey = "mac-arm64" | "mac-x64" | "windows";
+
+/** Tauri 更新清单里的平台键 —— 清单那条兜底路径按这个名字取 URL。 */
+const MANIFEST_KEY: Record<DownloadKey, string> = {
+  "mac-arm64": "darwin-aarch64",
+  "mac-x64": "darwin-x86_64",
+  windows: "windows-x86_64",
+};
 
 type Release =
   | { state: "checking" }
-  | { state: "ready"; version: string; urls: Partial<Record<OS, string>> }
+  | { state: "ready"; version: string; urls: Partial<Record<DownloadKey, string>> }
   | { state: "none" };
 
 /** Best guess at the visitor's platform; both downloads stay reachable either way. */
@@ -61,6 +76,79 @@ function useDetectedOS(): OS {
   return os;
 }
 
+type NavigatorUAData = {
+  getHighEntropyValues?: (hints: string[]) => Promise<{ architecture?: string }>;
+};
+
+/**
+ * 这台 Mac 的 GPU 名字，取不到就是空串。
+ *
+ * Safari 和 Firefox 不实现下面那个客户端提示 API，但它们如实报告 GPU —— 而 Mac 上
+ * GPU 和 CPU 架构是绑定的：M 系是 Apple 自家的 GPU，Intel 机器上是 Intel / AMD / NVIDIA。
+ * 所以这个字符串就成了这两个浏览器上唯一可用的判据。
+ */
+function unmaskedRenderer(): string {
+  try {
+    const canvas = document.createElement("canvas");
+    const gl = (canvas.getContext("webgl") ||
+      canvas.getContext("experimental-webgl")) as WebGLRenderingContext | null;
+    if (!gl) return "";
+    const ext = gl.getExtension("WEBGL_debug_renderer_info");
+    const raw = ext
+      ? gl.getParameter((ext as { UNMASKED_RENDERER_WEBGL: number }).UNMASKED_RENDERER_WEBGL)
+      : gl.getParameter(gl.RENDERER);
+    return typeof raw === "string" ? raw : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Intel Mac 还是 M 系 Mac —— 判不出来时返回 null。
+ *
+ * **UA 在这个问题上是死路。** macOS 上每个浏览器（包括 M 系上的 Safari 和 Chrome）
+ * 都仍然把自己报成 `Intel Mac OS X`，这是当年为了不打断老站点的兼容性决定，至今没改。
+ * 照着 UA 判架构，结论**永远**是 Intel，一台 M 系也认不出来。所以这里一个字都不看 UA。
+ *
+ * 两条真正能回答的路：
+ *
+ * 1. `userAgentData.getHighEntropyValues(["architecture"])` —— 只有 Chromium 系
+ *    （Chrome / Edge / Arc / Brave）有，但在那里是权威答案："arm" 或 "x86"。
+ * 2. WebGL 的 unmasked renderer —— Safari / Firefox 走这条。见上面那个函数。
+ *
+ * 两条都可能失败（浏览器太老、WebGL 被禁、隐私模式把 GPU 名字抹成通用串），
+ * 所以返回值允许是 null，调用方必须为「判不出来」准备一条出路，而不是硬猜一个了事。
+ *
+ * 这个函数只负责**取信号**；「取到之后怎么判」在 lib/mac-arch.js，那边是纯函数、
+ * 有拿真实机器字符串跑的测试（test/mac-arch.test.mjs）。
+ */
+async function detectMacArch(): Promise<MacArch | null> {
+  let architecture: string | undefined;
+  const uaData = (navigator as { userAgentData?: NavigatorUAData }).userAgentData;
+  if (typeof uaData?.getHighEntropyValues === "function") {
+    try {
+      architecture = (await uaData.getHighEntropyValues(["architecture"])).architecture;
+    } catch {
+      // 提示被拒绝或不被支持 —— 掉到 GPU 那条，不是错误。
+    }
+  }
+  return pickMacArch({ architecture, renderer: unmaskedRenderer() });
+}
+
+function useMacArch(): MacArch | null {
+  const [arch, setArch] = useState<MacArch | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void detectMacArch().then((a) => {
+      if (alive && a) setArch(a);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return arch;
+}
+
 /**
  * The published installers, or `none` if there genuinely are not any.
  *
@@ -72,9 +160,19 @@ async function installersOrNone(): Promise<Release> {
   try {
     const res = await mseFetch(DOWNLOADS, { cache: "no-store" });
     if (!res.ok) return { state: "none" };
-    const body = (await res.json()) as { version?: string; mac?: string | null; windows?: string | null };
-    const urls: Partial<Record<OS, string>> = {};
-    if (body.mac) urls.mac = body.mac;
+    const body = (await res.json()) as {
+      version?: string;
+      mac?: string | null;
+      mac_arm64?: string | null;
+      mac_x64?: string | null;
+      windows?: string | null;
+    };
+    const urls: Partial<Record<DownloadKey, string>> = {};
+    // 网关分开给两个架构（update.rs 的 downloads handler）。`mac` 是它更早就有的那个键，
+    // 指向 x64 —— 只在分架构的键缺席时才用它兜底，别让它盖掉 arm64。
+    if (body.mac_arm64) urls["mac-arm64"] = body.mac_arm64;
+    if (body.mac_x64) urls["mac-x64"] = body.mac_x64;
+    if (!urls["mac-x64"] && body.mac) urls["mac-x64"] = body.mac;
     if (body.windows) urls.windows = body.windows;
     return Object.keys(urls).length
       ? { state: "ready", version: body.version ?? "", urls }
@@ -115,10 +213,10 @@ function useRelease(): Release {
           version?: string;
           platforms?: Record<string, { url?: string }>;
         };
-        const urls: Partial<Record<OS, string>> = {};
-        for (const os of ["mac", "windows"] as OS[]) {
-          const url = manifest.platforms?.[TARGET[os]]?.url;
-          if (url) urls[os] = url;
+        const urls: Partial<Record<DownloadKey, string>> = {};
+        for (const key of Object.keys(MANIFEST_KEY) as DownloadKey[]) {
+          const url = manifest.platforms?.[MANIFEST_KEY[key]]?.url;
+          if (url) urls[key] = url;
         }
         if (!alive) return;
         if (Object.keys(urls).length) {
@@ -142,19 +240,11 @@ function useRelease(): Release {
 
 type IconType = React.ComponentType<{ className?: string }>;
 
-const PLATFORMS: Record<OS, { label: string; requirement: string; icon: IconType }> = {
-  mac: {
-    label: "Download for MacOS",
-    // The published disk image is universal, so it covers both architectures. Saying
-    // "Apple Silicon" here turned away Intel Mac owners the build actually supports.
-    requirement: "MacOS 13+ · Intel & Apple Silicon · .dmg",
-    icon: Apple,
-  },
-  windows: {
-    label: "Download for Windows",
-    requirement: "Windows 10+ · x64 · .exe or .msi",
-    icon: WindowsMark,
-  },
+const MAC_LABEL: Record<MacArch, string> = { arm64: "Apple Silicon", x64: "Intel" };
+
+const PLATFORMS: Record<OS, { label: string; icon: IconType }> = {
+  mac: { label: "Download for MacOS", icon: Apple },
+  windows: { label: "Download for Windows", icon: WindowsMark },
 };
 
 export function DownloadButtons({
@@ -169,6 +259,7 @@ export function DownloadButtons({
 }) {
   const detected = useDetectedOS();
   const release = useRelease();
+  const arch = useMacArch();
   const other: OS = detected === "mac" ? "windows" : "mac";
   const Primary = PLATFORMS[detected].icon;
   const Secondary = PLATFORMS[other].icon;
@@ -189,9 +280,33 @@ export function DownloadButtons({
     );
   }
 
+  const urls = release.state === "ready" ? release.urls : {};
+  // 判不出架构时按 arm64 发。Apple 2022 年就停售 Intel 机器了，猜 M 系对的概率高得多；
+  // 而猜错的那部分人不会卡死 —— 下面那行「Intel Mac?」的链接始终在，一次点击就换过去。
+  const macArch: MacArch = arch ?? "arm64";
+  const macKey: DownloadKey = macArch === "arm64" ? "mac-arm64" : "mac-x64";
+  const otherArch: MacArch = macArch === "arm64" ? "x64" : "arm64";
+  const otherMacKey: DownloadKey = otherArch === "arm64" ? "mac-arm64" : "mac-x64";
+
+  // Mac 那个键没有包时退到另一个架构，别把一个空按钮摆在那儿。
+  const macHref = urls[macKey] ?? urls[otherMacKey];
+  const servedArch: MacArch = urls[macKey] ? macArch : otherArch;
+  const href = (os: OS) => (os === "mac" ? macHref : urls.windows);
+
   const checking = release.state === "checking";
-  const href = (os: OS) => (release.state === "ready" ? release.urls[os] : undefined);
   const live = (os: OS) => !checking && !!href(os);
+  const requirement = (os: OS) =>
+    os === "mac"
+      ? `MacOS 13+ · ${MAC_LABEL[servedArch]} · .dmg`
+      : "Windows 10+ · x64 · .exe or .msi";
+
+  const swapHref = urls[otherMacKey];
+  const swapLink =
+    swapHref && urls[macKey] ? (
+      <a href={swapHref} className="underline underline-offset-2 hover:opacity-80">
+        {MAC_LABEL[otherArch]} Mac? Get that build
+      </a>
+    ) : null;
 
   return (
     <div className={cn("flex flex-col items-center gap-3", className)}>
@@ -241,10 +356,12 @@ export function DownloadButtons({
             <span className="mx-1.5 opacity-50">·</span>
           </>
         ) : null}
-        {PLATFORMS[detected].requirement}
+        {requirement(detected)}
         <span className="mx-1.5 opacity-50">·</span>
-        {PLATFORMS[other].requirement}
+        {requirement(other)}
       </p>
+
+      {swapLink ? <p className={cn("text-xs", muted)}>{swapLink}</p> : null}
     </div>
   );
 }
