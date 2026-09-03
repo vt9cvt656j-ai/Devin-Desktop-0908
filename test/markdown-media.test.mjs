@@ -57,6 +57,7 @@ const {
   renderMarkdownInto,
   safeMediaSrc,
 } = await import("../src/markdown.js");
+const mod = await import("../src/markdown.js");
 
 function findTag(node, tagName) {
   const wanted = tagName.toUpperCase();
@@ -196,4 +197,27 @@ test("unsafe markdown media stays inert text", () => {
   assert.equal(findTag(container, "img"), null);
   assert.equal(findTag(container, "video"), null);
   assert.match(container.textContent, /Image: bad/);
+});
+
+test("回复里的文件路径变成可点击链接，标识符/口令不变", () => {
+  const { renderMarkdownInto } = mod;
+  const mk = (src) => { const c = new FakeNode("div"); renderMarkdownInto(c, src); return c; };
+  const findCode = (node, out = []) => {
+    if (node.tagName === "CODE") out.push(node);
+    for (const ch of node.childNodes || []) findCode(ch, out);
+    return out;
+  };
+  // 路径：带 .md-filelink + data-filepath
+  const c1 = findCode(mk("看 `decompiled/config.rt.py` 里的 AppConfig"));
+  const link = c1.find((n) => n.className === "md-filelink");
+  assert.ok(link, "decompiled/config.rt.py 没被标成文件链接");
+  assert.equal(link.attributes.get("data-filepath"), "decompiled/config.rt.py");
+  // 同一段里的普通代码不该被标
+  const plain = c1.filter((n) => n.className !== "md-filelink");
+  assert.ok(plain.length >= 0);
+  // 标识符 / 口令 / 命令：绝不标
+  for (const s of ["`AppConfig`", "`login`", "`RgL0g1n@2026Ky!1`", "`xattr -cr`", "`obj.method`"]) {
+    const codes = findCode(mk("值 " + s));
+    assert.ok(!codes.some((n) => n.className === "md-filelink"), `${s} 被误判成文件链接`);
+  }
 });

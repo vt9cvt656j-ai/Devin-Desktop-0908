@@ -47,8 +47,8 @@ export const CM_PROTOCOL_UI = {
       "温度 / top_p 不会发送：新一代 Claude 即使关掉思考也拒收这两个参数，发了整轮 400。",
       "思考开关的形状按你填的模型名猜：名字带版本号（claude-sonnet-4-5）才猜得准；写成 sonnet-latest 这类别名时认不出代次，这条模型上一律不发思考参数。",
       "不报推理 token 数：Anthropic 把思考算进输出 token，结构上就没有这个数，界面只能显示思考字数。",
-      "最深的两档（极限 / xhigh）会被折成「高」：本机没有模型目录，赌错是整轮 400。",
-      "不设提示词缓存断点：长会话每轮全价重算，缓存创建量会显示为 0。",
+      "**本机端点**上最深的两档（极限 / xhigh）会被折成「高」：本机直连没有模型目录，赌错是整轮 400。远程地址走网关代发，网关有目录，不折。",
+      "**本机端点**不设提示词缓存断点：长会话每轮全价重算，缓存创建量显示为 0。远程地址走网关代发，网关会打断点。",
       "最大输出没填时按 32000 发：模型上限低于这个数的（例如 Haiku 一族）请自己填，否则上游 400。",
       "输入框的「下一句预测」不出现：那条路自己拼 /chat/completions，不经过协议翻译。宁可不预测，也不发一个必然 404 的请求。",
       "只在桌面版可用：网页版没有协议翻译，浏览器也直连不了 Anthropic。",
@@ -60,7 +60,7 @@ export const CM_PROTOCOL_UI = {
     hint: "自动拼成 /v1/responses，密钥走 Authorization: Bearer。选它的唯一理由是拿思考正文 —— xAI 在 /chat/completions 上结构性不返回思考内容。",
     desktopOnly: true,
     gaps: [
-      "最深的两档（极限 / xhigh）会被折成「高」：哪些模型收这两个词是按模型定的，本机没有模型目录，赌错是整轮 400。",
+      "**本机端点**上最深的两档（极限 / xhigh）会被折成「高」：哪些模型收这两个词是按模型定的，本机直连没有目录可查。远程地址走网关代发，不折。",
       "缓存明细只有读命中数：Responses 不报缓存写入量，缓存计量会比实际少一半。",
       "输入框的「下一句预测」不出现：那条路自己拼 /chat/completions，不经过协议翻译。宁可不预测，也不发一个必然 404 的请求。",
       "只在桌面版可用：网页版没有协议翻译。",
@@ -149,4 +149,41 @@ export function cmParseModels(payload) {
   }
   // 名字排序：中转站回来的顺序常常是入库顺序，同一家的模型会散在列表各处。
   return out.sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * 模型名和所选协议对不上时的提示。**只提示，不拦截。**
+ *
+ * 用户实际撞到的报错原文（上游中转回的）：
+ *   「本条请求疑似协议和模型不匹配导致 cache 异常，调用 claude-fable-5-1 模型请使用
+ *    Anthropic 协议。」
+ * 界面上此前没有任何东西提醒这件事：协议默认是 OpenAI 兼容，填一个 Claude 模型名
+ * 照样保存成功、照样发得出去 —— 直到上游回一句看不懂的错，或者更糟：**不报错，
+ * 只是缓存全程不命中**。而 Anthropic 的缓存写入按输入价 1.25 倍收、读只要 0.025 倍，
+ * 写了从来读不到比压根不缓存还贵 25%。
+ *
+ * 为什么只提示不拦截：确实存在"用 OpenAI 兼容协议转发 Claude"的中转，那种情况下
+ * 用户选 OpenAI 是对的。判据是模型**名字**，而名字是用户填的，不是执行事实 ——
+ * 拿它去拦人会拦错真实存在的用法。
+ *
+ * @returns {string} 要显示的一句话；没问题时空串
+ */
+export function protocolMismatchHint(modelName, protocol) {
+  const name = String(modelName || "").trim().toLowerCase();
+  const proto = String(protocol || "").trim().toLowerCase();
+  if (!name) return "";
+  // 只认**明确的**厂商前缀，不做模糊匹配：宁可漏提示，也不要对着一个正常的名字瞎报。
+  const anthropicish = /(^|[/_-])(claude|anthropic)([/_.-]|$)/.test(name);
+  const xaiish = /(^|[/_-])grok([/_.-]|$)/.test(name);
+  if (anthropicish && proto !== "anthropic") {
+    return `这个名字看着是 Claude 一族的模型，而你选的不是 Anthropic 协议。`
+      + `多数中转要求 Claude 走 Anthropic 协议（/v1/messages）——协议不对时轻则报错，`
+      + `重则**不报错但缓存全程不命中**，而缓存写入按输入价 1.25 倍收费，比不缓存还贵。`
+      + `如果你的端点确实用 OpenAI 兼容协议转发 Claude，忽略这条。`;
+  }
+  if (xaiish && proto === "anthropic") {
+    return `这个名字看着是 Grok 一族的模型，而 Anthropic 协议打的是 /v1/messages。`
+      + `xAI 的端点通常要 OpenAI 兼容或 xAI Responses 协议。如果你的端点确实这么转发，忽略这条。`;
+  }
+  return "";
 }

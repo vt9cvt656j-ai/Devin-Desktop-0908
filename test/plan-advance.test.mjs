@@ -18,7 +18,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, load } from "./helpers/source.mjs";
 import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/agent/plan-target.js";
 import { partialCause as _partialCause, runOutcome as _runOutcome } from "../src/agent/outcome.js";
 
@@ -187,8 +187,9 @@ test("计划继承：限 agent 模式、排在 planSteps 声明之后、并同�
   // 只读模式继承来的实现步骤根本执行不了，却会触发无模式门的 planFinish：
   // 最多 3 个多余回合去催一个只读模式"继续做下一步"，再给正常回答盖上未完成。
   assert.match(seg, /isAgent &&/, "继承没有模式门");
-  // 只设 run._planSteps 的话循环局部的 planSteps 永远是 null：
-  // 「改到第 3 个文件就提醒先停一下整合」会在每次续跑误报，周期性 planRefresh 也不触发。
+  // 只设 run._planSteps 的话循环局部的 planSteps 永远是 null，好几处判据都以为「没有计划」。
+  //（那两条靠它的注入——planNudge / planRefresh——2026-09-02 已并进〔执行状态〕块和
+  // update_plan 的工具描述，但 planSteps 本身仍有别的读者。）
   assert.match(seg, /planSteps = run\._planSteps;/, "没有同步循环局部的 planSteps");
   // isAgent 在 planSteps 声明附近才出现，继承块必须排在它之后
   assert.ok(loop.indexOf("let didMutate = false") < at, "继承块排在了 planSteps 声明之前");
@@ -241,4 +242,41 @@ test("用户按停必须产出可续跑的结局，否则整套交接是死的",
   assert.ok(capture > 0 && teardown > 0, "锚点缺失");
   assert.ok(capture < teardown,
     "在 _setStreaming(false) 之后才取值——那时每一次运行看起来都像被停了");
+});
+
+// ── 三条 plan 提醒并进已有通道（2026-09-02）───────────────────────────────────
+// 事实（还剩哪几步 / 状态多久没动）→〔执行状态〕块，每一轮都在；
+// 义务（改动铺开就该先落计划）→ update_plan 的工具描述，静态、走缓存。
+// 三条 _pushNudge 因此整条撤掉。下面这条守的是「真的搬过去了」，不是「删干净了」。
+test("plan 的三条提醒搬进每轮状态块与工具描述，事实与义务一条都不能少", () => {
+  const line = load("_planStateLineText", { _PLAN_STATE_TAG: "〔计划〕" });
+  const steps = (...st) => st.map((status, i) => ({ status, content: `第${i + 1}件事`, kind: "write" }));
+
+  // ① 后面还欠着的步骤要点名（原 planRefresh：每 8 轮说一次还剩哪几步）。
+  const mid = line({ _planSteps: steps("completed", "in_progress", "pending", "pending", "pending") });
+  assert.match(mid, /后面还有 3 步/, "不点名剩余步骤，planRefresh 就是被删掉而不是被搬走");
+  assert.match(mid, /第3件事/, "要点名具体是哪几步，只报数字等于没说");
+
+  // ② 状态一直不动要说出来（原 planStale：连续 8 次工具调用签名没变）。
+  const fresh = { _planSteps: steps("completed", "pending", "pending"), _planSigStaleOps: 7 };
+  assert.doesNotMatch(line(fresh), /一个都没动过/, "没到阈值就说话 = 每轮都在骂人");
+  const stale = { _planSteps: steps("completed", "pending", "pending"), _planSigStaleOps: 9 };
+  assert.match(line(stale), /9 次工具调用里/, "到了阈值必须说，否则进度条一直 0/N 没人管");
+  assert.match(line(stale), /进度条就一直停在 1\/3/, "要把用户那侧看到的数字摆出来");
+
+  // ③ 义务在**网关那份**工具描述里（发布构建会把客户端描述剥空，模型只看得到网关那份）。
+  const gw = JSON.parse(readFileSync(join(HERE, "..", "..", "server", "prompts", "tools.json"), "utf8"));
+  const up = (gw.find((t) => (t.function || t).name === "update_plan")?.function || {}).description || "";
+  assert.match(up, /three or more files/i, "原 planNudge 的义务没进工具描述 —— 那就是纯删弱");
+  assert.match(up, /land one before you touch the next file/i);
+
+  // ④ 三条 _pushNudge 确实不在了（搬走之后留着就是两处说同一件事）。
+  const loop = extractFn("_runAgenticLoop");
+  for (const c of ["planStale", "planRefresh", "planNudge"]) {
+    assert.doesNotMatch(loop, new RegExp(`_pushNudge\\("${c}"`), `${c} 还在推消息`);
+  }
+  // 但台账要留着：_planSigStaleOps 没人维护的话，②那段永远不成立。
+  assert.match(loop, /run\._planSigStaleOps = \(run\._planSigStaleOps \|\| 0\) \+ items\.length/,
+    "陈旧计数没人加，状态块里那句话永远不会出现");
+  assert.match(loop, /run\._planSigStaleOps = 0;/, "签名变了不清零，那句话就会永久卡住");
 });

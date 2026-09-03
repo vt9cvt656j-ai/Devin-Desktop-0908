@@ -214,8 +214,13 @@ test("门拦的写入不许把自己标成「没尝试过」（标了就从台�
   assert.doesNotMatch(gate, /attempted:\s*false/,
     "门拦把结果标成没尝试过——_toolExecutionAttempted 会把它从写盘台账里摘掉，"
     + "于是「已保存」那句话再没有任何事实与之矛盾");
-  // 台账的第二个写入点（对所有 item 的那一遍）是门拦唯一能进账的路径
-  assert.match(SRC, /\(run\._writeLedger = run\._writeLedger \|\| \[\]\)\.push\(\{ path: it\.call\.path, ok: _ok \}\)/,
+  // 台账的第二个写入点（对所有 item 的那一遍）是门拦唯一能进账的路径。
+  // 判据搬进了 src/agent/write-ledger.js 的 writeAttemptEntry，记账时刻也提前到了
+  // 每一项结算的那一刻（原来它在「批次中途按停」那条 break 下面 466 行，中途按停
+  // = 已落盘的 edit 一条账都没有 = 下一轮模型从头重写）。这里钉两个写入点都还在。
+  assert.match(SRC, /if \(_wl\) \{ \(run\._writeLedger = run\._writeLedger \|\| \[\]\)\.push\(_wl\);/,
+    "每项结算时的台账写入点没了");
+  assert.match(SRC, /if \(_wl2\) \{ \(run\._writeLedger = run\._writeLedger \|\| \[\]\)\.push\(_wl2\);/,
     "那一遍的台账写入点没了——门拦的写入不会留下任何痕迹");
 });
 

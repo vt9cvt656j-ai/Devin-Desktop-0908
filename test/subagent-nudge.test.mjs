@@ -17,6 +17,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CODE as SRC, SRC as RAW_SRC, fnSource, load } from "./helpers/source.mjs";
+import { NUDGE_GATE_EXEMPT } from "../src/agent/nudge-gate.js";
 
 const clip = () => load("_clipPreservingErrors", {
   _headTailModelText: load("_headTailModelText"),
@@ -66,11 +67,14 @@ test("子体报告：完整报告作为持久事实进历史，nudge 只带首�
   assert.match(facts[0], /src\/auth\/session\.ts:239/, "证据清单末尾的行号也要在");
   assert.match(facts[0], /\[ERROR\] 复现命令/, "错误行豁免");
 
-  assert.equal(pushes.length, 1);
-  assert.equal(pushes[0][0], "subagentResult");
-  assert.match(pushes[0][1], /await_subagent job=1/, "nudge 必须给出完整报告的取回指针");
-  assert.match(pushes[0][1], /结论：登录在 Safari/, "通知里带首段结论");
-  assert.ok(pushes[0][1].length <= 3200, "nudge 仍受 ~3K 字总量约束");
+  // **一条消息，不是两条**（2026-09-02）。
+  //
+  // 原来还有一条 `_pushNudge("subagentResult", …)` 带「首段结论 + 取回指针」，
+  // 而那个首段就是完整报告的第一段 —— 逐字重复。唯一独有的是取回指针，已经并进
+  // 事实消息本身。所以这里改成：nudge 一条都不推，指针和结论都在那条持久事实里。
+  assert.equal(pushes.length, 0, "子体产出又开始额外推一条提醒了 —— 同一段结论会出现两遍");
+  assert.match(facts[0], /await_subagent job=1/, "取回指针丢了：模型没法再取一次完整报告");
+  assert.match(facts[0], /结论：登录在 Safari/, "首段结论必须在（它本来就是报告的第一段）");
   assert.equal(run._subAgentJobs.get(1).consumed, true);
 
   // 并发多份时预算摊薄，一次交付的总量有界——证据进历史，但不是无上限地进。
@@ -178,6 +182,18 @@ test("陈旧提醒只注销、不从消息中段 splice——中段删一条就�
   assert.equal(reg.has("gone"), false);
 });
 
+/**
+ * _pushNudge 现在还要两个依赖：`run`（往它上面记这一轮推了几条、哪几类）和
+ * `_harnessNudgesEnabled`（总闸）。加它们是为了让「34 类提醒到底帮了多少」第一次能被量 ——
+ * 用户报的「简单事情也长篇大论 / 一个任务 27 步 / 190 万输入 token」很可能就是它们叠出来的，
+ * 而 Claude Code 的循环里 harness 对模型说的话是 0 条。
+ *
+ * load() 的依赖清单是**手工**的：函数体里多一个自由标识符就是 ReferenceError（不是断言失败，
+ * 是整条用例炸）。抽成工厂，免得每个用例各写一份、下次再漏。
+ * 每次调用返回**新的** run 对象：计数是累加的，共用一个会让用例之间互相污染。
+ */
+const NUDGE_DEPS = (on = true) => ({ run: {}, _NUDGE_GATE_EXEMPT: NUDGE_GATE_EXEMPT, _harnessNudgesEnabled: () => on });
+
 test("同类提醒重发：只有本轮尾部区间里的旧条才 splice，更早的留在原地", () => {
   const _nudgeRank = () => 1; // 全按事实类，避开淘汰逻辑，这条只看同类替换
   const _ORCH_NOTE = "〔编排〕";
@@ -186,7 +202,7 @@ test("同类提醒重发：只有本轮尾部区间里的旧条才 splice，更�
   {
     const messages = mkHistory(5);
     const reg = new Map();
-    const push = load("_pushNudge", { messages, _nudgeReg: reg, _nudgeRank, _ORCH_NOTE, _nudgeTurnFloor: 5 });
+    const push = load("_pushNudge", { messages, _nudgeReg: reg, _nudgeRank, _ORCH_NOTE, _nudgeTurnFloor: 5, ...NUDGE_DEPS() });
     push("diag", "第一次");
     const afterFirst = messages.length;
     push("diag", "第二次");
@@ -198,12 +214,12 @@ test("同类提醒重发：只有本轮尾部区间里的旧条才 splice，更�
   {
     const messages = mkHistory(5);
     const reg = new Map();
-    const pushEarly = load("_pushNudge", { messages, _nudgeReg: reg, _nudgeRank, _ORCH_NOTE, _nudgeTurnFloor: 5 });
+    const pushEarly = load("_pushNudge", { messages, _nudgeReg: reg, _nudgeRank, _ORCH_NOTE, _nudgeTurnFloor: 5, ...NUDGE_DEPS() });
     pushEarly("toolReminder", "第 12 轮的目录刷新");
     const old = messages[messages.length - 1];
     messages.push(...mkHistory(6)); // 中间隔了模型轮和工具结果
     const floor = messages.length;
-    const pushNow = load("_pushNudge", { messages, _nudgeReg: reg, _nudgeRank, _ORCH_NOTE, _nudgeTurnFloor: floor });
+    const pushNow = load("_pushNudge", { messages, _nudgeReg: reg, _nudgeRank, _ORCH_NOTE, _nudgeTurnFloor: floor, ...NUDGE_DEPS() });
     pushNow("toolReminder", "第 24 轮的目录刷新");
 
     assert.ok(messages.includes(old), "旧条被从中段抠走了——每 12 轮抠一次，前缀缓存每 12 轮塌一次");
@@ -245,7 +261,10 @@ test("run 用量读的是本 run 自己的结算账，不是挂在 session 上�
     "又回去累加 session._lastTurnTokens 了：那是上一轮（首轮是上一个 run 尾轮）的读数");
   assert.doesNotMatch(SRC, /run\._tokens = \(run\._tokens \|\| 0\) \+ \(session\._lastTurnTokens \|\| 0\)/,
     "逐轮累加一个滞后一轮的字段 = 判定整体错位、最后一轮永远不计入");
-  assert.match(SRC, /session\._runUsage = \{ in: 0[\s\S]{0,400}session\._lastTurnTokens = 0;/,
+  // 窗口从 400 放宽到 1200：_runUsage 初始化里后来挂了 run 级计费单价（prices，给费用
+  // 拆解用）并带一段注释，把 _lastTurnTokens 那行挤出了原窗口。守的性质没变——两行仍
+  // 必须挨在同一个 run 起点里；固定窗口本身是这条断言的已知弱点，函数一长就会再失效。
+  assert.match(SRC, /session\._runUsage = \{ in: 0[\s\S]{0,1200}session\._lastTurnTokens = 0;/,
     "run 起点必须把这个跨 run 存活的字段清零");
 });
 

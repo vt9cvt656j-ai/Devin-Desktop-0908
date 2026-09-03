@@ -145,17 +145,28 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
   // researchFirst 已经因为这条道理从建议类升过一次事实类，但事实类内部仍按「最旧的先走」
   // 淘汰，而它偏偏是**第一次写入**那一刻推的——四条事实一凑齐，第一个被踢的还是它。
   // 同一个病，低一层。
-  for (const once of ["researchFirst", "websiteContent", "emptyHistoryFact", "planFinish"]) {
+  // emptyHistoryFact 从这张表里移走了（2026-09-02）：它连同注入一起删了 ——
+  // 原则搬进常驻层 truthfulness（「Earlier conversation is not evidence about the current
+  // disk … the disk wins」），事实那半由环境块每轮承载（「🚫 现场已替你实探：当前工作区
+  // 是**空目录**」，main.js 里 parts.unshift，每轮都在）。两侧都在，注入是第三遍。
+  // websiteContent 也移出了（2026-09-02）：和 verifyNow/uiLook/browserVerify 一样，
+  // 文本并进了 [本轮交付事实] —— 那块每轮无条件推、推前 splice 掉上一份，
+  // **完全不参与同轮淘汰**，「一次性提醒被挤掉就永久失去」这个风险因此不存在了。
+  for (const once of ["researchFirst", "planFinish"]) {
     assert.equal(rank(once), 1, `${once} 是一次性提醒，挤掉就是整个 run 永久失去`);
   }
   // researchFirst 2026-08-22 从建议类改判事实类：它陈述的是执行事实（"这次工程语义要求
   // 外部参考，而取证账本是空的"，由 _missingResearchEvidence 按台账算出来），和 websiteContent
   // 是同一个判据的两半。而它偏偏只在**第一次写入**推一次（researchGateNudges < 1，整个 run
   // 就这一次机会），留在建议类里就意味着任何一条更晚的建议都能把它永久挤掉。
-  for (const fact of ["buildFix", "diag", "blindEdit", "subagentResult", "toolRepair", "recovery"]) {
+  // recovery 从这张表里移走了（2026-09-02）：它连同注入一起删了 —— 那是**同一段文字的
+  // 第二次投递**（_toolMsgForModel 生成失败工具结果时就把 [RECOVERY:…] 拼进正文了）。
+  // subagentResult 同理：并进了那条完整报告事实消息。
+  for (const fact of ["buildFix", "diag", "blindEdit", "toolRepair", "turnRetry"]) {
     assert.equal(rank(fact), 2, `${fact} 是事实类，丢了模型会按错误图景干活`);
   }
-  for (const advice of ["planNudge", "midSummary", "stuck", "askBudget"]) {
+  // midSummary 已删（它自称[事实]，陈述的却是模型自己刚发那条消息的重述；规则在 agent_core）。
+  for (const advice of ["planNudge", "stuck", "askBudget"]) {
     assert.equal(rank(advice), 3, `${advice} 是建议类，可以被事实挤掉`);
   }
   assert.equal(rank("someBrandNewNudge"), 3,
@@ -190,9 +201,9 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
   assert.equal(a.msgs.length, 3, "被淘汰的那条也要从消息列表里摘掉，不能只从注册表删");
 
   // ② 总额仍然有界：全是事实且已满额时，最旧的那条事实才让位。
-  const b = mk(["buildFix", "diag", "blindEdit", "cmdFail"]);
-  assert.deepEqual(evictWrap(b.reg, b.msgs, "recovery", rank),
-    ["diag", "blindEdit", "cmdFail"], "满额时让位的是最旧的事实，且总数收敛");
+  const b = mk(["buildFix", "diag", "blindEdit", "turnRetry"]);  // cmdFail 已删（重复投递），换一条同为事实类的
+  assert.deepEqual(evictWrap(b.reg, b.msgs, "subagentResult", rank),
+    ["diag", "blindEdit", "turnRetry"], "满额时让位的是最旧的事实，且总数收敛");
 
   // ③ 建议同时只留 1 条（正在推入的那条就是这 1 条），事实不受牵连。
   const c = mk(["buildFix", "askBudget"]);
@@ -200,9 +211,9 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
     "两条建议不能同时挂着，而事实要留下");
 
   // ④ steer 永远不被挤。
-  const d = mk(["steer", "buildFix", "diag", "blindEdit", "cmdFail"]);
-  assert.deepEqual(evictWrap(d.reg, d.msgs, "recovery", rank),
-    ["steer", "diag", "blindEdit", "cmdFail"], "用户实时插话被挤掉了");
+  const d = mk(["steer", "buildFix", "diag", "blindEdit", "turnRetry"]);
+  assert.deepEqual(evictWrap(d.reg, d.msgs, "subagentResult", rank),
+    ["steer", "diag", "blindEdit", "turnRetry"], "用户实时插话被挤掉了");
 });
 
 test("默认完整交付、先读懂再动手、每一步先想", () => {

@@ -281,69 +281,6 @@ export function _visualInspectJS(selector) {
   })()`;
 }
 
-// Node-tree extractor (把网站转成"节点"): snapshot the page as a compact, flat list
-// of interactive/structural NODES — each tagged with a stable `data-mnode` id so
-// the agent can act by id (`browser click node=N`) and re-snapshot to VERIFY the
-// new state, fast, without re-screenshotting. role + accessible-name + state
-// (disabled/checked/expanded/value/href) per node, plus headings for structure.
-// This is the accessibility-tree / browser-use approach: structured nodes are
-// 20-50× cheaper and far more reliable than pixel vision for click-and-verify.
-// No regex (template-literal safe); capped to stay under the browser_eval limit.
-// 指元素给 AI：用户在 browser 截图上点一个元素（坐标比例 rx,ry）→ 同一 browser 会话里
-// elementFromPoint 取出那个元素的选择器/文案/真实计算样式/outerHTML，发给 agent 精确改。
-// （这是 v0/Lovable「点元素编辑」的第一刀；走 headless 浏览器，绕开 iframe CSP + 远程窗口 IPC 两个坑。）
-export function _PICK_ELEMENT_JS(rx, ry) {
-  const RX = Number(rx) || 0, RY = Number(ry) || 0;
-  return `(() => { try {
-    var W = window.innerWidth || document.documentElement.clientWidth || 1;
-    var H = window.innerHeight || document.documentElement.clientHeight || 1;
-    var el = document.elementFromPoint(Math.round(${RX} * W), Math.round(${RY} * H));
-    if (!el) return JSON.stringify({error: 'no element'});
-    var cs = getComputedStyle(el), r = el.getBoundingClientRect();
-    var sel = el.tagName.toLowerCase();
-    if (el.id) { sel += '#' + el.id; }
-    else if (typeof el.className === 'string' && el.className.trim()) {
-      var c = el.className.trim().split(' ').filter(Boolean).slice(0, 2).join('.');
-      if (c) sel += '.' + c;
-    }
-    // 源码定位（关键：拿到这个元素在源码里的真实位置 file:line:col，给"点元素→直接改源码"用，
-    // 而不是盲改 CSS）。优先读构建期注入的 DOM 属性——对所有框架都稳、React 19 也不受影响：
-    //   · code-inspector-plugin：data-insp-path="path:line:col:name"（框架无关，首选）
-    //   · react-dev-inspector：data-inspector-relative-path / -line / -column
-    //   · vite-plugin-vue-inspector：data-v-inspector="file:line:col"
-    // 往上爬最多 15 层父节点找最近的一个；都没有再退回 React fiber._debugSource（老版 React <19）。
-    var source = null;
-    var _plc = function(s){ var m = String(s == null ? '' : s).match(/(.+):(\\d+):(\\d+)(?::[^:]*)?\$/); return m ? { file: m[1], line: parseInt(m[2],10)||0, col: parseInt(m[3],10)||0 } : null; };
-    for (var n = el, hop = 0; n && n.getAttribute && hop < 15 && !source; n = n.parentElement, hop++) {
-      source = _plc(n.getAttribute('data-insp-path')) || _plc(n.getAttribute('data-v-inspector'));
-      if (!source && n.getAttribute('data-inspector-line') != null) source = { file: n.getAttribute('data-inspector-relative-path') || '', line: parseInt(n.getAttribute('data-inspector-line'),10)||0, col: parseInt(n.getAttribute('data-inspector-column'),10)||0 };
-      if (!source && n.attributes) { try { for (var ai = 0; ai < n.attributes.length; ai++) { var a = n.attributes[ai]; if (/insp/i.test(a.name)) { var s2 = _plc(a.value); if (s2) { source = s2; break; } } } } catch (eA) {} }
-    }
-    if (!source) {
-      try {
-        var fk = Object.keys(el).find(function(k){ return k.indexOf('__reactFiber\$') === 0 || k.indexOf('__reactInternalInstance\$') === 0; });
-        var fb = fk ? el[fk] : null, fhop = 0;
-        while (fb && fhop < 40) {
-          if (fb._debugSource && fb._debugSource.fileName) { source = { file: fb._debugSource.fileName, line: fb._debugSource.lineNumber || 0, col: fb._debugSource.columnNumber || 0 }; break; }
-          fb = fb.return; fhop++;
-        }
-      } catch (e2) {}
-    }
-    return JSON.stringify({
-      tag: el.tagName.toLowerCase(), selector: sel,
-      text: (el.textContent || '').trim().slice(0, 200),
-      cls: (typeof el.className === 'string' ? el.className : ''),
-      isLeaf: el.children.length === 0,
-      source: source,
-      color: cs.color, background: cs.backgroundColor,
-      fontSize: cs.fontSize, fontWeight: cs.fontWeight, fontFamily: (cs.fontFamily || '').slice(0, 40),
-      padding: cs.padding, margin: cs.margin, borderRadius: cs.borderRadius,
-      boxShadow: (cs.boxShadow || '').slice(0, 60),
-      size: Math.round(r.width) + 'x' + Math.round(r.height),
-      outerHTML: (el.outerHTML || '').slice(0, 400)
-    });
-  } catch (e) { return JSON.stringify({error: String(e)}); } })()`;
-}
 
 export function _rgbToHex(rgb) {
   const m = String(rgb || "").match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);

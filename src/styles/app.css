@@ -1295,7 +1295,14 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
 .think-head .chev { flex: 0 0 auto; color: #80868b; transition: transform .25s cubic-bezier(.4,0,.2,1); }
 .think-card:not(.streaming):not([data-open="1"]) .think-head .chev { transform: rotate(-90deg); }
 /* think-body 嵌套滚动：防止与外层滚动链切换卡顿 */
-.think-body { padding: 0 14px 12px; font-size: 13px; line-height: 1.7; color: #3c4043; word-break: break-word; overflow-wrap: anywhere; max-height: 400px; overflow-y: auto; overflow-x: hidden; transition: max-height .28s cubic-bezier(.4,0,.2,1), opacity .2s ease, padding .2s ease; scroll-behavior: smooth; overscroll-behavior: contain; }
+/* **不要给这里加 scroll-behavior: smooth**（曾经有，是自动跟随掉线的真凶）：
+   流式时 main.js:31540 / 47625 每 ~90ms 做一次 `tb.scrollTop = tb.scrollHeight`，
+   而按规范 scroll-behavior 会把**直接赋值**也变成 ~300ms 的平滑动画 —— 每一发都在
+   90ms 后被下一发打断，scrollTop 永远追不上底部。差距一旦越过上面那个 48px 的
+   _stick 阈值就判定「用户自己滚开了」，从此不再赋值；而内容还在长，差距只增不减，
+   于是单向闩死、不会自愈，思考框停在半截要手动滚。
+   macOS 的滚轮/触控板本来就是平滑的，这个声明对手动滚动没有增益。 */
+.think-body { padding: 0 14px 12px; font-size: 13px; line-height: 1.7; color: #3c4043; word-break: break-word; overflow-wrap: anywhere; max-height: 400px; overflow-y: auto; overflow-x: hidden; transition: max-height .28s cubic-bezier(.4,0,.2,1), opacity .2s ease, padding .2s ease; overscroll-behavior: contain; }
 .think-card:not(.streaming):not([data-open="1"]) .think-body { max-height: 0; opacity: 0; overflow: hidden; padding-top: 0; padding-bottom: 0; }
 .think-body > :first-child { margin-top: 0; }
 .think-body > :last-child { margin-bottom: 0; }
@@ -5607,6 +5614,17 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 /* 流式中的消息仍保持 content-visibility: auto（视口内本就正常渲染），但把估高提到 800px：
    流式高度持续增长，估值偏小会在用户上滑时与滚动锚定打架、滚动条跳动 */
 .cv-safe .msg.is-streaming, .cv-safe .chat-session-container.is-streaming > .msg { content-visibility: auto; contain-intrinsic-size: auto 800px; }
+/* 用户行单独给一个准得多的占位高度。
+   上面那个 420px 是**所有** .msg 共用的常数，而一条 .msg 可能是一行提问（~60px），
+   也可能是一整轮几十张工具卡（几千像素）。配合 .chat 上显式的 overflow-anchor: none，
+   估错多少就位移多少，直接落到眼里。
+   用户行是这里唯一分布够窄、值得单独给常数的一类（助手行差着两个数量级，按内容估
+   反而更糟：写文件的 diff 卡是**无条件收起**的，按正文行数估会高估好几倍，
+   而高估导致的「整片塌回来」比低估更扎眼）。
+   写成 `.chat-session-container > .msg.user` 是**为了特异度**：只写 `.msg.user`
+   是 (0,3,0)，压不过上面那条 is-streaming 的 (0,4,0) —— 而流式那一刻正是位移最扎眼的时候。
+   这里是 (0,4,0) 且排在它后面，才真的生效。用户行本来就不会是流式那条。 */
+.cv-safe .chat-session-container > .msg.user { contain-intrinsic-size: auto 96px; }
 .agent-tool-row { min-width: 0; max-width: 100%; overflow: hidden; }
 .agent-tool-row > * { min-width: 0; }
 /* Inline code (incl. while streaming) wraps instead of forcing the line wider. */
@@ -5817,13 +5835,19 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   border-radius: 14px 14px 4px 14px;
   max-width: 88%;
   box-shadow: var(--shadow-sm);
+  /* 和助手正文同一档字号，整段对话读起来是一致的，不是一大一小。 */
+  font-size: 13.5px;
+  line-height: 1.6;
 }
 /* assistant renders markdown as a clean "document" (no bubble); code/tables
    become self-contained cards. user messages stay as blue bubbles above. */
 .msg.assistant .msg__body {
   color: var(--text);
   white-space: normal;
-  line-height: 1.62;
+  /* Cursor 观感：正文 13.5px（和全局 UI 同一档），行高 1.7 留白舒展；再大就"胖"。
+     没显式设过 font-size 时它继承 body 的浏览器默认 16px，中文一大就显得笨重。 */
+  font-size: 13.5px;
+  line-height: 1.7;
   width: 100%;
 }
 .msg.assistant .msg__body > *:first-child {
@@ -5841,14 +5865,16 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .msg__body h4,
 .msg__body h5,
 .msg__body h6 {
-  margin: 16px 0 8px;
-  font-weight: 680;
-  line-height: 1.3;
-  letter-spacing: -0.01em;
+  margin: 18px 0 8px;
+  /* 600 = 苹方真实的 Semibold；原来的 680 苹方没有这一档，macOS 会合成加粗，
+     中文标题因此发糊发黑。letter-spacing 归零：负字距在中文上会把字挤在一起。 */
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: normal;
 }
-.msg__body h1 { font-size: 18px; }
-.msg__body h2 { font-size: 16px; }
-.msg__body h3 { font-size: 14.5px; }
+.msg__body h1 { font-size: 16.5px; }
+.msg__body h2 { font-size: 15px; }
+.msg__body h3 { font-size: 14px; }
 .msg__body h4,
 .msg__body h5,
 .msg__body h6 { font-size: 13px; color: var(--text-dim); }
@@ -6013,6 +6039,24 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   padding: 1px 5px;
   border-radius: 5px;
 }
+/* 回复里的文件路径：默认还是代码样子，悬浮变蓝色链接、可点开（markdown.js 打的
+   .md-filelink，点击在 main.js 的 chatEl 委托里走 openFile）。 */
+.msg__body code.md-filelink {
+  cursor: pointer;
+  transition: color .12s ease, background .12s ease;
+}
+.msg__body code.md-filelink:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--hover));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+/* 用户蓝气泡里的路径：底色是深蓝，悬浮用白色下划线，别用同色蓝（看不见）。 */
+.msg.user .msg__body code.md-filelink:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.28);
+  text-decoration: underline;
+}
 .msg.user .msg__body code {
   background: rgba(255, 255, 255, 0.22);
 }
@@ -6079,6 +6123,17 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .queue-chip__insert:hover { filter: brightness(1.08); }
 .queue-chip__insert:active { transform: scale(0.96); }
 .queue-chip__insert .ic { width: 11px; height: 11px; }
+/* 删除：低调一档 —— 它是"撤销"，不该和"插入"抢注意力，但必须点得到（28px 命中区）。 */
+.queue-chip__del {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; margin-left: 2px; padding: 0;
+  border: none; border-radius: 999px; cursor: pointer;
+  background: transparent; color: var(--muted, #8b8b8b);
+  transition: background 0.13s ease, color 0.13s ease, transform 0.1s ease;
+}
+.queue-chip__del:hover { background: color-mix(in srgb, var(--danger, #d33) 12%, transparent); color: var(--danger, #d33); }
+.queue-chip__del:active { transform: scale(0.92); }
+.queue-chip__del .ic { width: 11px; height: 11px; }
 
 /* ---- code card (v3 — matching agent tool cards) ---- */
 .code-card {
@@ -6655,31 +6710,41 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .atc-result--warn { color: var(--atc-warning); background: transparent; }
 /* Telegram-style link preview card below browser screenshots */
 .browser-url-card {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 12px; margin-top: -1px;
-  background: rgba(128,128,128,.04);
-  border: 1px solid rgba(128,128,128,.2);
+  display: flex; align-items: stretch; gap: 10px;
+  padding: 9px 12px 10px; margin-top: -1px;
+  /* 底色跟着强调色走一点点（5%），而不是中性灰：卡片和上面那张截图之间需要一条
+     看得出来的分界，纯灰在深色下几乎化在背景里。 */
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 16%, transparent);
   border-top: none;
   border-radius: 0 0 8px 8px;
   overflow: hidden;
 }
+/* 左侧竖条：Telegram 那条的形状 —— 通栏、圆头、强调色实心。
+   原来写死 #4a9eff，换主题就和别处对不上了。 */
 .browser-url-card__bar {
-  width: 3px; align-self: stretch; min-height: 24px;
-  border-radius: 1.5px; background: #4a9eff; flex-shrink: 0;
+  width: 3px; align-self: stretch; min-height: 30px;
+  border-radius: 999px; background: var(--accent); flex-shrink: 0;
 }
 .browser-url-card__text {
   flex: 1; min-width: 0; overflow: hidden;
+  display: flex; flex-direction: column; gap: 1px; justify-content: center;
 }
-.browser-url-card__title {
-  display: block; font-size: 12px; font-weight: 600; line-height: 1.3;
+/* 站点名在**上**、用强调色 —— Telegram 链接预览就是这个顺序（站点 → 标题 → 描述）。
+   原来是标题在上、站点在下且 opacity .45，两行都是灰的，扫一眼分不出主次。 */
+.browser-url-card__host {
+  display: block; font-size: 11px; font-weight: 600; line-height: 1.35;
+  color: var(--accent); letter-spacing: .01em;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.browser-url-card__host {
-  display: block; font-size: 11px; opacity: .45; line-height: 1.3;
+.browser-url-card__title {
+  display: block; font-size: 12.5px; font-weight: 600; line-height: 1.35;
+  color: var(--text, inherit);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 [data-theme="dark"] .browser-url-card, .dark .browser-url-card {
-  background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.1);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 22%, transparent);
 }
 /* 撞上人机验证时贴在截图下面的那条：这是要**人**动手的一步，所以按警示色处理，
    不跟随普通 URL 卡片的低对比度。文案本身就是操作指引，不折行截断。 */
@@ -8829,6 +8894,16 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   border-radius: 5px;
   color: var(--ok, #2c6b4f);
   background: color-mix(in srgb, var(--ok, #2c6b4f) 14%, transparent);
+}
+/* 免费点用完时的样子。**不隐藏**：运营方在后台把这个模型标成了免费，那是他设定的
+   事实，界面上不该因为看的人今天点数用光就整个消失（旧版客户端一直显示，这一版
+   改成按余额隐藏之后，运营方的反馈就是「我明明标了 free，界面上没有」）。
+   两个事实都真、都要说：标记照旧显示，"此刻已用完"用弱化 + 悬停说明表达。 */
+.menu__item .free-tag.is-spent {
+  color: var(--muted, #8b8b8b);
+  background: color-mix(in srgb, var(--muted, #8b8b8b) 12%, transparent);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
 }
 /* meta 已经带 margin-left:auto；两个都带的话 free 会被推到 meta 右边、离对勾更近，
    顺序反而对。但 meta 和 free 同时出现时只需要一个自动外边距，否则中间会被均分开。 */

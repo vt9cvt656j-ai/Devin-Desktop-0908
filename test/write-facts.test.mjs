@@ -23,9 +23,13 @@ const loop = fnSource("_runAgenticLoop", { code: true });
 // ---- ① 三条写入质量事实在每轮工具阶段末尾就说，不再等收尾 ----
 
 test("写入质量扫描器在工具阶段（blindEdit 与 verifyNow 之间）就跑，输出走 writeFacts 事实通道", () => {
-  const from = loop.indexOf('_pushNudge("blindEdit"');
-  const to = loop.indexOf('_pushNudge("verifyNow"');
-  assert.ok(from > 0 && to > from, "blindEdit / verifyNow 两个锚点都得在");
+  // 上界锚点换了（2026-09-02）：blindEdit 那条 _pushNudge 已删（规则搬进工具描述、
+  // 拦截搬进 _blindOverwritePrecheck）。改钉同一位置那句仍在的真代码。
+  const from = loop.indexOf('const _isBlindable =');
+  // 下界锚点换了：verifyNow 的文本追加到交付事实块了，不再是一条 _pushNudge。
+  // 这条测试只拿它当"工具阶段到哪儿为止"的地标，换成它的文本即可。
+  const to = loop.indexOf("[未验证] 刚改了");
+  assert.ok(from > 0 && to > from, "盲改记账 / verifyNow 两个锚点都得在");
   const seg = loop.slice(from, to);
   assert.match(seg, /_stubDeliveryFindings\(run\)/,
     "占位扫描器只在静默收尾轮跑的话，结果随 break 蒸发，模型永远读不到");
@@ -33,11 +37,23 @@ test("写入质量扫描器在工具阶段（blindEdit 与 verifyNow 之间）�
     "「删了没查引用的导出」必须在写完那一轮就说");
   assert.match(seg, /run\._blindOverwrites \|\| \[\]/,
     "「没读过还覆写掉一半」的记账要在写时就转述给模型");
-  assert.match(seg, /_pushNudge\("writeFacts",/,
-    "三条事实必须走同一条写时通道");
+  // 载体换了（2026-09-02）：不再单独推一条 `_pushNudge("writeFacts", …)`，
+  // 而是**追加到本轮那条 [本轮交付事实] 上**。三条事实仍然走同一条通道，
+  // 而且拿到了那块的"每轮自替换、不累积"性质（原来走 _pushNudge，受同轮淘汰管，
+  // 长 run 里可能被别的提醒挤掉）。
+  assert.match(seg, /_DELIVERY_FACTS_TAG/, "三条事实必须走同一条写时通道");
+  assert.match(seg, /\[写入质量事实\]/, "标题丢了，模型分不出这是执行事实还是推断");
+  assert.doesNotMatch(seg, /_pushNudge\("writeFacts"/,
+    "又变回单独一条 harness 消息了 —— 同一轮里两条讲同一件事");
+  // **必须追加到本轮那条，不能存起来等下一轮**：交付事实块在更早处就推掉了，
+  // 而这些行到这里才算出来，存起来等于模型拿上一轮的写入质量判这一轮。
+  assert.match(seg, /for \(let i = messages\.length - 1; i >= 0; i--\)/,
+    "没有回头找本轮那条交付事实 —— 事实会晚一轮到");
+  assert.match(seg, /if \(!_appended\) messages\.push/,
+    "交付事实块是有条件推的，没找到时必须自己推一条，不能让事实凭空消失");
   // 只给事实不抢回合：收尾门「安静一轮＝模型的收尾判断」那条红线在这里同样成立。
-  const wfAt = seg.indexOf('_pushNudge("writeFacts"');
-  assert.doesNotMatch(seg.slice(wfAt, wfAt + 400), /\bcontinue;/,
+  const wfAt = seg.indexOf("[写入质量事实]");
+  assert.doesNotMatch(seg.slice(wfAt, wfAt + 700), /\bcontinue;/,
     "写入质量事实只陈述，不补回合");
 });
 
@@ -45,9 +61,14 @@ test("writeFacts 登记进事实类，且同一处每 run 只说一次（run 级
   // 按解析那张表判，不按子串——_pushNudge("writeFacts" 那一行自己就含这个子串。
   const facts = new Set([...(/const _NUDGE_FACTS = new Set\(\[([\s\S]*?)\]\)/.exec(SRC)[1]
     .matchAll(/"([a-zA-Z]+)"/g))].map((m) => m[1]));
-  assert.ok(facts.has("writeFacts"),
-    "writeFacts 没登记进事实类——会被一条建议挤掉，而它是落盘内容的真实扫描结果");
-  const from = loop.indexOf('_pushNudge("blindEdit"');
+  // 原来钉「writeFacts 登记进事实类」——为的是别被建议类挤掉。现在它不在淘汰表里了：
+  // 文本追加到 [本轮交付事实]，而那块每轮无条件推、推前把上一份 splice 掉，
+  // **完全不参与同轮淘汰**。「挤不掉」这个保证因此比原来更强，不是没了。
+  assert.ok(!facts.has("writeFacts"),
+    "writeFacts 又回到淘汰表里了 —— 它现在待在不参与淘汰的交付事实块里，两处都有就是重复");
+  // 上界锚点换了（2026-09-02）：blindEdit 那条 _pushNudge 已删（规则搬进工具描述、
+  // 拦截搬进 _blindOverwritePrecheck）。改钉同一位置那句仍在的真代码。
+  const from = loop.indexOf('const _isBlindable =');
   const seg = loop.slice(from, loop.indexOf('_pushNudge("verifyNow"'));
   assert.match(seg, /run\._writeFactsSaid \|\| \(run\._writeFactsSaid = new Set\(\)\)/,
     "没有 run 级去重，同一条事实会每轮复读、烧掉上下文预算");
@@ -152,7 +173,9 @@ test("命中的字面量对应 .env 里已有的 key 名时，措辞升级为「
   const [bare] = scan(mk('fetch("https://api.example.io/v1");'), []);
   assert.equal(bare.envKey, "");
   // 事实行里把配置项名字说出去。
-  const from = loop.indexOf('_pushNudge("blindEdit"');
+  // 上界锚点换了（2026-09-02）：blindEdit 那条 _pushNudge 已删（规则搬进工具描述、
+  // 拦截搬进 _blindOverwritePrecheck）。改钉同一位置那句仍在的真代码。
+  const from = loop.indexOf('const _isBlindable =');
   const seg = loop.slice(from, loop.indexOf('_pushNudge("verifyNow"'));
   assert.match(seg, /_hardcodedDeliveryFindings\(run, _envKeysByRoot\.get\(root\) \|\| \[\]\)/);
   assert.match(seg, /项目 \.env 里已经有配置项 \$\{h\.envKey\}/);
@@ -183,7 +206,9 @@ test("_touchedExportedDecls 只挑声明行真变了的导出，全新符号与�
 });
 
 test("引用查询分流：JS/TS 走进程内 TS worker，其它语言只在 LSP isRunning 时查，查不成不下结论", () => {
-  const from = loop.indexOf('_pushNudge("blindEdit"');
+  // 上界锚点换了（2026-09-02）：blindEdit 那条 _pushNudge 已删（规则搬进工具描述、
+  // 拦截搬进 _blindOverwritePrecheck）。改钉同一位置那句仍在的真代码。
+  const from = loop.indexOf('const _isBlindable =');
   const seg = loop.slice(from, loop.indexOf('_pushNudge("verifyNow"'));
   assert.match(seg, /_touchedExportedDecls\(run, run\._lastSuccessfulEdits \|\| \[\], 3\)/,
     "每轮最多 3 个符号的上界没了");
@@ -265,7 +290,8 @@ test("JS/TS 不受 isRunning 影响（Monaco 自带 worker），unchecked 事实
   assert.match(loop, /run\._writeFactsPending = run\._writeFactsPending \|\| \[\]/);
   assert.match(loop, /没有任何检查器看过/);
   // verifyNow 在无检查器语言上要把「这条命令是唯一的正确性检查」这半句事实补上。
-  const vAt = loop.indexOf('_pushNudge("verifyNow"');
+  // 锚点换了：verifyNow 的文本追加到交付事实块了，不再是一条 _pushNudge。
+  const vAt = loop.indexOf("[未验证] 刚改了");
   assert.match(loop.slice(vAt, vAt + 1400), /run\._uncheckedLangs && run\._uncheckedLangs\.size/,
     "verifyNow 没读 unchecked 事实——没有 LSP 的语言上它说得不够硬");
 });
@@ -307,4 +333,32 @@ test("testDir 必须先落到 stack 再进 _projectStacks（浅拷贝在先，�
   assert.ok(assignAt > 0 && setAt > 0);
   assert.ok(assignAt < setAt,
     "先 set 后赋 testDir 的话，Map 里那份浅拷贝没有 testDir——_strayScratchFiles 和同名测试判据读的都是 Map 里那份");
+});
+
+// ── 诊断门的扩展名表必须覆盖 Monaco 自带 worker 的那几种 ────────────────────
+//
+// json / css / html 三个 worker 在 main.js 顶部就 import 着、MonacoEnvironment 里接着，
+// 装都不用装、免费就能查。而它们一直不在 _LINTABLE_EXT 里 —— 于是模型写坏一个
+// package.json 或 tsconfig.json（整个项目当场跑不起来）、写出一条不闭合的 CSS，
+// 那道「你这次改动引入了新增错误」的闸一个字都不说。
+//
+// 这几种恰恰是「坏了整个项目就起不来」的那一类，比漏掉一门要另装语言服务器的语言严重得多。
+test("诊断门覆盖 Monaco 免费就能查的那几种扩展名", () => {
+  const m = /const _LINTABLE_EXT = new Set\(\[([\s\S]*?)\n\]\);/.exec(SRC);
+  assert.ok(m, "_LINTABLE_EXT 抠不出来了");
+  const body = m[1].split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  const set = new Set(eval("[" + body + "]"));   // eslint-disable-line no-eval
+  for (const ext of ["json", "jsonc", "css", "scss", "less", "html", "htm"]) {
+    assert.ok(set.has(ext),
+      `.${ext} 不在诊断门的扩展名表里 —— 而 Monaco 自带的 worker 免费就能查它。`
+      + "写坏一个 package.json 就是整个项目起不来，诊断门却一声不吭。");
+  }
+  // 对应的 worker 真的装着（表里加了而 worker 没接，就是另一种假话：查了、但永远没有结果）
+  for (const w of ["json/json.worker", "css/css.worker", "html/html.worker"]) {
+    assert.ok(SRC.includes(w), `Monaco 的 ${w} 没有 import —— 表里加了扩展名也查不出东西`);
+  }
+  assert.match(SRC, /self\.MonacoEnvironment = \{/, "MonacoEnvironment 没接，worker 起不来");
+  // 三个卡口都读这张表，漏一个那条腿就还是哑的
+  assert.equal((SRC.match(/_LINTABLE_EXT\.has\(ext\)/g) || []).length, 3,
+    "读这张表的卡口数变了 —— 重新核一遍哪几条腿真的用上了");
 });

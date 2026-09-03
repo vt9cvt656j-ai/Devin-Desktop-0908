@@ -175,3 +175,77 @@ test("判据不再是任务级首次事件", () => {
   // 这个函数必须继续自包含：它被单独取出来跑，引入新 helper 会当场 ReferenceError。
   assert.doesNotMatch(liveBlock, /_timelineElapsed\(/, "逐轮判据直接看字段是否为空即可");
 });
+
+// 实时费用要把「缓存命中」和「没命中」分别算清楚。
+//
+// 关键不变量：**拆出来的几项必须精确加回服务端结算的总额**。做法是按单价权重去摊那个
+// 总额，而不是拿单价另算一份——真正扣费的是 compute_cost 的 `usd * 100 * rate`，中间那个
+// 线路 rate 倍率和运行期目录单价客户端都复现不了，另算必然对不上，用户就会看到
+// 「四项相加 ≠ 总额」。摊开则 rate 和单位在比值里约掉，天然自洽。
+test("费用拆解按单价权重摊开，几项精确加回总额", () => {
+  const cents = [];
+  const title = load("_turnStatsTitle", {
+    _fmtElapsed: (ms) => `${ms}ms`,
+    _tokenShort: (n) => String(n),
+    // 记录每一次格式化的金额，用来验加总
+    _dispUsd: (c, d = 2) => { cents.push(Number(c) || 0); return "$" + (Number(c) / 663).toFixed(d); },
+    _MICHAEL_RAW_CENTS_PER_CREDIT_USD: 663,
+  });
+  const out = title({ elapsedMs: 5000, settlement: {
+    costCents: 298, usageReported: true, promptTokens: 53253, completionTokens: 4025,
+    cachedTokens: 46080, cacheCreationTokens: 0, settledTurns: 1, reportedTurns: 1,
+    promptIncludesCached: true,
+    prices: { in: 0.27, out: 1.10, cacheRead: 0.0123, cacheWrite: 0 },
+  }});
+  assert.match(out, /命中\/未命中分别算/, "没有出费用拆解");
+  assert.match(out, /cache HIT .*若未命中要 .*省下/, "没说清命中省了多少");
+  // **必须验真实渲染出来的那几个数**，不能在测试里把不变量重算一遍——重算的话，
+  // 生产代码改成「按单价另算一份」照样绿（实测过，那正是恒真守卫）。
+  const total = Number(out.match(/Credit cost: \$([0-9.]+)/)?.[1]);
+  // 只取每行 `→ $x` 那一个（括号里的「若未命中要/省下」不是份额，不参与加总）
+  const parts = [...out.matchAll(/·[^\n]*?→ \$([0-9.]+)/g)].map((m) => Number(m[1]));
+  assert.ok(parts.length >= 3, `只解析到 ${parts.length} 项份额`);
+  const sum = parts.reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(sum - total) < 0.005,
+    `拆出来的几项加不回总额：${parts.join(" + ")} = ${sum.toFixed(3)}，总额 ${total}`);
+});
+
+test("网关没下发缓存单价时不推算，宁可不显示", () => {
+  const title = load("_turnStatsTitle", {
+    _fmtElapsed: (ms) => `${ms}ms`, _tokenShort: (n) => String(n),
+    _dispUsd: (c, d = 2) => "$" + (Number(c) / 663).toFixed(d),
+    _MICHAEL_RAW_CENTS_PER_CREDIT_USD: 663,
+  });
+  const out = title({ elapsedMs: 1000, settlement: {
+    costCents: 100, usageReported: true, promptTokens: 10000, completionTokens: 100,
+    cachedTokens: 5000, cacheCreationTokens: 0, settledTurns: 1, reportedTurns: 1,
+    promptIncludesCached: true,
+    prices: { in: 0.27, out: 1.10, cacheRead: 0, cacheWrite: 0 }, // 缓存单价缺失
+  }});
+  assert.doesNotMatch(out, /命中\/未命中分别算/,
+    "缓存单价没下发却还是把拆解印出来了 —— 那等于按 0.1× 推算，实测偏一半");
+});
+
+// 缓存单价 0 有两种意思，必须分开：下发过的 0 = 这条线路不计缓存费（照实显示 $0）；
+// 压根没下发 = 不知道（整段不出）。混成一个 0 会两个方向都骗人。
+test("线路不计缓存费时照实显示 $0，而不是当成「不知道」藏起来", () => {
+  const title = load("_turnStatsTitle", {
+    _fmtElapsed: (ms) => `${ms}ms`, _tokenShort: (n) => String(n),
+    _dispUsd: (c, d = 2) => "$" + (Number(c) / 663).toFixed(d),
+    _MICHAEL_RAW_CENTS_PER_CREDIT_USD: 663,
+  });
+  const base = {
+    costCents: 298, usageReported: true, promptTokens: 53253, completionTokens: 4025,
+    cachedTokens: 46080, cacheCreationTokens: 0, settledTurns: 1, reportedTurns: 1,
+    promptIncludesCached: true,
+  };
+  // 下发过、且是 0 → 免费线路：出拆解，并写明不计缓存费
+  const free = title({ elapsedMs: 1000, settlement: { ...base,
+    prices: { in: 0.27, out: 1.10, cacheRead: 0, cacheWrite: 0, cacheKnown: true } } });
+  assert.match(free, /命中\/未命中分别算/, "免费线路把整段藏起来了");
+  assert.match(free, /此线路不计缓存费/, "没说明这条线路不计缓存费");
+  // 没下发 → 不知道：不出拆解，也绝不按 0.1× 推算
+  const unknown = title({ elapsedMs: 1000, settlement: { ...base,
+    prices: { in: 0.27, out: 1.10, cacheRead: 0, cacheWrite: 0 } } });
+  assert.doesNotMatch(unknown, /命中\/未命中分别算/, "单价未下发却还是把拆解印出来了");
+});

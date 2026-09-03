@@ -149,3 +149,27 @@ test("直连第三方端点时不许发 x-ide-* —— 我们自己的头会把�
   assert.ok(gateAt > lastHeader && lastHeader > 0,
     "清理放在了最后一个 x-ide-* 赋值之前 —— 后面那些仍会发出去");
 });
+
+test("角色声明了别的模型时，byo 三件套必须一起丢掉", () => {
+  // `_subConfig = { ...config, model: _roleModel, customModelId: undefined }` 只清了
+  // customModelId。而角色声明的是**我们目录里**的模型（判据就是 MODEL_NAMES[_roleModel]），
+  // 带着 byoBase 会让 Rust 照发 x-ide-byo-base → 网关把我们的模型名转发到**用户自己的
+  // 端点**去要 —— 静默换成了另一个模型、另一份账，而上面那句注释担心的正是这个。
+  //
+  // 这是本仓库反复出现的形状：新加了一个字段（byoBase），而「重置连接」的地方只清旧字段。
+  const src = fnSource("_runSubAgent", { code: true });
+  const at = src.indexOf("_subConfig = { ...config, model: _roleModel");
+  assert.ok(at > 0, "角色换模型那处改写了，这条守卫要跟着改");
+  const line = src.slice(at, src.indexOf("\n", at));
+  for (const f of ["customModelId", "byoBase", "byoKey", "byoProto"]) {
+    assert.match(line, new RegExp(`${f}: undefined`),
+      `换模型时没清 ${f} —— 连接身份要整套丢，漏一个就会带着旧线路跑新模型`);
+  }
+});
+
+test("byoBase 只有一个写入点，且没有别的地方在悄悄设它", () => {
+  // 它决定「这一轮走不走代发」，多一个写入点就多一条没人审过的路。
+  const code = CODE;
+  const writes = (code.match(/\.byoBase = /g) || []).length;
+  assert.equal(writes, 1, `byoBase 有 ${writes} 个写入点 —— 代发选路要能一眼看全`);
+});

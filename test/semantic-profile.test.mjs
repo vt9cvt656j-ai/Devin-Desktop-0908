@@ -72,7 +72,10 @@ test("转运层与网关判据没有漂：本文件模拟的那两道门就是�
     "engineering 分支不再装载 graph.agent.engineering");
 
   // ③ 生产日志里那四块，就是 graph 里的 agent.base——「画像空 = 只剩基础四块」得到复核。
-  assert.deepEqual(PROMPT_GRAPH.agent.base, ["agent_core", "reasoning", "truthfulness", "answer_quality"]);
+  // system_invariants 是**指令层级**，2026-09-02 加的，排在每个模式的第一块：
+  // 它是全系统唯一一条说明"几种指令谁大谁小"的排序，客户端任何文本都不该排到它前面。
+  assert.deepEqual(PROMPT_GRAPH.agent.base,
+    ["system_invariants", "agent_core", "reasoning", "truthfulness", "answer_quality"]);
   assert.deepEqual(PROMPT_GRAPH.agent.engineering, ["agent_engineering"]);
 });
 

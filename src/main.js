@@ -33,19 +33,29 @@ import { applyLayoutDensity, viewportW, viewportH } from "./agent/layout-density
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
 import { attachExecutionFacts as _attachExecutionFacts } from "./agent/execution-facts-meta.js";
-import { failedWritePaths as _failedWritePaths } from "./agent/write-ledger.js";
+import { failedWritePaths as _failedWritePaths, writeAttemptEntry as _writeAttemptEntry } from "./agent/write-ledger.js";
 import { buildCompactionTranscript } from "./agent/compaction-window.js";
 import { toolLedgerStats as _toolLedgerStats } from "./agent/tool-ledger.js";
+import { spinTargetOf as _spinTargetOf, annotateCrossToolMisses as _annotateCrossToolMisses } from "./agent/spin-target.js";
+import { NUDGE_GATE_EXEMPT as _NUDGE_GATE_EXEMPT } from "./agent/nudge-gate.js";
+import { decideQuietTurn as _decideQuietTurn, QUIET_RESUME_POOL as _QUIET_RESUME_POOL } from "./agent/quiet-turn.js";
+import { joinReasoningDelta as _joinReasoningDelta } from "./agent/reasoning-join.js";
 import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "./agent/verification-evidence.js";
 import { parallelUnsafeCommand as _parallelUnsafeCommand } from "./agent/parallel-command.js";
 import { movePreflightCardsAfter as _movePreflightCardsAfter, createPreflightCard as _createPreflightCard, settlePreflightCard as _settlePreflightCard, designPreflightSections as _designPreflightSections } from "./agent/knowledge-preflight-card.js";
 import { summarizeTiming as _summarizeTiming, intentRaceMarker as _intentRaceMarker, summarizeIntentRace as _summarizeIntentRace } from "./agent/turn-timing.js";
-import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives } from "./agent/chat-archive.js";
-import { planCoreFromReply, planTitleFromReply } from "./agent/plan-doc.js";
+import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives, _closedArchiveKey, _readSplitChatMirror } from "./agent/chat-archive.js";
+import { planCoreFromReply, planTitleFromReply, cleanPlanTitle } from "./agent/plan-doc.js";
 import { createPlanTab } from "./agent/plan-tab.js";
+import { runOrderedToolSegments } from "./agent/tool-scheduler.js";
 import { chipShortLabel as _chipShortLabel } from "./agent/chip-label.js";
 import { revealActiveTab } from "./agent/tab-strip.js";
+import {
+  stashHistoryNode as _stashHistoryNode,
+  takeHistoryNodes as _takeHistoryNodes,
+  dropHistoryNodesFrom as _dropHistoryNodesFrom,
+} from "./agent/history-node-cache.js";
 import {
   stackTable as _STACK_TABLE, stackManifestNames as _stackManifestNames,
   stackManifestExts as _stackManifestExts, manifestExtra as _MANIFEST_EXTRA,
@@ -55,7 +65,7 @@ import {
 import { _browserBatchFastJS } from "./agent/browser-batch-script.js";
 import {
   _DESIGN_EXTRACT_JS, _pageHookSrc, _NETWORK_CAPTURE_JS, _checkJS, _visualInspectJS,
-  _PICK_ELEMENT_JS, _rgbToHex, _swapTwClass, _NODES_EXTRACT_JS, _assertJS, _browserAutofillJS,
+  _rgbToHex, _swapTwClass, _NODES_EXTRACT_JS, _assertJS, _browserAutofillJS,
 } from "./agent/browser-page-scripts.js";
 import * as monaco from "monaco-editor";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
@@ -114,7 +124,7 @@ import {
   sendNotification as _notifySystem,
 } from "@tauri-apps/plugin-notification";
 import { listen } from "@tauri-apps/api/event";
-import { join } from "@tauri-apps/api/path";
+import { join, tempDir } from "@tauri-apps/api/path";
 import { registerSnippetProviders, setCustomSnippets } from "./snippets.js";
 import { createLspManager } from "./lsp-client.js";
 import { parseProblems } from "./problem-matchers.js";
@@ -222,12 +232,15 @@ import { contextPartsView as _contextPartsView } from "./agent/context-parts.js"
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { pointInTermSelection as _pointInTermSelection, termChipLabel as _termChipLabel, termSnippetText as _termSnippetText } from "./agent/term-drag.js";
-import { normalizeAskOptions as _normalizeAskOptions, askMode as _askMode, askAnswerText as _askAnswerText, askAnswerLabel as _askAnswerLabel } from "./agent/ask-user.js";
+import { normalizeAskOptions as _normalizeAskOptions, askMode as _askMode, askAnswerText as _askAnswerText, askAnswerLabel as _askAnswerLabel, decideQuestionBoundary } from "./agent/ask-user.js";
 import { normalizeAppSkin, clampSkinOpacity, skinPanelAlpha, SKIN_ENCODE_LADDER } from "./agent/app-skin.js";
 import { followAllows } from "./agent/live-follow.js";
 import { toolIconSvg as _toolIconSvg, toolIconFamily as _toolIconFamily } from "./agent/tool-icons.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
-import { capTurnToolResults } from "./agent/tool-output.js";
+import { capTurnToolResults, makeOverflowSink, withOverflowPointer } from "./agent/tool-output.js";
+import { createProgressLedger } from "./agent/idle-progress.js";
+import { readOnlyBatch } from "./agent/subagent-batch.js";
+import { INSTRUCTION_LADDER } from "./agent/prompt-layers.js";
 import { repairToolPairing } from "./agent/tool-pairing.js";
 
 // Global shared state store for sub-agent collaboration
@@ -331,6 +344,8 @@ try {
   for (const c of _engineRenderClasses(navigator.userAgent, canSkipOffscreen)) document.body.classList.add(c);
 } catch { /* no navigator (tests) → stay on the safe side and skip the optimization */ }
 const backend = inTauri ? await tauriBackend() : mockBackend();
+// 被截断的工具结果落盘用的目录，启动时解析一次 —— 收集器因此是纯同步的（正文要同步返回）。
+const _overflowSink = makeOverflowSink({ dir: inTauri ? await tempDir().catch(() => "") : "", writeText: (p, t) => backend.invoke("write_text_file", { path: p, content: t }) });  // 目录启动时解析一次 → 收集器纯同步
 
 // 网页版必须自己说清楚它是个演示工作区。
 //
@@ -503,6 +518,7 @@ function _groupRemoteSearchHits(root, query, caseSensitive, hits) {
   const _local = {
     readDir: backend.readDir, readTextFile: backend.readTextFile, readLogTail: backend.readLogTail, writeTextFile: backend.writeTextFile,
     writeTextFileIfUnchanged: backend.writeTextFileIfUnchanged,
+    writeTextFileIfUnchangedHashed: backend.writeTextFileIfUnchangedHashed,
     createFile: backend.createFile, createDir: backend.createDir, copyPath: backend.copyPath, renamePath: backend.renamePath,
     deletePath: backend.deletePath, deleteTextFileIfUnchanged: backend.deleteTextFileIfUnchanged,
     searchInProject: backend.searchInProject,
@@ -523,9 +539,21 @@ function _groupRemoteSearchHits(root, query, caseSensitive, hits) {
   backend.writeTextFileIfUnchanged = (p, expectedContent, c) => _remote.active
     ? _remoteCall("/fs/write", { path: p, expected_content: expectedContent, content: c })
     : _local.writeTextFileIfUnchanged(p, expectedContent, c);
+  // CAS 写入挂到 backend 上：调用点通过 backend 取用（理由见那边的注释——
+  // 测试用 load() 抠函数体跑，自由标识符会直接 ReferenceError）。
+  backend.casWriteEditorFile = (p, f, expected, snapshot) => _casWriteEditorFile(p, f, expected, snapshot);
   backend.deleteTextFileIfUnchanged = (p, expectedContent) => _remote.active
     ? _remoteCall("/fs/delete", { path: p, expected_content: expectedContent })
     : _local.deleteTextFileIfUnchanged(p, expectedContent);
+  // 远程守护进程（remote-agent/michael-remote-agent.py）的 /fs/write 只认 expected_content，
+  // 没有哈希 CAS 这条路。判断必须放在**调用时**而不是启动时判一次：远程会中途连上/断开。
+  // 不挡住的话，远程模式下这一路会照着同名路径写到**本机**磁盘上。
+  backend.writeTextFileIfUnchangedHashed = (p, expectedSha256, c) => _remote.active
+    ? Promise.reject(new Error("远程模式不支持哈希 CAS 写入"))
+    : _local.writeTextFileIfUnchangedHashed(p, expectedSha256, c);
+  // 调用点先问这一句再决定走哪条路。做成谓词而不是靠 try/catch 兜底：CAS 失败是**真结论**
+  // （磁盘被别人改了），必须原样往上抛；「能不能走哈希」是另一回事，不能混进同一个 catch。
+  backend.hashedCasAvailable = () => !_remote.active && typeof _local.writeTextFileIfUnchangedHashed === "function";
   backend.createFile = (p) => _remote.active ? _remoteCall("/fs/write", { path: p, expected_content: null, content: "" }) : _local.createFile(p);
   backend.createDir = (p) => _remote.active ? _remoteCall("/fs/mkdir", { path: p }) : _local.createDir(p);
   backend.copyPath = (from, to) => _remote.active ? _remoteCall("/fs/copy", { from, to }) : _local.copyPath(from, to);
@@ -548,6 +576,7 @@ function _groupRemoteSearchHits(root, query, caseSensitive, hits) {
       _hits.scannedFiles = Number.isFinite(Number(j?.scanned_files)) ? Number(j.scanned_files)
         : Number.isFinite(Number(j?.scannedFiles)) ? Number(j.scannedFiles) : undefined;
       _hits.scanScopeUnknown = _hits.scannedFiles === undefined;
+      _hits.sizeSkipped = Number(j?.size_skipped ?? j?.sizeSkipped) || 0;
       return _hits;
     })
     : _local.searchInProject(root, query, cs, mode);
@@ -683,6 +712,9 @@ async function tauriBackend() {
     reverseGeocodeCoordinates: (latitude, longitude, language) => core.invoke("reverse_geocode_coordinates", { latitude, longitude, language }),
     writeTextFile: (path, content) => core.invoke("write_text_file", { path, content }),
     writeTextFileIfUnchanged: (path, expectedContent, content) => core.invoke("write_text_file_if_unchanged", { path, expectedContent, content }),
+    // 只送旧全文的 sha256，不送旧全文本身。返回值是**刚落盘那份内容**的 sha256，
+    // 调用方缓存它，下一次保存连哈希都不用算。老命令原样留着给别的调用点用。
+    writeTextFileIfUnchangedHashed: (path, expectedSha256, content) => core.invoke("write_text_file_if_unchanged_hashed", { path, expectedSha256, content }),
     deleteTextFileIfUnchanged: (path, expectedContent) => core.invoke("delete_text_file_if_unchanged", { path, expectedContent }),
     // 同一个对象里 readDir / searchInProject 都过了 _toPosix，只有这一行漏了。
     // 后端 home_dir() 读的是 HOME 或 USERPROFILE，Windows 上只有后者、值是
@@ -714,6 +746,10 @@ async function tauriBackend() {
         result && typeof result.path === "string" ? { ...result, path: _toPosix(result.path) } : result);
       mapped.truncated = !Array.isArray(raw) && !!raw?.truncated;
       mapped.scannedFiles = Array.isArray(raw) ? undefined : raw?.scanned_files;
+      // 因体积（>2 MiB）被整份跳过的文件数。和 truncated 同一性质、而且更隐蔽的假阴性：
+      // 不是"没搜完"，是"这几个文件从头到尾没被看过"，返回的结果和"里面确实没有"一模一样。
+      // 本仓库自己的 src/main.js 就是 4.9 MB —— 在这个项目里搜任何东西，主文件永远搜不到。
+      mapped.sizeSkipped = Array.isArray(raw) ? 0 : (Number(raw?.size_skipped) || 0);
       return mapped;
     },
     gitStatus: (root) => core.invoke("git_status", { root }),
@@ -1042,7 +1078,15 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       // /api/ide-key now requires login (returns THIS user's own key) — pass the JWT.
       try { const tok = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || ""; const r = await fetch(config.baseUrl + "/api/ide-key", { headers: tok ? { Authorization: "Bearer " + tok } : {}, signal: turnController?.signal }); key = (await r.json()).api_key; } catch {}
     }
-    const payload = { model: config.model, messages, stream: true, stream_options: { include_usage: true } };
+    // 思考签名只有我们的网关认识，而且签名是**我们这条线路的上游**签的 —— 别家既
+    // 验不了也用不上。发过去轻则被忽略，重则被严格校验消息字段的端点判 400，把一条
+    // 本来能用的自定义端点弄坏。所以只在走网关时带，其余路径逐条剥掉。
+    const _outMsgs = isGateway ? messages : messages.map((m) => {
+      if (!m || !m.reasoning_blocks) return m;
+      const { reasoning_blocks: _drop, ...rest } = m;
+      return rest;
+    });
+    const payload = { model: config.model, messages: _outMsgs, stream: true, stream_options: { include_usage: true } };
     if (tools && tools.length) payload.tools = tools;
     if (config.reasoningEffort) payload.reasoning_effort = config.reasoningEffort;
     if (config.thinkingBudget) payload.thinking_budget = config.thinkingBudget;
@@ -1346,6 +1390,12 @@ async function _realAiFetch(config, messages, tools, onEvent) {
           const d = (v.choices && v.choices[0] && v.choices[0].delta) || {};
           const rt = d.reasoning_content || d.reasoning;
           if (rt) { markFirstProgress(); onEvent({ kind: "reasoning", delta: rt }); }
+          // 思考块的签名。网关在每个思考块收尾时整块发一次（文字和签名已在网关配好对），
+          // 这边只负责原样存、下一轮原样回传 —— 不解析、不合并、不当正文渲染。
+          // 没有它，模型每调一次工具就看不见自己上一轮的推理了。
+          if (Array.isArray(d.reasoning_blocks) && d.reasoning_blocks.length) {
+            onEvent({ kind: "reasoningBlocks", blocks: d.reasoning_blocks });
+          }
           if (d.content) { markFirstProgress(); onEvent({ kind: "token", delta: d.content }); }
           if (Array.isArray(d.tool_calls)) {
             for (const tc of d.tool_calls) {
@@ -2543,6 +2593,26 @@ try { _memProbeStart(); } catch {}
 // per-element click listeners are LOST on innerHTML restore, so a restored card wouldn't expand).
 chatEl?.addEventListener("click", (e) => {
   const t = e.target;
+  // 回复正文里的文件路径（markdown.js 标了 .md-filelink + data-filepath）：点击就在左侧
+  // 编辑器打开那个文件。相对路径按工作区根解析，和工具卡里那两处点开逻辑同源。
+  const fileLink = t && t.closest ? t.closest(".md-filelink[data-filepath]") : null;
+  if (fileLink) {
+    e.preventDefault();
+    e.stopPropagation();
+    const fp = fileLink.dataset.filepath;
+    if (fp) {
+      (async () => {
+        const direct = _resolveRel(fp, rootPath || workspaceRoots[0] || "");
+        // 先按根拼的路径试；它真在磁盘上才 openFile（避免给不存在的路径开一个坏标签页）。
+        if (await _fileExistsOnDisk(direct)) { await openFile(direct, fp.split("/").pop()); return; }
+        // 拼不中：模型多半只写了 basename 或漏了子目录，在项目里按名字找一遍。
+        const found = await _findFileInProjectByName(fp);
+        if (found) { await openFile(found, found.split("/").pop()); return; }
+        showToast(`项目里没找到 ${fp}`);
+      })();
+    }
+    return;
+  }
   const head = t && t.closest ? t.closest(".think-head") : null;
   if (!head) return;
   const card = head.closest(".think-card");
@@ -2895,21 +2965,6 @@ let _lastRenamePos = "";
 // 思考摘要按「段」下发（gpt-5.x 每段是 **标题**+正文），上游拼接时段与段之间没有分隔，
 // 渲染出来就是「…verificationUpdating plan…」这种加粗标题拼死的样子。这里对累积文本做
 // 修复而不是赌分片边界：不管一段的开头落在哪个 delta 里，拼进累积串后模式必然完整出现。
-function _joinReasoningDelta(acc, delta) {
-  if (!delta) return acc;
-  // 分片边界恰好是段首的旧兜底：上段以字母/数字收尾、这段以「完整起句词 + 空白」开头
-  if (acc && /[A-Za-z0-9)]$/.test(acc) && /^[A-Z][a-z]{2,}\s/.test(delta)) acc += "\n\n";
-  // 两条修补规则都只发生在本次拼接边界附近——旧版每个 delta 对全量累计思考文本跑两次
-  // 全文 replace，长思考就是 O(n²) 卡顿源。只重扫「旧文末尾 8 字符 + 新 delta」，语义
-  // 不变（模式最长回看 5 个字符；已插入的段落分隔含空白，不会被二次命中）。
-  const keep = Math.max(0, acc.length - 8);
-  let tail = acc.slice(keep) + delta;
-  // **标题A****标题B** → 中间补段落分隔（行首的 **** 水平线不受影响，前面要求非空白非星号）
-  tail = tail.replace(/([^\s*])\*\*\*\*(?=[^\s*])/g, "$1**\n\n**");
-  // 句子收尾紧贴下一段的加粗标题：…dependencies.**Updating → 补段落分隔
-  tail = tail.replace(/([.!?;:。！？；：])\*\*(?=[A-Z一-鿿])/g, "$1\n\n**");
-  return acc.slice(0, keep) + tail;
-}
 
 // Some OpenAI-compatible relays put reasoning in the ordinary content stream as
 // <think>...</think> (or <thinking>...</thinking>) instead of reasoning_content.
@@ -3141,7 +3196,6 @@ function _wellFormedContent(content) {
 }
 
 function _sanitizeProviderMessages(messages) {
-  // 补 tool_call ↔ tool_result 的空洞：chat/agent 共同的出线口，逐条 break 漏的一次覆盖。
   const source = repairToolPairing(Array.isArray(messages) ? messages : []);
   return source.map((message) => {
     if (!message || typeof message !== "object" || Array.isArray(message)) return message;
@@ -5111,6 +5165,7 @@ function _openFileInspectorTab(path, name, activateFile, reason = "") {
 }
 
 async function openFile(path, name, activateFile = true, options = {}) {
+  const _actOpts = { focus: options.focus !== false };   // 见 activate：跟随打开时不抢焦点
   // 预览页签在会话里和别的页签一样被保存，恢复时原路走进这里。它背后没有文件，
   // 放它继续往下走的话会读盘失败、被当成"文件已删除"丢掉——重开 IDE 预览就没了。
   if (path === PREVIEW_TAB_PATH) { openLivePreview("", { focus: activateFile }); return true; }
@@ -5118,7 +5173,7 @@ async function openFile(path, name, activateFile = true, options = {}) {
   if (path === PLAN_TAB_PATH) { return openPlanTab(_plan.md, { focus: activateFile }); }
   path = _coherentFilePath(path);
   if (openFiles.has(path)) {
-    if (activateFile) activate(path);
+    if (activateFile) activate(path, _actOpts);
     return true;
   }
   const pendingOpen = _openingFiles.get(path);
@@ -5131,28 +5186,28 @@ async function openFile(path, name, activateFile = true, options = {}) {
   if (isImageFile(name)) {
     openFiles.set(path, { model: null, name, dirty: false, viewState: null, isImage: true });
     renderTabs();
-    if (activateFile) activate(path);
+    if (activateFile) activate(path, _actOpts);
     return true;
   }
 
   if (isVideoFile(name)) {
     openFiles.set(path, { model: null, name, dirty: false, viewState: null, isVideo: true });
     renderTabs();
-    if (activateFile) activate(path);
+    if (activateFile) activate(path, _actOpts);
     return true;
   }
 
   if (isTableFile(name) && !_openAsTextPaths.has(path)) {
     openFiles.set(path, { model: null, name, dirty: false, viewState: null, isTable: true });
     renderTabs();
-    if (activateFile) activate(path);
+    if (activateFile) activate(path, _actOpts);
     return true;
   }
 
   if (isPdfFile(name)) {
     openFiles.set(path, { model: null, name, dirty: false, viewState: null, isPdf: true });
     renderTabs();
-    if (activateFile) activate(path);
+    if (activateFile) activate(path, _actOpts);
     return true;
   }
 
@@ -5189,7 +5244,7 @@ async function openFile(path, name, activateFile = true, options = {}) {
     opening.finalDiskContent = content;
     openFiles.set(path, openedFile);
     renderTabs();
-    if (activateFile) activate(path);
+    if (activateFile) activate(path, _actOpts);
     lspManager?.didOpen(path, model);
     _onFileOpened(model);
     return true;
@@ -5205,7 +5260,7 @@ function _setEditorModelIfChanged(editor, model) {
   return true;
 }
 
-function activate(path) {
+function activate(path, { focus = true } = {}) {
   closeDiffView();
   hideImagePreview();
   hideLivePreviewPane();
@@ -5258,7 +5313,7 @@ function activate(path) {
     editorEl.style.display = "";
     _setEditorModelIfChanged(monacoEditor, f.model);
     if (f.viewState) monacoEditor.restoreViewState(f.viewState);
-    monacoEditor.focus();
+    if (focus) monacoEditor.focus();   // 跟随打开时不抢：理由见 live-follow 的 ④
     if (path.endsWith(".md")) showMarkdownPreview(f.model);
     const lang = f.model?.getLanguageId();
     // Tool detection is handled by the LSP client's ensureServer(); no need to
@@ -5568,8 +5623,14 @@ const _plan = { md: "", title: PLAN_TAB_NAME };
 let _planTab = null; // 界面层在 src/agent/plan-tab.js，这里只做接线
 function _planUI() {
   if (!_planTab) _planTab = createPlanTab({
-    editorContainer, renderMarkdownInto, sendPrompt, planCoreFromReply, planTitleFromReply,
+    editorContainer, renderMarkdownInto, sendPrompt, planCoreFromReply, planTitleFromReply, cleanPlanTitle,
     tabPath: PLAN_TAB_PATH, tabName: PLAN_TAB_NAME,
+    // 方案的标题优先取**会话主题**（用户那句请求），它才是这份方案在讲什么；洗掉 emoji、截断。
+    // 默认名（Chat 1 之类）不算数，那时才回落到方案里的第一个小节标题。
+    getSessionTitle: () => {
+      const n = String(_currentSession()?.name || "").trim();
+      return (n && !_isDefaultChatName(n)) ? cleanPlanTitle(n) : "";
+    },
     openFiles, renderTabs, syncWelcome, activate, getActivePath: () => activePath,
     closeTab: () => closeFile(PLAN_TAB_PATH),
     onAccept: () => { // Plan 是只读模式，照做之前先切回 Agent
@@ -8779,7 +8840,9 @@ function _mpmAction(act) {
     _mpmState.files = null;
     _mpmState.inspections = {};
     _mpmRender();
-    _ensureFileIndex().then((files) => {
+    // 「重新扫描」必须真扫一轮：默认读取是 stale-while-revalidate，会把旧列表原样还回来，
+    // 那这个按钮就成了摆设——用户点它，正是因为他刚往磁盘上放了个新的库文件。
+    _ensureFileIndex({ force: true }).then((files) => {
       if (!_mpManagerEl || _mpManagerEl.hidden) return;
       _mpmState.files = (files || []).filter((rel) => !rel.endsWith("/") && _isDatabaseFileName(rel));
       _mpmRender();
@@ -9869,6 +9932,52 @@ async function _commitDiskTextIfUnchanged(path, expectedContent, content) {
 // terminal, Git, or second-window change.
 const _pendingEditorWrites = new Map();
 const _externalSyncGeneration = new Map();
+
+// sha256 → 小写 hex。算不出来回 null（网页壳/非安全上下文里可能没有 crypto.subtle），
+// 让调用方退回全文 CAS，而不是把一次真实保存判死。
+async function _sha256HexOrNull(text) {
+  if (!globalThis.crypto?.subtle || typeof TextEncoder === "undefined") return null;
+  try {
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  } catch { return null; }
+}
+
+// 后端一旦答「没这个命令」（旧壳配新前端，dev 期常见）就永久降级，别每次保存都白试一趟。
+let _hashedCasUnsupported = false;
+
+/**
+ * 编辑器保存的 CAS 写入：优先只把「旧全文的 sha256」送过去，退不动才送旧全文。
+ *
+ * 为什么单独抽成一个 async 函数、而不是在 _writeOpenFileSnapshot 里直接 await 算哈希：
+ * 那个函数靠「while (f._savePromise) await …」紧接着「f._savePromise = op」来串行化同一个
+ * 文件的保存。在这两句之间**多一个 await**，两个并发的保存就可能都穿过 while 各装一个 op，
+ * 串行化直接失效。抽出来之后调用点拿到的是立刻返回的 promise，中间零 yield。
+ *
+ * 哈希缓存连同它对应的原文一起存（_diskShaContent）。判据是跟 expected 相等，而不是一个
+ * 「缓存有效」的布尔标记：diskContent 在外部同步、回滚、重新打开等五六处都会被重设，
+ * 布尔标记只要漏改一处，就变成拿旧哈希去 CAS，后端比对不中，用户看到一次莫名其妙的
+ * 「自动保存失败」。用内容自证就不需要人工维护失效点。
+ */
+async function _casWriteEditorFile(path, f, expected, snapshot) {
+  if (!_hashedCasUnsupported && backend.hashedCasAvailable?.()) {
+    const sha = (typeof f._diskSha256 === "string" && f._diskShaContent === expected)
+      ? f._diskSha256
+      : await _sha256HexOrNull(expected);
+    if (sha) {
+      try {
+        return { sha256: await backend.writeTextFileIfUnchangedHashed(path, sha, snapshot) };
+      } catch (e) {
+        // 只有「后端根本没有这个命令」才算降级信号。[CONFLICT] 之类是真结论，必须原样抛：
+        // 吞掉它改走全文 CAS，等于拿旧全文再比一次，比中了就把别人的改动覆盖掉。
+        if (!/not found|not allowed|unknown command|未找到/i.test(String(e?.message || e))) throw e;
+        _hashedCasUnsupported = true;
+      }
+    }
+  }
+  await backend.writeTextFileIfUnchanged(path, expected, snapshot);
+  return { sha256: null };
+}
 async function _writeOpenFileSnapshot(path, snapshot) {
   path = _coherentFilePath(path);
   const f = openFiles.get(path);
@@ -9884,13 +9993,27 @@ async function _writeOpenFileSnapshot(path, snapshot) {
   const _docKind = _userDocKindForPath(path);
   const op = _docKind
     ? _writeUserDoc(_docKind, snapshot)      // 用户文档在沙箱外，走专用命令
-    : backend.writeTextFileIfUnchanged(path, expected, snapshot);
+    // 这一路以前直接是 writeTextFileIfUnchanged(path, expected, snapshot)：一次 invoke 里
+    // 塞「磁盘旧全文 + 新全文」两份原文，5MB 文件≈8.6MB JSON（还要按 JSON 规则转义再
+    // 解析），光序列化就比写盘贵。换成只送旧全文的 sha256。
+    // **挂到 backend 上而不是直接引用 _casWriteEditorFile。**
+    // 这个函数会被 test/logic.test.mjs 的「overlapping editor saves are serialized per path」
+    // 用 load() 抠出来跑，而 load 只把 deps 对象里列出的名字当形参注入 —— 函数体里多一个
+    // 自由标识符就是 ReferenceError（不是断言失败，是整条用例炸）。backend 本来就在注入
+    // 清单里，挂上去两边都不用改。旧壳没有这个方法时退回原来的全文 CAS。
+    : (backend.casWriteEditorFile
+        ? backend.casWriteEditorFile(path, f, expected, snapshot)
+        : backend.writeTextFileIfUnchanged(path, expected, snapshot));
   const pending = { content: snapshot, op };
   _pendingEditorWrites.set(path, pending);
   f._savePromise = op;
   try {
-    await op;
+    const _res = await op;
     f.diskContent = snapshot;
+    // 后端回的是刚落盘那份内容的 sha256，缓存下来下一轮就不用算。和它对应的原文一起存，
+    // 让「缓存还准不准」由内容自证——别处重设 diskContent 时不需要记得来这里清缓存。
+    f._diskSha256 = (_res && typeof _res.sha256 === "string") ? _res.sha256 : null;
+    f._diskShaContent = f._diskSha256 ? snapshot : null;
     f.externalConflict = false;
     f.externalDeleted = false;
   } finally {
@@ -11146,6 +11269,18 @@ function handleFsChanges(paths, missing = []) {
   // let it rebuild ONCE next time (picking up the new/edited files). When nothing changes, the cache
   // stays valid and the agent reuses it instead of re-scanning + re-reading every turn ("别一直复读").
   _agentContextCache.ts = 0;
+  // @ 的文件索引同样作废。它现在是 stale-while-revalidate，所以这里只是打个标记：下一次
+  // 按 @ 依然立刻用旧列表出候选，重扫在后台跑，成本不会压到那一次按键上。
+  // 也正因为有这条，_FILE_INDEX_TTL 才敢从 30 秒放宽到 5 分钟。
+  //
+  // 加地板：这一行落在 _FS_IGNORE_RE 过滤**之前**，任何 node_modules/dist/.git 的噪声
+  // 都会作废索引，而本仓 prune 之后仍有 6800 多个候选目录 —— 一轮遍历是上千次串行 IPC、
+  // 秒级。（不能挪到过滤之后：上面两个提前 return 会把它整个跳过。）
+  // gen 必须跟着推进，否则飞行中的那一轮会拿 Date.now() 把这次失效盖掉。
+  if (Date.now() - _fileIndex.ts > 10000) {
+    _fileIndex.ts = 0;
+    _fileIndexGen++;
+  }
   try {
     if (_bm25Index.root && paths.some((p) => p === _bm25Index.root || p.startsWith(_bm25Index.root + "/"))) {
       _bm25Index.built = false;
@@ -13958,14 +14093,16 @@ function updateGutter() {
   }
   const orig = gutterBaselineText.split("\n");
   const mod = model.getValue().split("\n");
-  // Guard against pathological sizes (O(n*m) LCS).
-  if (orig.length > 4000 || mod.length > 4000) {
+  // 守卫搬进了 lineDiffHunks，量的是剥掉公共前后缀之后的规模而不是文件行数 ——
+  // 原来「超过 4000 行就整片不画」等于大文件永远没有 git 改动条。
+  const hunks = lineDiffHunks(orig, mod);
+  if (!hunks) {
     gutterDecorations.set([]);
     return;
   }
   const lineCount = model.getLineCount();
   const decos = [];
-  for (const h of lineDiffHunks(orig, mod)) {
+  for (const h of hunks) {
     if (h.aCount === 0 && h.bCount > 0) {
       for (let k = 0; k < h.bCount; k++) decos.push(gutterDeco(h.bStart + 1 + k, "gutter-add"));
     } else if (h.bCount === 0 && h.aCount > 0) {
@@ -13985,7 +14122,52 @@ function gutterDeco(line, cls) {
 }
 
 // Longest-common-subsequence line diff → change hunks (0-based indices).
+// 4000×4000 —— 和原来那道「超过 4000 行就整片不画」的行数守卫等价的格数上限。
+// 区别是它量的是**剥掉公共前后缀之后**还剩多少格：大文件里改一两行照样画得出改动条。
+const _LINE_DIFF_CELL_BUDGET = 16000000;
+
+/**
+ * 进 DP 之前先剥掉公共前缀/后缀。
+ *
+ * 相同的行对 LCS 没有贡献，剥掉不改变**补丁的有效性和最小性**：
+ * 应用结果仍然是 b，改动行数仍然一样多（5000 组随机用例实测，两项都是 0 例外）。
+ *
+ * 但它**不是逐字节等价**：连续相同行处「删哪一行」本来就是歧义，剥掉后缀会让
+ * 回溯在另一个同样最优的位置收尾（5000 组里 162 组）。原因是走到中段末尾时
+ * 循环直接结束，而全量版会继续把中段的尾行和后缀的首行匹配掉。
+ * 这正是 git 的做法 —— Myers 之前先剥公共前后缀，同样接受这个行为。
+ * 对 git 改动条来说无影响：标记的增删行数一致，只是在一串相同行里可能上下挪一行。
+ *
+ * 起初我以为「同一个常数不改变 tie-break」就能推出逐字节等价，是对拍测试
+ * 把这个论证证伪的（test/line-diff-hunks.test.mjs 守着上面那两条真不变量）。
+ *
+ * 为什么值得改：DP 表是 (n+1)×(m+1) 的 Uint32Array，4000 行的文件一次分配
+ * **64MB** 并跑 1600 万格，然后立刻变垃圾 —— GC 压力比 CPU 更伤手感。而这条路
+ * 每次打字停顿 450ms 就走一遍（updateGutter → git 改动条），触发条件只是
+ * 「在 git 仓库里编辑被跟踪的文件」，也就是写代码的默认状态。
+ * 一次普通编辑只动一两行，剥完中间段就剩个位数。
+ *
+ * 下面那行 450ms 的注释写着 `was 250 — full-doc diff on every pause was too hot`：
+ * 症状早就被撞见过，当时是把防抖调大，卡顿被推迟而不是被消除。
+ *
+ * @returns 病态输入（整份被换掉）返回 null，调用方据此放弃这一次绘制。
+ */
 function lineDiffHunks(a, b) {
+  const n = a.length;
+  const m = b.length;
+  let pre = 0;
+  while (pre < n && pre < m && a[pre] === b[pre]) pre++;
+  let suf = 0;
+  while (suf < n - pre && suf < m - pre && a[n - 1 - suf] === b[m - 1 - suf]) suf++;
+  if ((n - pre - suf) * (m - pre - suf) > _LINE_DIFF_CELL_BUDGET) return null;
+  if (pre === 0 && suf === 0) return _lineDiffHunksCore(a, b);
+  const hunks = _lineDiffHunksCore(a.slice(pre, n - suf), b.slice(pre, m - suf));
+  // 公共前缀在 a、b 里长度相同（逐行对齐），所以两边加同一个偏移。
+  for (const h of hunks) { h.aStart += pre; h.bStart += pre; }
+  return hunks;
+}
+
+function _lineDiffHunksCore(a, b) {
   const n = a.length;
   const m = b.length;
   const dp = [];
@@ -14310,9 +14492,17 @@ const _billableAiTasks = new Map();
 // 判据用**执行事实**，不用模型名单：有界调用返回空串，就说明这个模型在这个预算下发不出正文。
 // 据此给它记一笔，之后所有有界调用都替推理留出余量。名单会随模型上下线漂掉，执行事实不会。
 const _AUX_HEADROOM_KEY = "michael_aux_headroom_models";
-// 余量给得宽，是因为 max_tokens 是**上限不是消费**：没生成的 token 不计费也不耗时，
-// 给宽只在模型真的需要时才被用到。实测短分类任务的推理正文就有 2239 字（约 1.5k token），
-// 而完整意图裁决的提示词比它长得多，推理只会更多——按最长的那条留，别按最短的那条卡。
+// 余量给得宽，是因为 max_tokens 是**上限不是消费**：没生成的 token 不计费也不耗时。
+// 实测短分类任务的推理正文就有 2239 字（约 1.5k token），完整意图裁决只会更多 ——
+// 按最长的那条留，别按最短的那条卡。
+//
+// **但「只在真的需要时才被用到」这句话在高档位下是假的**（2026-09-03 线上实拍）：
+// 认知腿原来拿用户的档位原样去思考，于是在这 4096 里一路想到底 ——
+// 五次腿分别吐了 3550 / 5255 / 3592 / 1323 / 5147 个输出 token，比同一段时间里
+// 三次真干活（155 + 304 + 153）加起来还贵，而输出价是输入价的 3 倍。
+// 已在 `_cognitiveLegEffort` 把档位封顶到 low：档位低了推理自然短，这条余量
+// 才重新变回「上限」。数字不动 —— 它是安全边界，压低它会让腿产不出 JSON，
+// 那是「第一发画像是空的」那个更贵的病。
 const _AUX_REASONING_HEADROOM_TOKENS = 4096;
 function _loadAuxHeadroomModels() {
   try { return new Set(JSON.parse(localStorage.getItem(_AUX_HEADROOM_KEY) || "[]") || []); } catch { return new Set(); }
@@ -14618,7 +14808,7 @@ const _CUSTOM_MODEL_PREFIX = "custom:";
 
 // 上游线协议：取值、归一化、界面文案。取值必须是 Rust 侧 crate::protocol::PROTOCOLS 的
 // 逐字子集 —— 对不上时不会报错，只会静默退回 openai 打错端点。
-import { CM_PROTOCOLS, CM_PROTOCOL_DEFAULT, CM_PROTOCOL_UI, cmProtocol, normalizeCustomModel, cmModelsUrl, cmModelsHeaders, cmParseModels } from "./agent/wire-protocol.js";
+import { CM_PROTOCOLS, CM_PROTOCOL_DEFAULT, CM_PROTOCOL_UI, cmProtocol, normalizeCustomModel, cmModelsUrl, cmModelsHeaders, cmParseModels, protocolMismatchHint } from "./agent/wire-protocol.js";
 // 协议缺口清单只从 Rust 拉一次（见 syncProto 上方说明）。
 let _protoGapsSynced = false;
 
@@ -15238,6 +15428,12 @@ async function loadBackendModels() {
         // 那版实测偏一半（deepseek 缓存读真实 0.0123、推算 0.0061）。
         cacheReadPrice: Math.max(0, Number(it.cache_read_price) || 0),
         cacheWritePrice: Math.max(0, Number(it.cache_write_price) || 0),
+        // 这两个价**下发过没有**。0 有两种意思，必须分开：字段在且是 0 = 这条线路
+        // 关了缓存计费（服务端 effective_cache_prices 在 cache_disabled 时正是返回
+        // (0,0)，其余分支一定给出非 0）；字段压根没有 = 老网关没下发 = 不知道。
+        // 混成一个 0 的话，「免费」会被当成「不知道」而不敢显示，反过来也会把
+        // 「不知道」当成「免费」写上 $0——两个方向都在骗人。
+        cachePriceKnown: Object.prototype.hasOwnProperty.call(it, "cache_read_price"),
         // 这个模型有没有一条强力线路。三态，不能压成布尔：
         //   true  → 显示右上角那个闪电按钮；
         //   false → 网关明确说了没有，别把按钮画出来（点了只会撞报错）；
@@ -15395,13 +15591,12 @@ let _michaelUser = _bootCompressionCapability
  * 余额未知（没登录、或 /api/me 还没回来）时按**显示**处理：那确实是一个免费模型，
  * 「不知道」不等于「用完了」。菜单每次打开重建，所以余额一变，下次打开就是新的。
  */
-function _modelIsFreeNow(m) {
-  if (!m) return false;
-  if (m.freeKind === "always") return true;
-  if (m.freeKind !== "pool") return false;
+function _modelFreeState(m) {
+  if (!m || !m.freeKind || m.freeKind === "none") return "";
+  if (m.freeKind !== "pool") return "free";
   const balance = Number(_michaelUser?.free_points);
-  if (!Number.isFinite(balance)) return true;
-  return balance >= (Number(m.freeCallPoints) || 0);
+  if (!Number.isFinite(balance)) return "free";
+  return balance >= (Number(m.freeCallPoints) || 0) ? "free" : "spent";
 }
 
 function _setMichaelUserProfile(user, compressionVerified = true) {
@@ -16222,10 +16417,14 @@ function _freePointsMetric(metric, _usd, u) {
   if (!Number.isFinite(pts)) return "";
   const daily = Number(u?.free_points_daily) || 0;
   const pct = daily > 0 ? Math.max(0, Math.min(100, Math.round((pts / daily) * 100))) : (pts > 0 ? 100 : 0);
-  // Rendered in 点, NOT dollars. This pool is priced in the operator's own unit
-  // (¥0.5 = 10 点), so running it through the credit-dollar denominator — as the first cut
-  // did — produced a real number in the wrong currency ("$3.02" for a ¥2 allowance).
-  const yuan = (n) => "¥" + (n * 0.05).toFixed(2);
+  // 用「点」显示，不用美元：这个池子是运营自己的面值单位，走美元面值分母会得出一个
+  // 币种不对的真实数字（第一版就是这么把 ¥2 的额度写成 "$3.02" 的）。
+  //
+  // 点价**跟着服务端下发**，不再硬编码。原来写死 0.05（1 点 = ¥0.05），而后台设定是
+  // 100 积分 = ¥1，也就是 ¥0.01 —— 界面上的钱数一直比真实值大 5 倍。老网关不发这个
+  // 字段时回落到 0.01（现行设定），不再回落到那个错的 0.05。
+  const cnyPerPoint = Number(u?.cny_cents_per_point) > 0 ? Number(u.cny_cents_per_point) / 100 : 0.01;
+  const yuan = (n) => "¥" + (n * cnyPerPoint).toFixed(2);
   // Sub-点 precision: a cheap per-call model costs a fraction of a 点, so a whole-number
   // display would sit at "40 点" through dozens of calls and look broken. Trim trailing
   // zeros so a full pool still reads "40 点", not "40.00 点".
@@ -16346,6 +16545,7 @@ async function showCustomModelsDialog() {
             <summary class="cm-gapsbox__sum"></summary>
             <ul class="cm-gaps" id="cmGapsProto"></ul>
           </details>
+          <p class="cm-field__err cm-proto-mismatch" id="cmProtoMismatch" hidden></p>
         </div>
         <div class="cm-field">
           <label for="cmInBase">对接地址</label>
@@ -16387,6 +16587,7 @@ async function showCustomModelsDialog() {
   const protoRadios = [...ov.querySelectorAll(".cm-in-proto")];
   const gapsProto = ov.querySelector("#cmGapsProto");
   const gapsBox = ov.querySelector(".cm-gapsbox");
+  const mismatchEl = ov.querySelector(".cm-proto-mismatch");
   const pullBtn = ov.querySelector(".cm-pull__btn");
   const modelList = ov.querySelector("#cmModelList");
   const revealBtn = ov.querySelector(".cm-reveal");
@@ -16423,7 +16624,7 @@ async function showCustomModelsDialog() {
   };
   const _clearErrs = () => { _fieldErr(errName, inName, ""); _fieldErr(errBase, inBase, ""); _fieldErr(errKey, inKey, ""); };
   const _announce = (msg) => { if (srEl) srEl.textContent = String(msg || ""); };
-  inName.addEventListener("input", () => _fieldErr(errName, inName, ""));
+  inName.addEventListener("input", () => { _fieldErr(errName, inName, ""); syncProto(); });
   inBase.addEventListener("input", () => _fieldErr(errBase, inBase, ""));
   inKey.addEventListener("input", () => _fieldErr(errKey, inKey, ""));
   // 网页构建（/app/）没有 Rust 那条协议分叉：_realAiFetch 自己拼 OpenAI 形状的请求体、
@@ -16477,8 +16678,8 @@ async function showCustomModelsDialog() {
       li.textContent = g;
       return li;
     }));
-    // 地址写法原来单独占一段说明文字，用户说没用（占位符里本来就写着形状）。
-    // 删的只是那一段；下面的能力缺口留着——它是「不许假装支持」在界面上的唯一落点。
+    const _mm = protocolMismatchHint(inName.value, readProto());
+    mismatchEl.textContent = _mm; mismatchEl.hidden = !_mm;
   };
   const writeProto = (p) => {
     const want = cmProtocol(p);
@@ -17595,7 +17796,7 @@ function showModelInfoCard(m, anchorEl) {
     // 「地址与密钥仅保存在本机，不会上传」。那句话对这条路不再成立，不说就是骗人。
     noteEl.textContent = "完整能力：提示词、工具和长上下文压缩都由服务端装配，和内置模型一样。请求经我们的服务器转发到你填的地址（用你自己的密钥计费，我们不收费）。";
   } else {
-    // **不能写「本机端点」**：网页版上远程端点也落进这个分支，那时这句是假话。只说「直连」。
+    // 不能写「本机端点」：网页版上远程端点也落这个分支，那时是假话。只说「直连」。
     noteEl.textContent = "直连你填的地址，不经过我们的服务器 —— 因此工具描述和完整系统提示词拿不到，长上下文压缩也会关闭，智能体会弱一些。";
   }
   const desc = (m.desc && m.desc.trim()) || officialModelDesc(m.id);
@@ -17742,7 +17943,11 @@ function buildModelMenu() {
       //   [图标] [名称] ……… [free] [对勾位]
       // 对勾那一列固定占位（.menu__item .check-slot），所以没选中的行里 free 徽标也停在
       // 同一个横坐标上，一列对齐 —— 用户要的就是这个。
-      const freeTag = _modelIsFreeNow(m) ? `<span class="free-tag">free</span>` : "";
+      const freeState = _modelFreeState(m);
+      const freeTag = freeState
+        ? `<span class="free-tag${freeState === "spent" ? " is-spent" : ""}"${freeState === "spent"
+            ? ` title="${_escAttr("这个模型是免费的，但你今天的免费点已经用完 —— 这一次会从会员额度或钱包扣。UTC 0 点回满。")}"` : ""}>free</span>`
+        : "";
       const b = brandFor(m);
       item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg>`
         + `<span class="name"></span>`
@@ -18025,6 +18230,13 @@ let _chatSeq = 0; // monotonic counter for auto-naming so "Chat N" never repeats
 // button); the running loop tracks its own `session.streaming`.
 function _isStreaming() { return !!_currentSession()?.streaming; }
 const CHAT_STORE_KEY = "michael-ide.chat-sessions";
+/// 已关闭会话的归档另存一个 key。实测整份镜像 1.88MB，其中 99.6% 是这些再也不会变的归档，
+/// 而每发一条消息、每轮结束都把它整份重新序列化并同步写回 localStorage。拆开之后主 key
+/// 只剩开着的会话，归档只在成员真的变了时才写（判据见 _closedArchiveKey）。
+/// 名字从主 key 派生而不是另写一个字面量：_flushChatHistorySync 里也要拼出同一个名字——
+/// 那个函数被单独抠出源码放进沙箱跑（test/helpers/source.mjs 的 extractFn），沙箱只给
+/// 显式列出的依赖名，引用这个常量就是 ReferenceError；两处各写一份字面量迟早会漂。
+const CHAT_CLOSED_STORE_KEY = `${CHAT_STORE_KEY}.closed`;
 /// 这次启动有没有完整读出聊天存档。为真时禁止把当前状态写回主存档——
 /// 残缺状态一旦覆盖上去，一次临时的读取失败就变成永久的数据丢失。
 let _chatArchiveIncomplete = false;
@@ -18253,6 +18465,10 @@ function _queueTranscriptMutation(session, mutation) {
         if (sequence >= session._historyTotal) session._historyCache.delete(sequence);
       }
     }
+    // DOM 缓存跟着切，理由和上面那半一样，而且更硬：数据作废了还会重新去 SQLite 取正确的，
+    // 而 DOM 缓存里躺的是**成品节点**，翻回去直接贴上屏——用户会看见自己刚编辑掉的那几轮
+    // 原封不动地回来，且这一次连一次取数都不发生，没有任何东西有机会纠正它。
+    _dropHistoryNodesFrom(session.container, session._historyTotal);
   } else if (mutation.kind === "append") {
     _cacheTranscriptMessage(session, mutation.sequence, mutation.message);
     session._historyTotal = Math.max(Number(session._historyTotal) || 0, mutation.sequence + 1);
@@ -18907,6 +19123,10 @@ const _RENDER_SLICE_BUDGET_MS = 50; // 历史渲染每片最多占用主线程 5
 // for the write again. Held as one string — the same one localStorage already holds.
 let _lastLocalMirror = null;
 let _lastLocalMirrorLen = -1;
+// 归档那半份的变更判据（id 列表）。初值是 null 而不是 ""：空归档的判据串就是 ""，
+// 拿 "" 起头的话「一条已关闭会话都没有」的用户第一次保存会被判成"没变"而永远不写归档 key，
+// 读取侧就一直停在迁移回退上，这条拆分对他等于没生效。
+let _lastClosedMirrorKey = null;
 const _HISTORY_CACHE_LIMIT = 384;
 // Hard byte ceiling for the per-session history cache. 24MB is generous for text paging
 // and small enough that a few pasted screenshots cannot silently pin hundreds of MB.
@@ -19004,6 +19224,28 @@ function _snapshotIsSafeToRestore(html) {
   return messages <= _SNAPSHOT_MAX_MESSAGES && toolSteps <= _SNAPSHOT_MAX_TOOL_STEPS;
 }
 async function _renderMsgRange(session, from, to, options = {}) {
+  // 整段都还在 DOM 缓存里，就把原来的节点原样插回去：取数、markdown、高亮全跳过。
+  //
+  // 取节点必须在**任何 await 之前一次做完**。下面那个渲染循环每 50ms 让路一次，让路期间
+  // 另一次翻页可能进来抢同一批节点；边取边用就会插进去半段、剩下半段凭空消失。
+  //
+  // 只在 skipPrune 时走这条快路。不是保守起见：!skipPrune 时 addMessage 还要额外做两件事
+  // （窗口不在最新就先跳回最新、然后把 DOM 裁到 _RENDER_LIMIT），而这条路整个绕过了
+  // addMessage，接不上那两件。眼下五个调用点全传 skipPrune:true，所以这道门槛一点收益都不
+  // 损失；而将来谁不传，拿到的是正确行为，只是没有加速——这个方向的坏法才是可接受的。
+  const reused = options.skipPrune ? _takeHistoryNodes(session?.container, from, to) : null;
+  if (reused) {
+    const target = session.container;
+    for (let sequence = from; sequence < to; sequence++) {
+      const node = reused.get(sequence);
+      // 插法照抄 addMessage：有锚点就插在它前面（往回翻页），否则追加（往后翻页时锚点是
+      // 尾部那个「更新的 N 条」按钮）。两种都保证升序。
+      if (options.before && options.before.parentNode === target) target.insertBefore(node, options.before);
+      else target.appendChild(node);
+    }
+    if (!options.skipFollow) _chatFollow(session);
+    return;
+  }
   const page = await _sessionHistorySlice(session, from, to);
   // RAFGAP 实锤：恢复大会话时逐条 markdown/高亮渲染一口气跑完 = 25-44s 冻结。
   // 每片 ≤50ms 就让出主线程；让路期间会话被关闭/释放则直接中断（中断安全）。
@@ -19129,6 +19371,13 @@ function _historyWindow(session) {
 }
 function _removeRenderedHistoryMessage(message) {
   if (!message) return;
+  // 先试着把整个节点存进容器上的 LRU：翻回来时直接 insertBefore 复用，省掉一整轮 markdown
+  // 解析 + 代码高亮（翻页真正的开销在这里，不在取数——消息数据本来就有 _historyCache 兜着）。
+  //
+  // 收下之后**不能**再走 _releaseBlobMediaInNode：那一句会把 <video> 的 src 摘掉再 load()，
+  // 存下来的就是一块空白播放器。两条规矩必须一起看——所以带 blob 的节点由 stashHistoryNode
+  // 自己挡在门外（返回 false），永远落到下面这条原路上。
+  if (_stashHistoryNode(message)) { message.remove(); return; }
   _releaseBlobMediaInNode(message);
   message.remove();
 }
@@ -19154,9 +19403,24 @@ function _trimRenderedHistoryWindow(session, edge) {
   const excess = Math.max(0, messages.length - _RENDER_LIMIT);
   if (!excess) return 0;
   if (edge === "end") {
-    messages.slice(messages.length - excess).forEach(_removeRenderedHistoryMessage);
-    session._historyVisibleEnd = Math.max(session._historyVisibleStart, (Number(session._historyVisibleEnd) || 0) - excess);
+    // **正在流式的那条必须留位。**
+    //
+    // 这一支删的是最后 excess 条，而正在流式的那条永远在最后。触发条件是「跑任务时
+    // 往上翻到渲染窗口顶部」—— 回复卡当场从 DOM 里消失，而且不再更新：流还在往一个
+    // 已经脱离文档的节点里写。用户看到的是「跑着跑着回复没了」。
+    //
+    // 「流式那条在最后」不是我这里新引入的假设：addMessage 自己的裁剪逻辑就写着
+    // 「The newest (possibly streaming) message is at the end and never pruned」，
+    // 这一支只是漏了同一条规矩。
+    const keepTail = session?.streaming ? 1 : 0;
+    const cut = messages.slice(Math.max(0, messages.length - excess), messages.length - keepTail);
+    // 保护之后没得可删就什么都别做 —— 尤其别把 _historyAtLatest 置 false，
+    // 那会让「已经在最新一页」的状态凭空丢掉，翻页按钮跟着乱。
+    if (!cut.length) return 0;
+    cut.forEach(_removeRenderedHistoryMessage);
+    session._historyVisibleEnd = Math.max(session._historyVisibleStart, (Number(session._historyVisibleEnd) || 0) - cut.length);
     session._historyAtLatest = false;
+    return cut.length;
   } else {
     messages.slice(0, excess).forEach(_removeRenderedHistoryMessage);
     _dropOrphanSuggestionBlocks(session?.container);
@@ -19278,12 +19542,28 @@ async function _renderLatestHistoryWindow(session) {
     if (node.classList?.contains("msg")) _removeRenderedHistoryMessage(node);
     else node.remove();
   });
+  // **插一个锚点，历史插到它前面。**
+  //
+  // 上面清空是同步的，而拿回历史要 await（一次 SQLite IPC）。唯一的调用方 addMessage
+  // 是 `void` 掉这个 promise 继续同步往下走的 —— 它紧接着就把**用户刚发的那条气泡**
+  // append 进这个刚被清空的容器。等历史 append 回来时，56 条旧消息就全排到新气泡
+  // **后面**去了：用户的提问和正在流式的回复顶在整段历史最上方，再配合钉底，
+  // 用户看到的就是「发出去了，没反应」。这是正确性 bug，只是长得像性能问题。
+  //
+  // 锚点用注释节点：它既不被 `:scope > .msg` 选到（不会被下一次清空误伤），
+  // 也不参与 nextElementSibling（addMessage 里判断「壳还是不是最后一条」靠它）。
+  const anchor = document.createComment("history-window-anchor");
+  container.appendChild(anchor);
   const length = _sessionHistoryLength(session);
   const start = Math.max(0, length - _RENDER_LIMIT);
   session._historyVisibleStart = start;
   session._historyVisibleEnd = length;
   session._historyAtLatest = true;
-  await _renderMsgRange(session, start, length, { skipPrune: true, skipFollow: true });
+  try {
+    await _renderMsgRange(session, start, length, { skipPrune: true, skipFollow: true, before: anchor });
+  } finally {
+    anchor.remove(); // 渲染中途抛异常也不能把锚点留在 DOM 里
+  }
   _updateHistoryControls(session);
 }
 async function _renderSessionHistory(session) {
@@ -19980,7 +20260,28 @@ function _flushChatHistorySync() {
     const budget = { remaining: CHAT_LOCAL_MEDIA_BUDGET };
     const textBudget = { remaining: CHAT_LOCAL_TEXT_BUDGET, perValue: CHAT_LOCAL_TEXT_PER_VALUE };
     const data = _chatSessionsForLocalStorage(_chatSessions, _activeChatIdx, budget, textBudget);
-    const closedSessions = _closedChatSessionsForLocalStorage(budget, textBudget);
+    const closedList = _closedChatSessionsForLocalStorage(budget, textBudget);
+    // 已关闭会话另有一个 key（后台那条防抖保存只在归档真的变了时才写它）。这条退出路径
+    // 每次都写：「关掉一个标签页后立刻退出」时那次防抖保存根本来不及跑，不在这里刷新的话，
+    // 下次启动读到的是过期的归档 key —— 而读取侧以归档 key 为准，刚关掉的那条就没了。
+    // 键名在这里重新拼一遍而不是引用 CHAT_CLOSED_STORE_KEY，原因见那个常量的注释。
+    let closedSessions = closedList;
+    try {
+      // **归档没变就不重写。** 这条路也挂在 visibilitychange 上：agent 跑着的时候
+      // Cmd+Tab 切走，就会在这里同步写一次 1.87MB —— 窗口当场僵一下。而归档条目是
+      // 关闭那一刻定型的普通对象，此后没有任何代码再改它，所以**成员没变 ⇒ 内容没变**
+      // （判据和后台那条防抖保存共用 _closedArchiveKey，两边同源）。
+      //
+      // 但只在「上一次确实写成功过」时才敢跳：_lastClosedMirrorKey 由防抖保存维护，
+      // 而「关掉一个标签页后立刻退出」时那次防抖根本来不及跑 —— 那时两边不相等，
+      // 照常写。跳过的只有「归档和上次落盘时一模一样」这一种情况。
+      const closedNow = _closedArchiveKey(closedList);
+      if (closedNow !== _lastClosedMirrorKey) {
+        localStorage.setItem(`${CHAT_STORE_KEY}.closed`, JSON.stringify({ closedSessions: closedList, savedAt: Date.now() }));
+        _lastClosedMirrorKey = closedNow;
+      }
+      closedSessions = []; // 归档 key 是最新的了，主 key 不必再存同一份 1.87MB
+    } catch { /* 配额/禁用：退回老形状内嵌，别让归档丢在迁移的半路上 */ }
     // `savedAt` 是恢复时比新旧的唯一判据（见 _mergeChatArchives）。少了它，这份
     // 「退出瞬间同步写下的最新镜像」在下次启动时会输给一份更旧的 SQLite 快照。
     localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({ sessions: data, closedSessions, activeIdx: _activeChatIdx, savedAt: Date.now() }));
@@ -20135,12 +20436,29 @@ async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) 
       await yieldIfOverBudget();
       mirrorParts[index] = _cachedSessionMirrorJson(sessionsSnapshot[index], localMediaBudget, localOptions);
     }
-    const closedParts = [];
-    for (const session of closedSnapshot) {
-      await yieldIfOverBudget();
-      closedParts.push(_cachedSessionMirrorJson(session, localMediaBudget, localOptions));
+    // 归档写自己的 key，且只在成员变了时才写。判据串从 closedSnapshot 取（不是从
+    // _closedChatSessions）：让路期间那个全局数组会被增删，而这里要写出去的正是快照。
+    // 不能沿用下面 `localJson !== _lastLocalMirror` 那条整串比较来省事——那要先把这
+    // 1.87MB 拼进同一份 JSON 再逐字节比一遍，省下的时间已经花在拼接和比较上了。
+    const closedMirrorKey = _closedArchiveKey(closedSnapshot);
+    let closedInline = "";
+    if (closedMirrorKey !== _lastClosedMirrorKey) {
+      const closedParts = [];
+      for (const session of closedSnapshot) {
+        await yieldIfOverBudget();
+        closedParts.push(_cachedSessionMirrorJson(session, localMediaBudget, localOptions));
+      }
+      try { _perfPhase(`localStorage:setItem closed n=${closedParts.length}`); } catch {}
+      try {
+        localStorage.setItem(CHAT_CLOSED_STORE_KEY, `{"closedSessions":[${closedParts.join(",")}],"savedAt":${Date.now()}}`);
+        _lastClosedMirrorKey = closedMirrorKey;
+      } catch {
+        // 归档 key 没写成（配额/禁用）就退回老形状内嵌进主 key。不退的话主 key 会被写成
+        // closedSessions:[] 而归档 key 里什么都没有 —— 老用户那份归档正好丢在迁移的半路上。
+        closedInline = closedParts.join(",");
+      }
     }
-    const localJson = `{"sessions":[${mirrorParts.join(",")}],"closedSessions":[${closedParts.join(",")}],"activeIdx":${Number.isFinite(activeIdxSnapshot) ? activeIdxSnapshot : 0}}`;
+    const localJson = `{"sessions":[${mirrorParts.join(",")}],"closedSessions":[${closedInline}],"activeIdx":${Number.isFinite(activeIdxSnapshot) ? activeIdxSnapshot : 0}}`;
     if (localJson.length !== _lastLocalMirrorLen || localJson !== _lastLocalMirror) {
       try { _perfPhase(`localStorage:setItem len=${localJson.length}`); } catch {}
       try {
@@ -20365,10 +20683,9 @@ async function restoreChatHistory() {
     let _mirror = null;
     try {
       const raw = localStorage.getItem(CHAT_STORE_KEY);
-      if (raw) {
-        const ls = JSON.parse(raw);
-        if (hasSavedChats(ls)) _mirror = ls;
-      }
+      // 归档拆在自己的 key 里，这里把两份合回一份恢复形状；老用户的迁移腿（归档 key 还不
+      // 存在时回退读主 key 内嵌的那份）也在那个纯函数里，连同「为什么空数组也算权威」。
+      _mirror = _readSplitChatMirror(raw, localStorage.getItem(CHAT_CLOSED_STORE_KEY));
     } catch {}
     if (_mirror) {
       const before = Array.isArray(saved && saved.sessions) ? saved.sessions.length : 0;
@@ -21405,8 +21722,49 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timel
       // cache read 明明是几千万。没有这个概念就别印这一位。
       ? `Tokens: input ${_tokenShort(inTok)} (uncached ${_tokenShort(uncachedTok)} · cache read ${_tokenShort(cacheReadTok)}${cacheWriteTok > 0 ? ` · cache write ${_tokenShort(cacheWriteTok)}` : ""}) · output ${_tokenShort(outTok)} · this whole reply: ${settledTurns} model request${settledTurns === 1 ? "" : "s"} (server-reported usage${unreported ? `; ${unreported} calls unreported` : ""})`
       : "Tokens: provider usage unavailable";
+  // 费用拆解：缓存命中的那部分和没命中的那部分**分别按各自单价算清楚**。
+  // 总额仍以服务端结算为准（settlement.costCents），这里只是把它拆开给人看：
+  // 单价用网关下发的那四个（输入/输出/缓存读/缓存写），和服务端计费同一份数，
+  // 所以四项相加≈总额。网关没下发缓存单价时写「未下发」，不推算（推算过的那版偏一半）。
+  // **按单价权重把服务端结算的总额摊开**，而不是用单价另算一份。
+  //
+  // 另算一份会和总额对不上：真正扣费的是 compute_cost 里的 `usd * 100 * rate`——中间还有
+  // 一个线路 `rate` 倍率，而单价本身又来自运行期目录（DB 里那几列是 0）。任何一处对不上，
+  // 用户就会看到"四项相加 ≠ 总额"，比不显示更糟。
+  // 摊开则天然自洽：rate 和单位换算在比值里全部约掉，四项必然精确加回总额，而"命中比
+  // 未命中便宜多少"这个比例仍然由真实单价决定。
+  const _p = settlement && settlement.prices ? settlement.prices : null;
+  let costBreakdown = "";
+  if (_p && settlement && settlement.usageReported && Number.isInteger(settlement.costCents)) {
+    const wUncached = uncachedTok * (Number(_p.in) || 0);
+    const wRead = cacheReadTok * (Number(_p.cacheRead) || 0);
+    const wWrite = cacheWriteTok * (Number(_p.cacheWrite) || 0);
+    const wOut = outTok * (Number(_p.out) || 0);
+    const wTotal = wUncached + wRead + wWrite + wOut;
+    // 有缓存读时，单价 0 分两种：网关**下发过**（cacheKnown）就是「这条线路不计缓存费」，
+    // 照实显示 $0；没下发过就是不知道，整段不出——绝不按 0.1× 推算（那版实测偏一半）。
+    const cacheFree = (Number(_p.cacheRead) || 0) === 0 && _p.cacheKnown === true;
+    const cacheReadPriced = cacheReadTok === 0 || (Number(_p.cacheRead) || 0) > 0 || cacheFree;
+    if (wTotal > 0 && cacheReadPriced) {
+      const share = (w) => settlement.costCents * (w / wTotal);
+      const rows = [];
+      if (uncachedTok > 0) rows.push(`uncached input ${_tokenShort(uncachedTok)} → ${_dispUsd(share(wUncached), 3)}`);
+      if (cacheReadTok > 0) {
+        // 「没命中的话要多少」：把这部分按未缓存单价重算，权重变大多少，钱就多多少。
+        // 线路不计缓存费时 wRead 本就是 0，这条式子照样成立：省下的正是整份未缓存价。
+        const wIfMissed = wTotal - wRead + cacheReadTok * (Number(_p.in) || 0);
+        const saved = settlement.costCents * ((wIfMissed - wTotal) / wTotal);
+        rows.push(`cache HIT ${_tokenShort(cacheReadTok)} → ${_dispUsd(share(wRead), 3)}`
+          + (cacheFree ? "（此线路不计缓存费）" : "")
+          + ` (若未命中要 ${_dispUsd(share(wRead) + saved, 3)}，省下 ${_dispUsd(Math.max(0, saved), 3)})`);
+      }
+      if (cacheWriteTok > 0) rows.push(`cache write ${_tokenShort(cacheWriteTok)} → ${_dispUsd(share(wWrite), 3)}`);
+      if (outTok > 0) rows.push(`output ${_tokenShort(outTok)} → ${_dispUsd(share(wOut), 3)}`);
+      if (rows.length) costBreakdown = `\n命中/未命中分别算：\n  · ${rows.join("\n  · ")}`;
+    }
+  }
   const costTitle = settlement && Number.isInteger(settlement.costCents)
-    ? `Credit cost: ${_dispUsd(settlement.costCents)} (${_MICHAEL_RAW_CENTS_PER_CREDIT_USD} raw cents = $1.00 credit; includes model, cache, and route pricing)`
+    ? `Credit cost: ${_dispUsd(settlement.costCents)} (${_MICHAEL_RAW_CENTS_PER_CREDIT_USD} raw cents = $1.00 credit; includes model, cache, and route pricing)${costBreakdown}`
     : "Cost: waiting for server settlement";
   const settledTitle = live && settlement?.settledTurns
     ? `\nSettled: ${settlement.settledTurns} model requests; pending requests are not estimated`
@@ -21664,6 +22022,24 @@ function _appendTurnStatsFooter(body, { elapsedMs = 0, settlement = null, timeli
   } catch { /* stats must never break a reply */ }
 }
 
+/**
+ * 这次 run 计费用的四个单价（美元 / 每 100 万 token），给实时费用做拆解用。
+ *
+ * **缓存两项一律用网关下发的数，绝不由输入价推算。** 推算过的那一版实测偏一半
+ * （deepseek 缓存读真实 0.0123，按 0.1× 推算得 0.0061）——见模型目录里 cacheReadPrice
+ * 那段注释。网关没下发就返回 0，展示侧据此写「网关未下发单价」，不编一个数糊上去。
+ */
+function _modelBillingPrices(modelId) {
+  let e = null;
+  try { e = _modelCatalogEntry(String(modelId || "")); } catch { e = null; }
+  if (!e) return null;
+  const n = (v) => Math.max(0, Number(v) || 0);
+  const inP = n(e.inPrice), outP = n(e.outPrice);
+  if (!inP && !outP) return null; // 按次计费 / 免费模型：没有 per-token 单价可拆
+  return { in: inP, out: outP, cacheRead: n(e.cacheReadPrice), cacheWrite: n(e.cacheWritePrice),
+    cacheKnown: e.cachePriceKnown === true };
+}
+
 function _addRunSettlement(runUsage, settlement) {
   if (!runUsage) return;
   const attemptCount = settlement ? Math.max(1, Math.round(Number(settlement.attemptCount) || 1)) : 1;
@@ -21719,6 +22095,9 @@ function _liveRunSettlement(runUsage) {
     // 还是加这一位之前的那条路。方向必须是 !== false：写成 === true 会把所有老回执
     // 当成 Anthropic 形状，行内数凭空多加一个 cached，反向弄坏一批本来对的路线。
     promptIncludesCached: runUsage.promptIncludesCached !== false,
+    // 计费单价原样带出去，给 tooltip 拆「命中 / 未命中分别花了多少」。这里只做属性透传，
+    // 不查目录——这个函数在测试里是**不注入任何依赖**直接跑起来的，碰全局就当场坏掉。
+    prices: runUsage.prices || null,
   };
 }
 
@@ -22018,8 +22397,23 @@ document.addEventListener("click", (e) => {
   if (!card || !card.classList.contains("is-foldable")) return;
   const wasFolded = card.classList.contains("is-folded");
   card.classList.toggle("is-folded");
+  // **记下这是用户的明确意图。** 回合收尾时会用 streaming:false 全量重建这段正文，
+  // 而 markdown.js 的规则是「完整的块默认折叠」—— 不留痕的话，用户刚展开正在读的
+  // 那个长代码块会被折回去：页面高度当场塌陷、滚动跳。
+  card.dataset.userFold = wasFolded ? "0" : "1";
   if (!wasFolded) return;                              // 收起：什么都不用建
-  const pending = card.dataset.code;
+  _expandCodeCard(card);
+});
+
+/**
+ * 把一张折叠卡的正文真正建进 DOM 并着色。
+ *
+ * 折叠卡的正文是**懒建**的：代码存在 data-code 上，没人看的代码不占节点、也不烧 CPU
+ * 去着色。所以「展开」不只是去掉一个 class，还得把正文补出来 —— 折叠委托和收尾重建
+ * 后的状态恢复都要做这件事，抽出来免得两边各写一份、日后只改一边。
+ */
+function _expandCodeCard(card) {
+  const pending = card?.dataset?.code;
   if (pending == null) return;                         // 已经建过了
   const codeEl = card.querySelector(".code-card__body code");
   if (!codeEl) return;
@@ -22029,7 +22423,49 @@ document.addEventListener("click", (e) => {
   if (mono !== "plaintext" && pending.trim()) {
     highlightCode(pending, mono).then((html) => { if (html) codeEl.innerHTML = html; }).catch(() => {});
   }
-});
+}
+
+/** 一张代码卡的正文文本 —— 折叠态在 data-code 上，展开态在 <code> 里。 */
+function _codeCardText(card) {
+  if (!card) return "";
+  if (card.dataset?.code != null) return card.dataset.code;
+  return card.querySelector(".code-card__body code")?.textContent || "";
+}
+
+/**
+ * 收尾全量重建之前：记下**用户明确展开过**的那几张卡的正文。
+ *
+ * 判据是 dataset.userFold === "0"（用户点开过），不是「此刻是展开态」：流式期间所有
+ * 可折叠的卡本来就是开着的（好让人看着代码写出来），那不是用户意图，收尾把它们折起来
+ * 是 markdown.js 有意的设计。这里只保用户亲手点开的那几张。
+ *
+ * 用正文文本而不是下标做身份：cleanFinal 经过 _dedupeRunNarrative / _dedupeRepeatedText，
+ * 段落可能被删掉，重建前后的卡片下标对不上。
+ */
+function _userExpandedCodeTexts(root) {
+  const out = new Set();
+  try {
+    root.querySelectorAll(".code-card.is-foldable").forEach((card) => {
+      if (card.dataset.userFold !== "0") return;
+      const text = _codeCardText(card);
+      if (text) out.add(text);
+    });
+  } catch {}
+  return out;
+}
+
+/** 收尾全量重建之后：把用户亲手展开过的那几张重新展开。 */
+function _restoreUserExpandedCode(root, texts) {
+  if (!texts || !texts.size) return;
+  try {
+    root.querySelectorAll(".code-card.is-foldable.is-folded").forEach((card) => {
+      if (!texts.has(_codeCardText(card))) return;
+      card.classList.remove("is-folded");
+      card.dataset.userFold = "0";
+      _expandCodeCard(card);
+    });
+  } catch {}
+}
 
 async function highlightCode(code, lang, opts = {}) {
   // 取证维度：块长/行数进相位名，冻结时能直接看出是哪种量级的块在 tokenize。
@@ -22083,6 +22519,13 @@ function _refreshUserLabels() {
   try {
     const label = _userLabel();
     document.querySelectorAll(".msg.user .msg__who span").forEach((el) => { el.textContent = label; });
+    // 上面那句是 document 作用域的，**够不到 DOM 缓存里那些脱离文档的节点** ——
+    // 不清的话，登录/登出之后往回翻，旧气泡还挂着上一个用户名。
+    // 缓存是挂在各自容器上的（没有全局注册表），所以逐个会话容器倒。
+    // 缓存只是加速，丢了退回重新解析即可，没有正确性代价。
+    for (const s of (Array.isArray(_chatSessions) ? _chatSessions : [])) {
+      if (s?.container) _dropHistoryNodesFrom(s.container, 0);
+    }
   } catch {}
 }
 
@@ -25904,7 +26347,16 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.fullWebsite = !!(m.fullWebsite || deliverySurface === "website" || deliverySurface === "web_app");
   m.referenceWebsiteUrls = Array.isArray(base?.referenceWebsiteUrls) ? [...base.referenceWebsiteUrls] : [];
   m.referenceWebsiteRequired = !!(m.ui && m.referenceWebsiteUrls.length);
-  m.fromZeroUiProject = !!(m.uiProject && (projectState === "greenfield" || designMode === "michael_design_2_5_greenfield"));
+  // 「起一个新站」和「工作区是不是空的」是两件事。原来只认 projectState，而它说的是
+  // **工作区**：仓库里已有后端/CLI、现在要建第一个网站时它老实报 existing，于是
+  // fromZeroUiProject 为假、designMode 回退成 existing、scaffold 那层一次都不加载，
+  // 模型拿不到脚手架配方只能手写组件。（这笔债在 prompts.rs 的字节闸注释里被点名三次
+  // 都没还——一直往提示词那边找解法，缺口其实在这一行。）第三条腿用 architectureMode：
+  // 模型同样必填，而它说的是**这件事本身**，design_new 就是"新设计一套"，与目录里
+  // 有多少文件无关；已有 Vue/React 站会报 follow_existing/extend_existing，不会误判。
+  m.fromZeroUiProject = !!(m.uiProject && (projectState === "greenfield"
+    || designMode === "michael_design_2_5_greenfield"
+    || architectureMode === "design_new"));
   m.existingWebsite = !!(m.existingProject && m.uiProject && !m.fromZeroUiProject);
   // A repository containing UI is a fact, not a request for a design review. Michael Design
   // participates only in actual UI implementation or an explicit visual/UI review.
@@ -28779,11 +29231,13 @@ function _clipUserDoc(text, label) {
 ///   · 习惯 = 他平时怎么干活。默认照做，但任务本身确实需要别的做法时可以让路，
 ///     且**要说一声**——不声不响地偏离，用户看到的就是"它没听我的"。
 /// 两者都低于他在**本轮**里的明确指令：长期偏好不该锁死他临时改主意的能力。
-function _userRulesBlock() {
+function _userRulesBlock({ ladder = false } = {}) {
   const rules = _clipUserDoc(_userRulesText, "用户规则");
   const habits = _clipUserDoc(_userHabitsText, "用户习惯");
-  if (!rules && !habits) return "";
-  let out = "";
+  // ladder：只在收不到网关那份层级时补（自定义端点直连、子智能体）。理由见该模块。
+  const out0 = ladder ? INSTRUCTION_LADDER : "";
+  if (!rules && !habits) return out0;
+  let out = out0;
   if (rules) {
     out += "\n\n# 用户规则（这台机器的主人定下的硬性要求，每一轮都适用）\n"
       + "这些是**约束**，不是建议：违反即为做错。优先级高于项目约定（那是团队的，这条是他本人的）；"
@@ -28955,6 +29409,10 @@ const _INCOMPLETE_LABELS = {
   // 最后一个动作轮里有工具明确报了失败（部署/命令/mcp/http 退出非零、被拒、冲突……），
   // 模型却收了尾。给一句能照做的下一步，而不是把 last_action_failed 这个枚举名甩给用户。
   last_action_failed: "上一步有工具报错，先把它弄好",
+  // 上游按**输出上限**把这一轮的正文砍断了（finish_reason=length，且这一轮一个工具都没调）。
+  // 原来这种情况整轮落进「模型自己收尾」：无错误、无重试、无标记，还记成 success。
+  // 用户看到的就是「没回答完内容就结束了」。正文照常保留，但这一轮不许冒充干净收尾。
+  output_truncated: "上一条回答被输出上限截断了，让它接着写完",
   // 用户原话：「完成真正的产品而不是虚假的」。判据是落盘内容里**新增**的占位行，
   // 不是猜"这个函数实现得够不够"——给得出文件、行号和那一行的原文。
   stub_delivery: "把留下的占位实现换成真的",
@@ -29819,8 +30277,12 @@ function _steerRunningAgent(sess, text, attachments = []) {
   } catch {}
   try { sess.memory?.recordUserCorrection?.(t); } catch {}
   (sess._steerQueue = sess._steerQueue || []).push({
-    text: "【用户实时引导 / steer】" + t +
-      "\n（这是任务进行中用户插入的新指令：立刻据此调整方向——必要时放弃或修改你正在做的，不必等本轮做完再返工。）",
+    // 措辞对齐 Claude Code（"Address the message above as you continue this turn"）：
+    // 一边继续手上的活一边处理，不是放弃重来。原来那句「必要时放弃或修改你正在做的」
+    // 语义正好相反，插一句话就变成整轮返工。理由全文见 test 里那两条改写说明。
+    text: "【用户在你工作时发来一条新消息】" + t +
+      "\n（这是他在本轮进行中发来的，不是新的一轮任务：**在继续手上这一轮的同时**处理它。" +
+      "要不要因此调整方向由你判断——他没有要求你放弃已经做到一半的工作。）",
     attachments,
     semanticText: t,
     intentContext,
@@ -29878,11 +30340,30 @@ function _renderQueueBar(sess) {
       btn.type = "button";
       btn.className = "queue-chip__insert";
       btn.innerHTML = `<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 12.5V3.5M4 7l4-3.5L12 7"/></svg><span>插入</span>`;
-      btn.title = "立即插入：阻断当前回答，结合两次输入继续";
+      btn.title = "立即插入：把这条交给正在跑的这一轮，它会一边继续手上的活一边处理";
       btn.addEventListener("click", () => _insertQueuedNow(sess, item));
-      chip.append(txt, btn);
+      // 删除：没有它的话，发错的那条只能等它自动发出去再撤，钱已经花了。
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "queue-chip__del";
+      del.title = "删掉这条，不发";
+      del.setAttribute("aria-label", "删除这条排队消息");
+      del.innerHTML = `<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>`;
+      del.addEventListener("click", () => _dropQueued(sess, item));
+      chip.append(txt, btn, del);
       bar.append(chip);
     });
+  } catch {}
+}
+/** 从队列里丢掉一条排队消息。只动队列，不碰对话历史（它从来没进过历史）。 */
+function _dropQueued(sess, item) {
+  try {
+    if (!sess || !Array.isArray(sess._pendingSends)) return;
+    const i = sess._pendingSends.indexOf(item);
+    if (i < 0) return;
+    sess._pendingSends.splice(i, 1);
+    saveChatHistory();
+    _renderQueueBar(sess);
   } catch {}
 }
 function _insertQueuedNow(sess, item) {
@@ -30182,11 +30663,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     text = _withoutModelToken(text);
     showToast(`本轮交给 ${_modelCatalogEntry(_routedModel)?.label || _routedModel}`);
   }
-  // If THIS tab is already running, a sent message becomes a real-time STEER ("引导"):
-  // inject it into the live run so the agent adapts mid-task instead of dropping it.
-  // (Other tabs still run concurrently — each has its own loop.)
-  // 和输入框那条同一个判据：有循环在跑就实时引导，纯对话才排队。见 composer submit 处的说明。
-  { const _rs = _currentSession(); if (_rs?.streaming) { if (_rs._runIsLoop) _steerRunningAgent(_rs, text, attachments); else _queueFollowup(_rs, text, attachments); return; } }
+  // 这一轮还在跑 → **排队**，不直接并入。判据和 composer submit 处同一条，说明也在那儿。
+  { const _rs = _currentSession(); if (_rs?.streaming) { _queueFollowup(_rs, text, attachments); return; } }
   // If all chats were closed, sending starts a fresh one so history has a home.
   if (!_currentSession()) _newChatSession();
   // Bind this whole turn to ONE session, captured now — so even if the user
@@ -30739,7 +31217,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const skillsBlock = effectiveMode === "chat" ? _activeSkillsBlock() : _skillsSystemBlock();
   // 用户规则连轻量轮也带上：那些轮次省的是系统提示词和工作区预热，而"用中文回答"这种
   // 要求恰恰在闲聊轮最该生效——省掉它等于每次寒暄都破一次规矩。
-  const userRulesBlock = _userRulesBlock();
+  const userRulesBlock = _userRulesBlock({ ladder: true });   // 这条 fullPrompt 走网关时会被整条丢掉
   const adaptiveBlock = _adaptivePromptBlock();
   const _adaptiveMemory = _adaptiveMemoryBlock(text);
   const languageBlock = _languagePreferenceBlock();
@@ -31340,6 +31818,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // ---- collapsible "thinking" (reasoning) card ----
   let reasoning = "";
   let reasoningAll = "";
+  // 拼接尾巴（各 8 字符）由调用方持有：让 _joinReasoningDelta 常见路径一次都不碰累加器，
+  // 不碰就不会让 V8 把整条 cons string 摊平。实测 12000 个 delta 463ms → 5.2ms。
+  const _rsTail = { tail: "" }, _rsAllTail = { tail: "" };
   let reasoningEl = null;
   // Route inline <think>…</think> into the thinking card. Many "thinking" models
   // (DeepSeek-R1 / V3.1-think, QwQ, GLM-Z1, Qwen3-think …) stream their reasoning
@@ -31400,8 +31881,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 「想→调工具→再想」是现代模型的常态形状）。
   const appendPlainReasoning = (delta, trusted = false) => {
     if ((!trusted && !_canRenderPreAnswerReasoning(_inlineThinkState)) || !delta) return false;
-    reasoning = _joinReasoningDelta(reasoning, delta);
-    reasoningAll = _joinReasoningDelta(reasoningAll, delta);
+    reasoning = _joinReasoningDelta(reasoning, delta, _rsTail);
+    reasoningAll = _joinReasoningDelta(reasoningAll, delta, _rsAllTail);
     if (reasoning.trim()) setThink(reasoning);
     return /\S/.test(delta);
   };
@@ -31657,7 +32138,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
           clientBlocks,
         );
       }
-      // `&& !byoBase`：代发线路是网关请求，档位得发否则网关不压；而本地三层已因 byoBase 让位。
+      // `&& !byoBase`：代发是网关请求，档位得发；本地三层已因 byoBase 让位。
       const _mcTierPlain = (requestConfig.customModelId && !requestConfig.byoBase) ? null : _compressionTier();
       if (_mcTierPlain && !requestConfig.customModelId) {
         requestConfig.michaelCompression = _mcTierPlain;
@@ -32436,6 +32917,21 @@ function _stripToolNarration(text) {
 // back-to-back), so it never eats legitimately-similar text. Used on the FINAL render.
 function _dedupeRepeatedText(s) {
   if (!s || s.length < 50) return s;
+  // 和 _cleanAgentText 同一个毛病、同一个修法：它也跑在流式的每一帧上、对**全量正文**
+  // 重跑（split + 一串 trim + 两次半文比对），150KB 的回复每帧白分配一堆临时字符串。
+  // 它是纯函数，缓存输入→输出就够。
+  //
+  // 缓存挂在函数自身属性上而不是模块级变量：测试的 load() 只把函数体抠出来跑，
+  // 够不着模块级变量（这是 _cleanAgentText 那边定下来的写法，照抄）。
+  // 多槽是因为两个标签页同时流式会交替调进来，单槽互相顶掉、命中率归零。
+  const _dc = _dedupeRepeatedText._cache || (_dedupeRepeatedText._cache = new Map());
+  if (_dc.has(s)) return _dc.get(s);
+  const _dcInput = s;
+  const _dcPut = (v) => {
+    _dc.set(_dcInput, v);
+    if (_dc.size > 4) _dc.delete(_dc.keys().next().value); // Map 保插入序，超了删最老的
+    return v;
+  };
   let t = s.trim();
   // 1) consecutive IDENTICAL paragraphs → keep one
   const paras = t.split(/\n{2,}/);
@@ -32449,7 +32945,7 @@ function _dedupeRepeatedText(s) {
   if (out.length >= 2 && out.length % 2 === 0) {
     const h = out.length / 2;
     if (out.slice(0, h).map((x) => x.trim()).join("") === out.slice(h).map((x) => x.trim()).join("")) {
-      return out.slice(0, h).join("\n\n");
+      return _dcPut(out.slice(0, h).join("\n\n"));
     }
   }
   t = out.join("\n\n");
@@ -32457,9 +32953,9 @@ function _dedupeRepeatedText(s) {
   const mid = Math.floor(t.length / 2);
   if (t.length % 2 === 0 || true) {
     const a = t.slice(0, mid).trim(), b = t.slice(mid).trim();
-    if (a.length > 40 && b === a) return a;
+    if (a.length > 40 && b === a) return _dcPut(a);
   }
-  return t;
+  return _dcPut(t);
 }
 
 // Exact paragraph memory across model turns in one run. Providers sometimes
@@ -32467,6 +32963,27 @@ function _dedupeRepeatedText(s) {
 // makes the run look stuck even when the tool did execute. Only byte-equivalent
 // normalized paragraphs are removed, so a conclusion changed by new evidence is
 // preserved.
+/**
+ * 段落指纹的记忆化。
+ *
+ * 那个 Unicode 属性类正则（\p{P}\p{S}）是 _dedupeRunNarrative 里的大头，而它跑在
+ * **流式的每一帧**上、对**全量正文**重跑：一轮里已经落定的段落每帧都被重新归一化一遍，
+ * 真正会变的只有最后那一段。
+ *
+ * 只缓存「段落原文 → 归一化指纹」这一步，`seen` 那套增删语义一个字都不动 ——
+ * 那是跨轮累积的状态，缓存它会改变行为。
+ */
+const _NARRATIVE_KEY_CACHE = new Map();
+function _narrativeKey(paragraph) {
+  let key = _NARRATIVE_KEY_CACHE.get(paragraph);
+  if (key === undefined) {
+    key = paragraph.replace(/[\s\p{P}\p{S}]/gu, "").toLowerCase();
+    // 有界：整段清空而不是 LRU —— 这里只求「同一轮内高命中」，跨轮丢光无所谓。
+    if (_NARRATIVE_KEY_CACHE.size > 512) _NARRATIVE_KEY_CACHE.clear();
+    _NARRATIVE_KEY_CACHE.set(paragraph, key);
+  }
+  return key;
+}
 function _dedupeRunNarrative(text, seen) {
   if (!text || !(seen instanceof Set)) return text || "";
   const kept = [];
@@ -32475,7 +32992,7 @@ function _dedupeRunNarrative(text, seen) {
     // 标点、加个加粗、改个语气词（"总结一句话：" vs "**总结一句话**——"），
     // 旧的逐字比对全部漏网，用户看到同一段总结刷 3-4 遍。归一化后≈逐字的重复
     // 全部命中；正文渲染仍用原文，只有指纹用归一化形式。
-    const key = paragraph.replace(/[\s\p{P}\p{S}]/gu, "").toLowerCase();
+    const key = _narrativeKey(paragraph);
     if (key.length >= 12 && seen.has(key)) continue;
     kept.push(paragraph);
     if (key.length >= 12) seen.add(key);
@@ -36206,165 +36723,6 @@ function _ensureLiveBrowserPreview(step, url, run) {
   return row;
 }
 
-// 给一张 browser 截图挂上「🎯 指元素给 AI」交互。
-function _attachElementPicker(vp) {
-  if (!vp || !inTauri) return;
-  const img = vp.querySelector("img");
-  if (!img || img._pickerWired) return;
-  img._pickerWired = true;
-  const bar = document.createElement("div");
-  bar.style.cssText = "margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
-  const btn = document.createElement("button");
-  btn.type = "button"; btn.textContent = "🎯 指元素给 AI";
-  btn.style.cssText = "padding:4px 10px;border:1px solid var(--border,#e5e7eb);border-radius:6px;background:var(--bg2,#f3f4f6);color:var(--fg,#1f2937);font-size:12px;cursor:pointer";
-  const hint = document.createElement("span");
-  hint.style.cssText = "font-size:11px;color:var(--fg3,#9ca3af)";
-  bar.appendChild(btn); bar.appendChild(hint); vp.appendChild(bar);
-  let picking = false;
-  const reset = () => { picking = false; img.style.cursor = ""; btn.style.background = "var(--bg2,#f3f4f6)"; btn.style.color = "var(--fg,#1f2937)"; };
-  btn.addEventListener("click", () => {
-    picking = !picking;
-    img.style.cursor = picking ? "crosshair" : "";
-    btn.style.background = picking ? "var(--accent,#4f46e5)" : "var(--bg2,#f3f4f6)";
-    btn.style.color = picking ? "#fff" : "var(--fg,#1f2937)";
-    hint.textContent = picking ? "在预览图上点你想改的那个元素…" : "";
-  });
-  img.addEventListener("click", async (e) => {
-    if (!picking) return;
-    e.preventDefault(); e.stopPropagation();
-    const rect = img.getBoundingClientRect();
-    const rx = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
-    const ry = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
-    hint.textContent = "识别元素中…";
-    let info = null;
-    try {
-      const st = await backend.invoke("browser_eval", { script: _PICK_ELEMENT_JS(rx, ry) });
-      let raw = st && st.result;
-      for (let k = 0; k < 2 && typeof raw === "string"; k++) { try { raw = JSON.parse(raw); } catch { break; } }
-      info = raw;
-    } catch (_e) {}
-    reset();
-    if (!info || typeof info !== "object" || info.error) { hint.textContent = "没识别到元素（" + ((info && info.error) || "再试一次或换个点") + "）"; return; }
-    _renderPickPanel(vp, bar, hint, info);
-  });
-}
-// 选中元素后的操作面板：① 免费直接改文字（有源码定位+叶子文本时，不走模型）② 发给 AI 改（样式/复杂）。
-function _renderPickPanel(vp, bar, hint, info) {
-  const prev = vp.querySelector(".mi-pick-panel"); if (prev) prev.remove();
-  const panel = document.createElement("div");
-  panel.className = "mi-pick-panel";
-  panel.style.cssText = "margin-top:8px;padding:8px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;background:var(--bg2,#f7f8fa);display:flex;flex-direction:column;gap:7px";
-  const head = document.createElement("div");
-  head.style.cssText = "font-size:12px;color:var(--fg2,#6b7280)";
-  const src = info.source && info.source.file ? info.source.file.split("/").pop() + ":" + info.source.line : null;
-  head.innerHTML = "已选中 <b>" + _escHtml(info.selector || info.tag) + "</b>" + (src ? " · 源码 <code>" + _escHtml(src) + "</code>" : " · <span style='color:#d97706'>无源码定位（多为 Vue / 非 dev，只能发给 AI）</span>");
-  panel.appendChild(head);
-  if (info.source && info.source.file && info.isLeaf && info.text) {
-    const row = document.createElement("div"); row.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap";
-    const ipt = document.createElement("input"); ipt.type = "text"; ipt.value = info.text;
-    ipt.style.cssText = "flex:1;min-width:160px;padding:5px 8px;border:1px solid var(--border,#e5e7eb);border-radius:6px;font-size:13px;background:var(--bg,#fff);color:var(--fg,#1f2937)";
-    const save = document.createElement("button"); save.type = "button"; save.textContent = "✏️ 直接改（免费·不走 AI）";
-    save.style.cssText = "padding:5px 10px;border:0;border-radius:6px;background:#10b981;color:#fff;font-size:12px;cursor:pointer;white-space:nowrap";
-    const msg = document.createElement("span"); msg.style.cssText = "font-size:11px;color:var(--fg3,#9ca3af);width:100%";
-    save.addEventListener("click", async () => {
-      const nt = ipt.value;
-      if (nt === info.text) { msg.textContent = "没改动"; return; }
-      msg.textContent = "写入源码中…";
-      const ok = await _directTextEdit(info, nt, msg);
-      if (ok) info.text = nt;
-    });
-    ipt.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); save.click(); } });
-    row.appendChild(ipt); row.appendChild(save); panel.appendChild(row); panel.appendChild(msg);
-  }
-  if (info.source && info.source.file) {
-    const sr = document.createElement("div"); sr.style.cssText = "display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--fg2,#6b7280)";
-    const sm = document.createElement("span"); sm.style.cssText = "font-size:11px;color:var(--fg3,#9ca3af);width:100%";
-    const mk = (label, prop, cur) => {
-      const wrap = document.createElement("label"); wrap.style.cssText = "display:inline-flex;gap:4px;align-items:center;cursor:pointer";
-      const ci = document.createElement("input"); ci.type = "color"; ci.value = _rgbToHex(cur);
-      ci.style.cssText = "width:26px;height:22px;padding:0;border:1px solid var(--border,#e5e7eb);border-radius:4px;cursor:pointer;background:none";
-      ci.addEventListener("change", () => _directStyleEdit(info, prop, ci.value, sm));
-      wrap.appendChild(document.createTextNode(label)); wrap.appendChild(ci); return wrap;
-    };
-    const mkNum = (label, prop, cur, unit) => {
-      const wrap = document.createElement("label"); wrap.style.cssText = "display:inline-flex;gap:4px;align-items:center";
-      const ni = document.createElement("input"); ni.type = "number"; ni.value = String(parseInt(cur, 10) || 0); ni.min = "0";
-      ni.style.cssText = "width:52px;padding:3px 5px;border:1px solid var(--border,#e5e7eb);border-radius:4px;font-size:12px;background:var(--bg,#fff);color:var(--fg,#1f2937)";
-      ni.addEventListener("change", () => _directStyleEdit(info, prop, (parseInt(ni.value, 10) || 0) + (unit || "px"), sm));
-      wrap.appendChild(document.createTextNode(label)); wrap.appendChild(ni); return wrap;
-    };
-    sr.appendChild(document.createTextNode("免费改样式（Tailwind·不走 AI）："));
-    sr.appendChild(mk("文字色", "color", info.color));
-    sr.appendChild(mk("背景色", "bg", info.background));
-    sr.appendChild(mkNum("字号", "fontSize", info.fontSize, "px"));
-    sr.appendChild(mkNum("内边距", "padding", info.padding, "px"));
-    sr.appendChild(mkNum("圆角", "radius", info.borderRadius, "px"));
-    panel.appendChild(sr); panel.appendChild(sm);
-  }
-  const aiBtn = document.createElement("button"); aiBtn.type = "button"; aiBtn.textContent = "🤖 发给 AI 改（样式 / 复杂改动）";
-  aiBtn.style.cssText = "align-self:flex-start;padding:5px 10px;border:1px solid var(--border,#e5e7eb);border-radius:6px;background:var(--bg,#fff);color:var(--fg,#1f2937);font-size:12px;cursor:pointer";
-  aiBtn.addEventListener("click", () => {
-    const lines = [
-      "我在预览里点选了这个元素，请针对**它**改（只动这个元素 / 它的组件，别动别处）：",
-      "· 元素：" + (info.selector || info.tag) + (info.text ? "（文字：" + info.text + "）" : ""),
-      (info.source && info.source.file
-        ? "· **源码位置：" + info.source.file + ":" + info.source.line + "** ← 直接打开这个文件、读它、改**这一处**的源码（JSX/模板结构 + 引用设计 token / Tailwind 类），别盲写内联样式或全局 CSS 去猜"
-        : "· （没解析到源码位置——用下面的选择器 + 现状样式在源码里搜到这个元素再改，别凭肉眼猜数值）"),
-      "· 现状样式：颜色 " + info.color + " / 背景 " + info.background + " / 字号 " + info.fontSize + " 字重 " + info.fontWeight + " / 内边距 " + info.padding + " / 圆角 " + info.borderRadius + " / 尺寸 " + info.size,
-      "· HTML：" + (info.outerHTML || ""),
-      "",
-      "我要改成：",
-    ].filter(Boolean);
-    try {
-      promptEl.value = lines.join("\n");
-      promptEl.style.height = "auto";
-      promptEl.dispatchEvent(new Event("input", { bubbles: true }));
-      promptEl.focus();
-      try { promptEl.setSelectionRange(promptEl.value.length, promptEl.value.length); } catch (_e) {}
-    } catch (_e) {}
-    hint.textContent = "已填进输入框，补上你要改成什么再发";
-  });
-  panel.appendChild(aiBtn);
-  if (bar.parentNode) bar.parentNode.insertBefore(panel, bar.nextSibling);
-  hint.textContent = "";
-}
-// 免费直接改源码文字：读源码文件 → 在源码行附近把旧文字替换成新文字 → 写回（dev server HMR 秒回显，零模型）。
-async function _directTextEdit(info, newText, msgEl) {
-  const file = _coherentFilePath(info.source && info.source.file), old = info.text;
-  if (!file || !old) { if (msgEl) msgEl.textContent = "没源码定位或没文字，改用发给 AI"; return false; }
-  try {
-    const content = await backend.readTextFile(file);
-    if (content.indexOf(old) < 0) { if (msgEl) msgEl.textContent = "源码里没找到这段原文字（多半是拼接 / 动态文本），请用「发给 AI 改」"; return false; }
-    const rows = content.split("\n");
-    const ln = Math.max(0, (info.source.line || 1) - 1);
-    let done = false;
-    for (let d = 0; d < 8 && !done; d++) {
-      for (const i of [ln + d, ln - d]) {
-        if (i >= 0 && i < rows.length && rows[i].indexOf(old) >= 0) { rows[i] = rows[i].replace(old, newText); done = true; break; }
-      }
-    }
-    await _commitDiskTextIfUnchanged(file, content, done ? rows.join("\n") : content.replace(old, newText));
-    if (msgEl) msgEl.textContent = "✅ 已直接改源码（" + file.split("/").pop() + "）— dev server 热重载即生效，免费、没走 AI";
-    return true;
-  } catch (e) { if (msgEl) msgEl.textContent = "写源码失败：" + String((e && e.message) || e).slice(0, 90); return false; }
-}
-// 免费直接改样式：在源码里定位这个元素的静态 class 串 → 换成任意值 Tailwind 类 → 写回（HMR 即生效，零模型）。
-// 仅对「源码里 class 是静态字符串」生效；动态/拼接 class 退回发给 AI。需项目用 Tailwind。
-async function _directStyleEdit(info, prop, value, msgEl) {
-  const file = _coherentFilePath(info.source && info.source.file), cls = info.cls;
-  if (!file || !cls) { if (msgEl) msgEl.textContent = "没源码定位或元素无 class，改用发给 AI"; return false; }
-  try {
-    const content = await backend.readTextFile(file);
-    const escaped = cls.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const attrRe = new RegExp('(class(?:Name)?\\s*=\\s*")(' + escaped + ')(")');
-    if (!attrRe.test(content)) { if (msgEl) msgEl.textContent = "源码里没找到这个元素的静态 class（多为动态 / 拼接 class），请用「发给 AI 改」"; return false; }
-    const newCls = _swapTwClass(cls, prop, value);
-    await _commitDiskTextIfUnchanged(file, content, content.replace(attrRe, "$1" + newCls + "$3"));
-    info.cls = newCls;
-    if (msgEl) msgEl.textContent = "✅ 已直接改样式（" + file.split("/").pop() + "）— HMR 即生效，免费、没走 AI";
-    return true;
-  } catch (e) { if (msgEl) msgEl.textContent = "写源码失败：" + String((e && e.message) || e).slice(0, 90); return false; }
-}
 
 // Fast structured assertion (快速验证): does an element matching {selector?, text?}
 // exist and is it visible/enabled? One cheap call returns yes/no + the first match
@@ -43366,7 +43724,7 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
       const head = lines[0].replace(/\s+/g, " ").slice(0, 80);
       const keyLines = lines.filter((l) => _IMPORTANT_LINE.test(l)).slice(0, 3).map((l) => l.trim().slice(0, 80));
       const digest = keyLines.length ? `\n关键行: ${keyLines.join(" | ")}` : "";
-      messages[i] = { ...messages[i], content: `[已折叠较早的 ${name} 结果（原 ${c.length} 字）：${head}…${digest}\n需要完整内容就重新调用 ${name} 取回。]` };
+      messages[i] = { ...messages[i], content: withOverflowPointer(`[已折叠较早的 ${name} 结果（原 ${c.length} 字）：${head}…${digest}\n需要完整内容就重新调用 ${name} 取回。]`, c) };
     }
   }
 
@@ -43404,7 +43762,7 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
           ...messages[i],
           // compressed 是这条消息"已定形"的唯一标记，上面那道守卫认它。
           _ideMeta: { ...(meta || {}), compressed: true, ...(meta?.kind === "read" ? { contextAvailable: false } : {}) },
-          content: comp.length < c.length ? comp + `\n（原 ${c.length} 字，已抽取压缩）` : comp,
+          content: withOverflowPointer(comp.length < c.length ? comp + `\n（原 ${c.length} 字，已抽取压缩）` : comp, c),
         };
         if (meta?.kind === "read") { readContextChanged = true; if (meta.signature) _foldedSigs.add(meta.signature); }
       }
@@ -43769,15 +44127,20 @@ function _clipPreservingErrors(text, budget) {
     if (i > 0) keep.add(i - 1);
     if (i + 1 < lines.length) keep.add(i + 1);
   }
+  // **先算正文，再只捞正文里没有的**（原来从末行往前挑、末尾正是已投递的 tail → 全是重复、
+  // 白扔 26% 预算、中段根因 0% 可见）。判据见 logic.test.mjs 同名测试。
+  const probe = _headTailModelText(raw, Math.max(200, limit - rescueMax - 80));
   let rescue = "";
   if (keep.size) {
-    // 靠后的错误离最终状态最近、诊断价值最高 → 超出豁免额度时从尾部往前保留
     const picked = [...keep].sort((a, b) => a - b);
     const parts = [];
+    const seen = new Set();
     let total = 0;
     for (let i = picked.length - 1; i >= 0; i--) {
       const line = lines[picked[i]].trim().slice(0, 320);
-      if (!line) continue;
+      if (!line || probe.includes(line)) continue;
+      const shape = line.replace(/\d+/g, "#").replace(/\s+/g, " ");
+      if (seen.has(shape)) continue; seen.add(shape);   // 同形报错只留一条，别被刷屏吃光额度
       if (total + line.length + 1 > rescueMax) break;
       parts.unshift(line);
       total += line.length + 1;
@@ -43786,7 +44149,6 @@ function _clipPreservingErrors(text, budget) {
   }
   if (!rescue) return _headTailModelText(raw, limit);
   const base = _headTailModelText(raw, Math.max(200, limit - rescue.length - 80));
-  // 已在头/尾里活下来的错误行不重复追回
   const missing = rescue.split(/\u000d?\u000a/).filter((line) => line && !base.includes(line));
   if (!missing.length) return base;
   return `${base}\u000a〔截断豁免·错误关键行（原文位于被省略的中段）〕\u000a${missing.join("\u000a")}`;
@@ -43957,8 +44319,7 @@ function _toolResultToStringRaw(call, result) {
   // 命令输出、README 里的代码块，随便哪个都带这四个字；攻击者要故意脱掉这层标记，只需要
   // 在网页里写一句 `[error]`。标记本身正是为这种内容存在的，不该被这种内容关掉。
   if (c && /\[(ERROR|BLOCKED|DENIED|失败|不可用|error)\]/i.test(c)) {
-    // 提前返回是为了保住失败正文不被套壳，**不是**为了跳过脱色——而它恰好跳过了：命中它的
-    // 主力是 run_cmd/termtask 的失败结果（成功的走 case "cmd" 会脱色）。实测 31.8% 是转义码。
+    // 提前返回是为保住失败正文不被套壳，不是为跳过脱色——而它恰好跳过了（实测 31.8% 转义码）。
     const plain = _stripAnsi(c);
     return tag ? `${tag}\n${plain}` : plain;
   }
@@ -44030,6 +44391,7 @@ function _toolMsgForModel(call, result) {
     : 8000;
   const rawMessage = _toolResultToString(call, result);
   let message = boundText(rawMessage, _cap);
+  message += _overflowSink(rawMessage, message.length, _rt);   // 丢了一大块 → 落盘并给出路径
   const recovery = typeof _blockedToolRecoveryInstruction === "function"
     ? _blockedToolRecoveryInstruction(rawMessage, call, result)
     : null;
@@ -44508,6 +44870,12 @@ function _depDocsCandidateFill(run, call) {
 const _bm25Index = {
   chunks: [],   // [{ id, path, start, end, snippet, termFreq:Map, len }]
   df: new Map(), // term → number of chunks containing it
+  // term → 含这个词的 chunk 列表（倒排表）。没有它，bm25Search 的内层循环是
+  // 「每个查询词扫一遍全部 chunk」——本仓 26,700 个 chunk，而中文一句话能切出
+  // 几十个 token，于是按下回车那一刻同步跑几十遍全表扫。倒排表让内层只碰真正命中的
+  // 那几个 chunk。代价是每个 (chunk, term) 对多一个指针（本仓约 20MB），
+  // 换掉的是用户盯着屏幕时的 50~110ms 同步阻塞。
+  post: new Map(),
   totalLen: 0,
   avgLen: 0,
   built: false,
@@ -44558,6 +44926,26 @@ function _tokenize(text) {
   return out;
 }
 
+/**
+ * 把一个 chunk 收进索引：chunks、df、倒排表三处一起更新。
+ *
+ * 抽成函数不是为了复用（只有一个调用点），是为了**这条不变量能被测到**：
+ * 「df 更新了但倒排表漏更新」在功能上不报错，只是查询悄悄退回全表扫。
+ * 测试若自己拼一份索引，就等于守着测试台自编的形状——源码里删掉倒排表照样绿
+ * （这个恒真守卫我实际撞到了，变异测试当场露的馅）。共用同一个函数才守得住。
+ */
+function _bm25AddChunk(chunk) {
+  _bm25Index.chunks.push(chunk);
+  _bm25Index.totalLen += chunk.len;
+  // df 和倒排表同一趟建完：多的只是一次 Map 查找 + 一次 push，建索引本来就是后台跑的。
+  for (const [term] of chunk.termFreq) {
+    _bm25Index.df.set(term, (_bm25Index.df.get(term) || 0) + 1);
+    const p = _bm25Index.post.get(term);
+    if (p) p.push(chunk);
+    else _bm25Index.post.set(term, [chunk]);
+  }
+}
+
 async function buildBM25Index(root) {
   if (!root || _bm25Index.building) return;
   if (_bm25Index.root === root && _bm25Index.built) return;
@@ -44567,6 +44955,7 @@ async function buildBM25Index(root) {
   _bm25Index.root = root;
   _bm25Index.chunks = [];
   _bm25Index.df.clear();
+  _bm25Index.post.clear();
   _bm25Index.totalLen = 0;
   const t0 = Date.now();
   let chunkId = 0;
@@ -44605,10 +44994,8 @@ async function buildBM25Index(root) {
         if (toks.length < 4) continue;
         const tf = new Map();
         for (const t of toks) tf.set(t, (tf.get(t) || 0) + 1);
-        for (const [term] of tf) _bm25Index.df.set(term, (_bm25Index.df.get(term) || 0) + 1);
         const len = toks.length;
-        _bm25Index.totalLen += len;
-        _bm25Index.chunks.push({ id: chunkId++, path: rel, start: i + 1, end: Math.min(i + slice.length, lines.length), snippet: snippet.slice(0, 600), termFreq: tf, len });
+        _bm25AddChunk({ id: chunkId++, path: rel, start: i + 1, end: Math.min(i + slice.length, lines.length), snippet: snippet.slice(0, 600), termFreq: tf, len });
       }
     }, _SYMBOL_INDEX_MAX_FILES);
     if (abandoned) {
@@ -44639,7 +45026,9 @@ function bm25Search(query, topK) {
     const df = _bm25Index.df.get(term) || 0;
     if (df === 0) continue;
     const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
-    for (const c of _bm25Index.chunks) {
+    // 只碰倒排表里的 chunk，不再全表扫。df > 0 保证这里必然非空；
+    // 万一索引是旧结构（没有 post）就退回全表扫，行为不变、只是慢。
+    for (const c of (_bm25Index.post.get(term) || _bm25Index.chunks)) {
       const tf = c.termFreq.get(term);
       if (!tf) continue;
       const denom = tf + _BM25_K1 * (1 - _BM25_B + _BM25_B * (c.len / avg));
@@ -45844,6 +46233,12 @@ function _looksLikeVerificationCommand(command) {
   // gate kept demanding proof the agent had already produced. Strip noise, then classify.
   let raw = _stripHarmlessRedirects(String(command || "")).trim();
   if (!raw || /[\r\n;|<>`]|\$\(/.test(raw)) return false;
+  // **watch/交互模式一律不算验证**，不管命令形态多像。它们是常驻会话：不会退出、
+  // 也就永远没有那个作为结论的退出码。原来只在个别 runner 的正则里躲开 `--watch`，
+  // 于是 `npm run test:watch`、`vitest --watch`、`npm run test -- --watch` 全部被
+  // 当成一次性检查 —— 而它们跑起来就不停，「退出码 0」根本不会到来。
+  // 这些该走 run_in_terminal，不该拿验证学分。
+  if (/(?:^|\s)--?watch\w*\b|(?:^|[\s:])watch(?:$|[\s:])|(?:^|[:\-])watch\b/i.test(raw)) return false;
   // A leading `cd <dir>` is navigation, not an effect. Real agents write
   // `cd <project> && npm run build`; requiring EVERY segment to be a checker rejected it.
   const _segs = raw.split(/\s*&&\s*/).map((x) => x.trim()).filter(Boolean);
@@ -45851,7 +46246,22 @@ function _looksLikeVerificationCommand(command) {
   if (!_segs.length) return false;
   const safeArgs = String.raw`(?:\s+[\w./:=,@%+~-]+)*`;
   const checks = [
-    new RegExp(String.raw`^(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:test|build|lint|check|typecheck|type-check)\b${safeArgs}$`, "i"),
+    // 脚本名带后缀是常态：`npm run test:unit` / `test:e2e` / `lint:fix` / `build:prod`。
+    // 原来只认光秃秃的 test/build/lint/check/typecheck，于是绝大多数真实项目跑的那条
+    // 命令拿不到验证学分 —— 而 run_cmd 的工具描述里白纸黑字写着「跑项目真实的检查
+    // 就拿到验证学分」。描述和行为对不上，模型跑了验证却被要求「再证明一次」。
+    new RegExp(String.raw`^(?:npm|pnpm|yarn|bun)(?:\s+run)?(?:\s+(?:-{1,2}[\w.-]+|-F|--filter)(?:[= ][\w./@-]+)?)*\s+(?:test|build|lint|check|typecheck|type-check|ci|verify|validate)(?:[:-][\w:.-]+)?\b${safeArgs}$`, "i"),
+    // yarn workspaces / pnpm 过滤器：`yarn workspace api test`、`pnpm -F web test`
+    new RegExp(String.raw`^(?:yarn|pnpm)\s+(?:workspace|--filter|-F)\s+[\w./@-]+\s+(?:run\s+)?(?:test|build|lint|check|typecheck)(?:[:-][\w:.-]+)?\b${safeArgs}$`, "i"),
+    // make：几乎所有 C/C++/Go/嵌入式项目的验证入口
+    new RegExp(String.raw`^make(?:\s+-{1,2}[\w.-]+)*\s+(?:test|check|lint|build|all|verify|ci)\b${safeArgs}$`, "i"),
+    // python -m pytest / unittest —— 比裸 pytest 更常见（保证用的是当前虚拟环境）
+    new RegExp(String.raw`^python\d*(?:\s+-\w+)*\s+-m\s+(?:pytest|unittest|mypy|ruff|tox|nox)\b${safeArgs}$`, "i"),
+    // 其它语言生态里公认的一次性检查入口
+    new RegExp(String.raw`^(?:tox|nox|mix\s+test|swift\s+(?:test|build)|ctest|rspec|phpunit|dart\s+(?:test|analyze)|flutter\s+test|elm-test|deno\s+(?:test|check|lint))\b${safeArgs}$`, "i"),
+    new RegExp(String.raw`^bazel\s+(?:test|build)\b(?:\s+[\w./:@*-]+)*$`, "i"),
+    // just / task：近年很常见的任务运行器，配方名同样带后缀
+    new RegExp(String.raw`^(?:just|task|mise\s+run|hatch\s+run)\s+(?:test|check|lint|build|ci|verify)(?:[:-][\w:.-]+)?\b${safeArgs}$`, "i"),
     new RegExp(String.raw`^cargo\s+(?:test|check|clippy|build)\b${safeArgs}$`, "i"),
     new RegExp(String.raw`^cargo\s+fmt\b(?=.*(?:^|\s)--check(?:\s|$))${safeArgs}$`, "i"),
     new RegExp(String.raw`^go\s+(?:test|build)\b${safeArgs}$`, "i"),
@@ -46957,10 +47367,20 @@ function _planStateLineText(run) {
   const mm = run._planStepMismatch;
   // 前面还欠着的步骤要点名。指针钉在最早未完成的那一步，模型看不到自己欠了几步。
   const behind = steps.slice(0, at).filter((s) => s?.status === "pending" || s?.status === "in_progress");
+  const ahead = steps.slice(at + 1).filter((s) => s?.status === "pending" || s?.status === "in_progress");
   return `${_PLAN_STATE_TAG} 共 ${steps.length} 步，已完成 ${done}。`
     + `当前第 ${at + 1} 步：${String(steps[at]?.content || "").slice(0, 160)}`
     + (next ? `（其后：${String(next.content || "").slice(0, 80)}）` : "（这是最后一步）")
     + (behind.length ? `\n它前面还有 ${behind.length} 步没做：${behind.slice(0, 3).map((s) => String(s.content || "").slice(0, 40)).join("、")}。` : "")
+    // 后面还欠着的步骤也点名（原来只点名指针**前面**那几步）。这块每一轮都在，所以
+    // 「每 8 轮提醒一次还剩哪几步」的 planRefresh 注入整条撤掉了：同一件事，八轮说一次
+    // 变成每轮都在，还少占一条消息。
+    + (ahead.length ? `\n后面还有 ${ahead.length} 步：${ahead.slice(0, 3).map((s) => String(s.content || "").slice(0, 40)).join("、")}${ahead.length > 3 ? "…" : ""}。` : "")
+    // 「状态一直没动」是执行事实，不是劝诫：连着这么多次工具调用，计划的状态签名一个字没变。
+    // 原来它是一条独立的 planStale 提醒（最多推 4 条消息），现在并进这块每轮都在的状态里。
+    + (Number(run?._planSigStaleOps) >= 8
+      ? `\n这 ${run._planSigStaleOps} 次工具调用里，上面这些状态一个都没动过——用户那边的进度条就一直停在 ${done}/${steps.length}。已经做完的步骤现在就 update_plan 标掉；确实不做的标 cancelled 并写明原因。`
+      : "")
     + (mm
       ? (mm.matchAt
           ? `\n上一次动作其实属于第 ${mm.matchAt} 步（${mm.matchStep}）那一类，而你当前停在第 ${mm.at} 步，所以两边都没被勾上——打勾只认当前这一步。要么回来把第 ${mm.at} 步做掉，要么 update_plan 把它标 cancelled 并写明为什么不做。`
@@ -47198,27 +47618,9 @@ function _isReadOnlyParallel(call) {
   return false;
 }
 
-async function _runOrderedToolSegments(items, segmentKeyOf, execute, isLive = () => true) {
-  // 段键语义：falsy = 硬屏障（串行执行）；相同 truthy 键的**连续**项组成一段并行执行。
-  // 这让"读工具段"与"worker 段"各自并行、互不混段——worker 会改文件，绝不能和
-  // 同轮的读工具并跑，否则读到半成品；不同 worker 之间由 scope 互不重叠守卫保证安全。
-  for (let index = 0; index < items.length && isLive();) {
-    const key = segmentKeyOf(items[index], index);
-    if (!key) {
-      await execute(items[index], index);
-      index++;
-      continue;
-    }
-    let end = index;
-    const segment = [];
-    while (end < items.length && segmentKeyOf(items[end], end) === key) {
-      const current = end++;
-      segment.push(execute(items[current], current));
-    }
-    await Promise.all(segment);
-    index = end;
-  }
-}
+// 调度器搬进了 src/agent/tool-scheduler.js（段语义逐字不变，新增逐项错误容器）。
+// 留这个同名薄壳是因为调用点和 17 个测试文件都按这个名字取；模块里那份才是实现。
+const _runOrderedToolSegments = runOrderedToolSegments;
 
 function _stableToolValue(value) {
   if (Array.isArray(value)) return value.map(_stableToolValue);
@@ -47342,11 +47744,20 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       return;
     }
     _removeAllThinking(body);
-    // Only the actively-streaming tail may carry a blinking caret. Wipe ALL carets
-    // first; renderMarkdownStream re-adds exactly one to the current segment. Without
-    // this, every prior segment/turn left its caret behind → blue blocks pile up in
-    // the transcript (the "残留光标" bug).
-    body.querySelectorAll(".md-caret").forEach((c) => c.remove());
+    // 残留光标的清扫：**每个 body 只做一次，不再每帧扫整棵子树。**
+    //
+    // 现在的代码根本造不出 caret —— renderMarkdownStream 的全部调用点都传
+    // showCaret:false，renderMarkdownInto 的全部调用点都传 streaming:false，
+    // 而两处创建条件都是 `opts.streaming && opts.showCaret !== false`。
+    // 所以这一行在稳态下是纯白烧，而它跑在流式的每一帧上。
+    //
+    // 但**不能直接删**：从磁盘恢复的 HTML 快照可能是老版本写的，里面真带着 caret
+    // （就是这段原注释说的「残留光标」bug）。留首帧那一次就够兜住它，
+    // 之后每一帧都扫是没有来源的开销。
+    if (!body._caretScrubbed) {
+      body._caretScrubbed = true;
+      body.querySelectorAll(".md-caret").forEach((c) => c.remove());
+    }
     _shownLen = acc.length;
     const clean = _streamCleanText(acc);
     if (clean.trim()) {
@@ -47406,6 +47817,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   // Keep the full accepted reasoning for the run ledger and crash draft even after
   // its visible card is settled before the answer begins.
   let reasoningAll = "";
+  // 思考块（带签名）的不透明中间形态，逐块保序。和 reasoningAll 分开存：那个是给人看的
+  // 文本，这个是要原样发回上游的凭据 —— 拼接、裁剪、去重任何一样都会让签名对不上。
+  let reasoningBlocks = [];
+  // 拼接尾巴（各 8 字符）由调用方持有：让 _joinReasoningDelta 常见路径一次都不碰累加器，
+  // 不碰就不会让 V8 把整条 cons string 摊平。实测 12000 个 delta 463ms → 5.2ms。
+  const _raTail = { tail: "" }, _raAllTail = { tail: "" };
   let reasoningEl = null;
   let reasoningTimer = 0;
   const _turnThinkCards = []; // 本回合创建的所有思考卡（含已 settle 的）——重试时要整批移除，否则失败 attempt 的思考残留并与重来的合并成近似重复
@@ -47431,8 +47848,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
    */
   const appendReasoning = (delta, trusted = false) => {
     if ((!trusted && !_canRenderPreAnswerReasoning(_inlineThinkState)) || !delta) return false;
-    reasoningAcc = _joinReasoningDelta(reasoningAcc, delta);
-    reasoningAll = _joinReasoningDelta(reasoningAll, delta);
+    reasoningAcc = _joinReasoningDelta(reasoningAcc, delta, _raTail);
+    reasoningAll = _joinReasoningDelta(reasoningAll, delta, _raAllTail);
     if (reasoningAcc.trim()) scheduleReasoning();
     return /\S/.test(delta);
   };
@@ -47482,7 +47899,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     const tt = reasoningEl.querySelector(".think-title"); if (tt) tt.textContent = "已思考";
     _thinkSetDuration(reasoningEl);
     reasoningEl = null;
-    reasoningAcc = "";
+    reasoningAcc = ""; _raTail.tail = "";
     // 连续两轮都只有思考没有可见产物时，把尾部相邻的思考卡并成一张（时长累加），
     // 避免"一堆已思考卡片"糊在消息里；中间隔着工具卡的真实步骤不受影响。
     // 正文还压在 acc 缓冲里没落 DOM（rAF 节流）时不合并：思考A→正文→思考B 若在正文
@@ -47496,11 +47913,16 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   // Tool-schema repair and transport recovery are separate state machines. Schema
   // repair remains capped at three completed responses. Transport retry is owned by
   // _runModelRequestWithRetry and is allowed only before the first real model event.
+  // 纯正文被上游按输出上限砍断这个事实要活到函数返回（return 在重试循环之外）。
+  // 声明在循环外、循环内每次重新赋值：重试成功的那一次说了算，不许继承上一次的。
+  let _proseCappedByLimit = false;
   for (let repairAttempt = 0; ; repairAttempt++) {
     let turnErr = null;
     // 本次 attempt 的 finish_reason（Rust 侧已把各家词表归一到 OpenAI 口径）。
     // 每轮重置：上一次 attempt 的 "length" 不能污染重试后的判定。
     let finishReason = "";
+    // 拒答时上游给的理由（category / explanation）。和 finishReason 一样每轮重置。
+    let _stopDetails = null;
     _activeStreamDiag = {
       attemptStartedAt: Date.now(),
       requestStartedMs: null,
@@ -47760,7 +48182,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           // revision wrongly abandoned this case instead of retrying it.
           for (const [, e] of byIndex) { try { _removeWritePreview(e, "resume"); } catch {} }
           byIndex.clear();
-          acc = ""; reasoningAcc = ""; reasoningAll = "";
+          acc = ""; reasoningAcc = ""; reasoningAll = ""; _raTail.tail = ""; _raAllTail.tail = "";
+          reasoningBlocks = []; // 这一次的响应作废了，它的签名不属于接下来那一次
           _inlineThinkState.inThink = false;
           _inlineThinkState.hold = "";
           _inlineThinkState.answerStarted = false;
@@ -47794,6 +48217,15 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         // tokens the model already read, and the meter has to keep saying what is in there.
         if (ev && ev.kind === "usage") {
           _recordStreamUsage(ev, { session, aux: meterScope !== "main", model: _turnConfig?.customModelId || _turnConfig?.model || "", requestId: _turnReqId });
+          return false;
+        }
+        // 思考块的签名。排在 Stop 闸**之前**，理由和 usage 那条一样：网关只在思考块
+        // 收尾时整块发一次，拿到的必然是完整的一块；而按停之后这一轮的助手消息照样
+        // 要落进历史，凭据得跟着一起留下，否则续着聊的第一轮就断了推理链。
+        // 不是可见进度，所以 return false —— 它不该让「这一轮有动静」成立。
+        if (ev && ev.kind === "stopDetails") { _stopDetails = ev.details || null; return false; }
+        if (ev && ev.kind === "reasoningBlocks") {
+          for (const b of ev.blocks || []) if (b && b.signature) reasoningBlocks.push(b);
           return false;
         }
         // User hit Stop: drop every further streamed event so output halts at once
@@ -47897,6 +48329,17 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     // 流结束：把最后一个（以及所有参数完整的）工具预览也定格，并同样通知外层。
     // （注：除 onStreamToolReady 接走的“流完即写”外，其余工具仍由外层主循环对
     // turn.toolCalls 统一调度；已即时执行的条目批量阶段只复用结果，绝不二次写盘。）
+    // 上游把这一轮按**输出上限**砍断了（finish_reason=length）。
+    //
+    // 下面这行原来还带一个 `byIndex.size > 0`：也就是**只有正在写工具参数时**才算截断。
+    // 而模型写纯正文、一个工具都没调、写到一半被上限砍掉时 byIndex 是空的，于是整轮落进
+    // 最后那个 `err = null`，主循环看到 toolCalls.length === 0 就当「模型自己决定收尾了」——
+    // 无错误、无重试、无标记，收尾还记成 success。用户看到的正是「没回答完内容就结束」。
+    //
+    // 拆成两件事：`truncatedByLimit` 仍然只管工具参数那一支（它要走拒绝执行那条路，
+    // 半条参数绝不能落盘）；纯正文那一支单独记 `_proseCappedByLimit` —— 正文**照常保留**
+    // （那是用户唯一剩下的东西），但如实带出去，不许冒充干净收尾。
+    _proseCappedByLimit = finishReason === "length" && byIndex.size === 0 && !!acc.trim();
     let truncatedByLimit = finishReason === "length" && byIndex.size > 0;
     let truncated = truncatedByLimit;
     if (!truncated) {
@@ -47980,7 +48423,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     const retryLimit = repairableToolArgs ? 3 : 0;
     if (repairableToolArgs && repairAttempt < retryLimit && _live()) {
       for (const [, e] of byIndex) _removeWritePreview(e); // drop the partial live previews
-      byIndex.clear(); acc = ""; reasoningAcc = ""; reasoningAll = "";
+      byIndex.clear(); acc = ""; reasoningAcc = ""; reasoningAll = ""; _raTail.tail = ""; _raAllTail.tail = "";
+      reasoningBlocks = [];
       _inlineThinkState.inThink = false;
       _inlineThinkState.hold = "";
       _inlineThinkState.answerStarted = false;
@@ -48042,9 +48486,27 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
        * 打上 [model-empty-output] 之后，下游那段（_emptyOut）会自动重开一轮并告诉模型
        * 哪些文件已经落盘——本来就是为这种情况准备的路，只是这一支拿不到标记。
        */
-      err = reasoningAcc.trim()
-        ? "[model-empty-output] 模型只输出了思考过程，没有正文或工具调用。"
-        : "[model-empty-output] 模型这一轮没有返回任何内容（上游波动或线路暂时不可用）。";
+      if (finishReason === "content_filter") {
+        /*
+         * **拒答不是零产出。**
+         *
+         * 安全分类器拒答走的是 HTTP 200 + stop_reason="refusal"，正文确实是空的 ——
+         * 形状和「上游抖了一下什么都没回」一模一样。打上 [model-empty-output] 的后果是
+         * 下游自动重开一轮：同一次拒答被付费执行三次，每次都会被同一个分类器拒，用户
+         * 三次都只看到空回复。重试在这一支上结构性地不可能成功。
+         *
+         * 所以单独走一条：说清楚是被挡了、拿得到理由就把理由说出来，然后停。
+         */
+        const _cat = _stopDetails && (_stopDetails.category || _stopDetails.type);
+        const _why = _stopDetails && _stopDetails.explanation;
+        err = "[model-refusal] 模型拒绝了这次请求"
+          + (_cat ? `（${_cat}）` : "")
+          + (_why ? `：${String(_why).slice(0, 300)}` : "。换个说法或换个模型再试。");
+      } else {
+        err = reasoningAcc.trim()
+          ? "[model-empty-output] 模型只输出了思考过程，没有正文或工具调用。"
+          : "[model-empty-output] 模型这一轮没有返回任何内容（上游波动或线路暂时不可用）。";
+      }
     } else {
       err = null;
     }
@@ -48161,7 +48623,17 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   const _keepProse = (!_hasNonControlToolCall || !!err) && cleanFinal.trim();
   if (streamEl) {
     if (_keepProse) {
+      // 这一次是 streaming:false 的**全量重建**，长代码卡会按设计折回折叠态。
+      // 折叠本身没问题，但两件事要保住，否则用户正在读的位置当场被抽走：
+      //   ① 他亲手点开的卡不能被折回去（判据见 _userExpandedCodeTexts）；
+      //   ② 高度塌陷带来的滚动位移要补回去 —— 复用 _preserveHistoryAnchor，
+      //      它就是干这个的（翻页重建时用同一招保住阅读位置）。
+      const _reopen = _userExpandedCodeTexts(streamEl);
+      let _anchorTop = NaN;
+      try { _anchorTop = streamEl.getBoundingClientRect().top; } catch {}
       renderMarkdownInto(streamEl, cleanFinal, { streaming: false, highlighter: highlightCodeFinal });
+      _restoreUserExpandedCode(streamEl, _reopen);
+      _preserveHistoryAnchor(streamEl, _anchorTop, session);
       _agentTimelineMarkVisible(timeline, _timelineTurn, "text");
     }
     else streamEl.remove();
@@ -48217,7 +48689,10 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     text: (_hasNonControlToolCall && !err) ? "" : cleanFinal,
     toolCalls,
     error: err,
+    // 纯正文被输出上限砍断：正文保留，但这个事实要跟着走，否则这一轮会被记成干净收尾。
+    proseCappedByLimit: _proseCappedByLimit,
     reasoning: _reasoningFinal,
+    reasoningBlocks,
     invalidToolAttempts: fatalRejectedToolAttempts,
     invalidToolIssue: fatalToolArgIssue,
   };
@@ -49485,7 +49960,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     // （子体人格全部来自客户端本地这一份）。技能块本来就在上面进来了，同为用户自己写下的
     // 东西却唯独少了规则块，是漏不是设计。
     // 位置在 _SUBAGENT_TRUTH 之前：真话下限必须压轴（truthfulness 那条测试钉着）。
-    + _userRulesBlock()
+    + _userRulesBlock({ ladder: true })   // 子体收不到网关那份层级
     // 语言与风格：同样是用户在设置面板里**亲手选下**的值，同样只有这一条补给路。
     // _agentModelTurn 那边把 clientBlocks（规则 + 语言 + 风格 + …）算出来后，
     // `if (!_isSub)` 一到子体就整个丢弃，旁边那句注释写着「它的系统提示词是本地的、已经对了」
@@ -49718,9 +50193,8 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   let _roleModelNote = "";
   if (_roleModel && _roleModel !== config?.model) {
     if (MODEL_NAMES && MODEL_NAMES[_roleModel]) {
-      // customModelId 必须一并丢掉：推理档位按 `customModelId || model` 查偏好，
-      // 留着的话新模型会去读旧连接的档位。
-      _subConfig = { ...config, model: _roleModel, customModelId: undefined };
+      // 连接身份要**整套**丢：byo 三件套留着的话，角色声明的我们目录里的模型会被转发到用户端点。
+      _subConfig = { ...config, model: _roleModel, customModelId: undefined, byoBase: undefined, byoKey: undefined, byoProto: undefined };
       _roleModelNote = `[role:${role}] 按声明跑在 ${MODEL_NAMES[_roleModel]}`;
     } else {
       _roleModelNote = `[role:${role}] 声明的模型 ${_roleModel} 不在可用清单里，已继承父体的模型`;
@@ -49770,7 +50244,8 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         _scheduleRender(report);
       }
       const am = { role: "assistant", content: turn.text || "" };
-      if (turn.toolCalls.length) am.tool_calls = turn.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.argsRaw } }));
+      if (turn.reasoningBlocks?.length) am.reasoning_blocks = turn.reasoningBlocks;
+            if (turn.toolCalls.length) am.tool_calls = turn.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.argsRaw } }));
       messages.push(am);
       if (!turn.toolCalls.length) {
         // A sibling can finish while this child's model request is in flight. Give that
@@ -49793,6 +50268,17 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       }
       // 本轮的图先攒着，等**所有** tool 结果都推完再一次性推给子体（见循环末尾）。
       const _turnImgs = [];
+      // 整批纯读时预先起跑，结果仍按声明顺序逐条推。判据和理由见 agent/subagent-batch.js。
+      const _pre = new Map();
+      const _batch = _live() ? readOnlyBatch(turn.toolCalls, (n, a2) => _mapToolCall(n, a2, run?.mcpToolMap),
+        { readOnlyTypes: _READ_ONLY_TYPES, execTypes: _execTypes }) : null;
+      if (_batch) turn.toolCalls.forEach((tc, _i) => {
+        const c = _batch[_i];
+        c._toolName = c._toolName || tc.name || c.type;
+        const st = _createToolStep(c); vp.appendChild(st);
+        _pre.set(tc, { step: st, p: _executeToolStep(st, c, root, execRun)
+          .catch((e) => ({ type: c.type, path: c.path, content: `[ERROR] ${String(e?.message || e)}` })) });
+      });
       for (const tc of turn.toolCalls) {
         const call = _mapToolCall(tc.name, tc.parsedArgs, run?.mcpToolMap);
         if (call) call._toolName = call._toolName || tc.name || call.type;
@@ -49930,8 +50416,9 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
           messages.push({ role: "tool", tool_call_id: tc.id, content: _clip(String(_nestReport || ""), 8000, "子智能体的简报") + _nestDrop });
           continue;
         }
-        const step = _createToolStep(call);
-        vp.appendChild(step);
+        const _preRun = _pre.get(tc);
+        const step = _preRun ? _preRun.step : _createToolStep(call);
+        if (!_preRun) vp.appendChild(step);
         toolCount++;
         let result;
         if (!_live()) result = { type: call.type, path: call.path, content: "[interrupted]" };
@@ -49968,7 +50455,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
                 result.content += `\n[failDigest:${_clipPreservingErrors(String(result.content), 300).replace(/\s+/g, " ").slice(0, 200)}]`;
               }
             } else {
-              result = await _executeToolStep(step, call, root, execRun);
+              result = _preRun ? await _preRun.p : await _executeToolStep(step, call, root, execRun);
             }
           }
           catch (e) {
@@ -50739,6 +51226,22 @@ async function _buildImageFeedback(imgs, config, leadText, perImageHint) {
 // file in the tree. Toggleable (some users dislike focus changes); main-loop only
 // (sub-agents/workers don't hijack the UI). Best-effort + guarded — never throws into
 // the loop, never steals focus from another chat tab. ---
+/**
+ * harness 提醒的总闸。默认**开**——这一版不改任何人的行为，只让它可关、可比。
+ *
+ * 为什么需要它：这套提醒有 34 类、40 个注入点，每条都在告诉模型「你还该再做点什么」，
+ * 而 Claude Code 的循环里 harness 对模型说的话是 0 条。用户报的「简单事情也长篇大论」
+ * 「一个任务 27 步、190 万输入 token」很可能就是它们叠加出来的 —— 但**从来没被量过**，
+ * 所以既不能拍脑袋删，也不该继续装看不见。有了这个闸，同一个任务可以开着跑一遍、
+ * 关掉跑一遍，比步数、token、时长和结果，用数据决定哪几条该留。
+ *
+ * 关掉的方法：localStorage 里 michael-ide.harness-nudges = "off"。
+ * steer（用户自己的实时插话）不受它管，见 _pushNudge。
+ */
+function _harnessNudgesEnabled() {
+  try { return localStorage.getItem("michael-ide.harness-nudges") !== "off"; } catch { return true; }
+}
+
 function _liveStageOn() { try { return localStorage.getItem("michael-ide.live-stage") !== "off"; } catch { return true; } }
 function _setLiveStage(on) { try { localStorage.setItem("michael-ide.live-stage", on ? "on" : "off"); } catch {} }
 let _lastStagedPath = "";
@@ -50781,7 +51284,8 @@ async function _stageForTool(call, root, session, run = null) {
       // 创建了。用户看到的是"写成功了却报文件不存在"，纯噪音。
       // 路径真写错时模型仍会从工具结果里收到报错（那条带"新建文件请用 write_file"
       // 的提示），那是给模型的通道；这个 toast 是给人看的，人不该被预备动作打扰。
-      if (_followOk("openFile")) { try { await openFile(fp, String(rel).split("/").pop(), true, { silentMissing: true }); } catch {} }
+      // 自动打开可以，抢插入点不行（takeFocus 恒 false）。
+      if (_followOk("openFile")) { try { await openFile(fp, String(rel).split("/").pop(), true, { silentMissing: true, focus: _followOk("takeFocus") }); } catch {} }
       if (_followOk("revealInTree")) { try { revealInTree(fp); } catch {} }
     } else if (t === "read") {
       _lastStagedPath = fp;
@@ -50998,9 +51502,6 @@ function _buildToolHint() {
 }
 // (B) Keep this reminder catalog-free. A hand-written list makes the agent overfit to
 // yesterday's tools and hides newly discovered MCP capabilities.
-function _toolReminderBlock() {
-  return "📋 (reminder) The tool window changes as the user's goal, new evidence and MCP discovery change. Keep choosing the next step from the goal and the real results — do not treat a tool list you saw earlier as the limit. The capability you need will be loaded by the semantic orchestration checkpoint, and you can also ask for an exact name with search_tools.";
-}
 
 // Per-turn "old hand" operating frame. This is deliberately dynamic and compact:
 // it gives the model a decision law for THIS task instead of bloating the global
@@ -52262,9 +52763,31 @@ function _ipSafeRoute(config) {
   return !(config && config.customModelId);
 }
 
+/**
+ * 认知腿（意图判定 / 工具编排 / 收尾评审）的思考档位。
+ *
+ * **跟随用户的开关，但封顶在 low。**
+ *
+ * 跟随「关」：用户显式关了思考，这几条腿也必须关 —— 不能背着他偷偷开一份。
+ *
+ * 封顶在 low 的理由是实测出来的钱：这几条腿填的是**固定 schema 的 JSON**（几百个
+ * token 就够），而它们原来拿用户的档位原样去思考，于是在 4096 的推理余量里
+ * 一路想到底。线上实拍（2026-09-03 04:17，20 秒内）：
+ *   3 次真干活（find_files / list_dir ×2）  输出 155+304+153 token，扣 21.00 点
+ *   5 次认知腿                              输出 3550+5255+3592+1323+5147 token，扣 23.35 点
+ * **辅助腿比真活还贵**，而输出价是输入价的 3 倍。用户看到的就是「还没读三个文件，
+ * 免费额度就扣完了」。
+ *
+ * 为什么是封顶而不是关掉：这几条腿的产出（意图画像、工具窗口、收尾判断）是整个
+ * 循环的输入，全关掉就是「第一发画像是空的」那个病。low 足够填一份 schema，
+ * 而深度推理在一次分类上买不到准确率，只买到 token。
+ */
 function _cognitiveLegEffort(config) {
   const pref = String(config?.reasoningEffort || config?.thinkingEffort || "").toLowerCase();
-  return pref && pref !== "off" ? { reasoning_effort: pref } : {};
+  if (!pref || pref === "off") return {};
+  // 用户拨得比 low 低（minimal/none 这类）就照他的来，只封上界。
+  const CHEAP = new Set(["off", "none", "minimal", "low"]);
+  return { reasoning_effort: CHEAP.has(pref) ? pref : "low" };
 }
 
 /**
@@ -52359,6 +52882,27 @@ function _predictMaxTokens(model) {
 function _criticMaxTokens(model) {
   const declaresReasoning = String(_thinkingProfileFor(model)?.kind || "none") !== "none";
   return 2000 + (declaresReasoning ? _AUX_REASONING_HEADROOM_TOKENS : 0);
+}
+
+/**
+ * 收尾评审结论 → 建议卡的形状。**两条路共用**：run 收尾时按当时的结论画一次；
+ * 结论晚到时（评审现在是并发跑的）再按同一份逻辑补画一次。抽出来是因为这个形状
+ * 一旦两处各写一份，就会悄悄长歪——这个仓库为这类手工重复名单付过很多次账。
+ *
+ * falseGreen 需要 run 收尾才知道的两个事实（验证通过 + 真改过东西），晚到那条路
+ * 拿不到，按 false 处理：宁可不喊假绿灯，也不凭空喊一个。
+ */
+function _wrapUpCardShape(v, verificationPassed = false, didMutate = false) {
+  if (!v) return null;
+  const clean = (x, n) => String(x || "").replace(/\s+/g, " ").trim().slice(0, n);
+  const instruction = v.done === false ? clean(v.instruction, 300) : "";
+  const direction = clean(v.direction, 300);
+  const falseGreen = v.verified === false && verificationPassed === true && didMutate === true;
+  const findings = (Array.isArray(v.findings) ? v.findings : [])
+    .map((f) => clean(`${f?.where ? f.where + " " : ""}${f?.what || ""}`, 160))
+    .filter(Boolean).slice(0, 3);
+  return (instruction || direction || findings.length || falseGreen)
+    ? { instruction, direction, findings, falseGreen } : null;
 }
 
 async function _wrapUpCritic({ config, task, padText, draft, readList, executionEvidence, toolRegistry, contract = "", changeDigest = "", demands = [] }) {
@@ -53235,7 +53779,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // while _isStreaming() is still false → the Stop click is a dead no-op.
   session._runIsLoop = true; // this run has a draining loop → a 2nd message steers it mid-run
   const _runGenSnap = session._runGen || 0; // 代际快照：旧 run 不能被新回合的 streaming=true 救活
-  session._runUsage = { in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0, turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true };
+  session._runUsage = { in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0, turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true,
+    // 计费单价在 run 开头钉一次：一次 run 只跑一个模型（见 _addRunSettlement 里那段注释），
+    // 拿它给实时费用做「命中/未命中分别多少钱」的拆解。
+    prices: (() => { try { return _modelBillingPrices(config?.model); } catch { return null; } })() };
   // 这个字段是"上一轮"的用量，挂在 session 上、跨 run 存活。不清零的话它会把上一个 run
   // 最后一轮的读数带进新 run 的第一次读取。
   session._lastTurnTokens = 0;
@@ -53283,7 +53830,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // 会话历史规模快照（历史幻觉压制用）：在 harness 注入任何附加消息前统计。>2 说明带着
   // 旧对话进场——旧对话里「已搭好 Electron+React 框架」之类的叙述会压过磁盘实况（实测
   // 弱模型直接把历史当现状复述）。
-  if (isAgent) run._historyMsgCount = (Array.isArray(messages) ? messages : []).filter((m) => m && (m.role === "user" || m.role === "assistant")).length;
+  // run._historyMsgCount 随 emptyHistoryFact 一起删了：它唯一的读者就是那条注入。
   // 空工作区前置登记：模型开场直接猜 read_file package.json/src/main.tsx（不先 list_dir）时，
   // _emptyRootSkipMessage 因为空根从未登记而不拦 → 撞真实 cannot stat 错误卡（实测：旧对话/
   // 旧项目残影让它乱探已删除的文件）。运行一启动就后台探一次根目录，空的立刻登记；
@@ -53458,11 +54005,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // file: its own declaration. They read as a continuation-pressure mechanism that does not
   // exist, which is why "does anything push the model to keep going?" looked answered when the
   // real answer was no. The plan gate above is the thing that was missing.
-  let researchGateNudges = 0, planGateNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0;
+  let researchGateNudges = 0, planGateNudges = 0, toolFirstNudges = 0, invalidArgNudges = 0;
   // More "Claude Code way" discipline: did this run investigate (read/search) before
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
-  let didInvestigate = false, didEdit = false, investigateNudged = false, planNudged = false, verifyRuns = 0;
+  let didEdit = false, verifyRuns = 0;
   let buildFixAttempts = 0; // bounded red-build → fix → rerun loop (Cursor caps at 8; we allow 6)
   let verifyNudges = 0, _lastVerifyNudgeAtImplOps = -1;
   let _lastUiNudgeAtImplOps = -1;
@@ -53478,7 +54025,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   const _uiPassedViewports = new Set();
   const _uiInteractionViewports = new Set();
   const _readFiles = new Set();  // files explicitly read in this run (for read-before-edit check)
-  let blindEditNudges = 0;       // nudge count when editing un-read files
   let _novelEvidenceCount = 0;   // successful, non-duplicate read/search evidence this run
   const _evidenceSeen = new Set();
   let _implOps = 0;              // successful workspace changes that require fresh verification
@@ -53486,7 +54032,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   const _runtimeEffects = new Set(); // successful build/run/test/install/package obligations
   const _researchEvidence = { official: new Set(), community: new Set() };
   run._researchEvidence = _researchEvidence;
-  let _implNudges = 0;           // "stop researching, start implementing" nudge count
   // Honesty gate: did the LAST tool-using turn hit a failure/unavailable result?
   // If so and the model then tries to wrap up, we make it own the failure instead
   // of reporting fake success (the "实打实，不讲假话" rule, enforced structurally).
@@ -53525,8 +54070,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   //
   // 这里拦的**不是步数多**，是"步数多但什么都没发生"——产出（改文件/跑命令/外部副作用）
   // 和证据（新的读取/搜索）任意一样有进展就清零，所以正当的长任务一步都不会被砍掉。
-  let _idleIters = 0;
-  let _idleProgressMark = -1;
+  let _idleIters = 0, _idleProgressMark = -1;
+  const _progress = createProgressLedger();   // 空转判据的进展度量，两个坑的说明见该模块
   const _IDLE_ITER_LIMIT = _idleIterLimit();
   // 步数预算已拆除：结束由 AI 自主判定（做完→静默→finish gate），不设步数天花板。
   // budget 仅作为 token 预算超限时的收尾钳位句柄（Math.min(Infinity, iter+3) 有效）。
@@ -53538,9 +54083,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // 判据保持宽（implementation 也算构建型）——空目录下连小实现都该快动手，防「只思考不写代码」回归。
   // 它不再兼任规划/拆分/子智能体的开关：那些触发只看计划步骤/领域/模块数的事实（_splitGateNudgeMessage /
   // _inferOrchestrationFromPlan / _shouldDispatchSubagent），与空目录、从零（fromZeroUiProject）字段彻底解耦。
-  const _emptyBuildIntent = () => !!(run.engineering && (run.engineering.substantial || run.engineering.projectScope
-    || run.engineering.fromZeroUiProject || run.engineering.uiProject || run.engineering.fullWebsite || run.engineering.implementation));
-  run._emptyBuildNudges = 0;        // 行动催促次数（整 run 上限 2，防死循环）
   run._emptyExploreCount = 0;       // 空目录探索计数：第 1 次 list/纯探索命令放行取证，第 2 次起机制层短路（_emptyExploreSkipMessage）
   const _quick = () => task.trim().length < 80 && !run.engineering?.applies && !_mustUseWorkspaceToolsNow();
   const _pad = { goal: (task || "").slice(0, 200), requirements: run._requirementsChecklist, modified: new Map(), errors: [], findings: [] };  // done[] retired: the plan lane renders run._planSteps directly
@@ -53549,16 +54091,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     if (!preflight || run._michaelDesignPreflightConsumed === preflight) return false;
     run._michaelDesignPreflightConsumed = preflight;
     if (!run.engineering?.designKnowledgeRequired || !preflight.required) return false;
-    // 这里原来有一句 `didInvestigate = true`——**后台检索设计知识库 ≠ 模型读过这个项目的代码**。
-    //
-    // didInvestigate 唯一的读者是那道「你还没用 read_file / search 摸过相关代码就动手改了」
-    // 的闸门，它管的是**项目源码**。而这次预取是 harness 自己在后台跑的 michael-design
-    // 知识库检索，和这个项目里有什么代码毫无关系。于是只要任务沾 UI/设计（`designKnowledgeRequired`），
-    // 那道闸门一次都不会响——用户实拍的正是这个：「我如果有项目内容的话他就会变蠢了，
-    // 不会去调研，就会一股无脑写内容」。
-    //
-    // 这是 harness 给模型记了一笔它没做过的功。预取这件事本身照旧记账（下面那条 findings），
-    // 只是不再冒充"读过代码"。
+    // **后台检索设计知识库 ≠ 模型读过这个项目的代码**：预取是 harness 自己在后台跑的
+    // michael-design 知识库检索，和这个项目里有什么代码毫无关系。所以这里不给模型记
+    // 任何"读过代码"的功（那道闸门后来搬进了 edit_file/write_file 的工具描述与
+    // _blindOverwritePrecheck，判据一律是"这个 run 真的 read_file 读过这个文件"）。
+    // 预取这件事本身照旧记账（下面那条 findings）。
     _pad.findings.push(preflight.evidence
       ? `michael-design 已后台检索并注入：${(preflight.evidence.sourceSections || []).join("、") || "已命中但未返回 section"}`
       : "michael-design 后台检索没有可用命中；已明确注入不可用状态，不能伪造其内容。");
@@ -53572,8 +54109,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // provider 消息数组，而且必须戴编排信封——不戴它就长得像"用户刚说的话"，实拍到的后果是
   // 模型在思考里逐条讨论 harness 的规则，然后判定"这一轮没有新的用户指令"。
   //
-  // 也照抄那条最要紧的克制：**不设 didInvestigate**。后台检索专业语料 ≠ 模型读过这个项目
-  // 的代码，那道"没读过相关代码就动手改"的闸门管的是项目源码，和知识库毫无关系。
+  // 也照抄那条最要紧的克制：**不冒充读过代码**。后台检索专业语料 ≠ 模型读过这个项目的代码，
+  // "没读过就不许覆写"那道闸门认的是真实的 read_file 覆盖记录，和知识库毫无关系。
   // 记一笔 findings 说明小抄已到位就够了，不给模型记一笔它没做过的功。
   const _consumeDomainKnowledgePreflight = () => {
     const preflight = run._domainKnowledgePreflightResult;
@@ -53618,21 +54155,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   //
   // 数字越大越先被淘汰。没登记的一律按建议类处理——新加的提醒默认可丢，要保命就显式登记。
   const _NUDGE_FACTS = new Set([
+    // verifyNow 2026-09-02 移出：它的文本并进了不参与淘汰的 [本轮交付事实]
     // turnRetry：「上一轮线路断了，这几个文件已经落盘」是执行记录不是建议。
     // 不登记的话它会被判成建议类——而建议类同时只留一条，它会挤掉别的建议，
     // 自己也是下一条建议到来时第一个被踢出去的。
-    "toolRepair", "turnRetry", "cmdFail", "buildFix", "diag", "diagFinish", "bugEvidence",
-    "blindEdit", "subagentResult", "recovery", "emptyHistoryFact",
-    // 「刚改完、这个版本还没验过」是执行记账里的硬事实，丢了模型就会照着"应该没问题"收尾。
-    "verifyNow", "uiLook", "browserVerify",
+    "toolRepair", "turnRetry", "buildFix", "diag", "diagFinish", "bugEvidence",
+    "blindEdit", "subagentResult", // 「刚改完、这个版本还没验过」是执行记账里的硬事实，丢了模型就会照着"应该没问题"收尾。
     // 写入质量事实（占位/删了没查引用的导出/盲覆写/硬编码/真实引用/没碰过的同名测试）：
     // 全部来自 checkpoint 基线相减和只读查询，丢了模型就按「刚写的都没问题」的图景继续。
-    "writeFacts",
     // 「页面写了，可这个 run 一条真实产品事实都没取到过」同理：丢了它，模型就按
     // "内容没问题" 的图景继续把编出来的文案铺满整站。判据是取证台账空不空，是硬事实。
     // （referenceSite 故意**不**登记：参考站律每轮都在提示词里，模型收得到信号，
     //   那条只是兜底，按默认建议类处理就够。）
-    "websiteContent",
     // researchFirst 和上面那条 websiteContent 是**同一个判据的两半**：一个说"页面写了、
     // 产品事实台账是空的"，一个说"这次工程语义要求外部参考、取证台账是空的"。两者都由
     // _missingResearchEvidence / 取证台账按**执行事实**算出来（工具真调成功、正文够长才
@@ -53643,6 +54177,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 挤掉就等于这一整个 run 再也不会有第二次提起。
     // 而丢了它的后果正是事实类的判据：模型按「我大概知道这个库怎么用」的图景继续写下去。
     "researchFirst",
+    // 2026-09-02 移出六条：browserVerify、uiLook（并进 [本轮交付事实]，同 verifyNow）、cmdFail / recovery（都是同一段文字的第二次投递，
+    //   原文早就随工具结果同行）、emptyHistoryFact（规则进常驻提示词、事实由环境块每轮带）、
+    //   writeFacts（并进 [本轮交付事实]，那块不参与淘汰，比登记在这里更结实）。
   ]);
   /**
    * **一次性**提醒：整个 run 只推得出来一次，被挤掉就是永久失去。
@@ -53660,8 +54197,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
    */
   const _NUDGE_ONCE = new Set([
     "researchFirst",      // researchGateNudges < 1
-    "websiteContent",     // run._websiteContentStopUsed
-    "emptyHistoryFact",   // run._historyInvalidatedNote
     "planFinish",         // run._planQuestionIntercepted（建议类里唯一的一次性）
   ]);
   // 数字越大越先被淘汰：一次性 < 普通事实 < 建议。
@@ -53676,6 +54211,23 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // 缓存本来就没覆盖到），更早的留在原地当历史。
   let _nudgeTurnFloor = 0;
   const _pushNudge = (cat, content) => {
+    // **先记账，再看闸。**
+    //
+    // 这套提醒有 34 个类别、40 个注入点，每一条都是往上下文里塞一段「你还应该再做点什么」。
+    // 它们各自都为修一个真实事故而加，但叠在一起就是用户报的那三样：简单事情也长篇大论、
+    // 一个任务跑 27 步、190 万输入 token。而 Claude Code 的循环里 harness 对模型说的话是 **0 条**。
+    //
+    // 问题是：**这 40 条到底帮了多少、害了多少，从来没被量过。** 没有数据就删是拍脑袋，
+    // 留着就是继续挨骂。所以先让它可数、可关：
+    //   · 计数在闸门**之前**——关掉之后「本来会推几条」照样有数，A/B 才比得了；
+    //   · steer 不受闸门管：那是用户自己的实时插话，不是 harness 的话。
+    run._nudgeCounts = run._nudgeCounts || Object.create(null);
+    run._nudgeCounts[cat] = (run._nudgeCounts[cat] || 0) + 1;
+    run._nudgeAttempts = (run._nudgeAttempts || 0) + 1;
+    if (!_NUDGE_GATE_EXEMPT.has(cat) && !_harnessNudgesEnabled()) {
+      run._nudgeSuppressed = (run._nudgeSuppressed || 0) + 1;
+      return;
+    }
     const prev = _nudgeReg.get(cat);
     if (prev) {
       const i = messages.indexOf(prev);
@@ -54191,7 +54743,31 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // 从 _rawConfig 重推而不是原地改 config：映射器会删掉并重建各家族专属字段，原地改会留下
       // 上一个家族形状的残键。
       {
-        Object.assign(config, _applyThinkingToConfig(_rawConfig, { agentTurn: true }));
+        // **语义画像必须跨过这次覆盖。**
+        //
+        // `_applyThinkingToConfig` 返回的是 `{ ...cfg }` —— _rawConfig 的整份展开。所以这句
+        // Object.assign 会把 _rawConfig 上的**每一个**键写回 config，包括 20 行前
+        // `_applyFastRouteProfileIfLanded` / `_applyExecutionFactProfile` 刚算出来的
+        // `ideSemanticProfile`（它们写在 config 上，而 _rawConfig 里是发车时那一份）。
+        //
+        // 后果：网关按 `x-ide-semantic-profile` 决定往系统提示里拼哪几层领域提示，而循环内
+        // 补上的域旗标每轮都被盖回去 —— 迟到的裁决要等到**下一个用户轮**（重新走 30972 那条
+        // 装配）才生效。实测「完整裁决健康时 6.9~7.6 秒、拥堵 19.8 秒」，也就是说它几乎总是迟到，
+        // 于是「本轮补上的领域层」几乎总是白算。
+        //
+        // 不是「这个功能从没生效过」——请求头一直在发（发车前 30972 就写好了），而且
+        // `_sessionStableSemanticProfile` 把旗标并进 session._semanticProfileFlags（单调并集），
+        // 所以下一轮会带上。真实缺陷是**晚一个用户轮**，不是全丢。
+        //
+        // 画像不是思考字段，这句 assign 的本意（从 _rawConfig 干净重建各家族专属思考字段、
+        // 不留上一个家族的残键）和它无关，所以原样保住它即可。
+        // 做法是**把画像从这次重铺的源里摘掉**，而不是"存下来再写回" ——
+        // 后者会构成一次对 config.ideSemanticProfile 的直接赋值，绕过
+        // `_sessionStableSemanticProfile` 那条单调并集（有两条测试正面守着「每一次写入
+        // 都只经由并集」）。摘掉之后这里一次都不写画像，那条不变量字面成立。
+        const _thinkRebuilt = _applyThinkingToConfig(_rawConfig, { agentTurn: true });
+        delete _thinkRebuilt.ideSemanticProfile;
+        Object.assign(config, _thinkRebuilt);
         // The meter was written once, before the loop, from the UN-demoted config — so it
         // reported "high" for entire runs that were on the wire at "medium". Write it here and
         // it tells the truth.
@@ -54212,51 +54788,52 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       if (run._subAgentJobs instanceof Map) {
         const _settledJobs = [...run._subAgentJobs.values()].filter((j) => !j.consumed && (j.status === "done" || j.status === "failed" || j.status === "timeout" || j.status === "truncated"));
         if (_settledJobs.length) {
-          const _jobBudget = Math.max(300, Math.floor(3000 / _settledJobs.length));
           // 完整报告的预算：单份对齐同步路的 8000，并发多份时摊薄，一次交付总量有界。
           const _factBudget = Math.min(8000, Math.max(2000, Math.floor(16000 / _settledJobs.length)));
-          const _jobParts = [];
           for (const j of _settledJobs) {
             j.consumed = true;
             const _jobTag = j.status === "done" ? "完成"
               : (j.status === "timeout" ? "超时(部分结果)"
               : (j.status === "truncated" ? "未完成·轮次用尽(中间状态，不是结论)" : "失败"));
             const _jobText = String(j.result || "（无产出）");
+            // **一条消息，不是两条。**
+            //
+            // 原来这里投两次：`_pushRunFact` 推完整报告，紧接着 `_pushNudge("subagentResult", …)`
+            // 再推一条「首段结论 + 取回指针」。而那个首段**就是完整报告的第一段** —— 逐字重复；
+            // 唯一独有的只有 `await_subagent job=N` 那句指针。于是把指针并进事实消息本身：
+            // 通知和证据合成一条，信息一个字没少，上下文里少一条消息。
+            //
+            // 之所以能由它独自承担：_pushRunFact 是直接 messages.push，不进 _nudgeReg，
+            // 因此不受 _sweepNudges 清扫和同轮淘汰管，报告会一直留在上下文里。
+            //
+            // 向 Claude Code 的形状收敛：循环里 harness 说的话趋近 0，子智能体的产出以
+            // **事实**随消息流同行，不再额外发一条「提醒你看一下」。
             if (typeof run._pushRunFact === "function") {
-              run._pushRunFact(`[子智能体 job#${j.id} ${_jobTag}·${j.desc}·完整报告]\n${_clipPreservingErrors(_jobText, _factBudget)}`);
+              run._pushRunFact(`[子智能体 job#${j.id} ${_jobTag}·${j.desc}·完整报告]\n${_clipPreservingErrors(_jobText, _factBudget)}`
+                + `\n\n（需要再取一次这份报告：await_subagent job=${j.id}。）`);
             }
-            // 首段 = 子体简报里的"结论"段（_SUBAGENT_SYSTEM 要求结论写在最前）。
-            _jobParts.push(`[子智能体 job#${j.id} ${_jobTag}·${j.desc}] ${_clipPreservingErrors(_jobText.split(/\n\s*\n/)[0], Math.min(1200, _jobBudget))}`
-              + `\n（完整报告已在上文；也可用 await_subagent job=${j.id} 再取一次。）`);
           }
-          _pushNudge("subagentResult", _jobParts.join("\n").slice(0, 3200));
         }
       }
       // ── 空项目行动门禁①（行动催促）：空目录起步的构建任务，思考/环境探测都保留，
       //    但想了 ≥2 个回合还零写操作 → 催它立刻开建。第 1 次在第 2 回合、第 2 次隔 3 回合
       //    再催，整个 run 上限 2 次（计数挂 run 上），防死循环。
-      if (isAgent && run._emptyRootAtStart && !didMutate && _implOps === 0 && _emptyBuildIntent()
-          && ((run._emptyBuildNudges === 0 && iter >= 2) || (run._emptyBuildNudges === 1 && iter >= 5))) {
-        run._emptyBuildNudges++;
-        // 这句要看**计划落地了没有**。同一份上下文里还有两条方向相反的：整体规划先行律
-        //（「计划落地前不写文件、不派 worker」）和难度自适应律（「先把不确定的地方查清楚再动手」）。
-        // 无条件催写文件时，需要计划的任务会被逼在没有计划的情况下开写——而计划门那边还会
-        // 因为「从零建的第一次落盘没有计划」把这次写入硬拦回去，两头空转。
-        // 这句本身是对的（防「只思考不写代码」），错在无条件。判据用执行事实：
-        // 已经有计划步骤，或这个任务本来就不需要计划。
-        const _planLanded = Array.isArray(run._planSteps) && run._planSteps.length > 0;
-        _pushNudge("emptyBuildAct", _planLanded || !_runRequiresPlan(run)
-          ? "[行动门禁] 环境和方案已经想得够多了，现在立即开始 write_file 创建第一批文件；剩余的设计决策边写边定，不要再输出纯思考。"
-          : "[行动门禁] 想得够多了，但**还没有计划**。先用 update_plan 一次性把步骤列出来（做哪几步、每步产出什么、怎么验证），紧接着同一轮就开始 write_file 落第一批文件——别再输出纯思考，也别把规划拖成第三轮。");
-      }
+      // emptyBuildAct 删了（2026-09-02）：两支说的都搬进常驻提示词了。
+      //   · agent_core §3「A warranted plan lands before the first file you write; prose in your
+      //     reply is not a plan — only update_plan is. An empty workspace has nothing to discover:
+      //     land the first files by your second turn.」
+      // 运行时那半（"这个目录是空的"）不需要跟着搬：环境块每轮**开头**就顶着
+      // 「🚫 现场已替你实探：当前工作区是**空目录**，没有任何文件…第一步就按用户需求
+      // 规划并 write_file/脚手架开建」（main.js:28660，parts.unshift，每轮都在）。
+      // 也就是说事实和规则两侧都已就位，这条注入是第三遍。
       // ── 空项目历史幻觉压制（一次性事实注入）：空目录起步 + 会话里带着旧对话（历史消息 >2）
       //    时注入磁盘硬事实——实测弱模型会声称「我看了项目历史，之前已经搭建了框架」而磁盘上
       //    根本不存在（历史叙述压过磁盘实况）。每 run 只注入一次，写入开始后不再需要。
-      if (isAgent && run._emptyRootAtStart && !run._historyInvalidatedNote && !didMutate && _implOps === 0
-          && (run._historyMsgCount || 0) > 2) {
-        run._historyInvalidatedNote = true;
-        _pushNudge("emptyHistoryFact", "⚠️ 磁盘实况: 当前目录为空 (0 文件)。历史对话中提到的任何文件/框架/搭建成果在磁盘上均**不存在**——历史信息已作废，以磁盘为准，直接重新开建，不要'确认当前状态'。");
-      }
+      // emptyHistoryFact 删了（2026-09-02）：原则进了常驻层的 truthfulness
+      //   「Earlier conversation is not evidence about the current disk: when history says
+      //    something was built and this round's tool output shows it is not, the disk wins —
+      //    treat that history as void and build it again.」
+      // 事实那半（"当前目录为空"）由环境块每轮承载（main.js:28660）。两侧都在，这条是第三遍。
       // ── 自动并行派发 + 拆分/编排 nudge：已整体移除（AGENT_LOOP_REBUILD.md 阶段 3）──
       //
       // 这里曾经在计划跨 ≥2 领域时由 IDE **自动派发最多 4 个会写文件的子智能体**——模型从没
@@ -54642,8 +55219,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           if (_eagerNote) run._breakWriteFact = _eagerNote;
           // 同上：这条 break 也绕过了批处理里的记账。落了盘就得认，否则收尾按
           // 「本轮什么都没改」结算，未验证的代码被静默放行。
+          //
+          // **只数本轮的**（水位线 _ledgerAtTurnStart）。原来是整本遍历，而账本是
+          // 整个 run 累积、从不清空的：只要之前任何一轮写成功过，这条路每走一次就白加
+          // 一次 _implOps。而模型轮撞上一次**可重试**的线路抖动（或 [model-empty-output]，
+          // 推理模型上很常见）时，这一轮结构上一个字节都没写——byIndex 是空的，
+          // 流式即写钩子根本没触发——却照样 +1，然后重试 continue，计数器再也回不去。
+          // 后果是一次真的跑过测试的干净交付被判成 partial：_verifiedAtImplOps 和
+          // 执行证据的 implementationVersion 都按旧值钉着，版本一错位就全被判废，
+          // 收尾记 code_delivered_unverified，还通过 _lastRunState 传给下一轮当「上次没做完」。
           let _landed = 0;
-          for (const item of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) {
+          for (const item of (run._writeLedger || []).slice(_ledgerAtTurnStart)) {
             if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landed++; }
           }
           if (_landed) { didMutate = true; run._didMutate = true; _implOps++; }
@@ -54688,46 +55274,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // 这一轮好好回来了：抖动预算复位。判据要的是「连续两次都断」，
       // 不是「整个 run 里断过两次」——60 轮的任务撞三次互不相关的抖动不该被判死。
       run._turnErrRetries = 0;
-      // A steer that arrived while the model was deciding invalidates this turn's
-      // still-unexecuted tools. Do not run stale writes/commands; the next iteration
-      // drains the steer queue first and lets the model produce a fresh tool batch.
-      if (turn.toolCalls.length && Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) {
-        // 丢掉这批**还没执行**的工具是对的（插话已经让它们过时了）。但"流完即写"是在
-        // 流式阶段就真落盘的：参数流完那一刻文件已经写进磁盘，它自己的插话闸门只在钩子
-        // 触发那一瞬间查队列。所以插话晚一点点到，磁盘变了而账本、历史、run 摘要里一个
-        // 字都没有——下一轮模型看不到"本次运行已落盘"清单，会把同一个文件再从头写一遍，
-        // 或者收尾时说"我没有改动文件"。和上面两条 break 完全一样地先收账。
-        const _eagerNote = await _settleEagerWritesForBreak(run);
-        // 记成状态而非可见正文；插话后 run 继续，模型本就从每轮的运行草稿纸（_padText 带
-        // 「改过的文件」）看到落盘清单，这里不需要把页脚塞进聊天记录。
-        if (_eagerNote) run._breakWriteFact = _eagerNote;
-        let _landed = 0;
-        for (const item of (run._writeLedger || []).slice(_ledgerAtTurnStart)) {
-          if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landed++; }
-        }
-        // 补清单还不够：didMutate / run._didMutate / _implOps 是在**批处理**里置位的，
-        // 而这条 continue 整个跳过了那段。于是磁盘上多了一份没验证过的代码，收尾时
-        // didMutate 仍是 false —— 「改了代码要验证」那条记账根本不会触发，run 被判成
-        // 干干净净的 success。_implOps 也要加：新代码落盘之后，之前那次验证就过期了。
-        // 只数**本轮**落盘的（上面那条水位线），否则每插一次话就白判一次验证过期。
-        if (_landed) {
-          didMutate = true;
-          run._didMutate = true;
-          _implOps++;
-        }
-        // 模型这一轮出了一整批工具调用，不是空转——是插话让它作废的。不归零的话，
-        // 静默计数会一路涨到 2，而那会**同时**关掉诊断门、构建门、计划门直接收尾：
-        // 插一次话，反而让它提前一轮进入「不再补回合」的状态。
-        quietTurns = 0;
-        // 那一轮模型说了什么、决定了什么，原来随着这条 continue 从 messages 里整个消失，
-        // 下一轮它拿着被清空的上下文重新组织，很容易又变成一个纯说话轮。正文留下来。
-        // 不带 tool_calls：那批调用已经作废，留下孤儿 id 而没有对应的 tool 结果，上游会拒。
-        if (turn.text && turn.text.trim()) {
-          summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
-          messages.push({ role: "assistant", content: turn.text.trim() });
-        }
-        continue;
-      }
+      // 插话**不作废这一批工具**。
+      //
+      // 这里原来的做法是：收到插话就把模型这一轮还没执行的工具整批丢掉、continue 回到
+      // 循环开头重开。为此还得补一大堆账（结算流式已落盘的写入、补记 didMutate/_implOps、
+      // 把 quietTurns 归零、把正文单独留下且不能带 tool_calls）—— 那一整套复杂度都是
+      // 「丢弃」这个决定的连带成本。
+      //
+      // 而 Claude Code 的做法是不丢：手上这一批照跑，用户的消息**随下一批工具结果一起**
+      // 递给模型（原话「Address the message above as you continue this turn」），由它自己
+      // 判断要不要转向。这样插一句话的代价是「下一轮开始调整」，而不是「本轮全部作废」。
+      //
+      // 位置本来就对：队列在下一次迭代的开头被抽干，而工具结果是在上一次迭代的末尾推进去的
+      // —— 插话消息正好落在这批工具结果的后面，就是「随结果一起」。
       // Per-run token 预算控制：用户可在设置里给单次运行设 token 上限
       // （localStorage "michael-ide.token-budget"，0/未设 = 不限）。超限后不再硬扩步数，
       // 只给模型留收尾轮，把已做的如实交代——预算烧穿前有序着陆而不是无感烧钱。
@@ -54762,6 +55321,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
 
       const assistantMsg = { role: "assistant", content: turn.text || "" };
+      // 思考块的签名原样带回上游 —— 这是「原生 Anthropic」的实质部分：没有它，模型
+      // 每拿回一次工具结果就看不见自己上一轮的推理，多步任务里每一步都从头想一遍。
+      // 网关侧有一整套判据决定要不要真发出去（换了模型、这轮没开思考、签名缺失都会
+      // 静默跳过），这边只负责别把凭据弄丢。
+      if (turn.reasoningBlocks?.length) assistantMsg.reasoning_blocks = turn.reasoningBlocks;
       if (turn.toolCalls.length) {
         assistantMsg.tool_calls = turn.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.argsRaw } }));
         quietTurns = 0; // real action → reset the consecutive-quiet counter
@@ -54773,36 +55337,29 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // infer an answer or turn classifier-derived workspace/verification preferences into a
       // second model request. Any unfinished verification remains visible in final accounting.
       if (_agentTurnMustWaitForUser(turn)) {
-        // 「第三步做完了，要不要我继续？」会命中这里。方向性问题确实该停下来等用户，但计划
-        // 里还剩 5 步时那不是方向问题，是它自己该往下做的事——而这个分支同样一眼都没看计划，
-        // 还顺手 _clearNudges() 把刚推的提醒抹掉，最后记成 awaiting_user（连"未完成"都不算）。
-        // 拦一次：把问题按回去继续做。第二次再问就是真的在等用户了。
-        const _pendingPlan = (Array.isArray(run._planSteps) ? run._planSteps : [])
-          .filter((step) => step?.status === "pending" || step?.status === "in_progress");
-        if (_pendingPlan.length && _live() && !run._planQuestionIntercepted) {
-          run._planQuestionIntercepted = true;
-          _pushNudge("planFinish", `计划还剩 ${_pendingPlan.length} 步没做完（下一步：${_pendingPlan[0].content}）。`
-            + `\n这不是需要用户拍板的方向问题，直接继续做，别用「要不要我继续」停下来。`);
-          continue;
-        }
-        // 正文提问和 ask_user 卡片是同一件事的两种形态，额度要合起来算。
-        //
-        // 否则模型会在两条路之间来回横跳：卡片被拦下之后改用正文问，正文被拦下之后再调
-        // 一次卡片——用户看到的还是"一直在问"，只是形式变了。上面那条只管"计划还有剩步"
-        // 这一种情形，管不到没有计划的任务。
-        run._askUserCount = (run._askUserCount || 0) + 1;
-        if (run._askUserCount >= 3 && _live()) {
-          _pushNudge("askBudget", `这是本次任务第 ${run._askUserCount} 次向用户提问（卡片和正文提问合并计数）。`
-            + `\n别再问了：按最合理的方案直接做下去，把假设写进最终回答（"我按 X 处理了，因为 Y；要是你想要 Z，说一声我改"）。`
-            + `\n能自己查清的先查（read_file / search / probe_env 都在手边）。`
-            + `\n只有在"不做假设就没法继续、或者做错了整个成果作废"时才停——那种情况把卡在哪、需要什么写进最终回答，用一句话说清，而不是再问一次。`);
-          continue;
-        }
-        // Genuinely waiting now — but if steps are still open, say so in the accounting rather
-        // than letting "awaiting_user" read as a clean finish.
-        if (_pendingPlan.length && (!run._planInherited || run._planTouchedThisRun)) {
-          run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
-        }
+        // 判定整段搬进 src/agent/ask-user.js 的 decideQuestionBoundary（纯函数），
+        // 这里只留分派。搬的动机不是"整洁"，是这条腿原来**没有预算**：
+        // `if (run._askUserCount >= 3) { 推提醒; continue; }`，而 _askUserCount 只增不减，
+        // 于是第 4、5、6…次提问全部再次命中同一条、每次都 continue —— 模型只要每轮以问句
+        // 收尾，循环就永不退出。它还绕得过所有兜底（budget 是 Infinity，_idleIters++ 和
+        // quietTurns++ 都在这条腿 continue 之后才执行）。全循环唯一一处缺陷直接换算成账单。
+        // 现在预算是 ASK_PUSHBACK_LIMIT，用完必须停；「这条腿有没有界」也终于能在 Node 里
+        // 做真往返断言，而不是靠正则扫源码。
+        const _qb = decideQuestionBoundary({
+          planSteps: run._planSteps,
+          planIntercepted: run._planQuestionIntercepted,
+          askUserCount: run._askUserCount || 0,
+          pushbacks: run._askPushbacks || 0,
+          planInherited: run._planInherited,
+          planTouched: run._planTouchedThisRun,
+          live: _live(),
+        });
+        run._askUserCount = _qb.counters.askUserCount;
+        run._askPushbacks = _qb.counters.pushbacks;
+        run._planQuestionIntercepted = _qb.counters.planIntercepted;
+        if (_qb.nudge) _pushNudge(_qb.nudge.cat, _qb.nudge.text);
+        if (_qb.action === "resume") continue;
+        if (_qb.incompleteReason) run._incompleteReason = run._incompleteReason || _qb.incompleteReason;
         awaitingUserReply = true;
         _clearNudges();
         break;
@@ -54833,20 +55390,43 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
          * 缺席不是失败。"没跑验证""没写测试"是观测到的**缺席**，只记账、永不补回合
          * （test/logic.test.mjs 两条断言钉着，别动）。
          */
-        // R0 全局关闸：这几种情形下任何门都不开。
-        // 不要用 run.engineering.explicitReadOnly —— 它是分类器画像推出来的，
-        // 纯问答（workspaceAction="none"）时它是 false，救不了任何一次问答。
-        const _gatesOff = run.mode !== "agent"
-          || run._userDenied === true
-          || run._readOnlyBlocked === true;
-        // R2 连续静默闸：推了提醒、模型却只把文字重写一遍 → 立刻停，别再开门。
-        // 正常的修复路径是"推提醒 → 模型调工具修 → 再静默"，中间那个工具轮会把
-        // quietTurns 归零，所以这条闸只拦真正的空转，不影响任何真实修复循环。
-        const _quietRepeat = quietTurns >= 2;
-        // 全局预算：三道门的子上限（诊断 2 / 构建 2 / 计划 2）之外再加一个总闸。
-        // 没有它，四道门各算各的，一次 run 最多能多转 9 轮。
-        if (run._quietResumePool == null) run._quietResumePool = 3;
-        const _canResume = !_gatesOff && !_quietRepeat && run._quietResumePool > 0 && _live();
+        // ── 裁决一次算完，动作留在各自原位 ──────────────────────────────
+        // 判定搬进了 src/agent/quiet-turn.js（纯函数，能在 Node 里真跑，于是守卫做的是
+        // 真往返而不是匹配这里的源码文本）。动作——推提醒、写计数、continue——留在循环里：
+        // 提醒正文要拼运行时数据，而 continue 是控制流，搬不出去。
+        //
+        // 四道门的输入事实在这里就全齐了：下面那段收尾评审只写 _incompleteReason，
+        // 不碰 _planSteps / _diagnosticBlock / _implOps / 任何计数器（核对过）。
+        const _buildFail = _freshBuildFailure(run, _implOps);
+        const _pendingPlan = (Array.isArray(run._planSteps) ? run._planSteps : [])
+          .filter((step) => step?.status === "pending" || step?.status === "in_progress");
+        // 继承来、本轮模型压根没碰过的计划，不许拿它硬顶一个回合。用户实拍：问一句跟上个
+        // 任务不相干的话，答完了界面还自己多跑一轮，下一步建议变成「继续没做完的步骤」。
+        const _planActionable = !run._planInherited || run._planTouchedThisRun;
+        if (run._quietResumePool == null) run._quietResumePool = _QUIET_RESUME_POOL;
+        const _qt = _decideQuietTurn({
+          mode: run.mode, live: _live(),
+          userDenied: run._userDenied === true, readOnlyBlocked: run._readOnlyBlocked === true,
+          quietTurns, quietResumePool: run._quietResumePool,
+          steerQueued: Array.isArray(session._steerQueue) && session._steerQueue.length > 0,
+          diagnosticBlock: run._diagnosticBlock,
+          diagnosticNudges: run._diagnosticNudges || 0,
+          // **上一轮**的成功编辑数。本轮那份（_successfulEdits）在这一行之后才汇总，
+          // 读它是纯 TDZ —— 这个坑真发生过，而且因为 && 短路，只有第二次才抛。
+          lastSuccessfulEdits: (run._lastSuccessfulEdits || []).length,
+          buildFail: _buildFail, buildFixAttempts,
+          pendingPlanSteps: _pendingPlan.length, planActionable: _planActionable,
+          planFinishNudges: run._planFinishNudges || 0,
+        });
+        const _applyQuietCounters = () => {
+          const c = _qt.counters || {};
+          if ("diagnosticNudges" in c) run._diagnosticNudges = c.diagnosticNudges;
+          if ("buildFixAttempts" in c) buildFixAttempts = c.buildFixAttempts;
+          if ("planFinishNudges" in c) run._planFinishNudges = c.planFinishNudges;
+          if ("quietResumePool" in c) run._quietResumePool = c.quietResumePool;
+          if ("quietTurns" in c) quietTurns = c.quietTurns;
+        };
+        const _quietLabel = (prefix) => (_qt.labels || []).find((l) => l === prefix || l.startsWith(prefix + ":"));
         // 上一轮门推的提醒必须清掉再进下一轮。不清的话那条 _ORCH_NOTE 会一直挂在消息
         // 尾部，而模型又被禁止在回复里提及它——它唯一能做的合规动作就是把上一轮的答案
         // 换个说法重写，于是产生第二个静默轮。这正是"再空转一轮"的机器成因。
@@ -54854,16 +55434,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // R1 用户插话优先：提到所有门之前。
         // 原来这一句夹在构建门和计划门中间——只要上面任何一道门先 break，用户中途发的
         // 那条消息就被永久搁死。用户重新定义了任务，之前的欠账账本一并作废。
-        if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) {
-          run._diagnosticNudges = 0;
-          buildFixAttempts = 0;
-          run._planFinishNudges = 0;
-          run._quietResumePool = 3;
-          // 静默计数是同一本欠账里的第五个计数器（它到 2 就把 _canResume 整体置假，
-          // 三道续跑门一起关掉）。上面四个都作废了，它不作废等于账没销干净。
-          quietTurns = 0;
-          continue;
-        }
+        if (_qt.gate === "steer") { _applyQuietCounters(); continue; }
+        // 上游按输出上限砍断了这一轮的正文：最直接的一条「没说完」，排在所有推断之前。
+        // 正文已经保留在 turn.text 里，这里只负责让收尾不撒谎。
+        if (turn.proseCappedByLimit) run._incompleteReason = run._incompleteReason || "output_truncated";
         // 模型自己派发的子智能体（run_subagent）：模型知道它们在跑，也有 await_subagent 可以
         // 显式汇合。它选择收尾就是它的判断——只如实记账那些还没读的结果，绝不制造回合去覆盖它。
         // （原来还有一条"IDE 自动派发的孩子给一次有界整合机会"的腿；auto-dispatch 删除后没有任何
@@ -54948,6 +55522,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               // 重审可能跑第二次，而评审超时/回垃圾 JSON 时返回的是 null。直接赋值会把
               // 第一次那份**好结论**覆盖成 null —— 一次成功的评审被一次失败的重审抹掉，
               // 用户那几张卡跟着一起消失。只有真拿到新结论才换。
+              // **收尾评审不再阻塞收尾。** 它跑在 `!turn.toolCalls.length` 这条分支里，
+              // 也就是模型已经把最终答复写完了；再 await 一次额外的付费模型调用，用户看到的
+              // 就是"正文不动了、圈还在转"（用户实拍并点名要求改掉）。
+              //
+              // 敢并发的依据：这份结论**不决定要不要继续跑**（上次重构特意根除了"拿评审
+              // 意见覆盖模型收尾判断"），出口只有两个——建议卡、以及若真有下一轮则作为
+              // 事实注入。所以发出去就走，回来再落地；晚一轮到也不损失正确性。
+              const _genAtReview = session?._runGen || 0;
+              // 不存 promise：没有任何地方该去 await 它——存下来就是一处只写不读的状态
+              // （仓库里有条守卫专门抓这个，它抓对了）。结论通过 run._wrapUpVerdict 落地。
+              void (async () => {
               const _newVerdict = await _wrapUpCritic({
                 config,
                 task,
@@ -54978,10 +55563,28 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
                   } catch { return ""; }
                 })(),
               });
+              // **用户已经发了新消息就不要再显示了。** 结论晚到时，run 收尾早就过去了，
+              // 这张卡会画到用户那条新消息**下面**去——时序上是错的，比不显示更糟。
+              // 判据是会话代际（_runGen 在每次新回合自增），不是"streaming 与否"。
+              if ((session?._runGen || 0) !== _genAtReview) return null;
               if (_newVerdict) run._wrapUpVerdict = _newVerdict;
               // 评审整份 null（弱模型上是常态）不再静默：记一笔「这轮没评审过」。
               // 出口在收尾落盘处——wrapUp 退到代码已算好的收尾事实，用户看得见缺席。
               else run._wrapUpReviewFailed = (run._wrapUpReviewFailed || 0) + 1;
+              // 结论比 run 收尾晚到时，卡片已经按"当时还没有结论"画过一次了——补画一次。
+              // falseGreen 需要收尾才知道的两个事实，这条路拿不到，按 false（宁可不喊假绿灯）。
+              try {
+                const _late = _wrapUpCardShape(_newVerdict);
+                if (_late && session?._lastRunState && !session._lastRunState.wrapUp) {
+                  session._lastRunState.wrapUp = _late;
+                  if (inTauri) _renderSuggestionChips(session, _runStateNextActionSuggestions(session), t("chat.nextSteps"));
+                }
+              } catch {}
+              return _newVerdict;
+              // 并发之后 reject 不再落到外面那个 try/catch 里——不接住就是一个
+              // unhandledrejection，全局处理器会给用户弹一条 "Unhandled:" 的红字。
+              // 评审失败本来就该静默记账，绝不该变成一条用户看得见的报错。
+              })().catch(() => { run._wrapUpReviewFailed = (run._wrapUpReviewFailed || 0) + 1; return null; });
 
             } catch { run._wrapUpReviewFailed = (run._wrapUpReviewFailed || 0) + 1; /* 评审失败不该弄坏一轮交付 */ }
           }
@@ -55026,29 +55629,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 别的门用完——「有新增错误」「构建是红的」这些**已经观测到**的执行事实就连账都不记，
         // 收尾时那份未完成原因是空的，于是整轮被判成功、对用户说做完了。判「要不要补一轮」
         // 才看闸门，判「要不要如实记账」只看事实本身。下面的计划门本来就是这个形状。
-        if (run._diagnosticBlock) {
-          if (_canResume) {
-            run._diagnosticNudges = (run._diagnosticNudges || 0) + 1;
-            if (run._diagnosticNudges <= 2) {
-              run._quietResumePool--;
-              // 上一轮已经推过一次、而这一轮模型没有产生任何新的成功编辑 → 说明提醒没起作用，
-              // _diagnosticBlock 又只在有成功编辑时才重算，再推就是拿一个陈旧值反复烧钱。
-              // 读的是**上一轮**的成功编辑，不是 _successfulEdits。
-              //
-              // _successfulEdits 在同一个函数体里、但**在这一行之后**才计算（本轮工具阶段跑完才汇总），
-              // 所以这里读它是纯 TDZ：`Cannot access '_successfulEdits' before initialization`。
-              // 因为 && 短路，第一次推送（nudges===1）躲得过，**第二次必然抛**——而这一行的唯一
-              // 用途就是给第二次用的，等于这条「推过一次还没起作用就别再推」的判断从来没生效过。
-              // 语义上要的本来就是「刚跑完那一轮有没有新的成功编辑」，跨轮存活的值挂在 run 上。
-              if (run._diagnosticNudges >= 2 && !(Array.isArray(run._lastSuccessfulEdits) && run._lastSuccessfulEdits.length)) {
-                run._quietResumePool++;   // 没真的开火，把刚扣的还回去
-                run._incompleteReason = run._incompleteReason || "new_diagnostics_unresolved";
-              } else
-              _pushNudge("diagFinish", "[BLOCKING_NEW_DIAGNOSTICS] 收尾前还有你这次改动引入的新增错误没清零。先定位并修掉，再确认它们消失；不要在这个状态下宣布完成：\n\n"
-                + String(run._diagnosticBlock).slice(0, 2400));
-              continue;
-            }
-          }
+        // 诊断门：这次改动把项目改红了。**推过一次而模型没产生任何新的成功编辑**时
+        // 不再开火——原来那种情况下判完「再推也没用」照样 continue，白烧一次付费轮：
+        // 模型收到的还是上一轮那条一模一样的提醒，只能把答案换个说法重写，
+        // 撞到连续静默 2 轮才收尾。判定不开火，就该收尾。（判据在 quiet-turn.js。）
+        if (_qt.gate === "diagnostics") {
+          _applyQuietCounters();
+          _pushNudge("diagFinish", "[BLOCKING_NEW_DIAGNOSTICS] 收尾前还有你这次改动引入的新增错误没清零。先定位并修掉，再确认它们真的没了；不要用「应该能过 / LSP 误报」收尾。\n\n"
+            + String(run._diagnosticBlock).slice(0, 2400));
+          continue;
+        }
+        if (_quietLabel("new_diagnostics_unresolved")) {
           run._incompleteReason = run._incompleteReason || "new_diagnostics_unresolved";
         }
         // Red-build → fix → rerun (Cursor's Agent Loop, Warp's terminal verification): the
@@ -55056,26 +55647,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // Feed the real stderr back and keep fixing — do NOT finish on a broken build,
         // which is the "开发服务器在跑但页面不可见 / 13 个 TS 错误" symptom. Bounded so an
         // unfixable build converges to an honest incomplete instead of thrashing forever.
-        const _buildFail = _freshBuildFailure(run, _implOps);
-        if (_buildFail) {
-          if (_canResume && buildFixAttempts < 2) {
-            buildFixAttempts++;
-            run._quietResumePool--;
-            // 两路都要给，不能二选一。pytest / vitest / go test / cargo test /
-            // node --test 都把「哪条挂了、期望什么、实际什么」写 stdout，stderr 里
-            // 往往只有一条弃用警告——短路 || 让 stderr 有一个字节就把 stdout 整段丢掉，
-            // 于是模型收到的"真实报错"是句无关的警告，两次修复机会全部空烧。
-            const _tail = [
-              String(_buildFail.stdout || "").slice(-1600),
-              String(_buildFail.stderr || "").slice(-1600),
-            ].filter((part) => part.trim()).join("\n--- stderr ---\n");
-            _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，代码现在跑不起来。这是交付前必须清零的硬事实。先读下面的真实错误、定位并修掉根因，再重新运行同一条验证命令确认退出 0；在拿到绿色之前不要收尾、不要转去做别的：\n\n${_tail}`);
-            continue;
-          }
-          // 账不在这里记：红了之后又修好、重跑绿了的话，中途记的账会粘到收尾变成假 partial。
-          // 收尾处用 `_freshBuildFailure(run, _implOps)` 按终态重判——它自带版本钉，
-          // 红完又改过代码的那条会被剔掉（对已经不存在的那版代码断言「构建是红的」没意义）。
+        // 红构建 → 修 → 重跑（Cursor 的 Agent Loop、Warp 的终端验证同一形状）：
+        // 模型**自己声明为验证**的命令在当前编辑版本上退出码非零。把真实报错喂回去接着修，
+        // 绝不在构建红着的时候收尾——那就是「开发服务器在跑但页面打不开 / 13 个 TS 错误」的样子。
+        if (_qt.gate === "build") {
+          _applyQuietCounters();
+          // 两路都要给，不能二选一。pytest / vitest / go test / cargo test / node --test
+          // 都把「哪条挂了、期望什么、实际什么」写 stdout，stderr 里往往只有一条弃用警告——
+          // 短路 || 让 stderr 有一个字节就把 stdout 整段丢掉，于是模型收到的"真实报错"
+          // 是句无关的警告，两次修复机会全部空烧。
+          const _tail = [
+            String(_buildFail.stdout || "").slice(-1600),
+            String(_buildFail.stderr || "").slice(-1600),
+          ].filter((part) => part.trim()).join("\n--- stderr ---\n");
+          _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，现在还红着。下面是真实输出，按它定位根因、修掉，然后**重跑同一条命令**确认变绿；不要换一条更容易过的命令，也不要在这个状态下收尾。\n\n${_tail}`);
+          continue;
         }
+        // 构建的账不在这里记：红了之后又修好、重跑绿了的话，中途记的账会粘到收尾变成假 partial。
+        // 收尾处用 `_freshBuildFailure(run, _implOps)` 按终态重判——它自带版本钉。
+
         // B — procedural memory: removed (2026-07-05). Model remembers on its own.
         // A steer ("引导" / a 2nd message) arrived during THIS turn — it's sitting in the
         // queue but the loop was about to end and would never drain it. Loop once more so the
@@ -55088,23 +55678,23 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 结构上永远到不了这里。于是计划停在 2/7、没有报错、没有提示，用户只能自己打「继续」。
         //
         // 有界（3 次）：计划确实做不下去时收敛成一次诚实的「未完成」，而不是无限循环。
-        const _pendingPlan = (Array.isArray(run._planSteps) ? run._planSteps : [])
-          .filter((step) => step?.status === "pending" || step?.status === "in_progress");
-        // 预算从 3 下调到 2，和另外两道门对齐——全局池只有 3，单门占 3 会把另外两道饿死。
-        // 继承来、本轮模型压根没碰过的计划，不许拿它硬顶一个回合。
-        // 用户实拍：问一句跟上个任务不相干的话，答完了界面还自己多跑一轮，
-        // 最后下一步建议变成「继续没做完的步骤」—— 去做他已经不要的事。
-        const _planActionable = !run._planInherited || run._planTouchedThisRun;
-        if (_pendingPlan.length && _planActionable && _canResume && (run._planFinishNudges || 0) < 2) {
-          run._planFinishNudges = (run._planFinishNudges || 0) + 1;
-          run._quietResumePool--;
+        // 计划没做完就不算 truly done。这个退出点正是「模型写完第 2 步、说两句话、然后
+        // 停下来」的那一轮——上面三道门没有一条读计划，而唯二读计划的两个提醒都在
+        // 「本轮有工具调用」的分支里，结构上永远到不了这里。于是计划停在 2/7、没有报错、
+        // 没有提示，用户只能自己打「继续」。有界（2 次，和另外两道门对齐——全局池只有 3，
+        // 单门占 3 会把另外两道饿死）。
+        if (_qt.gate === "plan") {
+          _applyQuietCounters();
           _pushNudge("planFinish", `[计划未完成] 还有 ${_pendingPlan.length} 步没做完：${_pendingPlan.slice(0, 8).map((step) => step.content).join("、")}。`
-            + `\n继续做下一步。某一步确实不该做，就用 update_plan 标 cancelled 并写明原因——不要在还有未完成步骤时静默收尾，也不要反问「要不要我继续」。`);
+            + `\n继续做下一步。某一步确实不该做，就用 update_plan 标 cancelled 并写明原因——不要在还有未完成步骤时静默收尾。`);
           continue;
         }
-        // 同上：继承来又没碰过的计划不该把一次干净的问答记成 partial（那会让下一步
-        // 建议冒出「继续没做完的步骤」，指向用户已经不要的事）。
-        if (_pendingPlan.length && _planActionable) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
+        // 同上：继承来又没碰过的计划不该把一次干净的问答记成 partial（那会让下一步建议
+        // 冒出「继续没做完的步骤」，指向用户已经不要的事）。
+        {
+          const _planLabel = _quietLabel("plan_steps_pending");
+          if (_planLabel) run._incompleteReason = run._incompleteReason || _planLabel;
+        }
         // 收尾诚实：最后一个动作轮有工具明确报失败（部署/命令/mcp/http 退出非零、被拒、冲突…），
         // 模型却安静收尾——「没启动也说启动了」的机器成因。只记账、不补回合（同上诸门哲学）；
         // 排在最后，更具体的原因靠 !run._incompleteReason 先占位；用 lastTurnHadFailure（只看最后
@@ -56308,8 +56898,35 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           if (it.rawResult?.evidence) message._ideMeta = it.rawResult.evidence;
           if (it._readGroup) _advanceReadBatchGroup(it._readGroup);
           toolMsgs[index] = message;
+          // **写入账本在这一刻就记，不等整批跑完。**
+          // 原来这笔账记在批次后那个大记账循环里，而它在「批次中途按停」那条 break 的
+          // 下面 466 行。于是 [edit_file A, run_cmd npm test] 这种一批（修改类是硬屏障、
+          // 串行）里，A 真落了盘、用户在 npm test 跑着时点停 —— A 在磁盘上，而账本空的。
+          // 后果不是少一条日志：run._breakWriteFact 因此为空，下一轮模型读到「本次运行还
+          // 没有任何文件落盘」，于是从头整份重写。判据在 write-ledger.js，和下面那处同源。
+          const _wl = _writeAttemptEntry({
+            type: it.call?.type, path: it.call?.path,
+            // 三个排除项写在 attempted 之前不是洁癖：logic.test.mjs 那条「每个读
+            // _toolExecutionAttempted 的地方都要排除 _notAttempted」的扫描器，切的是
+            // 「包住它的 if 到读取点为止」这一段。排在后面它就看不见。
+            eager: !!it._eagerEntry, skipped: !!it._skipped, notAttempted: !!it._notAttempted,
+            ok: _toolExecutionSucceeded(it.call, it.rawResult),
+            attempted: _toolExecutionAttempted(it.rawResult),
+          });
+          if (_wl) { (run._writeLedger = run._writeLedger || []).push(_wl); it._ledgerRecorded = true; }
         },
         _live,
+        // **每一个 tool_call 都必须拿到一条结果。**
+        // 上面那条 assistant 消息已经带着 tool_calls 进 messages 了；少一条结果，
+        // 这份转录就是不合法的，下一次请求会被上游拒。而在有这个兜底之前，
+        // execute 里一次没包住的抛出会直接炸出整个 for(iter) 循环 —— 本轮工具结果
+        // 一条都进不去，用户看到一句原生 JS 报错。
+        (it, index, error) => {
+          if (toolMsgs[index]) return;
+          const why = String(error?.message || error || "unknown").slice(0, 400);
+          toolMsgs[index] = { role: "tool", tool_call_id: it.tc.id, content: `[ERROR] 这个工具执行时抛出异常，未能完成：${why}` };
+          try { console.error("[agent] tool item threw:", it?.call?.type, error); } catch {}
+        },
       );
       // Fold investigation facts only after every item in this model response has
       // settled. Therefore read_file + edit_file in one response cannot borrow the
@@ -56332,13 +56949,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           if (items[j]._readGroup) _settleReadBatchGroup(items[j]._readGroup, t("tool.stopped"));
         }
         for (const m of toolMsgs) messages.push(m);
-        // 工具途中按停（最常见的那次，三个结算点全在批次之前）：漏掉 → 续跑时整份重写。
+        // 工具途中按停（最常见那次，三个结算点全在批次前）：漏掉 → 续跑时整份重写。
         try {
           const _eagerNote = await _settleEagerWritesForBreak(run);
           if (_eagerNote) run._breakWriteFact = _eagerNote;
-          for (const item of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) {
-            if (item?.ok && item.path) _mutatedFiles.add(_normRel(item.path, root));
+          // 同样只数本轮的（水位线 _ledgerAtTurnStart）：账本整 run 累积、从不清空，
+          // 整本遍历的话「之前写过东西」就足以让这条按停路白加一次 _implOps。
+          // 这一条随后就 break，伤害比 turn.error 那条小，但写法一并对齐，免得再漂回去。
+          let _landedHere = 0;
+          for (const item of (run._writeLedger || []).slice(_ledgerAtTurnStart)) {
+            if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landedHere++; }
           }
+          // 同族另一条 break（turn.error）也写了这三样，**只有最常见的这条曾经漏了**：
+          // 落了盘就得认，否则收尾按「本轮什么都没改」结算，未验证的改动被静默放行。
+          if (_landedHere) { didMutate = true; run._didMutate = true; _implOps++; }
         } catch {}
         break;
       }
@@ -56359,7 +56983,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           content: "[未执行] 这次调用没有被执行，没有产生任何结果，也没有改动任何东西。不要把它当成已完成——仍然需要的话，重新发起这次调用。" };
         _settleToolStep(items[j].step, { content: "[未执行]" }, "未执行");
       }
-      for (const m of capTurnToolResults(toolMsgs)) messages.push(m);
+      // 「换着工具找同一个不存在的东西」：结论接在**第二次失败那条工具结果本身**上，
+      // 而不是等 stuck 计数攒够再追一句提醒。工具自己把发生了什么讲清楚 —— 这是
+      // Claude Code 的形状，落点也比事后提醒早好几轮（原来要 stuckNudges>=2 才说）。
+      _annotateCrossToolMisses(run, items, toolMsgs, {
+        failed: (it, text) => !!_toolFailureMatch(text) || _toolExecutionSucceeded(it.call, it.rawResult) === false,
+        sig: _stableToolCallSignature,
+        resultSig: _resultFingerprint,
+      });
+      for (const m of capTurnToolResults(toolMsgs, undefined, _overflowSink)) messages.push(m);
       if (turn._invalidToolRepairInstruction && _live()) {
         _pushNudge("toolRepair", turn._invalidToolRepairInstruction + "\n现在基于上方真实工具结果继续执行，不要再重复同一个残缺工具调用。");
       }
@@ -56369,59 +57001,55 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // “还没看完就开始总结、看完又总结一遍”。判定只用结构事实（长度+段落数），
       // 不做语义猜测；update_plan/think/ask_user 随行文本是正常交付，不计。只附事实，
       // 判断权留给模型；每 run 最多提醒 2 次，不变成新的啰嗦源。
-      if (run.mode === "agent" && _live() && (run._midSummaryNudges || 0) < 2) {
-        const _evidenceCalls = turn.toolCalls.filter((tc) => !["update_plan", "think", "ask_user"].includes(tc.name)).length;
-        const _narr = String(turn.text || "").trim();
-        const _narrParas = _narr.split(/\n{2,}/).filter((p) => p.trim().length > 40).length;
-        if (_evidenceCalls > 0 && _narr.length >= 400 && _narrParas >= 2) {
-          run._midSummaryNudges = (run._midSummaryNudges || 0) + 1;
-          _pushNudge("midSummary", `[事实] 你在还有 ${_evidenceCalls} 个取证/施工工具要执行（调研未完成）时，已向用户输出了 ${_narr.length} 字的结论式长文。用户看到的效果是：没看完就开始下结论，看完后同一件事又总结一遍。接下来：证据没收齐前最多写一句过渡语（正在查什么/下一步）；完整分析只在全部看完后给一次，且不重复前面已说过的段落，只补新证据和最终判断。]`);
-        }
-      }
+      // midSummary 删了（2026-09-02）。
+      //
+      // 它自称 [事实]，但陈述的两个量——「你这轮调了 N 个取证工具」和「你写了 N 字长文」——
+      // 都是对**模型自己刚发出的那条消息**的重新描述，两者原样就在上下文里。这不是模型
+      // 算不出来的派生状态（对比 buildFix 的版本钉、researchFirst 的台账判据），
+      // 所以它不是事实类，是一条规则被伪装成了事实。
+      //
+      // 规则本身逐字在基础层：agent_core「facts already on screen do not need repeating」
+      // 「Progress updates state only the current finding and the next step.」
 
-      // If a guard/error fired, don't let the model "creatively" try a different
-      // forbidden path (the classic edit blocked → perl/sed → write_file loop).
-      // Feed one concrete recovery move back into the next turn, bounded so it
-      // corrects behavior without becoming another source of chatter.
-      if (run.mode === "agent" && recoveryNudges < 4 && _live()) {
-        const recovery = toolMsgs
-          // rawResult 必须一起传：只传文案的话这条路径依然在靠中文散文分流，
-          // capture_empty_background 那个误分支在这里会原样复活 —— agent 循环里的
-          // 纠偏提示恰恰是最需要给对的地方。
-          .map((m, idx) => items[idx]?._notAttempted
-            ? null
-            : _blockedToolRecoveryInstruction(m.content || "", items[idx]?.call || null, items[idx]?.rawResult || null))
-          .filter(Boolean)[0];
-        if (recovery && recovery.key !== run._lastRecoveryKey) {
-          run._lastRecoveryKey = recovery.key;
-          recoveryNudges++;
-          runHadTrouble = true;
-          _pushNudge("recovery", `工具刚被保护门/错误挡住了，别换旁门左道、别重复失败调用。下一步只按这条恢复动作执行：\n${recovery.text}`);
-        }
-      }
+      // 恢复动作的提醒**删掉了（2026-09-02）——它是同一段文字的第二次投递。**
+      //
+      // `_toolMsgForModel`（main.js:44498-44506）在生成那条失败工具结果时就已经调过
+      // `_blockedToolRecoveryInstruction`，把 `[RECOVERY:…]` 的正文拼在结果末尾了
+      // （守卫是 `!/\[RECOVERY:/i.test(message)`）。而这里做的事情是：从**已经含有它的**
+      // 那条正文里，把同一段话重新推导一遍，再作为一条独立的 harness 消息推第二遍。
+      // 模型同一段指令收两遍 —— 这正是「简单事情也长篇大论」的一份来源。
+      //
+      // 走向 Claude Code 的形状：循环里 harness 对模型说的话收敛到 0，指导要么在
+      // 系统提示词里（静态、可被上游缓存、说一次），要么以工具结果的形式随事实同行。
+      // 这一条属于后者，而且**已经在那儿了**，所以是纯删，不需要任何补偿。
+      // 判据可自查：grep `_blockedToolRecoveryInstruction`，写入侧只剩 44498 那一处。
 
-      // Design pipeline nudge: after design_board results, remind agent of next step
-      if (run.mode === "agent") {
-        const _allContent = toolMsgs.map(m => m.content || "").join("\n");
-        if (/用户选择了设计方向/.test(_allContent)) {
-          const boardStack = run.engineering?.fromZeroUiProject
-            ? "先确认用户未指定其他栈，再用 React + Tailwind CSS + shadcn/ui；采用 Tailwind v4 时使用 CSS-first 配置"
-            : "沿用已确认的项目框架、组件库、token/theme/style 和构建系统，不新增平行组件体系";
-          _pushNudge("design", `✅ 设计方向选完了。**现在开始写代码**：①按布局骨架→区块→交互→响应式实现 ②${boardStack}，把本轮 Michael Design 设计事实映射进去 ③遇到会实质改变方案的多种设计选择时用 **preview_choices** 让用户选 ④写完用 browser 验证`);
-        }
-      }
+      // design 提醒删了（2026-09-02）：三层意思分别在两个每次都在的载体里。
+      //
+      //   · ①③④「按布局骨架→区块→交互→响应式实现 / 多方案时用 preview_choices /
+      //     写完用 browser 验证」—— **designboard 工具自己的返回正文里逐条写着**
+      //     （main.js 的 `⚡ **下一步行动**：1…2…3…4…`）。这条提醒的触发条件正是匹配
+      //     那条返回里的「用户选择了设计方向」，也就是说它在复述刚读到的东西。
+      //   · ②「从零项目用 React+Tailwind+shadcn / 已有项目沿用现有栈」——
+      //     design_components.txt:3 说得**更完整**（还多了「用户指定的栈优先」
+      //     「绝不混入第二套组件库」）。
+      //
+      // 上一轮我拦下过这条，理由是 design_components 是按语义画像路由的**条件层**，
+      // 而画像的循环内补充会被 Object.assign 盖回发车快照、晚一个用户轮才生效 ——
+      // 刚选完设计方向的那一轮那层可能还没装上。**那个前提这一轮修掉了**
+      // （见上面 _thinkRebuilt 那段：画像不再参与思考配置重铺），所以现在可以删。
 
-      // 规划优先催单（不拦截）：大工程 run 的摸底轮结束后计划仍缺席，就把“先排计划”
-      // 顶到下一轮最高注意力位——弱模型爱用散文方案代替 update_plan（实测“三轨采用
-      // 方案”写了一屏字却不落计划），等到拦截门出手就又回到被拦后补半截计划的老路。
-      if (run.mode === "agent" && _live()
-        && _runRequiresPlan(run) && _planGateGrandProject(run)
-        && !(Array.isArray(run._planSteps) && run._planSteps.length)
-        && !items.some((it) => it.tc && it.tc.name === "update_plan")
-        && (run._planFirstNudges || 0) < 2) {
-        run._planFirstNudges = (run._planFirstNudges || 0) + 1;
-        _pushNudge("planFirst", "摸底已有结果，但任务计划还没落地。下一步**先调用 update_plan** 一次性排出完整、顺序正确、覆盖全部交付的计划，再开始写文件——方案写在正文里不算计划，只有 update_plan 才是计划。计划优先级高于一切实现动作。");
-      }
+      // planFirst 删了（2026-09-02）：三层意思分别落在两个每轮都在的静态载体上。
+      //   · 「计划在写第一个文件之前落地 / 方案写在正文里不算计划，只有 update_plan 才是」
+      //     → agent_core §3「A warranted plan lands before the first file you write; prose in
+      //       your reply is not a plan — only update_plan is.」（常驻层，每轮必装）
+      //   · 「摸底已有结果才排计划 / 计划要覆盖全部交付」
+      //     → update_plan 的工具描述：「Before you draft a plan you must already have looked at
+      //       the real workspace contents」「a complex write task covers … investigating and
+      //       understanding the current state, making the change, and real verification」
+      //       （工具描述随工具同行，每次都在）
+      // 两侧都在了，这条注入是第三遍。原注释记的病是「弱模型爱用散文方案代替 update_plan」，
+      // 而提示词那句「prose in your reply is not a plan」正是照着它写的。
 
       // 计划实时跟进强制器：模型列了计划却闷头干活几十个工具不更新状态（用户盯着 0/N
       // 干着急），这里按"执行了多少工具但计划状态签名没变"来催。签名 = 各步骤状态串联；
@@ -56436,11 +57064,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           } else {
             run._planSigStaleOps = (run._planSigStaleOps || 0) + items.length;
           }
-          if (run._planSigStaleOps >= 8 && (run._planStaleNudges || 0) < 4) {
-            run._planStaleNudges = (run._planStaleNudges || 0) + 1;
-            run._planSigStaleOps = 0;
-            _pushNudge("planStale", `[计划状态陈旧] 你已经连续执行了多个工具，但任务计划的步骤状态一直没动（用户盯着 ${_ps.filter((s) => s.status === "completed").length}/${_ps.length} 干着急）。立刻调用 update_plan 把真实进度同步上去：正在做的标 in_progress、真做完的标 completed、不做的标 cancelled——然后继续干活。计划是给用户看的实时仪表盘，不是开工仪式。`);
-          }
+                    // planStale 那条独立提醒已删：并进了每轮都在的〔执行状态〕块（_planStateLineText
+          // 里 `_planSigStaleOps >= 8` 那段），这里只留台账。**清零留给签名变化**，不再由
+          // 提醒消费掉：状态一直不动那行就一直在（正是用户抱怨的「进度条一直 0/N」），
+          // 模型一 update_plan 签名就变、自动清零。原来「全程最多 4 次」的上限随之作废。
         }
       }
 
@@ -56739,10 +57366,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // tool catalog at the context tail (recency) so advanced tools don't fade out of
       // attention (Lost-in-the-Middle). Bounded + only in agent mode; phrased so it
       // doesn't derail the current task.
-      if (run.mode === "agent" && iter > 0 && (iter + 1) % 12 === 0 && toolReminders < 5 && _live()) {
-        toolReminders++;
-        _pushNudge("toolReminder", _toolReminderBlock());
-      }
+            // Tool-RAG (B) 的「防遗忘刷新」整条撤掉了：它推的是一段 367 字符的**纯静态指令**
+      // （零运行时事实），一个 run 里最多重复五次、每次全价。同一句话已经写进 agent_core §4
+      // ——那是走缓存的静态前缀，每一轮都在，成本约十分之一。
 
       // Track this turn for the finish/verify gates above.
       for (const it of items) {
@@ -56803,10 +57429,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 这本账的两个读者都会被带偏：每轮喂给模型的「本轮交付事实」会多出一条不存在的
         // 失败写入，收尾的 writes_failed 计数也跟着虚高。
         // （第一版修复只补了上面工具台账那一处，这一处隔了三行，漏了。）
-        if (!it._eagerEntry && !it._skipped && !it._notAttempted
-          && (t === "write" || t === "edit" || t === "multiedit")
-          && it.call.path && _toolExecutionAttempted(it.rawResult)) {
-          (run._writeLedger = run._writeLedger || []).push({ path: it.call.path, ok: _ok });
+        // 每一项结算时已经记过了（见调度器回调里那段）。这里只兜住走不到那条路的项 ——
+        // 记两笔会把 writes_failed 的计数吹大一倍，正是上面那段注释说的老账。
+        if (!it._ledgerRecorded) {
+          const _wl2 = _writeAttemptEntry({
+            type: t, path: it.call.path, ok: _ok,
+            eager: !!it._eagerEntry, skipped: !!it._skipped, notAttempted: !!it._notAttempted,
+            attempted: _toolExecutionAttempted(it.rawResult),
+          });
+          if (_wl2) { (run._writeLedger = run._writeLedger || []).push(_wl2); it._ledgerRecorded = true; }
         }
         const _workspaceMutated = _ok && (it._wikiMutated || _toolMutatesWorkspace(it.call, it.rawResult));
         if (_ok) {
@@ -56819,14 +57450,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           }
           if (it.tc.name !== "update_plan" && (it._planAdvanced || _advancePlanFromTool(run, it.call, it.rawResult))) planSteps = run._planSteps;
           for (const kind of _runtimeEvidenceKinds(it.call, it.rawResult)) {
-            _runtimeEffects.add(kind);
+            _runtimeEffects.add(kind); _progress.noteRuntimeKind(kind);   // 后者只添不删
             // Runtime kinds satisfy requested side-effect obligations. Verification
             // credit is granted separately from the structured evidence record below.
             if (kind === "test" || kind === "build" || kind === "run") {
               didVerify = true;
             }
           }
-          for (const kind of _externalEvidenceKinds(it.call, it.rawResult)) _externalEffects.add(kind);
+          for (const kind of _externalEvidenceKinds(it.call, it.rawResult)) { _externalEffects.add(kind); _progress.noteExternalKind(kind); }
         }
         if (_workspaceMutated) {
           // Clear browser operation dedup ledger on mutation so post-mutation checks are legitimate
@@ -56845,6 +57476,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             || /(^|\/)(license|notice|changelog|authors|contributing|code_of_conduct)(\.[a-z]+)?$/i.test(mutationPath);
           if (!_docOnlyMutation && !it._implCounted) {
             _implOps++;
+            // 命令类的"改了工作区"可能只来自模型自填的 purpose，空转账本按执行事实再核一道。
+            _progress.noteImplOp({ cmdLike: it.call.type === "cmd" || it.call.type === "termtask", fsDelta: it.rawResult?._fsDelta });
             // Verification credit expires with the artifact it certified — the same rule
             // already applied to _uiVerifiedAtImplOps below. Leaving it sticky was the outlier.
             // `didVerify` is deliberately NOT cleared: it means "a check was attempted this run",
@@ -56958,28 +57591,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         }
         // (removed) merely CALLING get_diagnostics no longer counts as "verified" — only the finish-gate's
         // real check (which counts actual error markers) sets didVerify. A tool call ≠ a passing result.
-        if (t === "read" || t === "list" || t === "search" || t === "find" || t === "lsp") didInvestigate = true;
-        // 有日志/报错就逼它照真实输出诊断——命令跑失败 → 硬把它拽回"照真实报错定位根因、直接改对应
-        // 文件:行"，而不是凭记忆瞎推断、绕远改别处（治"10分钟的事绕40分钟还烧token"）。报错已在上一条
-        // 工具结果里，这里只补一句硬指令，不重复贴。
-        // 判据同 _toolExecutionSucceeded：**执行事实优先**。
-        // 原来只看正文匹配，于是 exit 0 但输出里有 [ERROR]（或某条通过的测试打印了
-        // TypeError）也会被告知「上一条命令报错了」—— 和那条主 bug 是同一个病根，
-        // 只修主处会剩这一半继续误导模型。
-        if ((t === "cmd" || t === "termtask" || t === "termread") && it.rawResult
-            && !_toolExecutionSucceeded(it.call, it.rawResult)
-            && (_toolFailureMatch(it.rawResult.content || "") || /error TS\d|SyntaxError|TypeError|ReferenceError|Traceback|ModuleNotFound|ImportError|\bpanic|Exception|command not found|cannot find|No such file|编译失败|运行时错误|EADDRINUSE|ECONNREFUSED|\brefused\b|exit(ed)? (code|status)?\s*[1-9]/i.test(String(it.rawResult.content || "")))) {
-          const evidence = it.rawResult.commandFailure;
-          const paths = evidence?.paths?.length ? evidence.paths.join("、") : "";
-          _pushNudge("cmdFail", paths
-            ? `〔命令没跑通·先取证再修〕上一条命令报错了。先 read_file/read_logs 复核这些真实证据：${paths}。这些是失败后的当前磁盘/日志复核，允许重新读取，不要被“别重读”挡住。读完按真实内容定位根因、改对应文件，再重跑同一验证命令；不要原样连续重跑确定性错误。`
-            : /command not found|no such file or directory|: not found/i.test(String(it.rawResult.content || "").slice(0, 400))
-            // 命令在这台机器上不存在——报错里没有任何 file:line。让它「照报错定位根因」只会去
-            // 自己刚改的文件里瞎找，或原样重跑同一条不存在的命令。用户现场撞过：`vhs demo.tape`
-            // 连着两次退出 127（没装 vhs）。agent_engineering.txt:32：跑不起来的验证器什么都没断言。
-            ? "〔这条命令这台机器上没有·不是代码的问题〕上一条命令没能启动（找不到可执行文件）。**不要**去改代码找根因——它一行都没被执行过。换一条这个项目真能跑的（项目自带的 venv/scripts、python -m compileall、node --check、或直接跑入口），或者先把这个工具装上再跑。装不了就如实说这一项没验证成、以及因此哪些判断先留着。"
-            : "〔命令没跑通·走实际的〕上一条命令报错了。**照它刚输出的那段真实报错定位根因、直接改对应的文件:行**——别凭记忆猜、别绕去改无关的地方。报错里提到的日志文件 / 路径，直接 read_logs(path=...) 看尾部；服务类的用 read_logs/read_terminal 看运行日志。改完再把它跑一遍，确认真通了才算。");
-        }
+        // cmdFail 删了（2026-09-02）：它是**同一句话的第二次投递**。
+        //
+        // `paths` 取自 `it.rawResult.commandFailure` —— 正是用来生成那条 `[失败诊断]` note
+        // 的同一个对象，而那条 note 在 run_cmd 失败时就已经拼进工具结果正文了
+        // （main.js 的 `if (result.code !== 0) { … _content += note }`）。note 原文：
+        //   「[失败诊断] 相关证据：文件 X、日志 Y。下一步先 read_file 这些路径复核当前磁盘
+        //     内容；这类失败复核读取不会被"别重读"挡住。」
+        // 和这条提醒逐句对应，连「别重读」那个特批都重复。另一支（无 paths 时）说的
+        //   「不要只看 exit code；按上面真实输出和日志定位根因，修完再重跑验证」
+        // 也逐字在 note 的兜底分支里。
+        //
+        // 上面那句老注释「报错已在上一条工具结果里，这里只补一句硬指令，不重复贴」
+        // 曾经成立 —— 但那句硬指令后来也进了 note，于是这里变成了纯重复。
+        // 向 Claude Code 的形状收敛：事实随工具结果同行，说一次。
         // Investigation vs implementation accounting (for the "research forever, never
         // build" loop breaker below).
         if (!it._skipped && _ok && (t === "read" || t === "list" || t === "search" || t === "find" || t === "lsp"
@@ -57091,13 +57716,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // Investigate-before-edit: edited existing code without reading/searching anything
       // first → likely a blind edit. Nudge once to ground it in the real code (the
       // exact-match on edit_file already catches many blind edits, this catches the rest).
-      if (didEdit && !didInvestigate && !investigateNudged && _live()) {
-        investigateNudged = true;
-        _pushNudge("investigate", "你还没用 read_file / search 摸过相关代码就动手改了——先确认你**真读懂了改的那段及其上下文 / 调用方**，别凭猜改。必要时 read_file 读全、search 找用法，再继续。");
-      }
+            // investigate-nudge 已删：规则搬进 edit_file / multi_edit 的**工具描述**（静态、走缓存、
+      // 每一轮都在），而不是事后追一句。这正是 Claude Code 放这条规则的地方。
+      // 对不上的 old_string 本来就报错，那是比提醒更硬的判据。
       // Per-file blind-edit check: if this turn edited files that were NEVER read in
       // this run, it's likely a blind edit based on guessed content. Nudge up to 2×.
-      if (blindEditNudges < 2 && _live()) {
+      if (_live()) {   // 每轮都记：blindEditNudges 计数器随 nudge 一起删了（它现在恒为 0，比较恒真）
         const _blind = [];
         for (const it of items) {
           // write 覆写已有文件也算盲改，而且后果更重：edit 至少要求 old_string 对得上，
@@ -57112,14 +57736,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           if (/\[(ERROR|BLOCKED|DENIED)\]/.test((it.rawResult && it.rawResult.content) || "")) continue;
           if (!_runHasRead(run, root, it.call.path)) _blind.push(it.call.path);
         }
-        if (_blind.length) {
-          blindEditNudges++;
-          const _hadOverwrite = items.some((x) => x?.call?.type === "write" && x?.rawResult?.overwroteExisting && _blind.includes(x.call.path));
-          _pushNudge("blindEdit", `你改了 ${_blind.join("、")} 但**这个 run 里从没 read_file 读过它**。`
-            + (_hadOverwrite
-              ? "其中有整文件覆写：write_file 不校验任何东西，你没读过的部分已经直接消失了——现在就 read_file 看一眼实际结果，确认没有把别人的代码盖掉。"
-              : "old_string 很可能和文件实际内容不匹配。先 read_file 读一遍原文、确认实际内容，再重新 edit。"));
-        }
+                // blindEdit-nudge 已删，拆成两半各归其位：
+        //   · 规则 → edit_file / write_file 的工具描述（静态，每轮都在）。
+        //   · 拦截 → _blindOverwritePrecheck，判据同步放宽成「没读过就不许覆写已有文件」，
+        //     不再只拦缩水的那一种。它在落盘**之前**返回 [BLOCKED] 并把当前全文带回去，
+        //     比事后推一句「你可能盖掉了别人的代码」强一个量级。
+        // 只保留下面这本 _blindOverwrites 账（结束时的交付事实要用）。
       }
 
       // ── 写入质量事实：算完当场说，不等收尾 ──────────────────────────────────
@@ -57244,8 +57866,29 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             _wfLines.push(`${hit.src} 有专门的测试文件 ${hit.rel}，写着它的预期契约——本 run 没读过它，也没有任何验证跑过`);
           }
         } catch {}
+        // **不再自己推一条消息，追加到本轮那条 [本轮交付事实] 上。**
+        //
+        // 这些行是纯事实（对真实落盘内容的 LSP 只读查询 + 文件扫描），别处拿不到，不能删；
+        // 但它没有理由单独占一条 harness 消息 —— 交付事实块每轮无条件推一次、推之前把上一份
+        // splice 掉（自替换、不累积），正是这类事实该待的地方。合进去之后同样的信息、
+        // 上下文里少一条消息，还顺带拿到"不累积"这个性质（原来走 _pushNudge，受同轮淘汰管，
+        // 长 run 里可能被别的提醒挤掉）。
+        //
+        // **必须追加到已推的那条，不能存到 run 上等下一轮**：交付事实块在本函数更早处
+        // （_DELIVERY_FACTS_TAG 那处）就推掉了，而这些行到这里才算出来 —— 存起来等于
+        // 事实晚一整轮到，模型会拿着上一轮的写入质量去判断这一轮。
         if (_wfLines.length) {
-          _pushNudge("writeFacts", `[写入质量事实]（对本轮真实落盘内容的扫描与只读查询，不是推断）\n- ${_wfLines.slice(0, 8).join("\n- ")}`);
+          const _wq = `\n[写入质量事实]（对本轮真实落盘内容的扫描与只读查询，不是推断）\n- ${_wfLines.slice(0, 8).join("\n- ")}`;
+          let _appended = false;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const m = messages[i];
+            if (m && m.role === "user" && typeof m.content === "string" && m.content.includes(_DELIVERY_FACTS_TAG)) {
+              m.content += _wq; _appended = true; break;
+            }
+          }
+          // 那条交付事实是有条件推的（_facts 和 _openLine 都空时不推）。没找到就自己推一条，
+          // 免得这些事实凭空消失 —— 宁可多一条消息，不可丢事实。
+          if (!_appended) messages.push({ role: "user", content: _ORCH_NOTE + _DELIVERY_FACTS_TAG + _wq });
         }
       }
 
@@ -57302,13 +57945,29 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             run._browserVerifyPromptedUrls.add(_bvUrl);
             run._browserVerifyCandidate = { action: "navigate", url: _bvUrl };
             _bvSpokeThisBatch = true;
-            _pushNudge("browserVerify",
-              `[前端改了没看] 刚改了 ${[...new Set(_bvUi)].slice(0, 4).join("、")}`
-              + `${_bvUi.length > 4 ? ` 等 ${_bvUi.length} 个前端文件` : ""}，`
-              + `而 dev server 正在运行：${_bvUrl}（终端「${_bvTermLabel}」的真实输出）。`
-              + `**当前这个版本还没有任何浏览器侧验证证据**。`
-              + `已预填浏览器验证候选——现在调 browser（参数留空即可，留空时执行预填的这一条：navigate 打开 ${_bvUrl}）。`
-              + `这一步只完成「打开页面」；打开后第二步自己再调 browser action:"check" 读控制台错误/接口失败——JS 报错和挂掉的接口在截图上看不出来。`);
+            // 和 verifyNow / uiLook 同一套：**追加到本轮那条 [本轮交付事实] 上**。
+            //
+            // 这里全是执行事实：改了哪些前端文件（本批工具调用）、dev server 真的在跑且地址是
+            // 什么（终端的真实输出）、这一版有没有浏览器侧证据（版本钉）。上面那句
+            // `run._browserVerifyCandidate = …` 是**机制**不是文本（参数留空即执行这一条），
+            // 原样留着 —— 开不开浏览器仍完全是模型的决定。
+            // 必须追加到本轮已推的那条：交付事实块在更早处就推掉了。
+            {
+              const _bf = `\n[前端改了没看] 刚改了 ${[...new Set(_bvUi)].slice(0, 4).join("、")}`
+                + `${_bvUi.length > 4 ? ` 等 ${_bvUi.length} 个前端文件` : ""}，`
+                + `而 dev server 正在运行：${_bvUrl}（终端「${_bvTermLabel}」的真实输出）。`
+                + `当前这个版本还没有任何浏览器侧验证证据。`
+                + `已预填浏览器验证候选——现在调 browser（参数留空即可，留空时执行预填的这一条：navigate 打开 ${_bvUrl}）。`
+                + `这一步只完成「打开页面」；打开后第二步自己再调 browser action:"check" 读控制台错误/接口失败 —— JS 报错和挂掉的接口在截图上是看不见的。`;
+              let _bap = false;
+              for (let i4 = messages.length - 1; i4 >= 0; i4--) {
+                const m4 = messages[i4];
+                if (m4 && m4.role === "user" && typeof m4.content === "string" && m4.content.includes(_DELIVERY_FACTS_TAG)) {
+                  m4.content += _bf; _bap = true; break;
+                }
+              }
+              if (!_bap) messages.push({ role: "user", content: _ORCH_NOTE + _DELIVERY_FACTS_TAG + _bf });
+            }
           }
         }
       }
@@ -57350,18 +58009,38 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           // 发不发这条 run_cmd 仍完全是模型/用户的决定，那条禁令测试继续成立。
           if (_cmd) run._verifyCandidate = { command: _cmd, cwd: root };
 
-          _pushNudge("verifyNow",
-            `[未验证] 刚改了 ${[...new Set(_justChanged)].slice(0, 4).join("、")}`
-            + `${_justChanged.length > 4 ? ` 等 ${_justChanged.length} 个文件` : ""}，`
-            + `**当前这个版本还没有任何验证证据**。`
-            + (_cmd
-              ? `这个项目的验证命令是 \`${_cmd}\`，已预填为 run_cmd 候选——现在跑它（run_cmd，purpose="verify"；command 原样带上这条，或干脆留空，留空时会执行预填的这一条），拿到退出码再往下走。`
-              : `跑一遍这个项目自己的编译/类型检查/测试；没有现成命令就用最直接的那条（能跑起来入口、或 tsc --noEmit 之类）。`)
-            + (run._uncheckedLangs && run._uncheckedLangs.size
-              ? `本 run 改过的 ${[...run._uncheckedLangs].join("/")} 文件没有任何语言检查器在看（对应语言服务器没在运行），这条命令是那些改动**唯一**的正确性检查。`
-              : "")
-            + `不跑就交付，等于把没编译过的代码交给用户。`
-            + `IDE 只会在你被提醒过、又落出新的一版却仍然不跑时兜底——每版最多一次、全程最多 3 次，那是兜底，不是你的默认路径。`);
+          // **不再单独推一条，追加到本轮那条 [本轮交付事实] 上**（和 writeFacts 同一套做法）。
+          //
+          // 「刚改了哪些文件、这一版没有验证证据」交付事实块本来就在说（它按 mutated/verifiers
+          // 记账，正文里也写着「说了『验证过』而这里写着没跑过验证，就改口」）。这条注入独有的
+          // 只有两半：**这个项目的验证命令**（由真实栈探测算出）和**哪些语言没有检查器在看**
+          // （LSP 运行状态）—— 都是 harness 算出来、模型自己拿不到的执行事实，所以不能删，
+          // 只能换个更结实的通道。
+          //
+          // 上面那句 `run._verifyCandidate = …` 是**机制**不是文本（空参数调 run_cmd 即执行这一条），
+          // 原样留着 —— 发不发这条命令仍完全是模型/用户的决定。
+          //
+          // 必须追加到**本轮已推的那条**：交付事实块在更早处就推掉了，存起来等下一轮
+          // 等于事实晚一整轮到。
+          {
+            const _vf = `\n[未验证] 刚改了 ${[...new Set(_justChanged)].slice(0, 4).join("、")}`
+              + `${_justChanged.length > 4 ? ` 等 ${_justChanged.length} 个文件` : ""}，当前这个版本还没有任何验证证据。`
+              + (_cmd
+                ? `这个项目的验证命令是 \`${_cmd}\`，已预填为 run_cmd 候选——现在跑它（run_cmd，purpose="verify"；command 原样带上这条，或干脆留空由 IDE 代填）。`
+                : `跑一遍这个项目自己的编译/类型检查/测试；没有现成命令就用最直接的那条（能跑起来入口、或 tsc --noEmit 之类）。`)
+              + (run._uncheckedLangs && run._uncheckedLangs.size
+                ? `本 run 改过的 ${[...run._uncheckedLangs].join("/")} 文件没有任何语言检查器在看（对应语言服务器没在运行），这条命令是那些改动**唯一**的检查。`
+                : "")
+              + `不跑就交付，等于把没编译过的代码交给用户。`;
+            let _ap = false;
+            for (let i2 = messages.length - 1; i2 >= 0; i2--) {
+              const m2 = messages[i2];
+              if (m2 && m2.role === "user" && typeof m2.content === "string" && m2.content.includes(_DELIVERY_FACTS_TAG)) {
+                m2.content += _vf; _ap = true; break;
+              }
+            }
+            if (!_ap) messages.push({ role: "user", content: _ORCH_NOTE + _DELIVERY_FACTS_TAG + _vf });
+          }
         }
       }
 
@@ -57463,12 +58142,28 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         if (_uiChanged.length) {
           uiVerifyNudges++;
           _lastUiNudgeAtImplOps = _implOps;
-          _pushNudge("uiLook",
-            `[没看过] 刚改了界面文件 ${[...new Set(_uiChanged)].slice(0, 4).join("、")}`
-            + `${_uiChanged.length > 4 ? ` 等 ${_uiChanged.length} 个` : ""}，`
-            + `**当前这个版本还没有人在浏览器里看过一眼**。构建通过不等于好看，更不等于能用。`
-            + `起真实 dev server 之后按这个顺序走一遍（记账只认 action:"viewport" 那两次精确调用）：`
-            + `viewport(1440,900) → check → 关键交互 → assert，再 viewport(390,844,mobile:true) → check → 交互 → assert。`);
+          // 和 verifyNow 同一套：**追加到本轮那条 [本轮交付事实] 上**，不再单独占一条消息。
+          //
+          // 「刚改了哪些界面文件、这一版没人在浏览器里看过」是纯执行事实（改动清单来自本批
+          // 工具调用、看没看过来自 _uiVerifiedAtImplOps 的版本钉），交付事实块正是这类事实
+          // 该待的地方；而且那块每轮自替换、不参与同轮淘汰，比走 _pushNudge 更不容易丢。
+          // 必须追加到**本轮已推的那条**：交付事实块在更早处就推掉了，存起来等下一轮
+          // 等于模型拿上一轮的界面改动判这一轮。
+          {
+            const _uf = `\n[没看过] 刚改了界面文件 ${[...new Set(_uiChanged)].slice(0, 4).join("、")}`
+              + `${_uiChanged.length > 4 ? ` 等 ${_uiChanged.length} 个` : ""}，`
+              + `当前这个版本还没有人在浏览器里看过一眼。构建通过不等于好看，更不等于能用。`
+              + `起真实 dev server 之后按这个顺序走一遍（记账只认 action:"viewport" 那两次精确调用）：`
+              + `viewport(1440,900) → check → 关键交互 → assert，再 viewport(390,844,mobile:true) → check → 交互 → assert。`;
+            let _uap = false;
+            for (let i3 = messages.length - 1; i3 >= 0; i3--) {
+              const m3 = messages[i3];
+              if (m3 && m3.role === "user" && typeof m3.content === "string" && m3.content.includes(_DELIVERY_FACTS_TAG)) {
+                m3.content += _uf; _uap = true; break;
+              }
+            }
+            if (!_uap) messages.push({ role: "user", content: _ORCH_NOTE + _DELIVERY_FACTS_TAG + _uf });
+          }
         }
       }
 
@@ -57498,14 +58193,26 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           .filter((path) => _UI_SOURCE_EXT.test(path));
         if (_pageWrites.length) {
           run._websiteContentStopUsed = true;
-          _pushNudge("websiteContent",
-            `[内容无据] 刚写了 ${[...new Set(_pageWrites)].slice(0, 3).join("、")}`
+          // 并进 [本轮交付事实]（同 verifyNow / uiLook / browserVerify）。
+          // 「刚写了哪些页面文件」「取证台账是空的」都是纯执行事实，而交付事实块每轮
+          // 自替换、不参与同轮淘汰，比走 _pushNudge 更不容易被别的提醒挤掉。
+            {
+              const _wcf = "\n" + (`[内容无据] 刚写了 ${[...new Set(_pageWrites)].slice(0, 3).join("、")}`
             + `${_pageWrites.length > 3 ? ` 等 ${_pageWrites.length} 个` : ""}，`
             + `但**这个 run 到现在一条真实产品事实都没取到过**——页面上的文案现在全是编的。`
             + `按取证律取一条真的：先 read_file 工作区的 README/产品文档/既有文案；`
             + `品牌官网已知就 web_fetch 读正文；代码里已有功能就 generate_wiki 提取。`
             + `（搜索标题和竞品措辞不算证据。）确实没有可验证的产品事实，就先写 PRODUCT_BRIEF.md`
             + `讲清"原创内容/假设/待确认"，再按这些边界写文案——别把通用 AI 口号当成产品事实。`);
+              let _ap2 = false;
+              for (let ix = messages.length - 1; ix >= 0; ix--) {
+                const mx = messages[ix];
+                if (mx && mx.role === "user" && typeof mx.content === "string" && mx.content.includes(_DELIVERY_FACTS_TAG)) {
+                  mx.content += _wcf; _ap2 = true; break;
+                }
+              }
+              if (!_ap2) messages.push({ role: "user", content: _ORCH_NOTE + _DELIVERY_FACTS_TAG + _wcf });
+            }
         }
       }
       // 同一形状的第二处：用户自己打出来的参考站 URL。referenceWebsiteUrls 是用户原话里的
@@ -57525,11 +58232,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             .filter((it) => _UI_SOURCE_EXT.test(String(it.call.path)));
           if (_uiWrites.length) {
             run._referenceSiteStopUsed = true;
-            _pushNudge("referenceSite",
-              `[参考站没读] 你已经在写界面了，但用户给的这几个参考站**一个都还没真读过**：`
+            // 同上并进 [本轮交付事实]。「用户给了这几个参考站、一个都还没真读过」
+          // 是台账事实（读没读由取证账本判），不是劝诫。
+            {
+              const _rsf = "\n" + (`[参考站没读] 你已经在写界面了，但用户给的这几个参考站**一个都还没真读过**：`
               + `${_unread.slice(0, 4).join("、")}${_unread.length > 4 ? ` 等 ${_unread.length} 个` : ""}。`
               + `那些 URL 不是装饰性链接。先对每个调用 web_fetch 或 learn_design 读正文，`
               + `把色板/字阶/密度、内容与信息架构、响应式与动效节奏记进 reference/，再往下写。`);
+              let _ap2 = false;
+              for (let ix = messages.length - 1; ix >= 0; ix--) {
+                const mx = messages[ix];
+                if (mx && mx.role === "user" && typeof mx.content === "string" && mx.content.includes(_DELIVERY_FACTS_TAG)) {
+                  mx.content += _rsf; _ap2 = true; break;
+                }
+              }
+              if (!_ap2) messages.push({ role: "user", content: _ORCH_NOTE + _DELIVERY_FACTS_TAG + _rsf });
+            }
           }
         }
       }
@@ -57542,12 +58260,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // `_requiredEffectContract` 挑"该看哪个计数"——那是分类器的预测，正是本次重构在拆的
       // 那一层。真正的死循环是"读一堆、零产出"，和分类器猜的任务类型无关；改用"任一产出
       // 为零"更保守：跑了命令但没写文件的 run 不会再被误催。每个 run 顶 2 次。
-      const _anyProgressOps = _implOps + _runtimeEffects.size + _externalEffects.size;
-      if (run.mode === "agent" && _live() && _anyProgressOps === 0 && _novelEvidenceCount >= 6 && _implNudges < 2) {
-        _implNudges++;
-        runHadTrouble = true;
-        _pushNudge("implLoop", `⚠️ 你已经取得 ${_novelEvidenceCount} 份新的读取/搜索证据，**仍没有实际改动**。调查是手段，不是产出；如果这是修复/实现任务，现在基于已掌握内容直接 write_file / edit_file，别继续追加相似搜索。只有纯查询/解释任务才应直接给结论收尾。`);
-      }
+      // implLoop 删了（2026-09-02）：它说的规则**逐字在基础层提示词里** ——
+      // agent_core §2「Never pass analysis off as implementation, and never wrap up
+      // before delivering.」（agent 的 base 组每轮必装，不是条件层）。
+      // 它唯一多出来的是「你已经取得 N 份证据」这个数，而模型自己上一批工具调用就摆在
+      // 它的上下文里，是冗余复述；去掉那个 N，剩下每个字都是普适规则。
+      //
+      // 向 Claude Code 的形状收敛：规则说一次（静态提示词、可被上游缓存），
+      // 不在每轮往上下文里再催一遍 —— 同一条规则收两遍（一遍静态、一遍伪装成紧急消息）
+      // 正是「简单事情也长篇大论」的机制。
       // 走偏检查：在**还来得及改**的时候问一次方向，而不是等收尾。
       //
       // 「你真正想做的是另一件事」这个判断此前只在模型已决定收尾、且这轮改过源码时跑一次。
@@ -57594,34 +58315,36 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         }
       }
       // 空转断路器：连续 _IDLE_ITER_LIMIT 轮既无产出也无新证据 → 如实收尾，别再烧下去。
-      // 只在 agent 模式生效；对话/规划这些本来就不产出的模式不适用。
+      //
+      // **模式门 2026-09-02 拆了。** 原来只在 agent 模式计数，理由写的是「对话/规划这些
+      // 本来就不产出的模式不适用」—— 那句话对 implOps 成立，对这道闸**实际用的度量**不成立：
+      // `_progress.total(n)` = implOps + runtimeKinds + externalKinds + novelEvidenceCount，
+      // 而 novelEvidenceCount 恰恰是规划模式唯一的产出（每读到/搜到一份新东西就 +1）。
+      // 一个真在取证的 plan run 每轮都会把它顶上去，结构上不可能被这道闸误杀；把 plan
+      // 排除在外等于白白放弃保护。
+      //
+      // 而代价是实拍的：plan 模式下 _idleIters 恒为 0 → 这条 break 恒不成立，而它是循环里
+      // **唯一一条 harness 主动叫停的路**（另外七条 break 要么是用户按停、要么是模型自己
+      // 不再调工具）。默认没设 token 预算时，plan 模式重复读同一批文件可以一直转下去，
+      // 每转一圈一次完整的付费调用，只能等用户自己按停止。
+      // （chat 不进这个循环；explorer/reviewer 在 _normalizeAiMode 里已折回 agent。）
       {
-        const _progressNow = _anyProgressOps + _novelEvidenceCount;
+        const _progressNow = _progress.total(_novelEvidenceCount);
         if (_progressNow > _idleProgressMark) { _idleProgressMark = _progressNow; _idleIters = 0; }
-        else if (run.mode === "agent") _idleIters++;
+        else _idleIters++;
         if (_idleIters >= _IDLE_ITER_LIMIT && _live()) {
           run._incompleteReason = "no_progress";
           runHadTrouble = true;
           break;
         }
       }
-      if (_mutatedFiles.size >= 3 && !planSteps && !planNudged && _live()) {
-        planNudged = true;
-        _pushNudge("planNudge", "这已经动了好几个文件、还在扩大——先停一下整合剩余工作：直接列清还要改哪些、要验证哪些，然后继续用 edit/write/run 收敛，别散着改、改漏了。");
-      }
-      // Pre-Act: on long runs with an existing plan, nudge incremental plan refresh
-      // every ~8 iterations so the model re-evaluates remaining steps vs. what it
-      // learned. Research shows +102% action recall vs. single-step thinking.
-      if (planSteps && iter > 0 && iter % 8 === 0 && iter <= 40 && _live()) {
-        const pending = Array.isArray(planSteps) ? planSteps.filter(s => s.status === "pending" || s.status === "in_progress") : [];
-        if (pending.length) {
-          // 原文的后半句是"不用为了形式更新计划，直接继续完成剩余改动和验证"——它在**劝退**：
-          // 一边每 8 轮提醒回顾计划，一边告诉模型别管计划。用户看到的就是"计划列得挺准，
-          // 但它不照着走，进度条一直是 0/N"。删掉那半句；剩下的话只报事实：还剩哪几步。
-          // 催同步进度已经有 planStale 那条按证据触发的提醒，这里不重复说。
-          _pushNudge("planRefresh", `你已经执行了 ${iter} 步，计划里还剩 ${pending.length} 步没做完：${pending.slice(0, 5).map((s) => s.content).join("、")}。对着真实证据看一眼：哪几步其实已经做到了（去 update_plan 标 completed）、哪几步查清之后不该做了（标 cancelled 并写明原因）、下一步该做哪个。`);
-        }
-      }
+            // planNudge 那条「动了好几个文件还在扩大，先停下整合」已删，两半各归其位：
+      //   · 事实（本次运行已落盘哪些文件）——〔执行状态〕块每轮都在带。
+      //   · 义务（改动铺开到三个以上文件就该先落一个计划）——写进了 update_plan 的工具描述，
+      //     静态、走缓存、每一轮都在，这正是 Claude Code 放这类纪律的地方。
+      // Pre-Act 那道「每 8 轮回顾一次计划」的注入整条撤掉了（原理由：+102% action recall）。
+      // 它说的事——还剩哪几步没做——现在由〔执行状态〕块每一轮原样带着（_planStateLineText
+      // 的 ahead 段）。每轮都在，比每八轮一条更强，而且不多占消息。
 
       // Churn breaker：拦的是**盲改**，不是「改得多」。
       //
@@ -57661,38 +58384,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // readable prefix + a hash of the FULL arg string so distinct calls stay distinct.
         const _tmsg = (toolMsgs[i] && toolMsgs[i].content) || "";
         const callSig = _stableToolCallSignature(c);
-        // 死循环判据拆成**两个**签名，不再把结果文本揉进同一个 key。
-        //
-        // 原来是 `callSig@resultFingerprint`：调用和结果拼在一起当唯一键。问题是 harness
-        // 自己会往结果里追加**易变的事实**——响应头里的日期、慢安装命令的 `(93s)` 耗时、
-        // 重试上下文的 [RETRY_CONTEXT] 前缀、[IDE刷新] 标记。同一个调用因此被拆成 N 个
-        // 互不相同的签名，重复计数永远凑不满。http_request 尤其明显：Rust 侧的响应头是
-        // HashMap，每次迭代顺序都可能不同，于是**即使打同一个静态接口**指纹也对不上。
-        //
-        // 拆开之后语义才对：
-        //   · callSig 相同 **且** resultSig 相同 → 真死循环（同样的调用拿到同样的结果）
-        //   · callSig 相同 **但** resultSig 变了 → 有进展（比如轮询构建日志），不算空转
-        // 不能只留 callSig：那样 `read_terminal` 这类正当轮询会被判成死循环。
-        const resultSig = _resultFingerprint(_tmsg);
+        // 「调用相同 **且** 结果也相同」才算原地打转——只看调用会把正当轮询（构建跑着的时候
+        // 反复 read_terminal）判成死循环，只看结果则什么都不是。这条判据现在住在
+        // src/agent/spin-target.js 的 repeatNote 里，结论直接挂到那条重复调用自己的结果上；
+        // 这里的窗口只留「失败率」这一个跨调用聚合（没有任何单条工具结果能看见它）。
         const sig = callSig;
-        // http 的非 2xx 原来根本不算失败——`_toolFailureMatch` 扫的是文本，而 http 结果
-        // 是格式化好的响应体，500 也读不出"失败"两个字。用执行侧已经算好的结论。
         const failed = !!_toolFailureMatch(_tmsg) || _toolExecutionSucceeded(items[i]?.call, items[i]?.rawResult) === false;
         // A deduped re-read ("别重读" / "死循环") = the model tried to re-read an unchanged file it
         // already has. Two of those = spinning, a stuck signal on par with repeated failures.
         const dupRead = /\[别重读\]|\[停止·你在死循环\]/.test(_tmsg) && !/命令失败后的当前磁盘版本复核|失败后的当前磁盘\/日志复核/.test(_tmsg);
-        // 这次调用冲着**哪个东西**去的。用于识别"换着工具找同一个不存在的东西"：
-        // 用户实拍——view_image image.png 读不到，接着 find **/image*.png 无匹配，
-        // 两次是**不同的调用**、各失败一次，所以按签名计数的那道闸一次都没响，模型继续换
-        // 工具找同一个根本不存在的文件。归一化到"去掉目录和通配符的名字"，两次才对得上。
-        const spinTarget = (() => {
-          const c = items[i]?.call || {};
-          const raw = String(c.path || c.pattern || c.query || c.name || "").trim();
-          if (!raw) return "";
-          const base = raw.split("/").filter(Boolean).pop() || raw;
-          return base.replace(/[*?\[\]]/g, "").toLowerCase().slice(0, 60);
-        })();
-        _callLog.push({ sig, resultSig, failed, dupRead, spinTarget });
+        // 窗口里现在只剩「失败率」一个读者（同调用重复、跨工具找同一个目标、重读没变过的
+        // 文件，三条都搬到工具结果上了），所以这本账也只需要这两样。
+        _callLog.push({ sig, failed });
         // ── 步数效率（step efficiency）──────────────────────────────────────
         // `_callLog` 是给死循环检测用的 12 条滑动窗口，问不出"这个 run 整体绕了多少路"。
         // 这里另记一份**累计**账：总调用、失败、重复签名、重复读取。
@@ -57710,56 +58413,26 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       if (_callLog.length > 12) _callLog.splice(0, _callLog.length - 12);
       let _stuckNudgedNow = false; // 同批已触发 stuck 提醒时，探测循环检测让行，不叠加同类干预
       {
+        // 近 8 次调用里失败了几次。**只留这一个计数**：原来这里还算 maxRepeat /
+        // maxFailRepeat / dupReads / maxTargetToolFails 四项，它们各自搬到了工具结果上
+        // （见下面的注释），留在这儿就是两处说同一件事。
         const win = _callLog.slice(-8);
-        const counts = {};
-        const failCounts = {};
-        let maxRepeat = 0, maxFailRepeat = 0, fails = 0, dupReads = 0;
-        const targetFailSigs = {};
-        let maxTargetToolFails = 0, stuckTarget = "";
-        for (const e of win) {
-          // 「调用相同 **且** 结果也相同」才算原地打转。只看调用会把正当轮询
-          // （比如构建跑着的时候反复 read_terminal）判成死循环；只看结果则什么都不是。
-          const spinKey = `${e.sig}@${e.resultSig}`;
-          counts[spinKey] = (counts[spinKey] || 0) + 1;
-          if (counts[spinKey] > maxRepeat) maxRepeat = counts[spinKey];
-          if (e.dupRead) dupReads++;
-          if (e.failed) {
-            fails++;
-            // 失败计数只按**调用**归并：同一个调用连续失败，报错文案里带个时间戳或行号
-            // 差异不该让它逃过计数——这正是原来那套拼接签名最容易漏掉的情形。
-            failCounts[e.sig] = (failCounts[e.sig] || 0) + 1;
-            if (failCounts[e.sig] > maxFailRepeat) maxFailRepeat = failCounts[e.sig];
-            // 同一个目标上，有几个**不同**的调用失败过。≥2 就说明不是"这个工具不行"，
-            // 是这个东西根本不在——再换工具也没用。
-            if (e.spinTarget) {
-              (targetFailSigs[e.spinTarget] ||= new Set()).add(e.sig);
-              const n = targetFailSigs[e.spinTarget].size;
-              if (n > maxTargetToolFails) { maxTargetToolFails = n; stuckTarget = e.spinTarget; }
-            }
-          }
-        }
-        // STRONGER triggers: same call FAILED 3+ times (true stuck), OR 4+ total failures, OR same
-        // call repeated 6+ times even if succeeding, OR 2+ deduped re-reads (the model re-reading a
-        // file it already has = classic spin — intervene at 2, don't wait for 6 blind re-reads).
-        if ((maxFailRepeat >= 3 || fails >= 4 || maxRepeat >= 6 || dupReads >= 2 || maxTargetToolFails >= 2)
-          && stuckNudges < 2 && _live()) {
+        let fails = 0;
+        for (const e of win) if (e.failed) fails++;
+        // 触发收窄到**只剩一条**：近 8 次里失败 ≥4。另外四条信号已经各自搬到工具结果上了，
+        // 那是模型注意力最高、也最及时的位置，留在这里只会两处说同一件事：
+        //   · 同一调用反复拿到同样结果（maxFailRepeat / maxRepeat）→ spin-target 的 repeatNote
+        //   · 换着工具找同一个不存在的东西（maxTargetToolFails）→ crossToolMissNote
+        //   · 重读没变过的文件（dupReads）→ 那本来就是 [别重读] 那条工具结果自己在说
+        // 剩下这条是**跨调用的聚合**：八次里四次失败，各次调用互不相同、错误也不同，
+        // 没有任何一条工具结果能看见它，所以它留在这里。
+        if (fails >= 4 && stuckNudges < 2 && _live()) {
           stuckNudges++;
           runHadTrouble = true;
           _stuckNudgedNow = true;
           const _stuckSig = win.map((e) => e.sig).join("; ").slice(0, 400);
           _callLog.length = 0; // fresh window after intervening
-          if (stuckNudges >= 2) {
-            // De-subagent'd (refactor 2026-07-05): spawning a "卡点诊断" sub-agent when stuck was more
-            // "子智能体" noise + latency. Just tell the model plainly to stop, rethink, or ask the user.
-            // 跨工具追同一个目标，要说清楚是"这东西不在"，而不是泛泛地喊别打转——
-            // 泛泛地喊，它会再换第三个工具找同一个文件。
-            if (maxTargetToolFails >= 2 && stuckTarget) {
-              _pushNudge("stuck", `已经有两个**不同的工具**都没找到「${stuckTarget}」——那说明它很可能**根本不存在**，不是这个工具不好使。**停止换工具找它。** 只有三条路：① 它本来就该由你创建，那就直接创建；② 你把名字或位置记错了，回到已经确认存在的证据（列一次目录、看一眼真实文件名）重新定位；③ 确实需要用户提供，用 ask_user 一句话问清它在哪。`);
-            } else _pushNudge("stuck", "还在原地打转（同样的动作 / 连续失败）。**停**——别再原样重试了。只有两条路：① 退一步写下这几次失败的**共同根因**（哪个假设 / 前提错了），换一条**完全不同**的思路或工具再来；② 如果是需求 / 方向定不下来、或你缺个前提（跑不起来、平台不对、缺信息），别空转——直接 **ask_user** 把卡点和你需要什么一句话问用户。");
-          } else {
-            _pushNudge("stuck", "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试。先找这些失败共同依赖的错误假设，然后换一种真正不同的策略：目标文件已知就直接使用已有读取证据或精读具体范围；只有位置未知才换工具定位一次；外部 API 不确定才查官方文档。方向确实无法从现有证据确定时再 ask_user。");
-          }
-        }
+          _pushNudge("stuck", "最近 8 次工具调用里失败了 4 次以上——不是某一次不巧，是整条路子的**共同前提**错了。停下别再原样重试：先写清这几次失败共同依赖的哪个假设不成立，再换一条真正不同的路。目标文件已知就直接用已有读取证据或精读具体范围；只有位置未知才换工具定位一次；外部 API 不确定才查官方文档。");        }
       }
 
       // ── 探测循环检测（根因检查点）：连续 4 批只有读/列/搜/纯探索命令、期间零改动、
@@ -57846,8 +58519,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
      * 抛了也不当没事：记一条结局原因，控制台留一行，用户至少知道这轮结局不可信。
      */
     try {
-      // 写盘事实的**兜底收账，覆盖所有退出路径**：逐个 break 点挂结算是在跟一份没人维护得全的
-      // 清单赛跑，而测试断的是「至少三个调用点」数够就绿。已算出的不覆盖；门控同下面那句。
       if (!run._breakWriteFact
           && (finalErr || _stoppedEarly || run._incompleteReason)
           && (Array.isArray(run._writeLedger) ? run._writeLedger.length : 0)) {
@@ -58109,24 +58780,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             codeUnverified: String(run._incompleteReason || "").split(":")[0] === "code_delivered_unverified",
           };
         }
-        const clean = (x, n) => String(x || "").replace(/\s+/g, " ").trim().slice(0, n);
         // instruction 只在评审判「没实现」时才算数；done 缺席（评审压根没跑成）不许
         // 被当成「没实现」——那是凭空冤枉自己。
-        const instruction = v.done === false ? clean(v.instruction, 300) : "";
         // findings / direction 按设计**不参与 done**（"先交付，再提醒"），所以它们和
         // done 通过与否无关，通过的那轮同样要说。
-        const direction = clean(v.direction, 300);
+        // 形状统一走 _wrapUpCardShape：结论晚到时那条路要画出一模一样的卡。
         // verified：评审读完执行证据之后，对「结果到底有没有被证明」的判断。此前算了没人读。
         // 它单独有价值的只有一种情形——和 harness 的记账**打架**：记账按「有一条 purpose=verify
         // 的命令退出 0」就算验过了，而评审读了那条命令的真实输出，说它根本没证明用户要的结果。
         // 那是假绿灯，也正是「写的东西都是报错、项目被写烂」的来法。
         // 记账自己就知道没验的那些不进这里（已经有 code_delivered_unverified 那条路），只留分歧。
-        const falseGreen = v.verified === false && verificationPassed === true && didMutate === true;
-        const findings = (Array.isArray(v.findings) ? v.findings : [])
-          .map((f) => clean(`${f?.where ? f.where + " " : ""}${f?.what || ""}`, 160))
-          .filter(Boolean).slice(0, 3);
-        return (instruction || direction || findings.length || falseGreen)
-          ? { instruction, direction, findings, falseGreen } : null;
+        return _wrapUpCardShape(v, verificationPassed, didMutate);
       })(),
       // 这一轮的工作区根。「接下来」建议要按**这个项目探测到的真实命令**给验证提示，
       // 而不是端一串写死的 npm/pytest/cargo 菜单出来——用户的项目大概率一条都不是。
@@ -58155,6 +58819,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // The visible response is already rendered and streaming has ended above.
       // Reflection therefore cannot delay first-token or live output latency.
       // 传身份根，不传会漂的 root —— 否则写进去的经验读取那侧永远取不回来（见函数头注释）。
+      // 这一轮 harness 到底往上下文里塞了多少条、哪几类 —— 落一条日志，别只活在内存里。
+      // 它是「关掉提醒到底变好还是变坏」这个 A/B 唯一的读数：开着跑一遍、关掉跑一遍，
+      // 比 nudge 条数、步数、token、时长和最终结果。
+      try {
+        const _nc = run._nudgeCounts || {};
+        const _keys = Object.keys(_nc);
+        if (_keys.length) {
+          console.log("[nudges] run=%s 闸=%s 注入=%d 被拦=%d 步=%d 明细=%s",
+            String(run._runId || "").slice(0, 12),
+            _harnessNudgesEnabled() ? "on" : "off",
+            run._nudgeAttempts || 0, run._nudgeSuppressed || 0, _implOps,
+            _keys.sort((a, b) => _nc[b] - _nc[a]).map((k) => `${k}:${_nc[k]}`).join(" "));
+        }
+        globalThis.__nudgeStats = { runId: run._runId, on: _harnessNudgesEnabled(), counts: _nc,
+          attempts: run._nudgeAttempts || 0, suppressed: run._nudgeSuppressed || 0 };
+      } catch {}
       try { await _recordEpisode(run, task, memoryRoot || root, _runOutcome, config, session); } catch {}
       // 离线通道：攒够一批就在后台批量看一次历史，沉淀跨轮规律。不 await——它跟这一轮的
       // 交付无关，任何异常都不许冒泡进收尾。
@@ -58566,7 +59246,17 @@ try { window.__midePerfPhase = _perfPhase; } catch {}
 {
   let _devOn = false;
   try { _devOn = !!(import.meta && import.meta.env && import.meta.env.DEV); } catch {}
-  if (_devOn) {
+  // **打包版也要能开。**
+  //
+  // 这个哨兵原来只在 `import.meta.env.DEV` 下装，而用户装的是打包版 —— 于是「跑一会儿
+  // 卡很久」这类现场一条都没被记下来过，只能靠读代码猜是哪一段占住了主线程。
+  // 而它恰恰是唯一能回答「冻结那一刻在跑什么相位」的东西。
+  //
+  // 判据放在 localStorage 而不是环境变量：用户自己就能开，不用重新打一版。
+  // 常态是关的 —— 它有一个 1 秒心跳定时器和一个 longtask 观察器，不该让所有人白付。
+  let _flagOn = false;
+  try { _flagOn = localStorage.getItem("michael-ide.perf-sentinel") === "1"; } catch {}
+  if (_devOn || _flagOn) {
     // STALL/SLEEP/LONGTASK 共用一个有界、单飞的落盘通道。旧实现每条记录都并发
     // read-whole-file + write-whole-file；主线程刚从卡顿恢复时会同时积压多轮 IPC，
     // 诊断工具反过来放大卡顿。现在同一时刻最多一个读写批次，期间的新记录合并。
@@ -59034,12 +59724,17 @@ function _scheduleWritePreviewFlush(entry) {
     for (let i = shown; i < entry._shownLen; i++) if (target.charCodeAt(i) === 10) n++;
     entry._shownLines = n;
     const codeEl = card.querySelector("code");
+    const pre = card.querySelector("pre");
+    // **先量再写。** 和本文件 59319 那处已经修好的完全同构（那儿的注释把道理写全了）。
+    // 写完再量，量到的是「本帧新内容有多高」，不是「用户往上翻了多远」：这个回调每帧
+    // 都在往里灌内容，一帧新增超过 48px 就判定用户滚开了、从此不再跟随，而内容还在长，
+    // 距离只增不减 —— 单向闩死，不会自愈。顺带也少一次「写完立刻读布局」的强制重排。
+    const _wasAtBottom = !!pre && (pre.scrollHeight - pre.scrollTop - pre.clientHeight) < 48;
     if (codeEl) codeEl.textContent = _clipStreamCode(target, entry._shownLen).view; // O(窗口) 而非 O(n)
     const lc = card.querySelector(".code-card__linecount");
     if (lc) lc.textContent = n + " 行";
-    const pre = card.querySelector("pre");
-    // 同上：写入预览每帧都在长，无条件贴底会让人没法回看已经写过的行。
-    if (pre && pre.scrollHeight - pre.scrollTop - pre.clientHeight < 48) pre.scrollTop = pre.scrollHeight;
+    // 写入预览每帧都在长，无条件贴底会让人没法回看已经写过的行。
+    if (_wasAtBottom && pre) pre.scrollTop = pre.scrollHeight;
     // 已打开 Monaco 缓冲区的同步走节流：节流只降低调用频率，不改护栏语义——
     // userChanged/committed/superseded 等检查仍在 _flushLiveEditorWritePreview 内部
     // 每次生效，用户一打字照样立即接管。首次同步不等待，保住"看着它写"的即时感。
@@ -59640,6 +60335,56 @@ function _resolveRel(rel, preferredRoot = "") {
     }
   }
   return _coherentFilePath(roots[0] + "/" + clean);
+}
+
+// 一个文件在不在磁盘上——列它父目录一眼就知道，不去 readTextFile（那会把整份读进来）。
+async function _fileExistsOnDisk(path) {
+  try {
+    const p = _normalizeFsPath(String(path));
+    const parent = p.replace(/\/[^/]*$/, "") || "/";
+    const base = (p.split("/").pop() || "").toLowerCase();
+    const entries = await backend.readDir(parent);
+    return (entries || []).some((e) => !_agentDirEntryIsDir(e) && String(_agentDirEntryName(e) || "").toLowerCase() === base);
+  } catch { return false; }
+}
+
+// 点开回复里的路径时，模型常常只写了 basename 或漏了子目录（`openai_adapter.py` 其实在
+// `cursor_proxy/` 下）。按根拼一次不中，就在项目里按 basename 找一遍：优先「路径以给定
+// 相对路径结尾」的，其次任意同名文件。跳过 node_modules/.venv 那些，有扫描上界防大仓卡死。
+async function _findFileInProjectByName(rel) {
+  const root = _normalizeFsPath(String(rootPath || workspaceRoots[0] || "")).replace(/\/+$/, "");
+  if (!root) return "";
+  const wantRel = _normalizeFsPath(String(rel)).replace(/^\.?\/+/, "");
+  const wantBase = (wantRel.split("/").pop() || "").toLowerCase();
+  if (!wantBase) return "";
+  const SKIP = new Set([
+    "node_modules", ".git", "dist", "build", "out", "target", ".next", "coverage",
+    ".cache", ".vscode", ".venv", "venv", "__pycache__", "vendor", ".gradle",
+  ]);
+  const stack = [root];
+  let dirsScanned = 0;
+  const byRel = [];
+  const byBase = [];
+  while (stack.length && dirsScanned < 3000) {
+    const dir = stack.pop();
+    dirsScanned++;
+    let entries;
+    try { entries = await backend.readDir(dir); } catch { continue; }
+    for (const e of entries) {
+      const name = _agentDirEntryName(e);
+      if (!name) continue;
+      if (_agentDirEntryIsDir(e)) { if (!SKIP.has(name)) stack.push(e.path); continue; }
+      if (name.toLowerCase() !== wantBase) continue;
+      const p = _normalizeFsPath(e.path);
+      if (wantRel.includes("/") && (p === root + "/" + wantRel || p.endsWith("/" + wantRel))) byRel.push(p);
+      else byBase.push(p);
+    }
+    if (byRel.length) break; // 有精确尾缀匹配就够了，不用扫完
+  }
+  // 精确尾缀优先；否则同名文件里挑路径最短的（最靠近根、最可能是模型说的那个）。
+  if (byRel.length) return byRel[0];
+  byBase.sort((a, b) => a.length - b.length);
+  return byBase[0] || "";
 }
 
 function _runEmptyRoots(run) {
@@ -60260,11 +61005,18 @@ function _blindOverwritePrecheck(run, root, call, fp, old, redactedRead) {
   const oldText = String(old ?? "");
   const _oldLines = oldText.split("\n").length;
   const _newLines = String(call.content ?? "").split("\n").length;
-  if (!(_oldLines >= 40 && _newLines < _oldLines * 0.5)) return null;
+  // 判据从「没读过 **且** 缩掉一半」放宽到 Claude Code 的原则本身：**没读过就不许覆写已有文件**。
+  // 缩不缩水根本不是要害 —— 拿记忆里的 480 行整份换掉磁盘上的 500 行，破坏程度和缩到 200 行
+  // 一模一样，只是从行数上看不出来，所以原来那条缩幅判据恰好把最难发现的一种放过去了。
+  // 保留的只有行数下限：<40 行的文件整份都摆在 diff 里，用户一眼能看见，不需要这道闸。
+  if (_oldLines < 40) return null;
   if (_runHasCurrentRead(run, root, oldText, call.path, fp)) return null;
   if (_writeGateBypass(call, { redactedRead: !!redactedRead, coverageImpossible: _readCoverageImpossible(oldText) })) return null;
 
-  const head = `[BLOCKED] ${fp} 现有 ${_oldLines} 行，这次 write_file 只给了 ${_newLines} 行，而本 run 没有当前版本的读取证据——差额会被静默删掉，且从这次调用的结果里看不出来。IDE 未写盘。`;
+  const head = `[BLOCKED] ${fp} 现有 ${_oldLines} 行，这次 write_file 给了 ${_newLines} 行，而本 run 没有当前版本的读取证据。`
+    + (_newLines < _oldLines
+      ? `差额会被静默删掉，且从这次调用的结果里看不出来。IDE 未写盘。`
+      : `凭记忆整份覆写一个没读过的文件，等于把磁盘上你没记住的部分直接换掉，而结果只会报“已修改”。IDE 未写盘。`);
   const safeBody = _redactSecrets(oldText, { map: _runRedactionMap(run) });
   if (safeBody.length <= _READ_SLICE_CHAR_CAP) {
     // 把真实内容随失败结果带回去，并按完整读取记账（与 read_file 同一套判据：
@@ -61333,7 +62085,17 @@ async function _executeToolStepInner(step, call, root, run) {
         const abs = _normalizeFsPath(String(e?.path || `${fp}/${e?.name || ""}`)).replace(/\/+$/, "");
         return _normRel(abs, root) || e?.name || "";
       };
-      const _depth = Math.max(0, Math.min(10, Number(call.depth) || 1));
+      // `Number(call.depth) || 1` 会把 **0 变成 1**（0 是假值），而 schema 里写的是
+      // 「0 = recurse all the way down」。于是模型按描述传 0，拿回来的是「只列当前层」，
+      // 它看不出任何异常，只会以为这个目录就这么点东西 —— 描述和行为对不上，是最难查的一种。
+      // （反过来，任何**负数**经 min/max 钳成 0，才是真正的「递归到底」开关，而 schema
+      // 里一个字都没写。）用 Number.isFinite 显式判，让 0 走它该走的那条路。
+      // 「没传」（undefined / null / 空串）一律是默认 1；只有真的给了一个数才照它算。
+      // 注意 Number(null) 和 Number("") 都是 0 且都是有限数，光用 isFinite 会把漏传
+      // 当成「递归到底」，那是另一个方向的错。
+      const _depthGiven = call.depth !== undefined && call.depth !== null && call.depth !== "";
+      const _rawDepth = _depthGiven ? Number(call.depth) : 1;
+      const _depth = Math.max(0, Math.min(10, Number.isFinite(_rawDepth) ? _rawDepth : 1));
       const _dirsE = entries.filter(e => _agentDirEntryIsDir(e)).sort((a, b) => _agentDirEntryName(a).localeCompare(_agentDirEntryName(b)));
       const _filesE = entries.filter(e => !_agentDirEntryIsDir(e)).sort((a, b) => _agentDirEntryName(a).localeCompare(_agentDirEntryName(b)));
       let listing;
@@ -61958,6 +62720,7 @@ async function _executeToolStepInner(step, call, root, run) {
       let _backendTruncated = false;
       let _scanScopeUnknown = false;
       let _scannedFiles = 0;
+      let _sizeSkipped = 0;
       for (const searchRoot of searchScopes) {
         let scopedMatches = [];
         try {
@@ -61965,6 +62728,7 @@ async function _executeToolStepInner(step, call, root, run) {
           successfulScopes++;
           if (scopedMatches && scopedMatches.truncated) _backendTruncated = true;
           _scannedFiles += Number(scopedMatches?.scannedFiles) || 0;
+          _sizeSkipped += Number(scopedMatches?.sizeSkipped) || 0;
           // 远端没报扫描规模时，"没搜完" 这一条这里判断不了——要说出来，别让沉默
           // 被读成「搜完了」。
           if (scopedMatches && scopedMatches.scanScopeUnknown) _scanScopeUnknown = true;
@@ -62075,10 +62839,19 @@ async function _executeToolStepInner(step, call, root, run) {
       const _backendNote = _backendTruncated
         ? `（**后端没搜完**：单文件命中上限 50 处，整次检索另有命中数与扫描文件数两道上限，触到就停${_scannedFiles ? `（已扫 ${_scannedFiles} 个文件）` : ""}。上面**不是全部命中**——重命名、改全部调用点这类要求"一个不漏"的活，必须按目录缩小范围分批重搜，不能据此认为已经找全。）`
         : "";
+      // 因体积被整份跳过的文件：跳过是对的（2 MiB 以上多半是压缩产物、锁文件、数据），
+      // **但跳过了就得说**。不说的话，返回的结果和"这些文件里确实没有"一模一样，
+      // 而模型据此得出的是「项目里没有这个」——最难查的一类假阴性。
+      // 本仓库自己的 src/main.js 就是 4.9 MB。
+      const _sizeNote = _sizeSkipped
+        ? `（另有 **${_sizeSkipped} 个文件因为超过 2 MiB 被整份跳过**，一个字都没搜过——`
+          + `要找的东西可能就在里面。确定目标在某个大文件里的话，用 read_file 按 offset/limit 精读，`
+          + `或者 run_cmd 跑 \`grep -n\` 直接搜它。）`
+        : "";
       const _ctxNote = ctxFiles < _shownFiles
         ? `（其中 ${_shownFiles - ctxFiles} 个文件只给了命中行、没带上下文：单轮读取文件数上限）`
         : "";
-      const summary = `${hits} 处匹配 · ${fileMatches.length} 个文件${ctxFiles ? "（►=命中行，带上下文）" : ""}${_truncNote}${_backendNote}${_ctxNote}`;
+      const summary = `${hits} 处匹配 · ${fileMatches.length} 个文件${ctxFiles ? "（►=命中行，带上下文）" : ""}${_truncNote}${_backendNote}${_sizeNote}${_ctxNote}`;
       const partialNote = searchErrors.length ? `\n\n[ERROR] 部分搜索范围未完成:\n${searchErrors.join("\n")}` : "";
       res.className = fileMatches.length && !searchErrors.length ? "atc-result atc-result--ok" : "atc-result atc-result--err";
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
@@ -62740,7 +63513,9 @@ async function _executeToolStepInner(step, call, root, run) {
       // 下面那套预算是**按 run 计数**的，而用户每发一条新消息就是一个新 run，计数当场归零
       // —— 所以模型可以每一轮都问同一个问题，永远撞不到那道门。用户经历的正是这个：
       // 问一次、答一次、下一轮再问一次，没完，而且每次都要对着界面干等两分钟。
-      const _auPrior = _repeatedQuestionAnswer(run?.session, q);
+      // 确认卡片同样不走这道门：拿上一次的「同意」去替**这一次**的删除操作点头，
+      // 比重复提问危险得多。两次「真的要删吗」问的很可能不是同一个东西。
+      const _auPrior = call.confirmText ? null : _repeatedQuestionAnswer(run?.session, q);
       if (_auPrior) {
         res.className = "atc-result atc-result--blocked";
         res.textContent = "这个已经问过了";
@@ -62758,9 +63533,25 @@ async function _executeToolStepInner(step, call, root, run) {
     // 表现是一次 unhandled rejection + 那张 ask_user 卡片**永远停在执行中**，
     // 用户对着它干等，界面上没有任何提示。同一分支上面几行用的就是 `run?.session`。
     const _auN = run ? (run._askUserCount = (run._askUserCount || 0) + 1) : 1;
-      const _auBackToBack = run._lastToolWasAsk === true;
-      run._lastToolWasAsk = true;
-      if (_auN >= 3 || (_auN >= 2 && _auBackToBack)) {
+      // 这两行也必须戴 run 守卫，理由和上一行一模一样：chat 那条路 run 是 undefined
+      // （_executeToolStep(step, call, _agentRoot) 只传三个参），而网关给 chat 注的 14 个
+      // 工具里恰好有 ask_user。上一行改对了、这两行漏了，于是 chat 里一调 ask_user
+      // 就是 TypeError；chat 侧那个 p.then(...) 没有 .catch，表现是一次 unhandled
+      // rejection + 卡片永远停在「执行中」，界面上一个字的提示都没有。
+      const _auBackToBack = run ? run._lastToolWasAsk === true : false;
+      if (run) run._lastToolWasAsk = true;
+      // **危险操作确认不受提问预算管。**
+      //
+      // confirm_text 那一支不是「收集信息」，是动手之前的安全闸：模型要删库、要 force push、
+      // 要覆盖一批文件时，先把这件事摆给用户点头。它和「这个配色你要哪个」根本不是一类东西，
+      // 而下面那道闸原来一视同仁地拦——拦下之后返回的话是
+      // 「下一步：**按最合理的方案直接做下去**」。也就是说：模型问「真的要删吗」，
+      // 系统答「删吧」，用户一个字都没看到。
+      //
+      // 提问预算防的是「原地停摆、让用户干等」；确认卡片恰恰相反，它拦的是不该自动发生的事。
+      // 所以判据挪到闸门之前读，confirm 一律放行。
+      const _auIsConfirm = !!call.confirmText;
+      if (!_auIsConfirm && (_auN >= 3 || (_auN >= 2 && _auBackToBack))) {
         res.className = "atc-result atc-result--blocked";
         res.textContent = _auBackToBack ? "连续提问已拦下" : `第 ${_auN} 次提问已拦下`;
         return { type: "askuser", path: "", content:
@@ -62776,7 +63567,7 @@ async function _executeToolStepInner(step, call, root, run) {
         : "";
       const opts = _normalizeAskOptions(call.options);   // 纯字符串 / {label, description} 都收
       const _auRecommended = call.recommended;
-      const _auConfirm = call.confirmText;
+      const _auConfirm = call.confirmText;   // 上面 _auIsConfirm 读的是同一个字段
       // 单选/多选/只给输入框的判据写在模块里（askMode），连同"为什么默认单选"的理由。
       const _auMode = _auConfirm ? "confirm" : _askMode({ options: opts, multiSelect: call.multiSelect });
       const _auMulti = _auMode === "multi";
@@ -62784,6 +63575,24 @@ async function _executeToolStepInner(step, call, root, run) {
       step.classList.add("is-open");
       _chatFollow(run && run.session);
       if (typeof vp === "undefined" || !vp) return { type: "askuser", path: "", content: "（无法渲染交互卡片，按你认为最合理的方案继续）" + _auRepeatNote };
+      // **无人值守时不弹卡片。** 下面那个 promise 只有「用户点按钮」一个出口——
+      // 定时任务（_unattendedRun）跑到这里就永远不 resolve，整个调度器挂死在这一格，
+      // 而界面上什么都没有，日志里也什么都没有。权限弹框那一层早就有这条出口
+      // （`if (_unattendedRun && _currentAiPerm === "approve") … return false`），
+      // ask_user 这条一直没接上。
+      //
+      // 说法照抄那边的克制：说清楚是「没人能点」而不是「有人不同意」——后者会让模型
+      // 以为方案被否了，转头去找一条绕过去的路。
+      if (_unattendedRun) {
+        res.className = "atc-result atc-result--blocked";
+        res.textContent = "无人值守，未提问";
+        return { type: "askuser", path: "", content:
+          `[UNATTENDED] 本次运行是无人值守启动的（定时任务），此刻没有人能回答，卡片没有弹出。\n\n`
+          + `你要问的是：「${q.slice(0, 200)}」\n\n`
+          + `按你认为最合理的方案继续做完，并把这个假设**写进最终回答**（"我按 X 处理了，因为 Y"）。`
+          + `如果这件事不做出假设就没法继续、或者做错了整个成果作废，那就停在这里，`
+          + `在回答里用一句话说清你卡在哪、需要什么——留给用户下次看到时决定。` };
+      }
       return await new Promise((resolve) => {
         let done = false;
         const _auSelected = new Set();
@@ -66470,11 +67279,17 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         if (_hasUrlInfo) {
           let _host = state.url || "";
           try { _host = new URL(state.url).hostname; } catch {}
-          _vpHtml += `<div class="browser-url-card"><div class="browser-url-card__bar"></div><div class="browser-url-card__text"><span class="browser-url-card__title">${_escHtml(state.title || _host)}</span><span class="browser-url-card__host">${_escHtml(_host)}</span></div></div>`;
+          // Telegram 链接预览的顺序：**站点名在上（强调色）、标题在下**。
+          // 标题缺失时只画站点名那一行 —— 原来是 `state.title || _host`，没标题时
+          // 两行会渲染出一模一样的字，看着像重复了一遍。
+          const _title = String(state.title || "").trim();
+          _vpHtml += `<div class="browser-url-card"><div class="browser-url-card__bar"></div>`
+            + `<div class="browser-url-card__text"><span class="browser-url-card__host">${_escHtml(_host)}</span>`
+            + (_title && _title !== _host ? `<span class="browser-url-card__title">${_escHtml(_title)}</span>` : "")
+            + `</div></div>`;
         }
         vp.innerHTML = _vpHtml;
       }
-      try { _attachElementPicker(vp); } catch (_e) {}
       // 常驻实时预览：有它在，逐轮的截图卡默认收起（要看证据/指元素再点开），
       // 只有明确的 screenshot 视觉验收才自动展开——不再一轮一张糊满对话。
       let _liveCard = null;
@@ -66718,8 +67533,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // Surface a clear, actionable hint so it FIXES the permission instead of
       // pretending the command worked or silently giving up.
       const _permDenied = (result.code !== 0) && /permission denied|operation not permitted|EACCES|EPERM|access is denied|not permitted|需要权限|拒绝访问|权限不足/i.test(output);
-      // **捕获期不许切**（原 `output.slice(0,2000)`）：投递层预算 8000 且走 _clipPreservingErrors，
-      // 2000 进去原样出来，那套「明说原始字数 + 错误行从中段豁免捞回」的机器一次都没跑过。
+      // **捕获期不许切**（原 slice(0,2000)）：2000 < 投递层 8000，截断说明+豁免全没跑过。
       let _content = output || (result.code === 0 ? "(executed)" : `(exit ${result.code}, 无输出)`);
       if (_retryHistory) _content = _retryHistory + "\n\n[CURRENT_RESULT]\n" + _content;
       if (commandRiskLabel) {
@@ -67468,6 +68282,16 @@ function initInlineCompletion() {
 
       const cacheKey = `${model.uri.toString()}:${position.lineNumber}:${position.column}:${textBefore.slice(-100)}`;
       if (cacheKey === _lastCompletionKey && _cachedCompletion) return _cachedCompletion;
+
+      // **真防抖。** 上面那个 _COMPLETION_DEBOUNCE 声明了却从来没有被引用过
+      // （全文件只出现一次），实际生效的是 Monaco 自己写死的那几十毫秒 ——
+      // 于是连续打字时**每一次按键都发一次真实的 LLM 请求，再立刻取消**：
+      // 两次 IPC、逐字符计费，而且因为下一键马上取消，用户几乎永远看不到那行灰字。
+      //
+      // 放在缓存命中判断之后：命中的补全仍然瞬时返回，只有真要发请求的才等。
+      // Monaco 会在下一次按键时取消这个 token，所以连续打字期间一发都出不去。
+      await new Promise((resolve) => setTimeout(resolve, _COMPLETION_DEBOUNCE));
+      if (token.isCancellationRequested) return { items: [] };
 
       const lang = model.getLanguageId();
       const fileName = activePath ? activePath.split("/").pop() : "untitled";
@@ -72701,6 +73525,11 @@ const _LINTABLE_EXT = new Set([
   "java", "rb", "php", "lua", "sh", "bash", "zsh", "yaml", "yml",
   "cs", "kt", "kts", "swift", "dart", "ex", "exs", "clj", "cljs", "scala", "sc",
   "tf", "tfvars", "graphql", "gql", "vue",
+  // Monaco **自带** json / css / html 三个 worker（见文件顶部的 import 和 MonacoEnvironment），
+  // 装都不用装、免费就能查，却一直不在这张表里 —— 于是模型写坏一个 package.json 或
+  // tsconfig.json（整个项目当场跑不起来）、写出一条不闭合的 CSS，诊断门一个字都不说。
+  // 这几种恰恰是「坏了整个项目就起不来」的那一类，比漏掉一门要装语言服务器的语言严重得多。
+  "json", "jsonc", "css", "scss", "less", "html", "htm",
 ]);
 
 /// 这个文件该用哪个 Monaco language id 建 model。
@@ -72809,7 +73638,11 @@ async function _projectLintFindings(editedRelPaths, root, baseline = null) {
   const unavailable = [];
   let ranAny = false;
   for (const linter of linters) {
-    const cmd = _lintCommand(linter, files);
+    // **root 必须传。** 模块里 `_relativeTo` 那段专门防「传进来的是绝对路径」——
+    // 阻断门那次调用喂的就是 `_resolvedPath`，而 go vet 吃的是包模式：
+    // `./` + 绝对路径 = `.//Users/…/…`，go 直接报 lstat 失败，整条项目 linter 腿
+    // 在所有 Go 仓库上恒不可用。少传这个参数，那段防护代码就是在空转。
+    const cmd = _lintCommand(linter, files, root);
     if (!cmd) continue;   // 这一批里没有它管得着的文件
     let out;
     try {
@@ -76127,7 +76960,16 @@ function _normalizeEmptyComposer() {
   } catch {}
 }
 
-promptEl.addEventListener("input", () => {
+promptEl.addEventListener("input", (e) => {
+  // **组字过程中（中文/日文输入法）只做必须做的两件事。**
+  // 同文件另外五处按键路径都有这道闸，两个 input 监听器偏偏没有 —— 于是敲一个汉字的
+  // 每一次 compositionupdate 都要把整棵 DOM 重新序列化好几遍、重算 ghost 预测。
+  // 草稿越长越黏，正是「中文输入发涩」的来源。
+  // 组字结束时输入法会补发一次 isComposing=false 的 input，那一次照常跑全套。
+  //
+  // 留下的两件：ghost 必须清（否则可能 Tab 到一条对半成品拼音的陈旧预测），
+  // 占位符必须同步（否则打拼音时「输入消息…」还挂在那儿）。
+  if (e.isComposing) { _clearComposerGhost(); _cePlaceholder(); return; }
   // 用户一开始打字，预测立刻作废——不能让一条稍晚落地的预测把已输入的内容冲掉。
   // 先清再重算，两步都要：清是同步的，保证这一刻不可能 Tab 到一条陈旧预测；
   // 重算是为了用户把输入框**清空之后**预测能回来（否则清一次就再也不出现了）。
@@ -76193,7 +77035,10 @@ _sendBtnEl?.addEventListener("click", (e) => {
   }
 });
 
-promptEl.addEventListener("input", () => {
+promptEl.addEventListener("input", (e) => {
+  // 组字过程中同上：@ 菜单和 / 菜单都不该对半成品拼音反应（它们本来就只认 ASCII 触发符），
+  // 而这两个函数每次都要把整棵 DOM 重新序列化。占位符照常同步。
+  if (e.isComposing) { _cePlaceholder(); return; }
   // contenteditable auto-grows via CSS min/max-height; chips are atomic natively (no manual height,
   // no highlight layer, no custom arrow-nav needed). Just keep the placeholder + menus in sync.
   _cePlaceholder();
@@ -76326,23 +77171,24 @@ $("composer").addEventListener("submit", (e) => {
   const droppedRefs = [..._droppedRefs];
   _pastedImages = [];
   _refreshImagePreviews();
-  // If THIS tab is already running, the message is a real-time STEER ("引导"): clear the
-  // input and inject it into the live run so the agent adapts mid-task — instead of being
-  // dropped. (Other tabs run concurrently; submitting on an idle tab starts its own run.)
+  // 这一轮还在跑 → 这条消息**排队**，在输入框上方显示一张卡片，末尾带「插入」按钮。
+  //
+  // 这个判据来回翻过两次，两次都是被同一个抱怨推的，所以把两边都记下来：
+  //   · 最早是纯排队 —— 用户报「说完话什么都没发生，它照旧做原来的事，等它彻底停下来
+  //     才回过神」。于是改成有循环就**默认实时引导**。
+  //   · 改完之后卡片在 agent 模式下**永远不出现**（消息直接变成气泡插进对话），
+  //     `_insertQueuedNow` 里那个「agent 循环运行中 → 实时引导」的分支成了死代码。
+  //     用户报「第一条没处理完就再发，第二条应该排队」。
+  //
+  // 两个抱怨其实是同一件事的两面：**要看得见，也要能立刻生效**。答案不是二选一，
+  // 是那张卡片本身 —— 默认排队（看得见、当前这轮跑完自动依次发出），点「插入」
+  // 立刻并入当前任务（agent 跑动中走实时引导，纯对话阻断当前回答重新作答）。
+  // 上一版把卡片一起丢掉了，才让这件事退回成二选一。
   if (_isStreaming()) {
     promptEl.value = "";
     _clearDroppedRefs();
     const _rs = _currentSession();
-    // 上面那段英文注释一直写着「这是实时引导」，而代码走的是纯排队——**注释和实现相反**，
-    // 而且 _steerRunningAgent 全文件唯一的调用点是队列小卡片上那个「插入」按钮。
-    // 也就是说：用户直接回车时，整条实时引导链路（drain、意图重判、按引导重排工具）
-    // 一次都不会被触发；这句话要等整个 run 跑完才作为全新一轮发出去。
-    // 用户看到的就是「说完话什么都没发生，它照旧做原来的事，等它彻底停下来才回过神」。
-    //
-    // 有智能体循环在跑（agent/explorer/reviewer/plan）时就走引导；纯对话没有循环可引导，
-    // 照旧排队，当前回答结束后自动依次发出。
-    if (_rs?._runIsLoop) _steerRunningAgent(_rs, text, attachments);
-    else _queueFollowup(_rs, text, attachments);
+    _queueFollowup(_rs, text, attachments);
     return;
   }
   _clearDroppedRefs();
@@ -76782,8 +77628,23 @@ document.body.appendChild(_atMenu);
 // File index for @-mentions: walk the workspace once and cache the relative file
 // list, so @-autocomplete fuzzy-matches INSTANTLY client-side instead of hitting
 // the backend on every keystroke. It rebuilds automatically when the root changes
-// or the cache ages out (30s), and is preloaded on composer focus.
+// or the cache ages out, and is preloaded on composer focus.
+//
+// 读取策略是 stale-while-revalidate：只要手上有属于当前 root 的内容，就先把旧列表交出去，
+// 重建丢到后台。不能沿用「过期了就 await 重建」——_buildFileIndex 是一目录一次 IPC 的串行
+// 遍历，大仓要几百上千次往返，而它就挂在按下 @ 的同一条路径上：TTL 一到，下一次按 @ 就得
+// 对着一个不出候选的菜单等完整轮重扫。旧列表最多差这段时间里新增的文件。
 let _fileIndex = { root: "", files: [], ts: 0, building: null };
+// 索引寿命。原来 30 秒之所以只能设这么短，是因为除了过期它没有别的刷新途径；现在 fs watcher
+// 一有增删就把 ts 清零（见 handleFsChanges），这条只剩兜 watcher 覆盖不到的那部分——非 Tauri
+// 的模拟壳里根本没有 watcher，被 _FS_IGNORE_RE 滤掉的目录也不上报。
+const _FILE_INDEX_TTL = 5 * 60 * 1000;
+// 代际号。ts 是「这份内容有多新」，gen 是「这份内容有没有被磁盘变更否定过」。
+// 两者必须分开：ts 存在**被整个替换掉**的那个对象上，而一轮遍历要跑几秒 ——
+// 期间 watcher 打的 ts=0 会被下面 .then 里那句整对象赋值原样盖掉，
+// 于是「刚建的文件」要等满一个 TTL 才出现。没有这个代际号，
+// 改成 stale-while-revalidate 反而是净退步（原来 30 秒 TTL 到期必重建）。
+let _fileIndexGen = 0;
 async function _buildFileIndex(root) {
   const IGNORED = new Set([".git", "node_modules", "target", "dist", "build", ".next", ".nuxt", ".venv", "__pycache__", ".cache", "vendor", "coverage", ".turbo", ".parcel-cache", ".DS_Store"]);
   const out = [];
@@ -76808,17 +77669,38 @@ async function _buildFileIndex(root) {
   }
   return out;
 }
-function _ensureFileIndex() {
+function _ensureFileIndex(opts) {
   const root = rootPath || workspaceRoots[0] || "";
   if (!root) return Promise.resolve([]);
-  if (_fileIndex.root === root && _fileIndex.files.length && (Date.now() - _fileIndex.ts) < 30000) return Promise.resolve(_fileIndex.files);
-  if (_fileIndex.building && _fileIndex.root === root) return _fileIndex.building;
-  const building = _buildFileIndex(root).then((files) => {
-    _fileIndex = { root, files, ts: Date.now(), building: null };
-    return files;
-  }).catch(() => { _fileIndex.building = null; return _fileIndex.files || []; });
-  _fileIndex = { root, files: _fileIndex.files, ts: 0, building };
-  return building;
+  const force = !!(opts && opts.force);
+  // 缓存必须属于当前 root 才算"有内容"：换过工作区之后，旧列表是另一个仓的相对路径，
+  // 拿它当 stale 结果插进 @，指向的是不存在的文件——那不是慢，是错。
+  const warm = _fileIndex.root === root && _fileIndex.files.length > 0;
+  if (warm && !force && (Date.now() - _fileIndex.ts) < _FILE_INDEX_TTL) return Promise.resolve(_fileIndex.files);
+  let building = (_fileIndex.building && _fileIndex.root === root) ? _fileIndex.building : null;
+  if (!building) {
+    const files0 = warm ? _fileIndex.files : [];
+    const ts0 = warm ? _fileIndex.ts : 0;
+    const gen0 = _fileIndexGen;
+    building = _buildFileIndex(root).then((files) => {
+      // root 可能在这一轮遍历期间被换掉，那份结果就属于上一个工作区，绝不能写回。
+      if (_fileIndex.root === root && _fileIndex.building === building) {
+        // 遍历期间磁盘变过 → 结果照收（当 stale 内容用，比空列表强），但**戳成过期**，
+        // 让下一次按 @ 立刻拿到旧候选、同时再开一轮。无条件 Date.now() 就是把这次变更
+        // 藏满一个 TTL（5 分钟）。
+        _fileIndex = { root, files, ts: _fileIndexGen === gen0 ? Date.now() : 0, building: null };
+      }
+      return files;
+    }).catch(() => {
+      // ts 停在 ts0：重建失败不算刷新。写成 Date.now() 会让一次失败静默续命整个 TTL。
+      if (_fileIndex.root === root && _fileIndex.building === building) _fileIndex.building = null;
+      return _fileIndex.root === root ? _fileIndex.files : [];
+    });
+    _fileIndex = { root, files: files0, ts: ts0, building };
+  }
+  // 冷启动（warm=false：首次、刚换 root）必须真的等：那时唯一能立刻返回的是空数组，
+  // 而空数组在 @ 菜单里读作"这个工作区没有文件"——是错误答案，不是慢答案。
+  return (warm && !force) ? Promise.resolve(_fileIndex.files) : building;
 }
 // Open files (relative to root), active one first — surfaced when "@" has no query.
 function _openFilesRel(root) {
@@ -81599,7 +82481,14 @@ async function restoreSession() {
           _previewToolRequest = data.tool;
           try {
             const sess = _currentSession();
-            if (sess?.container) sess.container.innerHTML = "";
+            if (sess?.container) {
+              sess.container.innerHTML = "";
+              // **缓存也要一起倒掉。** 这里是原地清空 + memory.reset()，不是新开会话：
+              // 序号从 0 重来，而 DOM 缓存里还压着上一轮同样从 0 开始编号的节点 ——
+              // 翻回去会贴出**上一个工具那一轮的内容**。清空 DOM 却不清缓存，
+              // 是这套复用机制最锋利的一个失效点。
+              _dropHistoryNodesFrom(sess.container, 0);
+            }
             if (sess?.memory?.reset) sess.memory.reset();
             else if (sess) { sess.history = []; if (sess.memory) { sess.memory.recent = []; sess.memory.transcript = []; } }
           } catch {}

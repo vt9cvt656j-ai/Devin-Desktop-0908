@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "node scripts/run-tests.mjs",
+    "test:e2e": "node test/e2e/run1.mjs && node test/e2e/run2.mjs && node test/e2e/run3.mjs && node test/e2e/run4.mjs",
     "build:signed": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat ~/.tauri/michael-ide.key)\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}\" tauri build",
     "icons": "node scripts/gen-brand-sprite.mjs",
     "icons:check": "node scripts/gen-brand-sprite.mjs --check"

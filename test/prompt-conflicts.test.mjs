@@ -75,15 +75,23 @@ test("「先写红测试」要有判据，不是无条件", () => {
 
 // ── 想 vs 干 ────────────────────────────────────────────────────
 test("催写文件要看计划落地了没有", () => {
-  // 同一份上下文里还有「计划落地前不写文件」和「先把不确定的地方查清楚再动手」。
-  // 无条件催写文件时，需要计划的任务会被逼在没计划的情况下开写——而计划门那边还会
+  // 同一份上下文里有两条会打架的话：「计划落地前不写文件」和「别想太多，赶紧动手」。
+  // 无条件催写文件时，需要计划的任务会被逼在没计划的情况下开写 —— 而计划门那边还会
   // 因为「从零建的第一次落盘没有计划」把这次写入硬拦回去，两头空转。
-  assert.match(SRC, /const _planLanded = Array\.isArray\(run\._planSteps\) && run\._planSteps\.length > 0;/,
-    "行动门禁又变回无条件了");
-  assert.match(SRC, /_planLanded \|\| !_runRequiresPlan\(run\)/, "判据算出来了却没接上");
-  assert.match(SRC, /但\*\*还没有计划\*\*/, "需要计划那一支没有给出正确的下一步");
+  //
+  // 载体换了（2026-09-02）：循环里那条 emptyBuildAct 注入删掉了，它两支说的都搬进了
+  // 常驻层 agent_core §3。**但冲突的解法必须跟着搬** —— 第一版削提示词时把
+  // 「需要计划就同一轮里 update_plan + 落第一批文件」削没了，只剩「赶紧动手」，
+  // 正是这条测试抓出来的。所以这里改成钉提示词那一侧。
+  const c = P("agent_core");
+  assert.match(c, /A warranted plan lands before the first file you write/,
+    "「计划在第一个文件之前」这条没了 —— 会被逼着无计划开写");
+  assert.match(c, /only update_plan is/, "「散文方案不算计划」没了，弱模型会用一屏字代替 update_plan");
+  assert.match(c, /if the task needs a plan, call update_plan and land the first files in that same turn/,
+    "两句话的**冲突解法**没了：只剩「赶紧动手」和「先有计划」各说各的，模型会卡在中间");
   // 反向：防「只思考不写代码」那条原意不能丢
-  assert.match(SRC, /现在立即开始 write_file 创建第一批文件/, "催动手那句被整条删了");
+  assert.match(c, /An empty workspace has nothing to discover: stop probing/,
+    "催动手那句被整条删了 —— 空目录会被无休止地探测");
 });
 
 test("从零建系统类项目要先读真实实现，建应用则直接开工", () => {
@@ -111,12 +119,20 @@ test("用户说「这轮只出计划」时也不催他去做第一步", () => {
 
 test("命令根本不存在时，不许指示去改代码", () => {
   // agent_engineering.txt:32：a verifier that cannot run asserts nothing about the code。
-  assert.match(SRC, /command not found\|no such file or directory\|: not found/,
-    "cmdFail 又不分「代码错了」和「命令没找到」了");
-  assert.match(SRC, /\*\*不要\*\*去改代码找根因——它一行都没被执行过/,
-    "认出来了却还给同一句指示");
+  //
+  // 载体换了（2026-09-02）：循环里那条 `_pushNudge("cmdFail", …)` 删掉了 —— 它是**同一句话
+  // 的第二次投递**（paths 取自 it.rawResult.commandFailure，正是生成 `[失败诊断]` note 的
+  // 同一个对象，而那条 note 在 run_cmd 失败时就已经拼进工具结果正文了）。
+  // 这条断言守的**能力没变**，只是改成钉活着的那个载体：_commandFailureDiagnostics。
+  // 那份实现比删掉的那条更强 —— 同样点明「环境问题，不是代码错误」，还多给四步取证链。
+  assert.match(SRC, /command not found\|not recognized as an internal or external command/,
+    "又不分「代码错了」和「命令没找到」了");
+  assert.match(SRC, /命令\/可执行文件不存在（环境问题，不是代码错误）/,
+    "认出来了却没说清它不是代码错误 —— 模型会去改一行都没被执行过的代码");
+  assert.match(SRC, /先调 probe_env/,
+    "命令不存在时没给确定性取证链，模型会连猜命令变体");
   // 反向：真报错时那条正确的指示不许丢
-  assert.match(SRC, /照它刚输出的那段真实报错定位根因、直接改对应的文件:行/,
+  assert.match(SRC, /不要只看 exit code；按上面真实输出和日志定位根因，修完再重跑验证/,
     "真失败时的正确指示被整条删了");
 });
 

@@ -177,11 +177,17 @@ test("评审 null 不再静默：调用点记账，收尾退到代码算好的�
   // 调用点：null / 抛异常都记「这轮没评审过」。
   const at = CODE.indexOf("await _wrapUpCritic({");
   assert.ok(at > 0);
-  const site = CODE.slice(at, at + 2600);
+  // 窗口 2600 → 3600：评审 2026-09-02 改成并发（正文写完就收尾，不等这次付费调用），
+  // 多出的注释把外层 catch 顶到了 2910。固定窗口是这条断言的已知弱点。
+  const site = CODE.slice(at, at + 3600);
   assert.match(site, /else run\._wrapUpReviewFailed = \(run\._wrapUpReviewFailed \|\| 0\) \+ 1;/,
     "null 又被静默吞了——用户分不清「评审通过」和「评审压根没跑成」");
   assert.match(site, /catch \{ run\._wrapUpReviewFailed = \(run\._wrapUpReviewFailed \|\| 0\) \+ 1;/,
     "异常路径也要记同一笔账");
+  // 并发之后 reject 不再落进外层 try/catch：那条路必须自己接住并记同一笔账，
+  // 否则既漏账、又会变成一条用户看得见的 "Unhandled:" 红字。
+  assert.match(site, /\)\(\)\.catch\(\(\) => \{ run\._wrapUpReviewFailed = \(run\._wrapUpReviewFailed \|\| 0\) \+ 1;/,
+    "并发的评审没接住 reject——漏账，且会弹一条用户看得见的报错");
 
   // 落盘兜底真的跑一遍（和 logic.test.mjs 同一套抠法：三个闭包变量）。
   const expr = /wrapUp: (\(\(\) => \{[\s\S]*?\}\)\(\)),/.exec(SRC);
@@ -235,9 +241,12 @@ test("评审 null 不再静默：调用点记账，收尾退到代码算好的�
 
 test("验证提醒带预填 run_cmd 候选：命令由代码算好，空参数调用即点头，IDE 不代跑", () => {
   const loop = fnSource("_runAgenticLoop", { code: true });
-  const at = loop.indexOf('_pushNudge("verifyNow"');
-  assert.ok(at > 0);
-  const armWindow = loop.slice(Math.max(0, at - 1200), at);
+  // 锚点换了（2026-09-02）：verifyNow 不再单独推一条 nudge，文本追加到本轮那条
+  // [本轮交付事实] 上了。**预填候选那半是机制不是文本**，原样留在原处 —— 这条断言守的
+  // 就是它还在，所以只换锚点，窗口和断言都不动。
+  const at = loop.indexOf("[未验证] 刚改了");
+  assert.ok(at > 0, "验证事实的文本不见了 —— 这条断言的锚点没了");
+  const armWindow = loop.slice(Math.max(0, at - 2000), at);
   assert.match(armWindow, /run\._verifyCandidate = \{ command: _cmd, cwd: root \}/,
     "候选没武装——「预填好参数」就无从发生，提醒退化回劝诫");
 
@@ -316,22 +325,32 @@ test("盲写事前拦截：没读过 + 行数骤减 → 不落盘，失败结果
   assert.ok(records.some((r) => r[0] === "redacted"), "打码状态也要同步记账，写回还原才走得通");
 });
 
-test("盲写事前拦截：不误伤——读过、合法重写、小文件、缩幅不足都放行", () => {
+test("盲写事前拦截：不误伤——读过、小文件、非 write 都放行；但缩不缩水一律拦", () => {
   const gate = _mkBlindGate();
   const old = Array.from({ length: 100 }, (_, i) => `line${i}`).join("\n");
   const shrink = { type: "write", path: "a.js", content: "short\n" };
   // 读过当前版本 → 放行（合法整文件重写、有意大幅删减都走这条）。
   const gateRead = _mkBlindGate([], { _runHasCurrentRead: () => true });
   assert.equal(gateRead({}, "/w", shrink, "/w/a.js", old, false), null);
-  // 小文件（<40 行）→ 放行。
+  // 小文件（<40 行）→ 放行：整份都摆在 diff 里，用户一眼能看见。
   assert.equal(gate({}, "/w", shrink, "/w/a.js", "a\nb\nc", false), null);
-  // 缩幅不足一半 → 放行。
-  const sixty = Array.from({ length: 60 }, () => "x").join("\n");
-  const forty = { type: "write", path: "a.js", content: Array.from({ length: 40 }, () => "y").join("\n") };
-  assert.equal(gate({}, "/w", forty, "/w/a.js", sixty, false), null);
   // 非 write 不碰。
   assert.equal(gate({}, "/w", { type: "edit", path: "a.js" }, "/w/a.js", old, false), null);
   assert.equal(gate(null, "/w", shrink, "/w/a.js", old, false), null);
+
+  // ── 缩幅判据 2026-09-02 拆掉了 ──
+  // 原判据是「没读过 **且** 缩掉一半」，于是恰好放过最难发现的那一种：拿记忆里的
+  // 480 行整份换掉磁盘上的 500 行，破坏一样大，但从行数上看不出来，工具结果只报「已修改」。
+  // Claude Code 的规则本来就只有一条：没读过就不许覆写已有文件。
+  const sixty = Array.from({ length: 60 }, () => "x").join("\n");
+  const forty = { type: "write", path: "a.js", content: Array.from({ length: 40 }, () => "y").join("\n") };
+  const mild = gate({}, "/w", forty, "/w/a.js", sixty, false);
+  assert.ok(mild, "缩幅不足一半也是没读过就覆写，一样要拦");
+  const grown = { type: "write", path: "a.js", content: Array.from({ length: 80 }, () => "y").join("\n") };
+  const bigger = gate({}, "/w", grown, "/w/a.js", sixty, false);
+  assert.ok(bigger, "写得比原文还长照样是拿记忆换掉磁盘");
+  assert.match(bigger.content, /凭记忆整份覆写/, "非缩水那一路要有自己的说法，不能沿用「差额会被静默删掉」");
+  assert.match(mild.content, /差额会被静默删掉/, "缩水那一路仍然说差额");
 });
 
 test("盲写事前拦截：_writeGateBypass 的两条豁免从死代码接活", () => {

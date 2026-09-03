@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { normalizeAskOptions, askMode, askAnswerText, askAnswerLabel, ASK_MAX_OPTIONS } from "../src/agent/ask-user.js";
-import { blockFrom, fnSource, CODE } from "./helpers/source.mjs";
+import { blockFrom, fnSource, CODE, SRC } from "./helpers/source.mjs";
 
 const CSS = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
 /**
@@ -378,4 +378,119 @@ test("系统开了「减少动态效果」就全部停掉", () => {
   for (const sel of ["is-open .atc-viewport", "atc-result--pending"]) {
     assert.ok(m[0].includes(sel), `${sel} 的动画没有被停掉`);
   }
+});
+
+// ── chat 模式：run 是 undefined，ask_user 分支里一处裸解引用就让卡片永远转圈 ──────
+//
+// chat 那条路调的是 `_executeToolStep(step, call, _agentRoot)` —— **只传三个参**，
+// 于是 `_executeToolStepInner(step, call, root, run)` 拿到的 run 是 undefined。
+// 而网关给 chat 注的 14 个工具里恰好有 ask_user。
+//
+// 实际发生过的形状：`_auN` 那一行改成了 `run ? … : 1`，紧跟的两行
+// `run._lastToolWasAsk` 却漏了守卫 → TypeError。chat 侧那个 `p.then(...)` 没有
+// `.catch`（唯一的 allSettled 在另一条分支上），所以表现不是报错，是
+// **一次 unhandled rejection + 卡片永远停在「执行中」**，界面上一个字的提示都没有。
+//
+// 判据按 AST 取整个 ask_user 分支，逐个查 `run.x` 形态的成员访问：
+// `run?.x` / `run && run.x` / `run ? run.x : …` 都算安全，裸的一个都不许有。
+test("chat 模式下 ask_user 分支不许裸解引用 run —— run 在那条路上是 undefined", async () => {
+  const acorn = await import("acorn");
+  const ast = acorn.parse(SRC, { ecmaVersion: "latest", sourceType: "module" });
+  let fn = null;
+  (function w(n) {
+    if (!n || typeof n !== "object") return;
+    if (Array.isArray(n)) return n.forEach(w);
+    if (/Function/.test(n.type) && n.id?.name === "_executeToolStepInner") fn = n;
+    for (const k of Object.keys(n)) if (k !== "type") w(n[k]);
+  })(ast);
+  assert.ok(fn, "找不到 _executeToolStepInner —— 这条守卫失去了对象");
+
+  const start = SRC.indexOf("const _auN = run ?", fn.start);
+  assert.ok(start > 0, "ask_user 的提问计数不见了；这条守卫的取景框失效了");
+  const end = SRC.indexOf('} else if (call.type ===', start);
+  assert.ok(end > start);
+  const seg = SRC.slice(start, end);
+
+  // 只认**语法上真的会解引用**的那种：三元/短路里的 run 已经被判过真。
+  const sub = acorn.parse("(async()=>{" + seg.replace(/\breturn\b/g, "void 0;return") + "})()",
+    { ecmaVersion: "latest" });
+  const bad = [];
+  (function w(n, safe) {
+    if (!n || typeof n !== "object") return;
+    if (Array.isArray(n)) return n.forEach((x) => w(x, safe));
+    // `run ? A : B` / `run && A` 内部视为安全
+    let inner = safe;
+    if (n.type === "ConditionalExpression" && n.test?.name === "run") inner = true;
+    if (n.type === "LogicalExpression" && n.operator === "&&" && n.left?.name === "run") inner = true;
+    if (n.type === "IfStatement" && n.test?.name === "run") inner = true;
+    if (n.type === "MemberExpression" && n.object?.type === "Identifier"
+        && n.object.name === "run" && !n.optional && !safe && !inner) {
+      bad.push(seg.slice(Math.max(0, n.start - 60), n.end + 6).replace(/\s+/g, " "));
+    }
+    for (const k of Object.keys(n)) if (k !== "type") w(n[k], inner);
+  })(sub, false);
+
+  assert.deepEqual(bad, [],
+    "ask_user 分支里还有裸的 run 解引用。chat 模式下 run 是 undefined，"
+    + "一次 TypeError 就让那张卡片永远停在「执行中」，而且因为没有 .catch，"
+    + "用户看到的不是报错，是干等。改成 run?.x / run && run.x / run ? run.x : …");
+});
+
+// ── 危险操作确认不受提问预算管 ─────────────────────────────────────────────
+//
+// confirm_text 那一支不是「收集信息」，是动手之前的安全闸：模型要删库、要 force push、
+// 要覆盖一批文件时，先把这件事摆给用户点头。
+//
+// 而提问预算（本轮第 3 次 / 连着问两次）原来一视同仁地拦它，拦下之后返回的话是
+// 「下一步：**按最合理的方案直接做下去**」——模型问「真的要删吗」，系统答「删吧」，
+// 用户一个字都没看到。跨轮去重那道门同样危险：拿上一次的「同意」替这一次的删除点头。
+test("危险操作确认（confirm_text）不许被提问预算或跨轮去重拦掉", async () => {
+  // 按 AST 取整条 askuser 分支：两道门一个在计数之前、一个在之后，从计数那行切会漏掉前者。
+  // 剥注释：源码里那段说明**逐字引用**了下面要断言的那句回执（「按最合理的方案直接做下去」），
+  // 不剥的话 indexOf 命中的是注释，位置断言当场假红。这个坑本仓库栽过好几次。
+  const branch = blockFrom('} else if (call.type === "askuser") {', { code: true });
+
+  // ① 提问预算那道闸
+  assert.match(branch, /const _auIsConfirm = !!call\.confirmText;/,
+    "确认判据要在闸门之前读，否则闸门看不见它");
+  assert.match(branch, /if \(!_auIsConfirm && \(_auN >= 3 \|\| \(_auN >= 2 && _auBackToBack\)\)\) \{/,
+    "确认卡片仍然会被提问预算拦掉 —— 模型问「真的要删吗」，系统答「按最合理的方案做下去」");
+  // ② 跨轮去重那道门
+  assert.match(branch, /const _auPrior = call\.confirmText \? null : _repeatedQuestionAnswer\(/,
+    "确认卡片仍然会被跨轮去重拦掉 —— 拿上次的「同意」替这次的删除点头");
+  // ③ 那句危险的回执还在（它对普通提问是对的），但必须只在非确认路径上。
+  const blockAt = branch.indexOf("按最合理的方案直接做下去");
+  assert.ok(blockAt > 0, "那句回执不见了，这条守卫失去了对象");
+  assert.ok(branch.indexOf("_auIsConfirm") < blockAt,
+    "确认豁免必须排在那句「直接做下去」之前");
+});
+
+// ── 无人值守（定时任务）时不许弹卡片 ───────────────────────────────────────
+//
+// ask_user 那个等待 promise 只有「用户点按钮」一个出口。定时任务跑到这里就永远不
+// resolve —— 整个调度器挂死在这一格，界面上什么都没有、日志里也什么都没有。
+// 权限弹框那一层早就有这条出口（`if (_unattendedRun && _currentAiPerm === "approve")
+// … return false`），ask_user 这条一直没接上。
+//
+// 说法要和那边一样克制：说清楚是「没人能点」，不是「有人不同意」——
+// 后者会让模型以为方案被否了，转头去找一条绕过去的路。
+test("无人值守运行时 ask_user 直接返回，不进那个只有用户能解开的 promise", () => {
+  const branch = blockFrom('} else if (call.type === "askuser") {', { code: true });
+  assert.match(branch, /if \(_unattendedRun\) \{/, "无人值守出口不见了 —— 定时任务会挂死在这一格");
+  assert.match(branch, /\[UNATTENDED\]/);
+  // 出口必须排在那个 promise **之前**，否则就是先挂住再说。
+  const exitAt = branch.indexOf("if (_unattendedRun)");
+  const waitAt = branch.indexOf("return await new Promise((resolve) => {");
+  assert.ok(exitAt > 0 && waitAt > exitAt,
+    "无人值守出口排在了等待 promise 之后 —— 那等于没有出口");
+  // 措辞：不能让模型以为「用户不同意」。
+  const msg = branch.slice(exitAt, waitAt);
+  assert.doesNotMatch(msg, /拒绝|不同意|否决/,
+    "不能说成「用户拒绝」——没有任何人做过这个决定，模型会转头去找绕过去的路");
+  assert.match(msg, /没有人能回答/);
+  assert.match(msg, /写进最终回答/, "要给一条能照做的下一步，不是单纯拒绝");
+  // 这个机制本身在别处已经用着，判据要和它同源。
+  assert.match(SRC, /let _unattendedRun = false;/);
+  assert.match(SRC, /if \(_unattendedRun && _currentAiPerm === "approve"\)/,
+    "权限弹框那条同源出口不见了，这条守卫的前提就没了");
 });

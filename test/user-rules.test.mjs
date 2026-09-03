@@ -273,8 +273,12 @@ test("子智能体的系统提示词必须带上用户规则", () => {
   const i = SRC.indexOf("const sysPrompt = (write");
   assert.ok(i > 0, "子智能体的系统提示词拼装挪走了，这条断言失去落点");
   const seg = SRC.slice(i, SRC.indexOf("_SUBAGENT_TRUTH;", i) + 20);
-  assert.match(seg, /\+ _userRulesBlock\(\)/,
+  // 不锁死实参：子体这一路还要带上 { ladder: true }（它收不到网关那份指令层级），
+  // 而把整串实参写死会让"加个参数"这种纯增量改动当场假红，报的错还和真实改动无关。
+  assert.match(seg, /\+ _userRulesBlock\([^)]*\)/,
     "派出去的子智能体收不到用户规则——它写的代码不受用户规矩约束，用户看到的就是「规则不起效」");
+  assert.match(seg, /_userRulesBlock\(\{[^}]*ladder: true/,
+    "子体收不到网关那份指令层级，这一路必须自己补 —— 否则它手上没有任何排序");
   // 技能块早就在里面了；同为用户自己写下的东西，规则块不该缺席。两者要么都在，要么这条
   // 断言就该跟着改——不许只剩技能块。
   assert.match(seg, /skillsBlock/, "技能块也不见了，这条对照失去意义");

@@ -2597,7 +2597,29 @@ export function applyToDOM(root) {
   }
 }
 
+let _localeInitDone = false;
+let _localePackLoaded = false;
+
+/**
+ * 初始化界面语言。**可以调两次，而且现在就是调两次的。**
+ *
+ * 第一次在 src/boot.jsx 里、flushSync 之后 main.js 之前：让第一帧就是中文。
+ * 原来只在 main.js 末尾调（8.3 万行之后），用户会先看到一屏英文占位字，
+ * 实测外壳 164ms 出现、文案 291~469ms 才翻过来。
+ *
+ * 第二次仍在 main.js 末尾，保留不动，因为那时才成立两件事：
+ *   · main.js 的 onLocaleChange 监听器注册好了 —— 语言包异步到货的通知得有人接；
+ *   · main.js 顶层新建的那批 DOM（对话框、菜单）已经在文档里了。
+ * 所以第二次只做「重扫一遍 DOM + 补发可能错过的通知」，不重跑清理和 observer
+ * （observer 装两次会重复翻译，清理名单重跑是白费）。
+ */
 export function initLocale() {
+  if (_localeInitDone) {
+    applyToDOM();
+    if (_localePackLoaded) notifyLocaleListeners(currentLocale);
+    return;
+  }
+  _localeInitDone = true;
   const saved = localStorage.getItem("michael-ide-locale");
   currentLocale = coerceSupportedLocale(saved || systemPreferredLocale());
   if (saved !== currentLocale) {
@@ -2616,6 +2638,10 @@ export function initLocale() {
   applyToDOM();
   installLocaleObserver();
   ensureLocalePack(currentLocale).then((loaded) => {
-    if (loaded) notifyLocaleListeners(currentLocale);
+    if (!loaded) return;
+    // 记下来：这一发可能早于 main.js 注册监听器，那样就没人接。
+    // 上面第二次 initLocale 会据此补发一次（重复通知是幂等的，漏发不是）。
+    _localePackLoaded = true;
+    notifyLocaleListeners(currentLocale);
   });
 }

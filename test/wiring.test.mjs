@@ -493,7 +493,13 @@ test("没跑成的工具调用必须如实回一条结果，不能在转录里�
   // 活路径的推送点（不是 !_live() 那条——它自带 [interrupted] 补齐后 break）
   // 活路径的推送点现在还过一道单轮聚合预算（capTurnToolResults）：逐次上限管不住
   // 并发批次，10 个并行 read 各自贴着自己那 60000 = 一轮 60 万字进上下文。
-  const pushAt = RAW_SRC.indexOf("for (const m of capTurnToolResults(toolMsgs)) messages.push(m);", at);
+  // 锚点**不锁死实参列表**：这里只需要定位「活路径的推送点」，而那道闸后来加了
+  // 落盘出口（多传一个参数）。把整串实参写死的后果实测过——加参数当场假红，
+  // 而报出来的错说的是「转录里留白」，和真实改动毫无关系。
+  const pushRe = /for \(const m of capTurnToolResults\(\s*toolMsgs\b[^)]*\)\) messages\.push\(m\);/g;
+  pushRe.lastIndex = at;
+  const pushMatch = pushRe.exec(RAW_SRC);
+  const pushAt = pushMatch ? pushMatch.index : -1;
   assert.ok(pushAt > at, "活路径的推送点没找到——这条断言可能钉错了地方");
   const before = SRC.slice(at, pushAt);
   // 补齐必须紧挨着推送点之前，且覆盖每一个 item
@@ -506,7 +512,12 @@ test("没跑成的工具调用必须如实回一条结果，不能在转录里�
   assert.match(before, /items\[j\]\._notAttempted = true;/,
     "补齐的同时要标 _notAttempted");
   assert.equal(count(SRC, /_notAttempted = true/g), 1, "_notAttempted 只该在补齐处写入");
-  assert.ok(count(SRC, /\?\._notAttempted/g) >= 3, "失败归因/恢复分析仍要按 _notAttempted 排除未执行项");
+  // 3 → 2（2026-09-02）：第三个消费方是循环里那条 `_pushNudge("recovery", …)`，
+  // 已经删掉了 —— 它是**同一段文字的第二次投递**（_toolMsgForModel 生成失败结果时就把
+  // `[RECOVERY:…]` 拼进正文了，那条路同样传结构化 result）。消费方少一个是删重复的结果，
+  // **不是这道守卫被放松**：剩下两处正是真正的失败归因（fails 收集、errSnippet 摘录），
+  // 它们照旧按 _notAttempted 排除，"没跑"仍然不会被算成"跑失败了"。
+  assert.ok(count(SRC, /\?\._notAttempted/g) >= 2, "失败归因仍要按 _notAttempted 排除未执行项");
   // UI 上不能把"未执行"显示成绿色的成功。
   // 这条原来钉的是 _settleToolStep 里那串判据正则的**字面量**。判据后来换成了结构化的
   // （failure.code / ok:false / cmd 退出码 / 正文首行的方括号标记，见 test/tool-card-verdict），
@@ -1401,14 +1412,18 @@ test("强力版：网关说了没有强力线路，就不该把那个按钮画�
   // 这时候必须退回旧行为。压成布尔的话按钮会在离线时集体消失，而那不是"没有强力线路"。
   const mapAt = RAW_SRC.indexOf("byGroup.get(label).push({");
   assert.notEqual(mapAt, -1, "目录映射那个对象字面量没了");
-  assert.match(SRC.slice(mapAt, mapAt + 2600), /powerRouteAvailable:/,
+  // 窗口从 2600 放宽到 3600：这个白名单后来又加了 cachePriceKnown（区分「线路不计缓存费」
+  // 和「网关没下发」）并带一段注释，把 powerRouteAvailable 挤出了原窗口。守的性质没变，
+  // 但固定窗口是这条断言的已知弱点——白名单再长几个字段就会再次静默失效。
+  assert.match(SRC.slice(mapAt, mapAt + 3600), /powerRouteAvailable:/,
     "映射层没接这个字段——那个 push 是逐字段列举的白名单，不在里面就到不了按钮那儿");
 
   // 字段名必须和网关下发的逐字一致，跨仓库对不上就是静默失效。
   const rustList = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
   assert.match(rustList, /"power_route_available"/,
     "网关没下发这个字段，客户端永远读到 undefined，等于这条闸不存在");
-  assert.match(SRC.slice(mapAt, mapAt + 2600), /it\.power_route_available/,
+  // 同一个固定窗口的问题，一并放宽（理由见上一条）。
+  assert.match(SRC.slice(mapAt, mapAt + 3600), /it\.power_route_available/,
     "客户端读的键名和网关下发的对不上");
 
   // 三态判定：只认布尔，其它一律 null（不知道）。

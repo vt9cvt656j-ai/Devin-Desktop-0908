@@ -346,6 +346,19 @@ pub enum AiEvent {
     FinishReason {
         reason: String,
     },
+    /// 思考块的签名（网关配好对的不透明数据）。前端原样存进这一轮的助手消息，下一轮
+    /// 原样回发 —— 没有它，模型每调一次工具就看不见自己上一轮的推理。
+    ///
+    /// **不解析、不合并、不当正文渲染**：签名签的是它自己那段思考文字，拼接或裁剪
+    /// 任何一样都会让它对不上，上游判 400。
+    ReasoningBlocks {
+        blocks: Vec<serde_json::Value>,
+    },
+    /// 拒答理由（`stop_details{type,category,explanation}`）。`finish_reason` 只说
+    /// 「被内容策略挡了」，这里说为什么 —— 否则用户看到的只是一次空回复。
+    StopDetails {
+        details: serde_json::Value,
+    },
     Done,
     /// Token accounting from the final stream chunk — lets the UI show how much of
     /// the prompt was served from cache (the payoff of the prompt-cache work).
@@ -1342,6 +1355,10 @@ fn normalize_finish_reason(raw: &str) -> &str {
         "max_tokens" => "length",
         "end_turn" | "stop_sequence" => "stop",
         "tool_use" => "tool_calls",
+        // 安全分类器拒答（HTTP 200，Opus 4.7+ / Opus 5 / Fable 5.x 都会产生）。
+        // 折成 "stop" 的话，它和「模型正常答完但一个字没说」逐字节不可分 —— 客户端
+        // 的空输出兜底会把同一次拒答自动重开两轮，用户付三次钱，而且理由始终不可见。
+        "refusal" => "content_filter",
         other => other,
     }
 }
@@ -1386,6 +1403,11 @@ mod ide_header_tests {
             max_tokens: None,
             temperature: None,
             protocol: None,
+            // 自带上游那三个：加字段时**必须**同步这里，否则 lib test 整个编不过
+            // （文件里上一条注释说的就是同一个坑，这已经是第二次了）。
+            byo_base: None,
+            byo_key: None,
+            byo_proto: None,
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
             ide_session_id: None,
@@ -1769,6 +1791,11 @@ mod stream_timeout_tests {
             max_tokens: None,
             temperature: None,
             protocol: None,
+            // 自带上游那三个：加字段时**必须**同步这里，否则 lib test 整个编不过
+            // （文件里上一条注释说的就是同一个坑，这已经是第二次了）。
+            byo_base: None,
+            byo_key: None,
+            byo_proto: None,
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
             ide_session_id: None,
@@ -3633,6 +3660,18 @@ async fn ai_chat_inner(
                     if !rt.is_empty() {
                         let _ = on_event.send(AiEvent::Reasoning { delta: rt });
                     }
+                }
+                if let Some(blocks) = delta["reasoning_blocks"].as_array() {
+                    if !blocks.is_empty() {
+                        let _ = on_event.send(AiEvent::ReasoningBlocks {
+                            blocks: blocks.clone(),
+                        });
+                    }
+                }
+                if let Some(details) = delta.get("stop_details").filter(|d| !d.is_null()) {
+                    let _ = on_event.send(AiEvent::StopDetails {
+                        details: details.clone(),
+                    });
                 }
                 if let Some(text) = delta["content"].as_str() {
                     if !text.is_empty() {

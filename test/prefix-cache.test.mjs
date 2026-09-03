@@ -1311,19 +1311,21 @@ test("计划文档写的四条续跑门，代码里必须真的存在", () => {
                            loop.indexOf("// Render every tool step up front"));
   const doc = fs.readFileSync("AGENT_LOOP_REBUILD.md", "utf8");
 
-  // 文档承诺的四条门 → 代码里的落点
+  // 文档承诺的四条门 → 代码里的落点。判定 2026-09-02 整段搬进了 src/agent/quiet-turn.js，
+  // 所以落点是循环里的分派（`_qt.gate === "…"`），上界在模块里（另有行为测试守）。
   const gates = {
-    "用户插话": /session\._steerQueue/,
-    "新增诊断": /run\._diagnosticNudges >= 2/,
-    "构建红了": /buildFixAttempts < 2/,
-    "计划未完": /\(run\._planFinishNudges \|\| 0\) < 2/,
+    "用户插话": /_qt\.gate === "steer"/,
+    "新增诊断": /_qt\.gate === "diagnostics"/,
+    "构建红了": /_qt\.gate === "build"/,
+    "计划未完": /_qt\.gate === "plan"/,
   };
   for (const [name, re] of Object.entries(gates)) {
     assert.ok(doc.includes(name), `文档的门表里没有「${name}」了——表和代码正在分家`);
     assert.match(quiet, re, `文档说有「${name}」这道门，静默轮里却找不到它的落点`);
   }
-  // 全局池也在表里承诺了。
-  assert.match(quiet, /run\._quietResumePool/, "文档写了共用 3 轮的全局池，代码里没有");
+  // 全局池也在表里承诺了：循环把它喂进判定、也把扣完的写回来。
+  assert.match(quiet, /quietResumePool: run\._quietResumePool/, "文档写了共用 3 轮的全局池，代码里没有");
+  assert.match(quiet, /run\._quietResumePool = c\.quietResumePool/, "池子扣了不写回等于没有池");
 
   // 反向：文档不许再提已经删掉的东西。这正是它上次出错的形状。
   for (const dead of ["_missingRequiredEffects", "_noWorkNudged"]) {
@@ -1346,8 +1348,9 @@ test("a run does not end while its own plan has open steps", () => {
   const quiet = loop.slice(loop.indexOf("if (!turn.toolCalls.length)"),
                            loop.indexOf("// Render every tool step up front"));
   assert.match(quiet, /run\._planSteps[\s\S]{0,300}status === "pending" \|\| step\?\.status === "in_progress"/);
-  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 2/, "bounded, so an unfinishable plan converges");
-  assert.match(quiet, /run\._incompleteReason = run\._incompleteReason \|\| `plan_steps_pending:/);
+  assert.match(quiet, /_qt\.gate === "plan"/, "计划这道门没接上，模型停在 2/7 就没人管了");
+  assert.match(quiet, /if \(_planLabel\) run\._incompleteReason/,
+    "放弃计划时要留下诚实的未完成原因");
 
   // And the other exit: "第三步做完了，要不要我继续？" trips the wait-for-user boundary, which
   // also read nothing about the plan — and cleared the pending nudges on its way out.
@@ -1393,17 +1396,29 @@ test("the loop stops advertising continuation machinery it does not have", () =>
   // 它不抢模型的收尾判断，只是在正确的时刻给事实；有界（每 run 2 次，且只在实现版本推进后
   // 重新武装）。见下面 live 那一组。
   for (const dead of ["continueNudges", "effectNudges", "researchNudges",
-                      "honestyNudges", "deepReadNudges", "codeVerifyNudges"]) {
+                      "honestyNudges", "deepReadNudges", "codeVerifyNudges", "toolReminders"]) {
     assert.doesNotMatch(SRC, new RegExp("(?:let|const|var)[^\\n;]*\\b" + dead + "\\b"),
       `${dead} is declared and never used — delete it or wire it`);
     assert.doesNotMatch(SRC, new RegExp("\\b" + dead + "\\s*(?:\\+\\+|=[^=])"),
       `${dead} is written to but never read`);
   }
   // The ones that survived are the ones that actually fire.
-  for (const live of ["planGateNudges", "toolReminders", "recoveryNudges", "invalidArgNudges",
-                      "verifyNudges"]) {
+  // recoveryNudges 从这张表里移走了（2026-09-02）：它和它唯一的推送点一起删了 ——
+  // 那条提醒是**同一段文字的第二次投递**（_toolMsgForModel 生成失败工具结果时，
+  // 就已经把 `[RECOVERY:…]` 拼在正文末尾了）。按这条断言自己的说法「delete it or wire it」，
+  // 走的是 delete。上面那张 dead 表管的是「声明了不用」，这条是连声明一起删干净，
+  // 两张表都不该再有它。
+  // toolReminders 也从 live 移走了（2026-09-02）：它推的是一段 367 字符的**纯静态指令**
+  // （零运行时事实），一个 run 里最多重复五次、每次全价。同一句话搬进了 agent_core §4
+  // ——走缓存的静态前缀，每一轮都在，成本约十分之一。计数器和 _toolReminderBlock 一起删掉。
+  for (const live of ["planGateNudges", "invalidArgNudges", "verifyNudges"]) {
     assert.ok((SRC.match(new RegExp("\\b" + live + "\\b", "g")) || []).length > 1, live);
   }
+  // 搬走不是删掉：那句话必须真的在**基线层**提示词里（每一轮都加载，不受语义画像路由影响）。
+  const core = fs.readFileSync(new URL("../../server/prompts/agent_core.txt", import.meta.url), "utf8");
+  assert.match(core, /the window changes during a run/i,
+    "「工具窗口会变、早先看到的清单不是上限」这句没进提示词 —— 那就是把能力删掉了");
+  assert.match(core, /search_tools fetches an exact name/i);
 });
 
 test("两处确认弹窗默认放行，但机制留着", () => {
@@ -1467,6 +1482,7 @@ test("一轮里每个写完的文件都立刻落盘，而不是只放行第一�
   // 断言的是顺序本身，不是两段之间隔了多少字符 —— 固定字宽的窗口会被后来人改一句注释就
   // 判死，而要守的从来是"先判断，再写盘"。
   const _truncAt = turn.indexOf('let truncatedByLimit = finishReason === "length"');
+  assert.ok(_truncAt >= 0, "截断判定不见了");
   const _notifyAt = turn.indexOf("if (!turnErr && !truncated) { for (const [, e] of byIndex)");
   assert.ok(_truncAt >= 0 && _notifyAt >= 0, "两段都要还在");
   assert.ok(_truncAt < _notifyAt,

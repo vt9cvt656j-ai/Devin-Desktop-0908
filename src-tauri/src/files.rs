@@ -2054,6 +2054,54 @@ pub fn write_text_file_if_unchanged(
     }
 }
 
+/// sha256 → 小写 hex。
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `write_text_file_if_unchanged` 的省流量版本：调用方只送**它读到的那一版的 sha256**，
+/// 不送那一版的全文。返回刚写下去那份内容的 sha256。
+///
+/// 为什么要有它：编辑器自动保存原本一次 invoke 要带「磁盘旧全文 + 新全文」两份原文，
+/// 5MB 的文件就是 ~8.6MB JSON（还要按 JSON 规则逐字转义再解析），序列化本身比写盘还贵，
+/// 大文件里连续打字时肉眼可见地卡。
+///
+/// 为什么不用 mtime/size 这种更省事的判据：原子写是「同目录暂存 + rename」，inode 会换、
+/// mtime 粒度只到秒，同秒内的外部改动会整个漏掉——CAS 的全部价值就在于不漏。
+///
+/// 老命令 `write_text_file_if_unchanged` 原样保留，判据语义和错误串（`[CONFLICT] …`）与
+/// 这里逐字一致：没更新的调用方（远程守护进程、网页壳、旧的前端 bundle）继续走老命令，
+/// 不会因为多出这个命令而失败，也不需要同步升级。
+#[tauri::command(async)]
+pub fn write_text_file_if_unchanged_hashed(
+    path: String,
+    expected_sha256: Option<String>,
+    content: String,
+) -> Result<String, String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
+    let resolved = require_inside_workspace(&path, true)?;
+    match expected_sha256 {
+        Some(expected) => {
+            if !resolved.exists() {
+                return Err("[CONFLICT] file was deleted after it was read".into());
+            }
+            // 仍然走 read_to_string 而不是按字节 read：老命令比的是 read_to_string 的结果，
+            // 非 UTF-8 文件在那条路上是**报错**而不是「内容不等」。改成字节读会把这类文件
+            // 从「报错」悄悄变成「CAS 通过并覆盖」，那是行为回退，不是优化。
+            let current = std::fs::read_to_string(&resolved).map_err(|e| e.to_string())?;
+            if !sha256_hex(current.as_bytes()).eq_ignore_ascii_case(expected.trim()) {
+                return Err("[CONFLICT] file changed after it was read".into());
+            }
+            atomic_write_text(&resolved, &content)?;
+        }
+        None => atomic_create_text(&resolved, &content)?,
+    }
+    Ok(sha256_hex(content.as_bytes()))
+}
+
 /// Delete a text file only if it still contains the version the caller last
 /// wrote. This is the deletion counterpart to `write_text_file_if_unchanged`
 /// and keeps Undo/revert from removing a newer IDE edit. External processes do
@@ -2373,6 +2421,14 @@ struct ProjectSearch {
     /// 于是在大仓里搜一个符号、扫到第两万个文件就停，界面照常显示「N 个结果」，
     /// 开发者据此得出"项目里没有这个"的**错误结论**。搜索给出假阴性比搜索慢严重得多。
     truncated: bool,
+    /// 因为**体积**被跳过的文件数（> SEARCH_MAX_FILE，2 MiB）。
+    ///
+    /// 和 `truncated` 完全同一性质的第二种假阴性，而且更隐蔽：它不是"没搜完"，
+    /// 是"这几个文件从头到尾没被看过"，而调用方拿到的结果和"这些文件里确实没有"
+    /// 长得一模一样。本仓库自己的 src/main.js 就是 4.9 MB —— 在这个项目里搜任何东西，
+    /// 主文件永远搜不到，而且没有任何提示。跳过是对的（2 MiB 以上多半是压缩产物、
+    /// 锁文件、数据），但**跳过了就得说**。
+    size_skipped: usize,
 }
 
 fn search_project_scope(
@@ -2409,6 +2465,7 @@ fn search_project_scope(
     let mut results: Vec<FileMatches> = Vec::new();
     let mut total = 0usize;
     let mut scanned_files = 0usize;
+    let mut size_skipped = 0usize;
     let mut truncated = false;
     let mut stack: Vec<PathBuf> = vec![root_path.clone()];
 
@@ -2452,7 +2509,12 @@ fn search_project_scope(
             }
             continue;
         }
-        if !md.is_file() || md.len() > SEARCH_MAX_FILE {
+        if !md.is_file() {
+            continue;
+        }
+        if md.len() > SEARCH_MAX_FILE {
+            // 跳过是对的，但要记一笔：调用方必须能分清「这些文件里没有」和「这些文件没看过」。
+            size_skipped += 1;
             continue;
         }
 
@@ -2545,6 +2607,7 @@ fn search_project_scope(
         files: results,
         scanned_files,
         truncated,
+        size_skipped,
     })
 }
 
@@ -2566,6 +2629,7 @@ pub fn search_in_project(
         files: search.files,
         scanned_files: search.scanned_files,
         truncated: search.truncated,
+        size_skipped: search.size_skipped,
     })
 }
 
@@ -2582,6 +2646,9 @@ pub struct SearchResponse {
     files: Vec<FileMatches>,
     scanned_files: usize,
     truncated: bool,
+    /// 因为体积（> 2 MiB）被整份跳过的文件数。和 truncated 同一性质的假阴性，
+    /// 前端会把它拼进给模型的搜索结果里 —— 跳过了就得说。
+    size_skipped: usize,
 }
 
 #[derive(Serialize)]
@@ -3042,6 +3109,36 @@ mod archive_summary_tests {
 
 #[cfg(test)]
 mod tests {
+    /// 工具输出溢出时会把完整结果落到**系统临时目录**，再让模型用 read_file 取回。
+    /// 这条链的全部前提是：临时目录下的路径，读和写**都**能过这道闸 ——
+    /// 而且在**没有任何工作区根**的时候也能过（闸门对空根表是 fail-closed 的）。
+    ///
+    /// 这条不变量此前只有注释在说，没有任何测试正面验过。它一旦破了，
+    /// 表现不是报错，是模型收到一句「完整内容在 /var/folders/…」然后读回来一个拒绝 ——
+    /// 一个凭空承诺的路径，比直接截断更糟。
+    #[test]
+    fn temp_dir_paths_pass_the_workspace_gate_for_both_read_and_write() {
+        let file = std::env::temp_dir()
+            .join(format!("mrdayone-overflow-gate-{}.txt", std::process::id()));
+        std::fs::write(&file, "x").expect("写临时文件");
+        let path = file.to_string_lossy().to_string();
+
+        // 空根表：闸门对普通路径此时是 fail-closed 的，临时目录必须**照样**放行。
+        {
+            let mut roots = super::ALLOWED_ROOTS.lock().expect("lock");
+            roots.clear();
+        }
+        assert!(
+            super::require_inside_workspace(&path, false).is_ok(),
+            "临时目录读被拒了 —— 溢出落盘的那句「完整内容在 …」会变成假话"
+        );
+        assert!(
+            super::require_inside_workspace(&path, true).is_ok(),
+            "临时目录写被拒了 —— 文件根本不会存在，而正文已经承诺了路径"
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
     #[tokio::test]
     async fn inspecting_a_sqlite_file_from_inside_the_async_runtime_returns_instead_of_blowing_up() {
         // inspect_file 标着 #[tauri::command(async)] 而本身是同步函数，Tauri 会把它 spawn

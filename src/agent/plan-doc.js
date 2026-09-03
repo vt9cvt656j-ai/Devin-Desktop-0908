@@ -82,9 +82,25 @@ export function planCoreFromReply(md) {
 }
 
 /** 窗口标题：取第一个标题，没有就用默认名。太长的截断（标签栏放不下）。 */
+// 把一段文字洗成干净的页签标题：去掉 emoji（🔴✅⚠️ 之类当图标看很丑）、markdown 记号、
+// 前导项目符号/序号，折叠空白，按显示宽度截断。
+export function cleanPlanTitle(raw, cap = 18) {
+  const t = String(raw || "")
+    // emoji / 杂项符号 / dingbat / 变体选择符：CJK（4E00-9FFF）不在这些区间，不会被误伤。
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{200D}\u{2190}-\u{21FF}]/gu, "")
+    .replace(/[*`#>~_]/g, "")
+    .replace(/^\s*[-•·—*]+\s*/, "")          // 前导项目符号
+    .replace(/^\s*\d+\s*[.、)\]]\s*/, "")      // 前导序号 "1. " "2、"
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!t) return "";
+  return [...t].length > cap ? [...t].slice(0, cap).join("") + "…" : t;
+}
+
+// 方案的第一个小节标题——**只当兜底**。真正的标题优先取会话主题（用户那句请求），
+// 因为评审型方案的小节名（「关键缺失」「亮点」）是"这一段讲什么"，不是整份方案的主题，
+// 拿它当标题既不代表内容、又常常吓人。会话主题拿不到时才回到这里。
 export function planTitleFromReply(md, fallback = "方案") {
   const first = splitSections(String(md || "")).find((s) => s.title);
-  const t = (first?.title || "").replace(/[*`#]/g, "").trim();
-  if (!t) return fallback;
-  return [...t].length > 14 ? [...t].slice(0, 14).join("") + "…" : t;
+  return cleanPlanTitle(first?.title || "") || fallback;
 }

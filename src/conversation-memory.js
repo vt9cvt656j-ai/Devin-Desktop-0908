@@ -34,9 +34,16 @@
  * 压缩的**总量不变**，变的只是频次——同样的历史照样被折叠，只是攒够一批再做，
  * 中间那些轮次里前缀逐字节不动。
  */
-export const RECENT_WINDOW = 128;
+// 高水位必须保持在原值（100 条 / 4.8 万）。
+//
+// 2026-09-02 我一度把它抬到 128 / 7.2 万，理由是合成测试里「前缀复用率」7.4% → 54.6%。
+// 那是**优化了代理指标而不是钱**：线上实测 deepseek-v4-pro 平均输入 17,214 → 27,448
+// （+59%），命中率反而 29.8% → 24.8%，单请求成本 $1.82 → $2.31（+27%）。
+// 高水位决定每轮塞给模型多少历史；抬高它 = 每轮按全价多发几万 token，而省下的
+// 那点压缩次数根本换不回来。判据是「每请求成本」，不是复用率。
+export const RECENT_WINDOW = 100;
 export const RECENT_WINDOW_LOW = 80;
-const COMPRESS_HIGH_TOKENS = 72000;
+const COMPRESS_HIGH_TOKENS = 48000;
 const COMPRESS_LOW_TOKENS = 36000;
 const MAX_SUMMARIES = 8;
 export const SUMMARY_BATCH = 10;

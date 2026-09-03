@@ -8,8 +8,10 @@ import assert from "node:assert/strict";
 import {
   capTurnToolResults,
   allocateTurnResultBudget,
+  makeOverflowSink,
   TURN_TOOL_RESULTS_MAX_CHARS,
   PER_RESULT_FLOOR,
+  OVERFLOW_MIN_OMITTED_CHARS,
 } from "../src/agent/tool-output.js";
 import { SRC } from "./helpers/source.mjs";
 
@@ -141,6 +143,167 @@ test("失败结果也要脱色：[ERROR] 那条提前返回不许绕过 _stripAn
 });
 
 test("工具批次推进消息流时过了聚合预算这道闸", () => {
-  assert.match(SRC, /for \(const m of capTurnToolResults\(toolMsgs\)\) messages\.push\(m\)/,
+  // 不锁死实参列表：这条守卫要守的是「批次有没有过这道闸」，不是它带几个参数。
+  // 原来写死成 `capTurnToolResults(toolMsgs)`，于是给这道闸加落盘出口（多传一个参数）
+  // 时它当场假红，而报出来的错说的是「段长没有任何上限」——和真实改动毫无关系。
+  assert.match(SRC, /for \(const m of capTurnToolResults\(\s*toolMsgs\b[^)]*\)\) messages\.push\(m\)/,
     "并发批次没有过聚合预算 —— 段长本身没有任何上限");
+  // 而「带没带落盘出口」单独守一条，说的是它自己的事。
+  assert.match(SRC, /capTurnToolResults\(\s*toolMsgs\s*,[^)]*_overflowSink\s*\)/,
+    "这道闸削短之后没有取回出口 —— 模型只知道被削了，拿不回被削掉的部分");
+});
+
+// ---- 被截断的内容：不但要「知道」，还要「拿得到」 ------------------------
+//
+// 投递层原本只做到「知道」：首尾预览 + 一句「原始结果共 N 字」，收尾是「换更窄的查询重取」。
+// 而 run_cmd 这类**不可重取**的工具（重跑命令有副作用，被刻意排除在 _REFETCHABLE 之外）
+// 上那句话是空的——模型只能对着缺一大块的内容往下猜，或者再跑一遍命令。
+// 落盘之后它才兑现：正文给出绝对路径，模型用 read_file(offset/limit) 取回任意一段。
+
+test("丢了一大块 → 落盘，并把绝对路径写进正文", () => {
+  const wrote = [];
+  const sink = makeOverflowSink({ dir: "/tmp/mrday/", writeText: (p, t) => wrote.push([p, t]) });
+  const raw = "x".repeat(200_000);
+  const note = sink(raw, 7871, "cmd");
+
+  assert.equal(wrote.length, 1, "没有落盘");
+  assert.equal(wrote[0][1], raw, "落盘的不是**完整**内容 —— 那就白落了");
+  assert.match(note, /完整内容在 \/tmp\/mrday\/tool-\d{4}-cmd\.txt/, "正文里没给出路径");
+  assert.ok(note.includes(wrote[0][0]), "正文里的路径和真正写的那个不是同一个");
+  assert.match(note, /200000/, "没说原始有多长");
+  assert.match(note, /7871/, "没说这次只投递了多少");
+  assert.match(note, /read_file/, "没告诉模型用什么读");
+  assert.match(note, /offset/, "大文件怎么分段读没说");
+  // run_cmd 不可重取，所以必须明确劝阻重跑——否则模型的默认反应就是再跑一遍。
+  assert.match(note, /不要为了看剩下的重跑/, "没劝阻重跑");
+});
+
+test("只丢一点点不落盘——不值得为几百字写一个文件", () => {
+  const wrote = [];
+  const sink = makeOverflowSink({ dir: "/tmp/mrday", writeText: (p, t) => wrote.push([p, t]) });
+  assert.equal(sink("a".repeat(9_000), 8_000, "cmd"), "", "丢 1000 字也落盘了");
+  assert.equal(wrote.length, 0);
+  // 边界：刚好到阈值就落。
+  assert.notEqual(sink("a".repeat(8_000 + OVERFLOW_MIN_OMITTED_CHARS), 8_000, "cmd"), "");
+  assert.equal(wrote.length, 1);
+});
+
+test("写不出去就**不许**承诺路径——宁可没有，也不能指向一个不存在的文件", () => {
+  const sink = makeOverflowSink({ dir: "/tmp/mrday", writeText: () => { throw new Error("EACCES"); } });
+  assert.equal(sink("z".repeat(200_000), 100, "cmd"), "",
+    "写失败了却还在正文里给路径 —— 模型会去 read_file 一个不存在的文件，白烧一轮");
+});
+
+test("没有可用目录时安静退化（网页版没有真文件系统）", () => {
+  assert.equal(makeOverflowSink({ dir: "", writeText: () => {} })("z".repeat(99_999), 10, "cmd"), "");
+  assert.equal(makeOverflowSink({ dir: "/tmp", writeText: null })("z".repeat(99_999), 10, "cmd"), "");
+});
+
+test("文件名逐次递增且不含可注入路径的字符", () => {
+  const sink = makeOverflowSink({ dir: "/tmp/mrday", writeText: () => {} });
+  const big = "q".repeat(200_000);
+  const a = sink(big, 10, "cmd");
+  const b = sink(big, 10, "../../etc/passwd");
+  assert.match(a, /tool-0001-cmd\.txt/);
+  assert.match(b, /tool-0002-etcpasswd\.txt/, `kind 里的路径分隔符没被剥掉：${b.slice(0, 160)}`);
+  assert.ok(!b.includes(".."), "文件名里留下了 .. —— 那是路径穿越");
+});
+
+test("接线：投递层真的调了它，且喂的是**原始**正文而不是裁剪后的", () => {
+  // 喂裁剪后的等于落盘一份同样缺中段的副本，那就白落了。
+  assert.match(SRC, /message \+= _overflowSink\(rawMessage, message\.length, _rt\)/,
+    "投递层没接落盘，或者喂错了参数（必须是 rawMessage，不是 message）");
+});
+
+test("一轮工具太多而被额外削短时，也要给出取回完整内容的路径", () => {
+  // 这道闸此前是整条链上唯一「削了却不给取回办法」的地方：正文只说「分几轮调用」，
+  // 而 run_cmd 这类工具重跑既有副作用、也会被同样削一遍。
+  const wrote = [];
+  const sink = makeOverflowSink({
+    dir: "/tmp/x",
+    writeText: (path, text) => wrote.push({ path, len: text.length }),
+    minOmitted: 1_000,
+  });
+  const big = (n, ch) => ({ role: "tool", tool_call_id: `t${n}`, content: ch.repeat(60_000) });
+  const msgs = [big(1, "a"), big(2, "b"), big(3, "c"), big(4, "d")];
+
+  const out = capTurnToolResults(msgs, 40_000, sink);
+
+  assert.equal(wrote.length, 4, "四条都被削了，四条都该落盘");
+  for (const m of out) {
+    assert.match(m.content, /完整结果已存盘/, "被削短的正文里必须有取回说明");
+    assert.match(m.content, /\/tmp\/x\/tool-\d{4}-turnclip\.txt/, "必须给出真实路径");
+  }
+  // 落盘的是**原文**，不是削过的
+  for (const w of wrote) assert.equal(w.len, 60_000, "落盘的必须是完整原文");
+});
+
+test("不给 sink 时行为和以前逐字一致（老调用方不受影响）", () => {
+  const msgs = [
+    { role: "tool", tool_call_id: "a", content: "x".repeat(60_000) },
+    { role: "tool", tool_call_id: "b", content: "y".repeat(60_000) },
+  ];
+  const withoutSink = capTurnToolResults(msgs.map((m) => ({ ...m })), 40_000);
+  const explicitNull = capTurnToolResults(msgs.map((m) => ({ ...m })), 40_000, null);
+  assert.deepEqual(
+    withoutSink.map((m) => m.content),
+    explicitNull.map((m) => m.content),
+  );
+  for (const m of withoutSink) assert.doesNotMatch(m.content, /完整结果已存盘/);
+});
+
+test("写不出去时绝不承诺路径", () => {
+  const sink = makeOverflowSink({
+    dir: "/tmp/x",
+    writeText: () => { throw new Error("磁盘满了"); },
+    minOmitted: 1_000,
+  });
+  const out = capTurnToolResults(
+    [{ role: "tool", tool_call_id: "a", content: "z".repeat(120_000) }],
+    20_000,
+    sink,
+  );
+  assert.doesNotMatch(out[0].content, /完整结果已存盘/, "写失败还给路径就是撒谎");
+  assert.match(out[0].content, /这一轮同时发了太多工具/, "但「被削了」这件事照样要说");
+});
+
+// ---- 取回指针要活过后续的两次改写 ----------------------------------------
+//
+// 工具结果进了历史之后还会被改写两次：Tier 1 折叠成一行桩、Tier 2 压到 400 字。
+// 那句给路径的话在正文**末尾**，两次改写都会把它扔掉 —— 文件还在、指针没了，
+// 而模型被告知的是「重新调用一次取回」，对 run_cmd 这类不可重取的工具是空话。
+
+test("折叠/再压缩之后，落盘路径必须还在", async () => {
+  const { withOverflowPointer, overflowPathOf, overflowNote } =
+    await import("../src/agent/tool-output.js");
+  const original = "很长的命令输出".repeat(500) + overflowNote("/var/folders/ab/tool-0007-cmd.txt", 500_000, 8_000);
+
+  assert.equal(overflowPathOf(original), "/var/folders/ab/tool-0007-cmd.txt");
+
+  const folded = withOverflowPointer("[已折叠较早的 run_cmd 结果（原 500000 字）：npm ERR!…]", original);
+  assert.match(folded, /\/var\/folders\/ab\/tool-0007-cmd\.txt/, "折叠桩把取回路径弄丢了");
+  assert.match(folded, /read_file/, "只给路径不说怎么读，等于没给");
+
+  const compressed = withOverflowPointer("压缩后的正文\n（原 500000 字，已抽取压缩）", original);
+  assert.match(compressed, /\/var\/folders\/ab\/tool-0007-cmd\.txt/, "二次压缩把取回路径弄丢了");
+});
+
+test("原文里没有落盘路径时，改写结果一个字都不动", async () => {
+  const { withOverflowPointer } = await import("../src/agent/tool-output.js");
+  assert.equal(withOverflowPointer("[已折叠]", "普通结果，没有落盘"), "[已折叠]");
+  assert.equal(withOverflowPointer("", ""), "");
+});
+
+test("已经带着路径的正文不再重复贴一遍", async () => {
+  const { withOverflowPointer, overflowNote } = await import("../src/agent/tool-output.js");
+  const original = "x".repeat(1000) + overflowNote("/tmp/t/tool-0001-cmd.txt", 99_999, 100);
+  const once = withOverflowPointer("头部…" + original.slice(-200), original);
+  assert.equal(once.match(/tool-0001-cmd\.txt/g).length, 1, "路径被贴了两遍");
+});
+
+test("main.js 的两处历史改写点都带上了指针", () => {
+  assert.match(SRC, /content: withOverflowPointer\(`\[已折叠较早的/,
+    "Tier 1 折叠没带取回指针 —— 文件还在，模型手上的路径没了");
+  assert.match(SRC, /content: withOverflowPointer\(comp\.length < c\.length/,
+    "Tier 2 再压缩没带取回指针");
 });

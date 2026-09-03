@@ -80,4 +80,34 @@ function _mergeChatArchives(primary, mirror) {
   };
 }
 
-export { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives };
+// 已关闭会话在 localStorage 里另存一个 key，这两个函数是它的判据和读取侧。
+//
+// 变没变的判据用 **id 列表**，不用内容比对：归档条目是 _archiveChatSession 在关闭那一刻
+// 序列化定型的普通对象，此后没有任何代码再改它，所以成员没变 ⇒ 内容没变。
+// （checkpoint 那条 _closedCache 用的就是这个判据，这里刻意照抄它的形状。）
+const _closedArchiveKey = (list) => (Array.isArray(list) ? list : []).map((s) => (s && s.id) || "").join(",");
+
+// 把拆开的两个 key 合回一份恢复形状；两个参数都是 localStorage 原文，都可能是 null。
+//
+// 老用户的迁移腿在这里：归档 key 整个缺失时，回退读主 key 内嵌的那份 closedSessions。
+// 不能写成 `closed || main.closedSessions` 这种更顺手的形式 —— 归档 key 一旦存在就是唯一
+// 权威，**哪怕它是空数组**：用户把归档里最后一条重新打开之后它正是空的，兜底会把这种情况
+// 误判成「还没迁移过」，那条已经不该存在的归档下次启动又冒出来。
+function _readSplitChatMirror(rawMain, rawClosed) {
+  let main = null;
+  try { main = rawMain ? JSON.parse(rawMain) : null; } catch { main = null; }
+  if (main && typeof main !== "object") main = null;
+  let closed = null;
+  try {
+    const parsed = rawClosed ? JSON.parse(rawClosed) : null;
+    if (parsed && Array.isArray(parsed.closedSessions)) closed = parsed.closedSessions;
+  } catch { closed = null; }
+  // 主 key 读不出来但归档还在（配额把主 key 挤掉过）：归档不该跟着一起丢。
+  if (!main) main = closed && closed.length ? { sessions: [], closedSessions: closed, savedAt: 0 } : null;
+  else if (closed) main.closedSessions = closed;
+  if (!main) return null;
+  // 判空必须**在合回来之后**：一个开着的会话都没有、只剩归档时，先判会把整份镜像当空的丢掉。
+  return _archiveHasChats(main) ? main : null;
+}
+
+export { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives, _closedArchiveKey, _readSplitChatMirror };

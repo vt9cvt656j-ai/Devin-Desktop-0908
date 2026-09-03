@@ -85,3 +85,88 @@ export function askAnswerLabel(kind, payload) {
   if (kind === "cancel") return "已取消";
   return "";
 }
+
+// ---------------------------------------------------------------------------
+// 提问边界：模型这一轮以问句收尾时，是把它按回去继续做，还是真的停下来等用户。
+// ---------------------------------------------------------------------------
+
+/**
+ * 「把问题按回去」的次数上限。
+ *
+ * **这个常数存在的唯一理由是止住一次无界自旋。** 原来的判据是
+ * `if (run._askUserCount >= 3) { 推提醒; continue; }` —— 而 `_askUserCount` 只增不减，
+ * 所以第 4、5、6……次提问全部再次命中同一条，每次都 continue。结果是：
+ * 模型只要每轮以一句问句收尾，循环就**永不退出**，每轮一次完整付费模型调用，
+ * 只能靠用户按停（按停还被记成 user_stopped）。
+ *
+ * 而且这条腿绕得过所有兜底：外层 `for (let iter = 0; iter < budget)` 的 budget 是
+ * `Infinity`，空转断路器 `_idleIters++` 在循环体尾部、这条腿在它之前就 continue 走了，
+ * 静默轮的 `quietTurns++` 同样够不着。**全循环唯一一处缺陷直接换算成账单的地方。**
+ *
+ * Claude Code 的 `while (true)` 敢那么写，靠的是一条不变量：**只有模型能决定停**，
+ * 没有任何一条强制续跑腿。这里做不到完全没有（那些提醒各自有事故背书），
+ * 那退而求其次：每一条强制续跑腿都必须有**有限的预算**。
+ */
+export const ASK_PUSHBACK_LIMIT = 2;
+
+/**
+ * 决定一次「模型正文提问」怎么处理。纯函数：不读 DOM、不读全局、不做 IO。
+ *
+ * @param facts 全部来自调用点现成的值
+ *   - planSteps        run._planSteps（原样传，内部自己过滤 pending/in_progress）
+ *   - planIntercepted  run._planQuestionIntercepted（计划提醒是否已经用掉那一次）
+ *   - askUserCount     run._askUserCount（卡片提问和正文提问**合并**计数）
+ *   - pushbacks        run._askPushbacks（已经把问题按回去几次）
+ *   - planInherited / planTouched  用于判断计划是不是「继承来又没碰过」
+ *   - live             _live()，用户按停之后一律不再推提醒
+ * @returns
+ *   - action: "resume" 继续跑 | "await_user" 停下来等用户
+ *   - nudge:  要推给模型的提醒（null 表示不推）
+ *   - incompleteReason: 收尾记账用；null 表示不写
+ *   - counters: 调用方要写回 run 上的计数
+ */
+export function decideQuestionBoundary(facts = {}) {
+  const {
+    planSteps, planIntercepted = false, askUserCount = 0, pushbacks = 0,
+    planInherited = false, planTouched = false, live = true,
+  } = facts;
+  const pending = (Array.isArray(planSteps) ? planSteps : [])
+    .filter((s) => s?.status === "pending" || s?.status === "in_progress");
+  // 「继承来、本轮模型压根没碰过」的陈旧计划不参与任何强制续跑：
+  // 否则一次不相干的问答会因为上一轮留下的计划硬多跑一轮。
+  const planActionable = pending.length > 0 && (!planInherited || planTouched);
+  const nextCount = askUserCount + 1;
+
+  // ① 计划还剩步骤：拦一次，把问题按回去继续做。第二次再问就是真的在等用户了。
+  if (planActionable && live && !planIntercepted) {
+    return {
+      action: "resume",
+      nudge: { cat: "planFinish", text: `计划还剩 ${pending.length} 步没做完（下一步：${pending[0].content}）。`
+        + `\n这不是需要用户拍板的方向问题，直接继续做，别用「要不要我继续」停下来。` },
+      incompleteReason: null,
+      counters: { askUserCount, pushbacks: pushbacks + 1, planIntercepted: true },
+    };
+  }
+
+  // ② 问得太多：推一次「别再问了」。**但这条腿有预算** —— 预算用完就必须停，
+  //    否则就是上面那个常数注释里说的无界自旋。
+  if (nextCount >= 3 && live && pushbacks < ASK_PUSHBACK_LIMIT) {
+    return {
+      action: "resume",
+      nudge: { cat: "askBudget", text: `这是本次任务第 ${nextCount} 次向用户提问（卡片和正文提问合并计数）。`
+        + `\n别再问了：按最合理的方案直接做下去，把假设写进最终回答（"我按 X 处理了，因为 Y；要是你想要 Z，说一声我改"）。`
+        + `\n能自己查清的先查（read_file / search / probe_env 都在手边）。`
+        + `\n只有在"不做假设就没法继续、或者做错了整个成果作废"时才停——那种情况把卡在哪、需要什么写进最终回答，用一句话说清，而不是再问一次。` },
+      incompleteReason: null,
+      counters: { askUserCount: nextCount, pushbacks: pushbacks + 1, planIntercepted },
+    };
+  }
+
+  // ③ 真的在等用户了。计划还有剩步就如实记账 —— 别让 awaiting_user 读起来像干净收工。
+  return {
+    action: "await_user",
+    nudge: null,
+    incompleteReason: planActionable ? `plan_steps_pending:${pending.length}` : null,
+    counters: { askUserCount: nextCount, pushbacks, planIntercepted },
+  };
+}

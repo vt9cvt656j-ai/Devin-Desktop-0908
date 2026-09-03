@@ -10,6 +10,8 @@
 // 最后两条**真的把 eslint 跑起来**——解析器是照着输出格式写的，格式变了只有真跑才知道。
 import test from "node:test";
 import assert from "node:assert/strict";
+// 走共享的 SRC，不自己读 main.js：从 main.js 搬出模块时自读会假红（元测试也拦这个）。
+import { SRC as MAIN_SRC } from "./helpers/source.mjs";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -333,4 +335,33 @@ test("这条腿真的接在那道阻断门上，而不是算完就扔", () => {
     "少了这一层，npx 找不到 eslint 的非零退出会被读成「零错误、干干净净」");
   assert.ok(exec.includes("_lintFindings(linter.id, out)"),
     "只读 stdout 的话 go vet 永远报告零问题（它的诊断在 stderr）");
+});
+
+// ── 调用点必须把 root 传进来，否则模块里那段防护是在空转 ────────────────────
+//
+// `lintCommand(linter, relPaths, root)` 里 `_relativeTo` 专门防「传进来的是绝对路径」：
+// 阻断门那次调用喂的就是 `_resolvedPath`。而 go vet 吃的是**包模式**，
+// `./` + 绝对路径 = `.//Users/…/…`，go 直接报 lstat 失败 —— 整条项目 linter 腿
+// 在所有 Go 仓库上恒不可用，而且失败长得像「跑了、没问题」。
+//
+// 这一条守两头：模块里的归一化真的有效，以及 main.js 真的把 root 传下去了。
+test("go vet 拿到的是仓库相对包路径，不是 .//绝对路径", () => {
+  const linter = { id: "go-vet", langs: new Set(["go"]) };
+  const abs = "/Users/michael/proj/pkg/svc/handler.go";
+  const withRoot = lintCommand(linter, [abs], "/Users/michael/proj");
+  assert.deepEqual(withRoot.args, ["vet", "./pkg/svc/..."]);
+  // 对照：不传 root 就是那个坏掉的形状 —— 留着它，说明这条断言守的是真东西
+  const noRoot = lintCommand(linter, [abs]);
+  assert.match(noRoot.args[1], /^\.\/\//, "对照组失效了：不传 root 现在也是对的？那这条守卫就没有对象了");
+  // 相对路径本来就对，加了归一化也不能弄坏
+  assert.deepEqual(lintCommand(linter, ["pkg/svc/handler.go"], "/Users/michael/proj").args,
+    ["vet", "./pkg/svc/..."]);
+  // 仓库根目录下的文件 → ./...
+  assert.deepEqual(lintCommand(linter, ["/Users/michael/proj/main.go"], "/Users/michael/proj").args,
+    ["vet", "./..."]);
+});
+
+test("main.js 的调用点真的把 root 传下去了——少这一个参数，上面那段归一化就是空转", () => {
+  assert.match(MAIN_SRC, /const cmd = _lintCommand\(linter, files, root\);/,
+    "_lintCommand 的调用点没传 root —— go vet 会拿到 .//绝对路径，整条腿在 Go 仓库上恒不可用");
 });

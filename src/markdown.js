@@ -215,6 +215,38 @@ function mediaNode(kind, url, label, { explicit = false } = {}) {
   return image;
 }
 
+// 已知的代码/文本文件扩展名白名单——只在**没有斜杠**的单文件名（`start.command`）上用它，
+// 避免把 `obj.method`、`Class.attr` 当成文件。带斜杠的（`a/b.py`）明确是路径，任意扩展都收。
+const FILE_EXTS = new Set([
+  "py", "js", "mjs", "cjs", "jsx", "ts", "tsx", "json", "jsonc", "txt", "md", "mdx",
+  "rs", "go", "java", "kt", "kts", "c", "cc", "cpp", "cxx", "h", "hpp", "cs", "rb",
+  "php", "swift", "m", "mm", "css", "scss", "sass", "less", "html", "htm", "xml",
+  "vue", "svelte", "yaml", "yml", "toml", "ini", "cfg", "conf", "env", "lock",
+  "sh", "bash", "zsh", "fish", "command", "ps1", "bat", "sql", "csv", "tsv",
+  "proto", "graphql", "gradle", "make", "mk", "dockerfile", "lua", "r", "dart",
+  "gitignore", "npmrc", "editorconfig", "config",
+]);
+
+/** 保守判断一段行内代码是不是"可点开的文件路径"。宁可漏，不可把标识符/口令误判成文件。 */
+function looksLikeFilePath(s) {
+  if (typeof s !== "string") return false;
+  s = s.trim();
+  if (!s || s.length > 240) return false;
+  // 整段只能由路径字符构成：字母数字、`_ . / -`、`~`。含空格/括号/@/! 等一律不是路径。
+  if (!/^~?[A-Za-z0-9_./-]+$/.test(s)) return false;
+  if (s.includes("..") || s.endsWith("/")) return false;
+  const last = s.split("/").pop();
+  const dot = last.lastIndexOf(".");
+  // 末段必须有扩展名（点在中间，不是开头点文件除非它本身在白名单里，如 .gitignore）。
+  if (dot <= 0) {
+    return last.startsWith(".") && FILE_EXTS.has(last.slice(1).toLowerCase());
+  }
+  const ext = last.slice(dot + 1).toLowerCase();
+  if (!/^[A-Za-z0-9]{1,10}$/.test(ext)) return false;
+  // 带斜杠 = 明确路径，任意扩展；无斜杠 = 单文件名，扩展必须在白名单里。
+  return s.includes("/") ? true : FILE_EXTS.has(ext);
+}
+
 // Inline token matchers, tried by earliest start index (ties: order below).
 const INLINE = [
   { // inline code `...`
@@ -226,6 +258,17 @@ const INLINE = [
       }
       const c = el("code");
       c.textContent = code;
+      // 回复里形如 `decompiled/config.rt.py` 的路径变成可点开的链接（悬浮蓝、点击左侧
+      // 编辑器打开）。判据保守：整段只能是路径字符、末段必须带扩展名——把 `login`、
+      // `AppConfig`、`RgL0g1n@2026Ky!1`、`xattr -cr` 这类标识符/口令/命令排除在外。
+      // 只打标记（class + data-filepath），真正的打开在 main.js 的 chatEl 点击委托里做，
+      // 这个模块要能被 node --test 直接加载，不能依赖 openFile。
+      if (looksLikeFilePath(code)) {
+        c.className = "md-filelink";
+        // 用 setAttribute 而不是 c.dataset.filepath：浏览器里 element.dataset.filepath
+        // 会照样读回这个 data-filepath，而测试台的 FakeNode 没有 dataset、只有 setAttribute。
+        c.setAttribute("data-filepath", code);
+      }
       return c;
     },
   },
@@ -778,7 +821,47 @@ function _advanceSettledScan(st, text) {
     if (nl === -1) break; // last line still incomplete — scanned once it terminates
     if (nl > i) {
       const line = text.slice(i, nl);
-      if (/^\s{0,3}(```|~~~)/.test(line)) st.inFence = !st.inFence;
+      // 缩进放宽到任意长度（原来是 `\s{0,3}`）。
+      //
+      // CommonMark 里 ≥4 空格在**顶层**是缩进代码块，但在列表项内部（内容缩进 4）
+      // ```` ``` ```` 就是一个正常的围栏。原来那个 0-3 的上限让这种围栏整个匹配不上，
+      // 于是 st.inFence 从不置位，代码块**内部的空行**（函数之间空一行，最常见的写法）
+      // 被当成块边界，已结算的那半从此永远保持切错的样子。实测：
+      //   顶格 / 缩进 2 → boundary 落在代码块之前（对）
+      //   缩进 4        → boundary 落在代码块**内部**（错）
+      //
+      // 放宽只影响 inFence 的跟踪；结算边界仍然只认顶格（下面 `fm[1] === ""`），
+      // 所以「从缩进围栏处切块会改变渲染」那条克制原样保留。
+      const fm = /^(\s*)(`{3,}|~{3,})/.exec(line);
+      if (fm) {
+        // **开启一个顶格 fence 也算块边界**，不必等下一个空行。
+        //
+        // 之前只认「fence 外的空行」，于是模型写 `**train.py**` 紧跟代码块（中间没空行）
+        // 时，整段散文和代码块一起留在 tail 里，正在生长的 <pre> 每帧销毁重建。
+        // 实测同一份 600 行 Python：紧贴写法 5257 节点 / 4.40MB DOM 文本写入，
+        // fence 前多一个空行则是 299 节点 / 0.03MB —— 147 倍。用户看到的就是
+        // 「同一个模型、同一类问题，这次流畅下次卡」，找不到规律。
+        //
+        // 只认**顶格**（`/^(```|~~~)/`，不是上面那个允许缩进的 `\s{0,3}`）：
+        // 缩进的 fence 可能在列表项里，从那儿切开会让尾块变成顶层代码块而不是
+        // 列表内的代码块——那是渲染变化，不是加速。顶格 fence 在 CommonMark 里
+        // 必然能打断段落，所以「散文 + 代码块」拆成两块的渲染结果和不拆完全一样。
+        //
+        // **fence 的开合要认标记长度**：CommonMark 里收尾标记必须和开头同字符、且不更短。
+        // 原来这里是无条件 `st.inFence = !st.inFence`，于是 ````md 里嵌的 ``` 会把外层
+        // 提前关掉。以前不出事，是因为从不设边界、整段留在 tail 每帧全量重解析 ——
+        // 渲染碰巧是对的。一旦按边界切块，这个跟踪缺陷就变成真实的渲染错误
+        // （新增的「嵌套 fence」用例正是这么抓到的）。
+        const marker = fm[2];
+        if (!st.inFence) {
+          st.fenceMark = marker[0];
+          st.fenceLen = marker.length;
+          if (fm[1] === "") st.boundary = i; // 顶格才结算，理由见上
+          st.inFence = true;
+        } else if (marker[0] === st.fenceMark && marker.length >= st.fenceLen) {
+          st.inFence = false;
+        }
+      }
       if (!st.inFence && line.trim() === "") st.boundary = nl + 1;
     } else if (!st.inFence) {
       st.boundary = nl + 1; // empty complete line

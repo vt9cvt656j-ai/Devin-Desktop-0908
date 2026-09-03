@@ -113,7 +113,7 @@ test("代填发生在唯一授权检查点之前，且与 run_cmd 代填同一�
 // ---- 触发：全是执行事实，候选在提示前武装 ----
 
 test("触发是执行事实：前端源码真落盘 + 运行中终端的 urls（运行状态同一来源）", () => {
-  const at = loop.indexOf('_pushNudge("browserVerify"');
+  const at = loop.indexOf("[前端改了没看] 刚改了");  // 载体换了：文本追加到 [本轮交付事实]，不再是一条 nudge
   assert.ok(at > 0, "改完前端没有任何一处在浏览器侧出声");
   const armWindow = loop.slice(Math.max(0, at - 3600), at);
   // 候选先武装、后开口——「预填好参数」才成立，否则提醒退化回劝诫。
@@ -137,7 +137,7 @@ test("触发是执行事实：前端源码真落盘 + 运行中终端的 urls（
 });
 
 test("事实文案写清两步：第一步 navigate 已预填，第二步 check 读控制台错误", () => {
-  const at = loop.indexOf('_pushNudge("browserVerify"');
+  const at = loop.indexOf("[前端改了没看] 刚改了");  // 载体换了：文本追加到 [本轮交付事实]，不再是一条 nudge
   const msg = loop.slice(at, at + 1200);
   assert.match(msg, /参数留空即可/, "没告诉模型空参数即点头——弱模型拼不出参数就烧轮");
   assert.match(msg, /navigate 打开/, "没说预填的是哪一步");
@@ -153,14 +153,16 @@ test("browserVerify 登记进事实类：不被一条建议挤掉", () => {
   // 按解析那张表判，不按子串——_pushNudge("browserVerify" 那一行自己就含这个子串。
   const facts = new Set([...(/const _NUDGE_FACTS = new Set\(\[([\s\S]*?)\]\)/.exec(SRC)[1]
     .matchAll(/"([a-zA-Z]+)"/g))].map((m) => m[1]));
-  assert.ok(facts.has("browserVerify"),
-    "browserVerify 没登记进事实类——「刚改完前端、server 活着、候选已挂」是执行记账里的硬事实");
-});
+  // 原来钉「登记进事实类」——为的是别被建议类挤掉。现在它不在淘汰表里了：文本追加到
+  // [本轮交付事实]，而那块每轮无条件推、推前把上一份 splice 掉，**完全不参与同轮淘汰**。
+  // 「挤不掉」这个保证因此比原来更强。
+  assert.ok(!facts.has("browserVerify"),
+    "browserVerify 又回到淘汰表里了 —— 它现在待在不参与淘汰的交付事实块里，两处都有就是重复");});
 
 // ---- 有界：每 run 每 URL 只提示一次 ----
 
 test("每 run 每 URL 只提示一次：URL 名额在开口那一刻消耗", () => {
-  const at = loop.indexOf('_pushNudge("browserVerify"');
+  const at = loop.indexOf("[前端改了没看] 刚改了");  // 载体换了：文本追加到 [本轮交付事实]，不再是一条 nudge
   const armWindow = loop.slice(Math.max(0, at - 3600), at);
   assert.match(armWindow, /!run\._browserVerifyPromptedUrls\.has\(_bvUrl\)/,
     "没有每 URL 上界——同一个 dev server 每批改动都唠叨一遍");
@@ -205,7 +207,7 @@ test("消费互不越界：browser 代填器只认 browser，cmd 代填器只认
 // ---- 红线：发起方永远是模型，IDE 不代跑 ----
 
 test("IDE 不代跑：武装段只挂状态推事实，不发浏览器调用、不补回合", () => {
-  const at = loop.indexOf('_pushNudge("browserVerify"');
+  const at = loop.indexOf("[前端改了没看] 刚改了");  // 载体换了：文本追加到 [本轮交付事实]，不再是一条 nudge
   const start = loop.lastIndexOf("_bvSpokeThisBatch = false", at);
   assert.ok(start > 0);
   const block = loop.slice(start, at);

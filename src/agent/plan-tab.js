@@ -6,7 +6,7 @@
 export function createPlanTab(deps) {
   const {
     editorContainer, renderMarkdownInto, sendPrompt,
-    planCoreFromReply, planTitleFromReply,
+    planCoreFromReply, planTitleFromReply, getSessionTitle,
     tabPath, tabName,
     openFiles, renderTabs, syncWelcome, activate, getActivePath,
     closeTab, onAccept, onDoc, isPlanMode,
@@ -60,12 +60,39 @@ export function createPlanTab(deps) {
   let liveDone = [];   // 本轮已经说完的那几条
   let liveCur = "";    // 当前这条累积到哪儿
   let liveShown = false; // 这一轮往面板里写过没有
-  function accumulate(turn, text) {
-    if (liveTurn !== turn) { liveTurn = turn; liveDone = []; liveCur = ""; liveShown = false; liveAt = 0; }
-    if (text.startsWith(liveCur)) liveCur = text;                        // 同一条在长
+  let sawHeading = false; // 已经见过小节标题（见 liveUpdate：只在还没开页签时才需要判）
+  // 拆成两半：**记账**每个 token 都要做（很便宜），**拼全文**只在真要渲染时做。
+  //
+  // 原来 accumulate 一个函数干两件事，而 300ms 节流排在它**之后**判——于是每个 token
+  // 都要付一次「展开数组 + filter + join 整份方案」。一份 8000 字的方案、按 token 流下来，
+  // 就是几千次全文重建，全部落在主线程上。节流的意义本来就是「别每个 token 都做重活」，
+  // 重活却排在节流前面，等于节流只省了 DOM、没省字符串。
+  // 同一条在长，还是换了一条？
+  //
+  // 精确判据是 `text.startsWith(liveCur)`，而它在长方案上是**每个 token 一次 O(n)**：
+  // V8 得先把整条 cons string 摊平再逐字比。实测 100k 字的方案、400 个 token：23.3ms，
+  // 全部落在主线程上，而这还只是一个 300ms 窗口里的量。
+  //
+  // 长文本上改用长度单调性，依据是这个函数的**调用契约**：liveUpdate 是按 token 调的，
+  // 传进来的是当前这条消息**到目前为止**的累积文本。所以一条新消息第一次被看见时
+  // 必然只有几个字 —— 长度当场回落，判得出来。
+  // 短文本（<4096）时照旧精确比较：那时 startsWith 的代价可以忽略，而「上一条很短、
+  // 新一条第一片就更长」恰恰是长度判据唯一会看错的情形，正好被精确比较盖住。
+  const EXACT_UNTIL = 4096;
+  function isSameMessage(text) {
+    if (!liveCur) return true;
+    if (liveCur.length < EXACT_UNTIL) return text.startsWith(liveCur);
+    return text.length >= liveCur.length;
+  }
+  function track(turn, text) {
+    if (liveTurn !== turn) { liveTurn = turn; liveDone = []; liveCur = ""; liveShown = false; liveAt = 0; sawHeading = false; }
+    if (isSameMessage(text)) liveCur = text;                             // 同一条在长
     else { if (liveCur.trim()) liveDone.push(liveCur); liveCur = text; } // 换了一条
+  }
+  function joinDoc() {
     return [...liveDone, liveCur].filter((s) => s.trim()).join("\n\n");
   }
+  function accumulate(turn, text) { track(turn, text); return joinDoc(); }
 
   return {
     state,
@@ -73,23 +100,26 @@ export function createPlanTab(deps) {
     /** @param turn 这一轮的会话 id；@param md 到目前为止累积的回复文本 */
     liveUpdate(turn, md) {
       if (!isPlanMode()) return;
-      const doc = accumulate(turn, String(md || ""));
+      track(turn, String(md || ""));
+      // 已经开着页签：**先看节流，再拼全文**。拼全文是这条路径上唯一的重活。
+      if (liveShown) {
+        const now = Date.now();
+        if (now - liveAt < 300) return;
+        liveAt = now;
+        this.openFromReply(joinDoc(), { focus: false }); // 只更新，不抢焦点
+        return;
+      }
+      const doc = joinDoc();
       // **等到出现第一个小节标题再开页签**，不是一有字就开：模型开头总有一两句引子，
       // 那时开等于刚吐两个字就把编辑区抢走，比不写还烦。
       // 判据是「这一轮写过没有」，不是「页签开着没有」：页签开着但换了新一轮时，按后者
       // 会直接掉进下面的节流分支 —— 上一轮的方案要么被新一轮的第一个 token 顶掉，要么
       // 被节流挡住一直挂着不动。两种都不对。
-      if (!liveShown) {
-        if (!/^#{1,6}\s+\S/m.test(doc)) return;
-        liveShown = true; liveAt = Date.now();
-        // 第一次开才跟过去；页签已经在了就别抢焦点，用户可能正在别的文件里。
-        this.openFromReply(doc, { focus: !openFiles.has(tabPath) });
-        return;
-      }
-      const now = Date.now();
-      if (now - liveAt < 300) return;
-      liveAt = now;
-      this.openFromReply(doc, { focus: false }); // 已经开着：只更新，不抢焦点
+      if (!sawHeading && !/^#{1,6}\s+\S/m.test(doc)) return;
+      sawHeading = true;
+      liveShown = true; liveAt = Date.now();
+      // 第一次开才跟过去；页签已经在了就别抢焦点，用户可能正在别的文件里。
+      this.openFromReply(doc, { focus: !openFiles.has(tabPath) });
     },
 
     // 回合收尾。**照样过累积器**：收尾那条消息只是本轮的最后一段，不是全文，
@@ -111,11 +141,20 @@ export function createPlanTab(deps) {
       const core = planCoreFromReply(markdown);
       if (!core) return false;
       state.md = core;
-      state.title = planTitleFromReply(markdown, tabName);
+      // **标题由模型自己起**：用方案正文的第一个标题（plan.txt 要求模型开头就写一个短标题，
+      // 比如「项目评价：cursor-proxy」）。模型没给标题时，才回落到会话主题（用户那句请求）。
+      // 上一版把会话主题排在前面，结果模型明明写了标题却被盖掉 —— 顺序反了。
+      const modelTitle = planTitleFromReply(markdown, "");
+      const sessTitle = (typeof getSessionTitle === "function" && getSessionTitle()) || "";
+      state.title = modelTitle || sessTitle || tabName;
       try { onDoc(state.md, state.title); } catch {}
-      if (!openFiles.has(tabPath)) {
-        openFiles.set(tabPath, { model: null, name: tabName, dirty: false, viewState: null, isPlan: true });
+      // 页签名用**从方案里起的标题**，不再是死板的「方案」。方案一变（流式/重写）也跟着更新。
+      const entry = openFiles.get(tabPath);
+      if (!entry) {
+        openFiles.set(tabPath, { model: null, name: state.title, dirty: false, viewState: null, isPlan: true });
         syncWelcome();
+      } else if (entry.name !== state.title) {
+        entry.name = state.title;
       }
       renderTabs();
       if (focus) activate(tabPath);

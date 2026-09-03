@@ -288,6 +288,7 @@ pub fn run() {
             repos::list_repositories,
             files::write_text_file,
             files::write_text_file_if_unchanged,
+            files::write_text_file_if_unchanged_hashed,
             files::delete_text_file_if_unchanged,
             files::write_tmp_file,
             files::home_dir,
