@@ -112,7 +112,7 @@ function freshState() {
     v: 1,
     skills,
     prefs: { explain: "auto", challenge: false },   // explain: auto | min | rich
-    stats: { messages: 0, aiEdits: 0, reviews: 0, undos: 0, reverts: 0, blind: 0, predicts: 0, predictHits: 0 },
+    stats: { messages: 0, aiEdits: 0, reviews: 0, undos: 0, reverts: 0, blind: 0, predicts: 0, predictHits: 0, reworks: 0, cleanRuns: 0, asked: 0 },
     trend: [],                                       // [{ msgs, avg, t }]
     sessionModes: [],                               // modes seen this run (tooling breadth)
     projects: {},                                    // root -> { name, first, last, turns, touched:{skill:count} }
@@ -127,7 +127,7 @@ let state = null;
 let currentProject = null;
 // Per-turn ledger, reconciled at the start of the next turn so that AI edits the
 // user never looked at count as "blind accepts" (the deskilling signal).
-let turn = { applied: 0, reviewed: 0, engaged: false };
+let turn = { applied: 0, reviewed: 0, engaged: false, verified: false };
 // At most one "predict-first" challenge gate per turn, so it teaches without nagging.
 let gatedThisTurn = false;
 
@@ -211,7 +211,12 @@ function snapshotTrend() {
 // accept → weak negative evidence for "reviewing" (and disengagement for
 // "authoring"). This is what makes over-reliance visibly cost mastery.
 function reconcileTurn() {
-  const blind = Math.max(0, turn.applied - turn.reviewed);
+  // 「闭眼接受」的判据原来只看"有没有在 IDE 里点开 diff"。2026-09-05 量了产品所有者自己的
+  // 档案：862 轮里 AI 改了 1041 处、点开 27 次，"未看就接受率" 70%，四项能力钉在地板 ——
+  // 他不是没审，是不在这个面板里审：改完立刻跑测试 / 看构建 / 直接用。
+  // 所以这一轮的 run 如果**验证过**（测试/构建/诊断真跑过且过了），没点开 diff 不算闭眼；
+  // 没验证过才算。验证是执行事实，点开面板只是一个界面事件。
+  const blind = turn.verified ? 0 : Math.max(0, turn.applied - turn.reviewed);
   if (blind > 0) {
     state.stats.blind += blind;
     const hits = Math.min(blind, 3);            // cap so one big run can't tank the estimate
@@ -220,7 +225,7 @@ function reconcileTurn() {
   } else if (turn.applied > 0 || turn.engaged) {
     observe("authoring", true);                 // they engaged with the work this turn
   }
-  turn = { applied: 0, reviewed: 0, engaged: false };
+  turn = { applied: 0, reviewed: 0, engaged: false, verified: false };
   gatedThisTurn = false;                         // allow one predict-gate next turn
 }
 
@@ -242,10 +247,8 @@ export function signal(type, payload = {}) {
           p.last = Date.now();
           p.turns += 1;
         }
-        const len = payload.len || 0;
-        // Sub-15-char turns are acks/continuations ("继续", "好"), not prompting
-        // attempts — scoring them as failures unfairly tanked the mastery estimate.
-        if (len >= 15) observe("prompting", len >= 60); // detailed asks vs one-liners
+        // 「表达需求」不再按字数判：≥60 字算好、否则算差，把老手的一句话指令全记成失败
+        // （实测 prompting 钉在 0.14）。改成 run 收尾按执行事实判——见 run-complete 里的 asked。
         if (payload.mode === "plan") { observe("planning", true); turn.engaged = true; }
         if (payload.complex && payload.mode === "agent") observe("planning", true); // 勇于接复杂任务
         if (payload.mode === "chat" || payload.mode === "plan") turn.engaged = true; // thinking, not autopiloting
@@ -271,11 +274,31 @@ export function signal(type, payload = {}) {
         turn.reviewed += 1; turn.engaged = true;
         state.stats.undos += 1;
         break;
-      case "run-complete":
+      case "run-complete": {
         // An agent run that edited files: did it verify its own work (tests /
         // build / diagnostics) or ship unverified? The beneficial-usage signal.
         observe("verifying", !!payload.verified);
+        turn.verified = !!payload.verified;   // 供下一轮 reconcileTurn 判"闭眼"用
+        // 下面三条全是执行事实，不是界面事件（判据见文件头 / docs/growth-system.md §3）：
+        //  · asked：这个 run 里问了用户几次。0 次且做成了 = 需求讲清楚了；≥2 次 = 没讲清。
+        //  · reworked：上一轮记了 ✓，用户半小时内又提了同一件事（情景档案 _markReworkIfAny 配出来的）
+        //    = 上一轮的产出没过用户这一关 → 审查/表达两项的负证据。
+        //  · 改了文件、验证过、没返工 = 干净的一轮 → 审查的弱正证据（他确实在把关，只是不在面板里）。
+        if (Number.isFinite(Number(payload.asked))) {
+          const asked = Math.max(0, Math.trunc(Number(payload.asked)));
+          state.stats.asked += asked;
+          if (payload.outcome === "success" || asked >= 2) observe("prompting", asked === 0);
+        }
+        if (payload.reworked) {
+          state.stats.reworks += 1;
+          observe("reviewing", false);
+          observe("prompting", false);
+        } else if (payload.wroteFiles && payload.verified && payload.outcome === "success") {
+          state.stats.cleanRuns += 1;
+          observe("reviewing", true);
+        }
         break;
+      }
       case "predict":
         // "你先猜": the user committed to a guess before seeing the AI's diff —
         // retrieval practice + desirable difficulty, the strongest learning signal.
@@ -288,6 +311,45 @@ export function signal(type, payload = {}) {
     }
     save();
   } catch { /* a telemetry bug must never break the editor */ }
+}
+
+/**
+ * 「老用户还是新用户」—— 只看用量和项目广度，不看 BKT。
+ *
+ * 为什么要这个：放宽工具窗口那条判据读的是 BKT 平均掌握度，而 BKT 的信号有一半是界面
+ * 事件（点没点开 diff）。产品所有者 862 轮、32 个项目，平均掌握度 0.42 < 0.45，被判成新手、
+ * 拿最窄的工具窗口。用了这么多轮、跨这么多项目的人不是新手 —— 这是执行事实，BKT 是估计。
+ */
+export function getExperienceTier() {
+  try {
+    load();
+    return (state.stats.messages >= 60 && projectCount() >= 2) ? "seasoned" : "new";
+  } catch { return "new"; }
+}
+
+/**
+ * 一个 run 收尾时喂给 run-complete 的三条执行事实（全从账本/档案读，不从界面事件推）：
+ *  · asked：这个 run 里 ask_user 了几次；
+ *  · reworked：档案里上一条 ✓ 被这一条返工了（_markReworkIfAny 配出来的 reworkedAt）；
+ *  · wroteFiles：这一轮改没改文件。
+ */
+export function factsFromRun(run, episodes, outcome) {
+  const eps = Array.isArray(episodes) ? episodes : [];
+  const last = eps[eps.length - 1], prev = eps[eps.length - 2];
+  return {
+    asked: (run?._toolLedger?.entries || []).filter((e) => e && e.tool === "ask_user").length,
+    reworked: !!(prev && last && prev.reworkedAt && prev.reworkedAt === last.ts),
+    wroteFiles: (run?.recording || []).some((st) => st && /write|edit|multiedit/.test(String(st.type || ""))),
+    outcome,
+  };
+}
+
+/** 测试专用：清掉模块级状态。生产代码不许调。 */
+export function _resetForTests() {
+  state = null;
+  turn = { applied: 0, reviewed: 0, engaged: false, verified: false };
+  gatedThisTurn = false;
+  currentProject = null;
 }
 
 // --- public: the "你先猜" (predict-first) challenge gate -----------------------
@@ -616,7 +678,7 @@ export function renderPanel(body, ctx = {}) {
     reset.addEventListener("click", () => {
       if (!confirm("确定清空「成长」对你的全部画像与统计？此操作不可撤销。")) return;
       state = freshState();
-      turn = { applied: 0, reviewed: 0, engaged: false };
+      turn = { applied: 0, reviewed: 0, engaged: false, verified: false };
       save();
       rerender();
     });

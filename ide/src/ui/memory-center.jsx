@@ -19,16 +19,36 @@ import { cn } from "./lib/cn.js";
  * rebuild. React owns layout; the widget owns itself.
  */
 // Listed here rather than inline so the rail stays a list of sections, not markup.
+// Core comes first: it is the layer that is present on every turn, so it is the one to check
+// when the assistant "keeps forgetting" something. Memory and Preferences are retrieved by
+// relevance; Core is not retrieved at all — it is simply always there.
 const SECTIONS = [
+  { value: "core", label: "Core" },
   { value: "memory", label: "Memory" },
   { value: "preferences", label: "Preferences" },
   { value: "graph", label: "Graph" },
+];
+/** Counters the host records about memory traffic; shown as plain numbers, no verdicts. */
+const STAT_ROWS = [
+  ["core.user", "Core entries (every project)"],
+  ["core.project", "Core entries (this project)"],
+  ["reflect.opened", "Run-end reflections that considered memory"],
+  ["reflect.accepted", "Entries those reflections wrote"],
+  ["capture.core.accepted", "Core entries captured from what you said"],
+  ["render.core", "Turns that carried the core block"],
+  ["retrieve.kg.hit", "Turns with a relevant memory hit"],
+  ["retrieve.kg.empty", "Turns with no relevant memory hit"],
+  ["retrieve.ep.hit", "Turns with a matching past task"],
+  ["retrieve.wf.hit", "Turns with a matching workflow"],
 ];
 
 export function MemoryCenter({
   hasRoot,
   initialProject,
   initialGlobal,
+  initialCore,
+  memoryStats,
+  onSaveCore,
   onGlobeMount,
   onTextChange,
   onSave,
@@ -38,7 +58,9 @@ export function MemoryCenter({
 }) {
   const [project, setProject] = useState(initialProject ?? "");
   const [global, setGlobal] = useState(initialGlobal ?? "");
-  const [tab, setTab] = useState("memory");
+  const [coreUser, setCoreUser] = useState(initialCore?.user ?? "");
+  const [coreProject, setCoreProject] = useState(initialCore?.project ?? "");
+  const [tab, setTab] = useState("core");
   const globeHost = useRef(null);
   const globeHandle = useRef(null);
   const projectRef = useRef(null);
@@ -117,6 +139,47 @@ export function MemoryCenter({
             ))}
           </TabsList>
 
+          <TabsContent value="core" className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col gap-3 px-5 py-4">
+            <p className="text-[12px] text-muted-foreground">
+              Always in context, every turn. Keep it short: a few rules and preferences, not notes.
+              Lines starting with <code className="rounded bg-muted px-1">[你记的]</code> were written by the assistant — delete the tag to adopt one as your own.
+            </p>
+            <div className="flex min-h-0 flex-1 flex-col gap-1.5">
+              <h3 className="text-[12px] font-medium text-foreground">My core (every project)</h3>
+              <textarea
+                className={editorClass}
+                spellCheck={false}
+                value={coreUser}
+                onChange={(e) => setCoreUser(e.target.value)}
+                placeholder="Reply in Chinese&#10;Keep answers short, lead with the conclusion"
+              />
+            </div>
+            <div className="flex min-h-0 flex-1 flex-col gap-1.5">
+              <h3 className="text-[12px] font-medium text-foreground">
+                Project core
+                {!hasRoot ? <span className="ml-2 font-normal text-muted-foreground">no folder open</span> : null}
+              </h3>
+              <textarea
+                className={editorClass}
+                spellCheck={false}
+                disabled={!hasRoot}
+                value={coreProject}
+                onChange={(e) => setCoreProject(e.target.value)}
+                placeholder="Goal: a movie site for one cinema&#10;API prefix is /api/v2&#10;Money is stored in cents"
+              />
+            </div>
+            {memoryStats && Object.keys(memoryStats).length ? (
+              <dl className="grid shrink-0 grid-cols-2 gap-x-4 gap-y-0.5 text-[11px] text-muted-foreground">
+                {STAT_ROWS.filter(([k]) => memoryStats[k] != null).map(([k, label]) => (
+                  <div key={k} className="flex justify-between gap-2">
+                    <dt className="truncate">{label}</dt>
+                    <dd className="tabular-nums text-foreground">{memoryStats[k]}</dd>
+                  </div>
+                ))}
+              </dl>
+            ) : null}
+          </TabsContent>
+
           <TabsContent value="memory" className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 px-5 py-4">
             <h3 className="text-[12px] font-medium text-foreground">
               Project memory
@@ -190,7 +253,7 @@ export function MemoryCenter({
               Clear preferences
             </Button>
           ) : null}
-          <Button size="sm" onClick={() => onSave?.(project, global)}>Save</Button>
+          <Button size="sm" onClick={() => (tab === "core" ? onSaveCore?.(coreUser, coreProject) : onSave?.(project, global))}>Save</Button>
         </div>
       </DialogContent>
     </Dialog>

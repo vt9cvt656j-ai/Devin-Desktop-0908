@@ -189,8 +189,9 @@ function pushOf(text, sess) {
   // 所以要把它按**真实实现**注进来 —— 在这里手写一份等价物就等于测试台自编形状，
   // 实现改了它还绿。
   const isFiller = load("_isFillerUtterance");
-  new Function("text", "sess", "_ledgerNorm", "_applyExplicitMemoryCorrection", "_autoMemoryCapture", "_identityRoot", "_isFillerUtterance", body)(
-    text, sess, norm, () => true, () => {}, "", isFiller,
+  new Function("text", "sess", "_ledgerNorm", "_applyExplicitMemoryCorrection", "_autoMemoryCapture", "_coreCaptureUtterance", "_identityRoot", "_isFillerUtterance", body)(
+    // _coreCaptureUtterance：用户原话进核心记忆那条（2026-09-05 加在同一段里），这个沙箱只验台账，桩掉。
+    text, sess, norm, () => true, () => {}, () => null, "", isFiller,
   );
 }
 
