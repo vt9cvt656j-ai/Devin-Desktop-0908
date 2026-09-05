@@ -11,6 +11,7 @@
 export function _browserBatchFastJS(steps) {
   const safeSteps = (Array.isArray(steps) ? steps : []).slice(0, 25).map((step) => ({
     op: String(step?.op || step?.action || "").toLowerCase().trim(),
+    kind: String(step?.kind || "").toLowerCase().slice(0, 8),
     selector: String(step?.selector || ""),
     node: Number.isFinite(+step?.node) ? Math.floor(+step.node) : null,
     index: Number.isFinite(+step?.index) ? Math.floor(+step.index) : null,
@@ -679,7 +680,19 @@ export function _browserBatchFastJS(steps) {
       for (var i=0; i<STEPS.length && !broken; i++) {
         var s = STEPS[i] || {}, op = s.op || '', label = selectorFor(s) || s.target || ((op === 'click' || op === 'wait' || op === 'hover') ? s.text : '') || op;
         try {
-          if (op === 'click' || op === 'tap' || op === 'dblclick' || op === 'doubleclick' || op === 'rightclick' || op === 'contextmenu' || op === 'longpress' || op === 'hold') {
+          if (op === 'locate') {
+            // 只定位不动手：用 click 同一套目标解析（selector/node/text/role + 可点性判断），把选中的元素
+            // 打上 data-mfind，让 Rust 侧的 browser_click / browser_type 按 '[data-mfind]' 走人类化 CDP
+            // （trusted 事件 + 真实轨迹）。以前单步 click 全程在这段页内脚本里用合成事件点，
+            // isTrusted=false，遇到只认 trusted 事件的站点就"点了没反应"。
+            try { document.querySelectorAll('[data-mfind]').forEach(function(e){ e.removeAttribute('data-mfind'); }); } catch(e){}
+            var lel = findTarget(s, s.kind === 'type' ? 'type' : 'click');
+            if (!lel) { var lch = candidateHints(s, 'click'); log.push((i+1)+'. locate ✗ 找不到 ' + label + (lch.length ? ' candidates=' + lch.join(' | ') : '')); failed = { step:i+1, op:op, reason:'not_found', target:label, candidates:lch }; broken = true; break; }
+            var lr = await actionable(lel);
+            if (!lr.ok) { var lblocker = lr.blocker ? brief(lr.blocker) : ''; log.push((i+1)+'. locate ✗ ' + lr.reason + (lblocker ? ' blockedBy=' + lblocker : '') + ' target=' + brief(lr.el || lel)); failed = { step:i+1, op:op, reason:lr.reason, target:brief(lr.el || lel), blocker:lblocker }; broken = true; break; }
+            try { lel.setAttribute('data-mfind', '1'); } catch(e){}
+            log.push((i+1)+'. locate ' + label + ' ✓ ' + brief(lel) + ' @' + Math.round(lr.point.x) + ',' + Math.round(lr.point.y));
+          } else if (op === 'click' || op === 'tap' || op === 'dblclick' || op === 'doubleclick' || op === 'rightclick' || op === 'contextmenu' || op === 'longpress' || op === 'hold') {
             var el = findTarget(s, 'click');
             if (!el) { var ch = candidateHints(s, 'click'); log.push((i+1)+'. ' + op + ' ✗ 找不到 ' + label + (ch.length ? ' candidates=' + ch.join(' | ') : '')); failed = { step:i+1, op:op, reason:'not_found', target:label, candidates:ch }; broken = true; break; }
             var before = signature(), cr = await smartClick(el, s);

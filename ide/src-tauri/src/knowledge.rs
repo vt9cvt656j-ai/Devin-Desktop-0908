@@ -1190,17 +1190,20 @@ pub async fn github_search(
     let stype = search_type.as_deref().unwrap_or("repositories");
 
     let url = format!("https://api.github.com/search/{stype}");
-    let resp = c
+    let mut req = c
         .get(&url)
         .query(&[("q", query.as_str()), ("per_page", &limit.to_string())])
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("GitHub: {e}"))?;
+        .header("Accept", "application/vnd.github+json");
+    // 带上用户的 token：匿名搜索每分钟只有 10 次（2026-09 本机经验表：github_search 17% 失败，
+    // 原文全是 GitHub 回的 403），code 搜索则根本不接匿名请求。
+    let authed = github_token().is_some();
+    req = github_auth_header(req);
+    let resp = req.send().await.map_err(|e| format!("GitHub: {e}"))?;
 
     if !resp.status().is_success() {
+        let code = resp.status().as_u16();
         let body = resp.text_capped().await.unwrap_or_default();
-        return Err(format!("GitHub error: {body}"));
+        return Err(github_error_text(code, &body, authed));
     }
 
     let json: Value = resp
@@ -1220,6 +1223,45 @@ pub async fn github_search(
         }
     }
     Ok(out)
+}
+
+/// 用户的 GitHub token。进程环境里有就用；桌面 App 从 Dock 启动时继承不到登录 shell 的 export，
+/// 再问一次登录 shell（process_util 那条探测，有 4 秒预算）。**只探一次**：探测要起一个登录 shell，
+/// 不能每次搜索都付。换 token 要重启 App。
+fn github_token() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let clean = |s: String| {
+                let t = s.trim().to_string();
+                if t.is_empty() { None } else { Some(t) }
+            };
+            if let Some(t) = std::env::var("GITHUB_TOKEN").ok().and_then(clean) {
+                return Some(t);
+            }
+            crate::process_util::login_shell_env()
+                .get("GITHUB_TOKEN")
+                .cloned()
+                .and_then(clean)
+        })
+        .clone()
+}
+
+/// 把 GitHub 的错误回成模型能行动的一句话。原来是 `GitHub error: {body}`——body 是一整段 JSON，
+/// 情景档案里截成 160 字后只剩 `GitHub error: {`，模型什么都读不出来。
+fn github_error_text(code: u16, body: &str, authed: bool) -> String {
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| body.chars().take(200).collect());
+    let hint = match code {
+        403 | 429 if authed => "（已带 token 仍被限流：等一分钟再试，或缩小查询范围）",
+        403 | 429 => "（匿名配额每分钟 10 次。在登录 shell 里 export GITHUB_TOKEN=<PAT> 后重启 App：配额到 30 次/分钟，code 搜索也才可用）",
+        422 => "（GitHub 不接受这个查询：去掉特殊符号或过长的短语，search_type 用 repositories / code / issues 之一）",
+        401 => "（token 无效或已过期）",
+        _ => "",
+    };
+    format!("GitHub {code}: {message}{hint}")
 }
 
 fn format_github_repo_overview(repo: &Value, retrieved: &str) -> String {
@@ -1345,11 +1387,7 @@ async fn github_discussions_graphql(
 }
 
 fn github_auth_header(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    match std::env::var("GITHUB_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
+    match github_token() {
         Some(token) => req.header("Authorization", format!("Bearer {token}")),
         None => req,
     }
@@ -5175,10 +5213,7 @@ pub async fn github_discussions_search(
     // 真能检索 discussions 的只有 GraphQL 的 search(type: DISCUSSION)，
     // 它**强制鉴权**（实测带 GITHUB_TOKEN 时 rust ownership 有 1485 条）。
     // 有 token 就走真路；没有就照实说这次搜的是 issue。
-    let has_token = std::env::var("GITHUB_TOKEN")
-        .ok()
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
+    let has_token = github_token().is_some();
     if has_token {
         if let Ok(text) = github_discussions_graphql(&c, &query, n as usize).await {
             return Ok(text);
@@ -6998,5 +7033,22 @@ mod wrong_field_tests {
         );
         let g = body_of("async fn github_discussions_graphql");
         assert!(g.contains("type:DISCUSSION"), "GraphQL 查询写错了类型");
+    }
+}
+
+#[cfg(test)]
+mod github_error_tests {
+    use super::github_error_text;
+
+    #[test]
+    fn 错误原文要能读出来_而不是半截json() {
+        let body = r#"{"message":"API rate limit exceeded for 1.2.3.4. (But here's the good news...)","documentation_url":"https://docs.github.com"}"#;
+        let t = github_error_text(403, body, false);
+        assert!(t.starts_with("GitHub 403: API rate limit exceeded"), "{t}");
+        assert!(t.contains("export GITHUB_TOKEN"), "匿名限流要告诉模型怎么解：{t}");
+        let t2 = github_error_text(403, body, true);
+        assert!(t2.contains("已带 token"), "{t2}");
+        let t3 = github_error_text(500, "<html>oops</html>", false);
+        assert!(t3.starts_with("GitHub 500: <html>oops"), "{t3}");
     }
 }

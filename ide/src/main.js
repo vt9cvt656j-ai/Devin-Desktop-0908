@@ -247,6 +247,10 @@ import { createProgressLedger } from "./agent/idle-progress.js";
 import { readOnlyBatch } from "./agent/subagent-batch.js";
 import { INSTRUCTION_LADDER } from "./agent/prompt-layers.js";
 import { repairToolPairing } from "./agent/tool-pairing.js";
+import { augmentSearchResult, looksLikeIdentifier } from "./agent/search-augment.js";
+import { runClickOrTypeStep } from "./agent/browser-click-route.js";
+import { webFetchNextStep } from "./agent/web-fetch-hint.js";
+import { automationNextStep } from "./agent/automation-hint.js";
 
 // Global shared state store for sub-agent collaboration
 const _globalSharedStore = getSharedStore();
@@ -62931,9 +62935,10 @@ async function _executeToolStepInner(step, call, root, run) {
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
       const _body = blocks.join("\n\n");
       vp.innerHTML = `<pre>${_escHtml((_body || "(无匹配)") + partialNote)}</pre>`;
+      const _augmentText = augmentSearchResult({ query: q, totalHits: hits, semanticIndexReady: !!(_bm25Index.built && _bm25Index.root === root), semanticHits: (!hits && _bm25Index.built && _bm25Index.root === root) ? bm25Search(q, 5) : [], symbolHits: (_symbolIndexBuilt && _symbolIndexRoot === root && looksLikeIdentifier(q)) ? (_symbolIndex.get(q.trim().toLowerCase()) || []).filter((e) => e.name === q.trim()) : [] }); // 零命中接语义索引、查标识符附定义：只附加，见 search-augment.js
       return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}${_scanScopeUnknown ? "（远端没报扫描规模，**判断不了这次搜完没有**——别按「这就是全部」下结论）" : ""}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。${_remote.active
         ? `当前工作区在**远程主机**上，这次搜索由远端代理执行，它的扫描范围以那台机器上的实现为准，这里说不准跳过了什么。${_scanScopeUnknown ? "远端也没报扫描规模，所以「搜完了」还是「没搜完」这里同样判断不了。" : ""}`
-        : "好消息是**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。但扫描确实会静默跳过这些：构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target、dist、build、out、vendor、coverage、Pods、venv、__pycache__）、**符号链接**（文件和目录都跳，monorepo/pnpm 的 workspace 链接整棵树都不在内）、**大于 2MB 的文件**、含 NUL 字节的二进制、以及**非 UTF-8 编码**的文件（GBK/Latin-1 的老代码整份搜不到）。所以先换关键词再试；如果目标可能落在上面任何一类里，直接 read_file 指名读"}：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
+        : "好消息是**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。但扫描确实会静默跳过这些：构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target、dist、build、out、vendor、coverage、Pods、venv、__pycache__）、**符号链接**（文件和目录都跳，monorepo/pnpm 的 workspace 链接整棵树都不在内）、**大于 2MB 的文件**、含 NUL 字节的二进制、以及**非 UTF-8 编码**的文件（GBK/Latin-1 的老代码整份搜不到）。所以先换关键词再试；如果目标可能落在上面任何一类里，直接 read_file 指名读"}：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote + _augmentText };
 
     } else if (call.type === "find") {
       const requestedPattern = call.pattern || call.path || "";
@@ -64115,7 +64120,7 @@ async function _executeToolStepInner(step, call, root, run) {
           const retryNote = e?.retryInfo ? `（${e.retryInfo}）` : "";
           res.className = "atc-result atc-result--err";
           res.textContent = msg.slice(0, 80);
-          return { type: "web", path: call.path, content: `[ERROR] 网页抓取失败: ${msg}${retryNote}。检查 URL 是否正确、网络是否畅通；内网地址确认 VPN/代理已连接。抓不到更常见的原因是反爬、需要 JS 渲染或需要登录——别就此判定「拿不到」：换 http_request 自带 header 直取，或 browser 打开真实页面，纯文本也可以 run_cmd 跑 curl。` };
+          return { type: "web", path: call.path, content: `[ERROR] 网页抓取失败: ${msg}${retryNote}。${webFetchNextStep(msg, url) || "检查 URL 是否正确、网络是否畅通；内网地址确认 VPN/代理已连接。抓不到更常见的原因是反爬、需要 JS 渲染或需要登录——别就此判定「拿不到」：换 http_request 自带 header 直取，或 browser 打开真实页面，纯文本也可以 run_cmd 跑 curl。"}` };
         }
       }
       const chars = text.length;
@@ -65803,7 +65808,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
         const _msg = String(e?.message || e);
-        const _hint = /找不到 automation-server|未就绪/.test(_msg) ? "\n（首次用需在 ~/Desktop/自动化工具框架 里 `cargo build --release --features 'system browser' --bin automation-server`；正常我会自动拉起它。）" : "";
+        const _hint = /找不到 automation-server|未就绪/.test(_msg) ? "\n（首次用需在 ~/Desktop/自动化工具框架 里 `cargo build --release --features 'system browser' --bin automation-server`；正常我会自动拉起它。）" : automationNextStep(_m, _msg); // sidecar 原文 → 下一步（automation-hint.js）
         const _perm = _callDrivesDesktop(call) ? await _desktopPermissionNote(_permScopeForMethod(_m)) : "";
         return { type: "automation", path: _m, content: `[失败] ${_m}: ${_msg.slice(0, 300)}${_hint}${_perm}` };
       }
@@ -67169,8 +67174,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         }
         else if (act === "click") {
           const smartStep = { op: "click", selector: _bsel, target: call.target || call.text || "", role: call.role || "", text: call.text || "", button: call.button, clickCount: call.clickCount ?? call.click_count, modifiers: call.modifiers, x: call.x, y: call.y, expect: call.expect || "", expectText: call.expectText ?? call.expect_text ?? call.assertText ?? call.assert_text ?? "", expectSelector: call.expectSelector ?? call.expect_selector ?? call.assertSelector ?? call.assert_selector ?? "", expectUrl: call.expectUrl ?? call.expect_url ?? "", expectValue: call.expectValue ?? call.expect_value ?? "", expectAbsent: !!(call.expectAbsent || call.expect_absent) };
-          state = await backend.invoke("browser_eval", { script: _browserBatchFastJS([smartStep]) });
-          const parsed = (() => { try { return JSON.parse(String(state?.result || "{}")); } catch { return null; } })();
+          const _cr = await runClickOrTypeStep({ kind: "click", call, selector: _bsel, smartStep, invoke: (n, a) => backend.invoke(n, a), fastJs: _browserBatchFastJS }); // 纯点击走人类化 CDP，页内只定位；失败回落合成事件
+          state = _cr.state; const parsed = _cr.parsed;
           if (parsed && parsed.ok === false) { res.className = "atc-result atc-result--err"; res.textContent = "点击未生效"; return { type: "browser", path: "click", browserResult: state?.result, content: `[失败] 浏览器 click 未生效：${(parsed.log || []).join("\n") || JSON.stringify(parsed.failed || {})}` }; }
         }
         else if (act === "observe") {
@@ -67225,8 +67230,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         }
         else if (act === "type") {
           const smartStep = { op: "type", selector: _bsel, target: call.target || "", role: call.role || "textbox", text: call.text || "", clear: !!call.clear, append: !!call.append, expect: call.expect || "", expectText: call.expectText ?? call.expect_text ?? call.assertText ?? call.assert_text ?? "", expectSelector: call.expectSelector ?? call.expect_selector ?? call.assertSelector ?? call.assert_selector ?? "", expectUrl: call.expectUrl ?? call.expect_url ?? "", expectValue: call.expectValue ?? call.expect_value ?? "", expectAbsent: !!(call.expectAbsent || call.expect_absent) };
-          state = await backend.invoke("browser_eval", { script: _browserBatchFastJS([smartStep]) });
-          const parsed = (() => { try { return JSON.parse(String(state?.result || "{}")); } catch { return null; } })();
+          const _cr = await runClickOrTypeStep({ kind: "type", call, selector: _bsel, smartStep, invoke: (n, a) => backend.invoke(n, a), fastJs: _browserBatchFastJS }); // 纯输入走人类化 CDP，页内只定位；失败回落合成事件
+          state = _cr.state; const parsed = _cr.parsed;
           if (parsed && parsed.ok === false) { res.className = "atc-result atc-result--err"; res.textContent = "输入未生效"; return { type: "browser", path: "type", browserResult: state?.result, content: `[失败] 浏览器 type 未生效：${(parsed.log || []).join("\n") || JSON.stringify(parsed.failed || {})}` }; }
         }
         else if (act === "autofill" || act === "fill") {

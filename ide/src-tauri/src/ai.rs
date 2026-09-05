@@ -4452,30 +4452,95 @@ async fn ddg_search_multi(q: &str) -> (Vec<(String, String, String)>, Vec<&'stat
         scrape_ddg_lite(q.to_string()),
         scrape_brave(q.to_string()),
     );
-    let sources: [(&'static str, Vec<(String, String, String)>); 5] = [
+    let sources: Vec<(&'static str, Vec<(String, String, String)>)> = vec![
         ("bing", bing),
         ("brave", brave),
         ("google", google),
         ("duckduckgo", ddg),
         ("duckduckgo-lite", lite),
     ];
-    let mut seen = std::collections::HashSet::new();
-    let mut merged = Vec::new();
+    merge_search_sources(sources)
+}
+
+/// 多源合并：**交错**取，不是把第一路的全部放前面。
+///
+/// 实测（2026-09-05，本机）五路里只有 bing、brave 活着（ddg 两路 202 挑战页、google 只回 JS 壳）。
+/// 原来的合并是 bing 全部 → brave 全部，再截 12 条：brave 的头部结果常被挤出去，而两个引擎
+/// 各自的第一名本该都在前面。去重按归一化 URL（见 normalize_result_url）：同一篇文章带不同
+/// 追踪参数、http/https、尾斜杠不再算两条。ok/empty 的顺序保持传入顺序，回执按它报。
+fn merge_search_sources(
+    sources: Vec<(&'static str, Vec<(String, String, String)>)>,
+) -> (Vec<(String, String, String)>, Vec<&'static str>, Vec<&'static str>) {
     let mut ok = Vec::new();
     let mut empty = Vec::new();
+    let mut lists: Vec<std::collections::VecDeque<(String, String, String)>> = Vec::new();
     for (name, rows) in sources {
         if rows.is_empty() {
             empty.push(name);
-            continue;
+        } else {
+            ok.push(name);
+            lists.push(rows.into_iter().collect());
         }
-        ok.push(name);
-        for r in rows {
-            if seen.insert(r.1.clone()) {
-                merged.push(r);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    loop {
+        let mut any = false;
+        for list in lists.iter_mut() {
+            if let Some(r) = list.pop_front() {
+                any = true;
+                if seen.insert(normalize_result_url(&r.1)) {
+                    merged.push(r);
+                }
             }
+        }
+        if !any {
+            break;
         }
     }
     (merged, ok, empty)
+}
+
+/// 去重用的 URL 归一化：主机小写、http→https、去 #fragment、去尾斜杠、去追踪参数
+/// （utm_* / fbclid / gclid / msclkid / ref / spm / mc_* 等）。只用于判"是不是同一页"，
+/// 展示给模型的仍是原始 URL。
+fn normalize_result_url(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    if let Some(i) = s.find('#') {
+        s.truncate(i);
+    }
+    let scheme_end = s.find("://").map(|i| i + 3).unwrap_or(0);
+    let host_end = s[scheme_end..].find('/').map(|i| scheme_end + i).unwrap_or(s.len());
+    let mut head = s[..host_end].to_lowercase();
+    if let Some(rest) = head.strip_prefix("http://") {
+        head = format!("https://{rest}");
+    }
+    let tail = &s[host_end..];
+    let (path, query) = match tail.find('?') {
+        Some(i) => (&tail[..i], Some(&tail[i + 1..])),
+        None => (tail, None),
+    };
+    let path = path.trim_end_matches('/');
+    let mut kept: Vec<&str> = Vec::new();
+    if let Some(q) = query {
+        for kv in q.split('&') {
+            let k = kv.split('=').next().unwrap_or("").to_ascii_lowercase();
+            let tracking = k.is_empty()
+                || k.starts_with("utm_")
+                || matches!(
+                    k.as_str(),
+                    "fbclid" | "gclid" | "msclkid" | "ref" | "ref_src" | "spm" | "_hsenc" | "_hsmi" | "mc_cid" | "mc_eid" | "igshid" | "yclid"
+                );
+            if !tracking {
+                kept.push(kv);
+            }
+        }
+    }
+    if kept.is_empty() {
+        format!("{head}{path}")
+    } else {
+        format!("{head}{path}?{}", kept.join("&"))
+    }
 }
 
 const SEARCH_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -5426,5 +5491,45 @@ mod web_search_sources_tests {
             code.contains("空手的那几个是常年被反爬拦着，不是这个词冷门"),
             "没告诉模型空手是常态，它会据此判断「这个话题没资料」"
         );
+    }
+}
+
+#[cfg(test)]
+mod search_merge_tests {
+    use super::{merge_search_sources, normalize_result_url};
+
+    fn row(url: &str) -> (String, String, String) {
+        (url.to_string(), url.to_string(), String::new())
+    }
+
+    #[test]
+    fn 多源交错_每路的第一名都在前面() {
+        let (merged, ok, empty) = merge_search_sources(vec![
+            ("bing", vec![row("https://a.io/1"), row("https://a.io/2"), row("https://a.io/3")]),
+            ("brave", vec![row("https://b.io/1"), row("https://b.io/2")]),
+            ("google", vec![]),
+        ]);
+        let urls: Vec<&str> = merged.iter().map(|r| r.1.as_str()).collect();
+        assert_eq!(urls, ["https://a.io/1", "https://b.io/1", "https://a.io/2", "https://b.io/2", "https://a.io/3"]);
+        assert_eq!(ok, ["bing", "brave"]);
+        assert_eq!(empty, ["google"]);
+    }
+
+    #[test]
+    fn 同一页的不同写法只算一条() {
+        let (merged, _, _) = merge_search_sources(vec![
+            ("bing", vec![row("http://Docs.Example.com/guide/?utm_source=bing&utm_medium=x")]),
+            ("brave", vec![row("https://docs.example.com/guide#intro"), row("https://docs.example.com/guide?page=2")]),
+        ]);
+        let urls: Vec<&str> = merged.iter().map(|r| r.1.as_str()).collect();
+        assert_eq!(urls.len(), 2, "带追踪参数/锚点/尾斜杠/大小写的同一页没去重：{urls:?}");
+        assert!(urls.contains(&"https://docs.example.com/guide?page=2"), "带真实查询参数的是另一页，不能被合掉");
+    }
+
+    #[test]
+    fn 归一化只用于判重_不吞真实参数() {
+        assert_eq!(normalize_result_url("HTTP://Example.com/A/?utm_campaign=z&id=7#x"), "https://example.com/A?id=7");
+        assert_eq!(normalize_result_url("https://example.com/"), "https://example.com");
+        assert_eq!(normalize_result_url(""), "");
     }
 }

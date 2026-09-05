@@ -14445,9 +14445,12 @@ test("browser batch prefers one fast DOM run over per-step screenshots", () => {
   assert.doesNotMatch(script, /browser_screenshot|capture_screenshot/);
   assert.match(SRC, /const canFastBatch = steps\.every\(\(s\) => fastOps\.has/);
   assert.match(SRC, /backend\.invoke\("browser_eval", \{ script: _browserBatchFastJS\(steps\) \}\)/);
-  assert.match(SRC, /const smartStep = \{ op: "click"[\s\S]{0,900}_browserBatchFastJS\(\[smartStep\]\)/,
+  // 单步 click/type 仍复用智能批处理那层，但现在经 runClickOrTypeStep 走：页内只定位（locate），
+  // 事件由 Rust 的 browser_click/browser_type 发 trusted 版本，失败再回落到 _browserBatchFastJS([smartStep])。
+  // 这里守的是「smartStep 和 _browserBatchFastJS 一起交给了它」——行为本身由 test/browser-click-route.test.mjs 真跑。
+  assert.match(SRC, /const smartStep = \{ op: "click"[\s\S]{0,900}runClickOrTypeStep\(\{ kind: "click", call, selector: _bsel, smartStep, [^\n]{0,160}fastJs: _browserBatchFastJS \}\)/,
     "single click/node/selector actions should reuse the smart batch action layer");
-  assert.match(SRC, /const smartStep = \{ op: "type"[\s\S]{0,900}_browserBatchFastJS\(\[smartStep\]\)/,
+  assert.match(SRC, /const smartStep = \{ op: "type"[\s\S]{0,900}runClickOrTypeStep\(\{ kind: "type", call, selector: _bsel, smartStep, [^\n]{0,160}fastJs: _browserBatchFastJS \}\)/,
     "single type/node/selector actions should reuse the smart batch action layer");
   assert.match(SRC, /不要每一步 screenshot/);
   assert.match(SRC, /连续动作必须用 batch/);
