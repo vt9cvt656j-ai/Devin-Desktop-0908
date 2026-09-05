@@ -30,6 +30,7 @@ window.addEventListener("unhandledrejection", (e) => {
 import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js";
 import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
 import { recoveredDraftNotice, recoveredThinkingOpen } from "./agent/draft-recovery.js";
+import { groupDeltasByGen, mergeJournalIntoDrafts, drainJournal } from "./agent/stream-journal.js";
 import { applyLayoutDensity, viewportW, viewportH } from "./agent/layout-density.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
@@ -2456,6 +2457,15 @@ try {
 // 1.2 秒一次——服务那边正卡着等回答，太慢会让人以为工具卡死了；而这一下只是一次
 // IPC，没有挂起请求时后端直接返回 None。
 setInterval(() => { void _mcpPollElicitation(); }, 1200);
+
+// 流式草稿增量落盘节拍：delta 追加进 Rust 真文件（强杀也保得住，见 stream_draft.rs / drainJournal）；常驻薄壳，空转极廉。
+let _journalTicking = false;
+setInterval(() => {
+  if (_journalTicking || !inTauri || _isSecondaryWindow) return;
+  if (!(Array.isArray(_chatSessions) && _chatSessions.some((sess) => sess && (sess._journalClearPending || (sess._journalBuf && sess._journalBuf.length))))) return;
+  _journalTicking = true;
+  Promise.resolve(drainJournal(_chatSessions, (cmd, args) => backend.invoke(cmd, args))).finally(() => { _journalTicking = false; });
+}, 400);
 
 // 内存压力自动减负：监测 WebView DOM 膨胀（历史卡死根因是 1.3GB），超过阈值时主动
 // 释放不可见的 heavy 资源（已完成工具卡的大 viewport、后台终端 canvas），
@@ -18686,7 +18696,10 @@ async function _streamDraftPersistDurable(draft = null) {
   } catch { /* 磁盘镜像只是保险，失败不影响 localStorage 主链路 */ }
 }
 function _streamDraftClear(session = null) {
-  if (session) { session._draftSaveAt = 0; session._draftDurableAt = 0; session._streamDraftLatest = null; session._streamRunPrefix = ""; }
+  if (session) {
+    session._draftSaveAt = 0; session._draftDurableAt = 0; session._streamDraftLatest = null; session._streamRunPrefix = "";
+    session._journalBuf = []; session._journalClearPending = true;
+  }
   try {
     // 分槽之后这里是精确删除：A 会话收尾只清 A 的槽，B 正在流式的草稿原样留着。
     if (session?.id) {
@@ -20821,7 +20834,10 @@ async function restoreChatHistory() {
       try {
         // 现在是每个会话一份：两个标签页同时被打断，两边都要补回来。
         let _restored = 0;
-        for (const _draft of await _streamDraftTake()) {
+        // 增量日志（Rust 真文件，强杀也在）与 2s 快照按会话取较全者：SIGKILL 时快照可能很旧甚至没有。恢复后一起清掉。
+        let _journalDrafts = [];
+        try { _journalDrafts = inTauri ? (await backend.invoke("stream_draft_read_all")) || [] : []; } catch {}
+        for (const _draft of mergeJournalIntoDrafts(await _streamDraftTake(), _journalDrafts)) {
           const _draftSession = _chatSessions.find((s) => s?.id === _draft.sessionId);
           const _draftText = String(_draft.text || "");
           const _draftReasoning = String(_draft.reasoning || "");
@@ -20859,6 +20875,8 @@ async function restoreChatHistory() {
           }
         }
         if (_restored) saveChatHistory({ immediate: true });
+        // 日志文件已消费（无论恢复成消息还是被查重跳过）：删掉，别下次启动再复活。
+        for (const _j of _journalDrafts) { if (_j && typeof _j.sessionId === "string") { try { await backend.invoke("stream_draft_clear", { sessionId: _j.sessionId }); } catch {} } }
       } catch (e) { console.warn("[chat] stream draft recovery failed:", e); }
       // _switchChatSession lazily renders the active tab's history into its
       // container (and every other tab renders the first time you click it).
@@ -32219,9 +32237,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       if (ev.kind === "reasoning") {
         // 厂商独立通道 → trusted（同 agent 路）。
         accepted = appendPlainReasoning(ev.delta || "", true);
+        if (sess) (sess._journalBuf || (sess._journalBuf = [])).push({ g: sess._runGen || 0, t: "", r: ev.delta || "" });
       }
       else if (ev.kind === "token") {
         const { th, an, accepted: routedAccepted } = _routeThink(ev.delta);
+        if (sess) (sess._journalBuf || (sess._journalBuf = [])).push({ g: sess._runGen || 0, t: an || "", r: th || "" });
         if (th) appendPlainReasoning(th, true);
         if (an) {
           // Whitespace may precede another reasoning delta. Preserve it in the
@@ -48269,9 +48289,11 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           // appendReasoning 的注释——工具调用会置真 answerStarted，而「想→调→再想」
           // 是现代模型的常态形状。
           accepted = appendReasoning(ev.delta || "", true);
+          if (session) (session._journalBuf || (session._journalBuf = [])).push({ g: session._runGen || 0, t: "", r: ev.delta || "" });
         }
         else if (ev.kind === "token") {
           const routed = _routeInlineThinkingDelta(_inlineThinkState, ev.delta || "");
+          if (session) (session._journalBuf || (session._journalBuf = [])).push({ g: session._runGen || 0, t: routed.answer || "", r: routed.reasoning || "" });
           // The parser only returns reasoning that occurred before its first visible
           // answer fragment, even when both appeared in one network delta.
           if (routed.reasoning) appendReasoning(routed.reasoning, true);
