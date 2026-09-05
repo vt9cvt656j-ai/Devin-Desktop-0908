@@ -6,6 +6,7 @@ mod preview_bridge;
 mod permissions;
 mod archive;
 mod repos;
+mod stream_draft;
 mod tabular;
 mod ui_clone;
 mod ai;
@@ -312,6 +313,9 @@ pub fn run() {
             conversation_store::conversation_transcript_window,
             conversation_store::conversation_transcript_content_slice,
             conversation_store::conversation_transcript_truncate,
+            stream_draft::stream_draft_append,
+            stream_draft::stream_draft_read_all,
+            stream_draft::stream_draft_clear,
             git::git_status,
             git::git_worktree_add,
             git::git_worktree_list,
