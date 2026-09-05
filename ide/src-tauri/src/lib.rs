@@ -410,6 +410,7 @@ pub fn run() {
             browser::browser_storage,
             browser::browser_close,
             browser::browser_user_tabs,
+            browser::browser_tab,
             browser::browser_extract_ui,
             sysctl::system_open_app,
             sysctl::system_list_apps,

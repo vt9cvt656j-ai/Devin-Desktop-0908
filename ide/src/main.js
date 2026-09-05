@@ -251,6 +251,8 @@ import { augmentSearchResult, looksLikeIdentifier } from "./agent/search-augment
 import { runClickOrTypeStep } from "./agent/browser-click-route.js";
 import { webFetchNextStep } from "./agent/web-fetch-hint.js";
 import { automationNextStep } from "./agent/automation-hint.js";
+import { _AUTOMATION_METHODS, _COMPUTER_METHODS } from "./agent/automation-methods.js";
+import { runBrowserTask, taskModelConfig, automationBrowserCall, mergedBrowserNote, browserNavAction } from "./agent/browser-task.js";
 
 // Global shared state store for sub-agent collaboration
 const _globalSharedStore = getSharedStore();
@@ -23885,42 +23887,6 @@ function _setAiPerm(p) { _currentAiPerm = (p === "approve" ? "approve" : "auto")
 // status/diff/log, lsp, think, screenshot, web search never ask.
 const _APPROVE_TYPES = approvalTypes(); // 见 agent/tool-policy.js —— 单一声明处，不再逐点重抄
 const _GIT_MUTATING_OPS = new Set(["clone", "commit", "push", "pull", "stash", "stash_pop"]);
-// computer 工具的合法动作。**唯一一份**：schema 的 enum、映射层的白名单、以及报错时
-// 那句「可用的是：…」以前是三处手抄，漏了 mouse.position——模型照 schema 调，撞一句
-// 「不支持的动作」，还附一份同样漏掉它的清单，于是认定读不到指针位置。
-// sidecar（automation-framework/src/rpc.rs）**真正实现**的方法全集。
-//
-// automation 此前零校验直通后端：方法名写错会一路打到 sidecar 才失败，而那边回的是
-// 一句底层错误，模型拿不到"可用的是这些"这份清单，只能猜下一个名字再来一轮。
-// computer 走 _COMPUTER_METHODS 校验、不认识就报 invalidMethod（全文件唯一产地），
-// 于是同一个笔误在两个入口上的代价差着好几轮往返。
-//
-// 这份是**超集**：computer 是它里面挑出来的、不含 browser.* / recorder.* / sleep 的
-// 那一档（那几族有自己的专用工具，或者会让模型拿它当 sleep 用）。
-const _AUTOMATION_METHODS = [
-  "mouse.click", "mouse.double_click", "mouse.triple_click", "mouse.down", "mouse.up",
-  "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll",
-  "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.down", "keyboard.up",
-  "keyboard.hold", "keyboard.paste",
-  "screen.info", "screen.displays", "screen.capture", "screen.elements", "screen.probe", "screen.act",
-  "clipboard.get", "clipboard.set",
-  "window.list", "window.activate", "window.minimize", "window.restore",
-  "recorder.save", "recorder.list", "recorder.replay",
-  "browser.start", "browser.goto", "browser.click", "browser.type", "browser.wait",
-  "browser.eval", "browser.content", "browser.screenshot", "browser.close",
-  "system.init", "system.open", "sleep",
-];
-
-const _COMPUTER_METHODS = [
-  "mouse.click", "mouse.double_click", "mouse.triple_click", "mouse.down", "mouse.up", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll",
-  "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.down", "keyboard.up", "keyboard.hold", "keyboard.paste",
-  // screen.capture：**真的拍屏幕像素**。在它之前整套系统没有任何一条通路能看到桌面
-  // ——screenshot 工具只会用无头浏览器渲染一个 http(s) 网址，于是模型对任何原生应用、
-  // 游戏、Canvas、视频、PDF 都是全盲的：动完手没法看一眼确认自己做成没有。
-  // 不给 x/y/width/height 就是整屏；四个要么都给要么都不给。
-  "screen.info", "screen.displays", "screen.capture", "clipboard.get", "clipboard.set",
-  "window.list", "window.activate", "window.minimize", "window.restore",
-];
 function _requiresApproval(call) {
   if (!call) return false;
   if (call.type === "git") return _GIT_MUTATING_OPS.has(call.op) || (call.op === "branch" && !!call.branch);
@@ -37058,9 +37024,9 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       // "open" 排头：它是**默认该先想到的那个**——只是要让用户看一眼页面时，交给他自己的
       // 默认浏览器，不起自动化窗口。这份名单会覆盖上面 schema 字面量里的 enum，
       // 只改那边等于没改（这次就先踩了一次）。
-      const wantedActions = ["mytabs", "open", "navigate", "observe", "viewport", "click", "dblclick", "rightclick", "longpress", "type", "clear", "append", "autofill", "fill", "hover", "drag", "slide", "swipe", "wheel", "toggle", "uncheck", "select", "focus", "blur", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"];
+      const wantedActions = ["mytabs", "open", "navigate", "observe", "viewport", "click", "dblclick", "rightclick", "longpress", "type", "clear", "append", "autofill", "fill", "hover", "drag", "slide", "swipe", "wheel", "toggle", "uncheck", "select", "focus", "blur", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close", "task", "back", "forward", "reload", "tab"];
       browserProps.action.enum = wantedActions;
-      browserProps.action.description = "The browser action to perform. **mytabs = look at what the user already has open in their OWN browser** (titles and URLs, macOS only, no automation window involved) — check this FIRST whenever the task touches a page the user might already be on, so you decide from what is actually open instead of reflexively launching a window. It returns titles and URLs only, never page text. **open = hand the URL to the USER'S OWN default browser for them to look at** — their tabs, their logins, their extensions; no automation session, no second Dock icon, works even if their default is Safari or Firefox. You do not see the page. Use it whenever the point is for the user to look (the dev server you just started, a deployed site, a doc, a link); use navigate and the rest only when YOU need to read, click or verify the page. observe = structured observation of the page (ready/active/iframe/shadow/nodes); check only performs a page health check; for checkboxes and switches use toggle + checked:true/false (or batch op:check/uncheck). For sequential or complex operations prefer batch (real pointer/mouse events, dblclick/rightclick/longpress, hover, drag/slide/swipe, wheel, focus/blur, clear/append, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, candidate recovery, native setters, settling after each action, expect* acceptance checks); for forms prefer autofill/fill (fields={email,password,...}, optionally submit:true/submitText to submit, returning filled/missing/invalid with the validation reason). upload sends a file to an <input type=file>: use selector to pick the file input and path/paths for the absolute local file path.";
+      browserProps.action.description = "The browser action to perform. **mytabs = look at what the user already has open in their OWN browser** (titles and URLs, macOS only, no automation window involved) — check this FIRST whenever the task touches a page the user might already be on, so you decide from what is actually open instead of reflexively launching a window. It returns titles and URLs only, never page text. **open = hand the URL to the USER'S OWN default browser for them to look at** — their tabs, their logins, their extensions; no automation session, no second Dock icon, works even if their default is Safari or Firefox. You do not see the page. Use it whenever the point is for the user to look (the dev server you just started, a deployed site, a doc, a link); use navigate and the rest only when YOU need to read, click or verify the page. observe = structured observation of the page (ready/active/iframe/shadow/nodes); check only performs a page health check; for checkboxes and switches use toggle + checked:true/false (or batch op:check/uncheck). For sequential or complex operations prefer batch (real pointer/mouse events, dblclick/rightclick/longpress, hover, drag/slide/swipe, wheel, focus/blur, clear/append, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, candidate recovery, native setters, settling after each action, expect* acceptance checks); for forms prefer autofill/fill (fields={email,password,...}, optionally submit:true/submitText to submit, returning filled/missing/invalid with the validation reason). upload sends a file to an <input type=file>: use selector to pick the file input and path/paths for the absolute local file path. task = give the goal in plain language (goal, optional url, max_steps): the tool observes, acts and re-observes by itself, up to max_steps rounds, and reports what it did and the result — use it when you do not know how many steps a page flow takes. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. back / forward / reload move through history.";
     }
     browserProps.width = { type: "integer", description: "For viewport: viewport width, e.g. 1440 on desktop, 390 on a phone" };
     browserProps.height = { type: "integer", description: "For viewport: viewport height, e.g. 900 on desktop, 844 on a phone" };
@@ -38989,6 +38955,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         mobile: !!args.mobile,
         steps: Array.isArray(args.steps) ? args.steps : (Array.isArray(args.actions) ? args.actions : null),
         uploadPaths: Array.isArray(args.paths) ? args.paths : (args.path ? [args.path] : (args.file ? [args.file] : (args.files ? (Array.isArray(args.files) ? args.files : [args.files]) : []))),
+        goal: String(args.goal || ""), maxSteps: Number.isFinite(+args.max_steps) ? +args.max_steps : (Number.isFinite(+args.maxSteps) ? +args.maxSteps : 0), op: String(args.op || ""), tab: Number.isFinite(+args.tab) ? +args.tab : undefined, // task / tab
       };
     }
     case "computer": { const _m = String(args.method || args.action || "").trim(); if (!_m) return { type: "automation", method: "screen.info", params: {} }; const _validMethods = _COMPUTER_METHODS; const _method = _validMethods.includes(_m) ? _m : null; if (!_method) return { type: "automation", via: "computer", method: "", invalidMethod: _m }; const _p = (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {}; return { type: "automation", method: _method, params: _p }; }
@@ -65784,6 +65751,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           + `\n组合键用 keyboard.combo；右键用 mouse.click{button:"right"}；按住修饰键点击用 {keys:["cmd"]}。` };
       }
       if (!_m) return { type: "automation", path: "", content: "[ERROR] automation 需要 method（如 browser.goto / mouse.click / recorder.replay）。" };
+      { const _b = automationBrowserCall(_m, call.params || {}); if (_b) { const _r = await _executeToolStepInner(step, _b, root, run); if (_r && typeof _r.content === "string") _r.content = `${mergedBrowserNote(_b.action)}\n${_r.content}`; return _r; } } // 两只 CDP 浏览器合成一只，见 browser-task.js
       try {
         const r = await backend.automationCall(_m, call.params || {});
         res.className = "atc-result atc-result--ok"; res.textContent = _m;
@@ -67178,6 +67146,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           state = _cr.state; const parsed = _cr.parsed;
           if (parsed && parsed.ok === false) { res.className = "atc-result atc-result--err"; res.textContent = "点击未生效"; return { type: "browser", path: "click", browserResult: state?.result, content: `[失败] 浏览器 click 未生效：${(parsed.log || []).join("\n") || JSON.stringify(parsed.failed || {})}` }; }
         }
+        else if (act === "task") { const _cfg = taskModelConfig(loadConfig(), _customModelById); const _tr = await runBrowserTask({ goal: call.goal, maxSteps: call.maxSteps, startUrl: call.url, invoke: (n, a) => backend.invoke(n, a), fastJs: _browserBatchFastJS, nodesScript: _NODES_EXTRACT_JS, askModel: (messages, maxTokens) => _cognitiveLegComplete(_cfg, { model: _cfg.model, messages, temperature: 0, ...(_cfg.viaGateway && _isAnthropicWireFamily(_cfg.model) ? { reasoning_effort: "off" } : {}) }, maxTokens), onProgress: (line) => { res.textContent = line; } }); state = _tr.state || (await backend.invoke("browser_screenshot")); if (state) state.result = _tr.text; } // 目标驱动循环：观察→行动→再观察，见 browser-task.js
+        else if (act === "back" || act === "forward" || act === "reload" || act === "tab") state = await browserNavAction({ act, call, invoke: (n, a) => backend.invoke(n, a) });
         else if (act === "observe") {
           state = await backend.invoke("browser_eval", { script: _browserBatchFastJS([{ op: "observe" }]) });
         }
@@ -67395,6 +67365,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
             + `剩下的步骤请再发一次 batch；不要以为整个序列已经走完。`;
         }
         content += `\n**批量自动化结果**（${call._batchFast ? "fast batch：页面内一次执行多步，只截最终一次" : "兼容 batch：一次模型调用跑完多步"}，不要再为同一步骤补 screenshot）：\n${call._batchLog || "(无步骤)"}` + (state.result != null && state.result !== "" ? `\n\n**执行后的结构化状态**（已是最新状态；接着用 \`node=i\` 继续操作，或用 assert/check 验证。只有最终视觉排版验收才截图）：\n${state.result}` : "");
+      } else if ((act === "task" || act === "tab") && state.result != null && state.result !== "") { content += `\n${state.result}`;
       } else if (act === "observe" && state.result != null && state.result !== "") {
         content += `\n**页面观察状态**（不是截图猜测，是结构化 DOM/可访问节点快照）。包含 ready、active、contexts(同源 iframe / shadow DOM 数量)、nodes、状态字段；复杂页面先看这里，再用 batch 连续执行，并用 expectText/expectSelector/expectUrl/expectValue 做动作后验收：\n${state.result}`;
       } else if (act === "design" && state.result != null && state.result !== "") {

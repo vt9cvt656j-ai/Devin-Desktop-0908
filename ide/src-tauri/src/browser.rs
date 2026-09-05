@@ -1687,6 +1687,133 @@ pub async fn browser_type(selector: String, text: String) -> Result<BrowserState
     .await
 }
 
+/// 标签页管理：list / new / switch / close。
+///
+/// 会话里一直只有**一个**当前 tab（`Session.tab`），所有动作都打在它上面。跨站流程
+/// （在邮箱里读验证码再回到登录页、对照两个页面）以前只能在同一个 tab 里来回 navigate，
+/// 登录表单一回来就重置。这里让模型开第二个 tab、在 tab 之间切换；`with_tab` 之后照常
+/// 作用于"当前 tab"，所以 switch 之后的 click/type/observe 不用改写法。
+/// 回执是结构化事实（tabs 数组 + current 下标），给模型的话在 JS 侧拼。
+#[tauri::command]
+pub async fn browser_tab(
+    op: String,
+    index: Option<usize>,
+    url: Option<String>,
+) -> Result<BrowserState, String> {
+    tauri::async_runtime::spawn_blocking(move || tab_op(&op, index, url.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// browser_tab 的同步核心：作用于全局会话（BROWSER）。拆出来是为了能在测试里对着一只
+/// 临时 profile 的无头 Chrome 真跑一遍（见 tab_ops_real_chrome，`--ignored`）。
+fn tab_op(op: &str, index: Option<usize>, url: Option<&str>) -> Result<BrowserState, String> {
+    {
+        let _operation = BROWSER_OPERATION
+            .lock()
+            .map_err(|_| "browser operation state poisoned")?;
+        let current = current_or_launch_tab()?;
+        let browser = {
+            let state = BROWSER.lock().map_err(|_| "browser state poisoned")?;
+            state
+                .session
+                .as_ref()
+                .map(|s| s._browser.clone())
+                .ok_or_else(|| "浏览器已关闭".to_string())?
+        };
+        let all: Vec<Arc<Tab>> = browser
+            .get_tabs()
+            .lock()
+            .map_err(|_| "tab list poisoned")?
+            .iter()
+            .cloned()
+            .collect();
+        let op = op.trim().to_ascii_lowercase();
+        let target_of = |i: Option<usize>| -> Result<Arc<Tab>, String> {
+            let i = i.ok_or_else(|| format!("browser tab op={op} 需要 tab（下标，从 list 里拿）"))?;
+            all.get(i)
+                .cloned()
+                .ok_or_else(|| format!("没有第 {i} 个标签页（现在共 {} 个，下标从 0 起）", all.len()))
+        };
+        let (tab, tabs_after): (Arc<Tab>, Vec<Arc<Tab>>) = match op.as_str() {
+            "list" => (current.clone(), all.clone()),
+            "new" => {
+                let tab = browser.new_tab().map_err(|e| e.to_string())?;
+                configure_new_tab(&tab)?;
+                if let Some(u) = url.filter(|u| !u.trim().is_empty()) {
+                    tab.navigate_to(u.trim()).map_err(|e| e.to_string())?;
+                    let _ = tab.wait_until_navigated();
+                }
+                let mut after = all.clone();
+                after.push(tab.clone());
+                set_current_tab(tab.clone())?;
+                (tab, after)
+            }
+            "switch" => {
+                let tab = target_of(index)?;
+                let _ = tab.activate();
+                set_current_tab(tab.clone())?;
+                (tab, all.clone())
+            }
+            "close" => {
+                let victim = target_of(index)?;
+                let was_current = victim.get_target_id() == current.get_target_id();
+                let after: Vec<Arc<Tab>> = all
+                    .iter()
+                    .filter(|t| t.get_target_id() != victim.get_target_id())
+                    .cloned()
+                    .collect();
+                if after.is_empty() {
+                    return Err("这是最后一个标签页，关它等于关浏览器：要关浏览器用 close".into());
+                }
+                let _ = victim.close(true);
+                let next = if was_current { after[0].clone() } else { current.clone() };
+                if was_current {
+                    let _ = next.activate();
+                    set_current_tab(next.clone())?;
+                }
+                (next, after)
+            }
+            other => return Err(format!("browser tab 不认识 op「{other}」；可用：list / new / switch / close")),
+        };
+        let rows: Vec<(String, String, String)> = tabs_after
+            .iter()
+            .map(|t| (t.get_target_id().to_string(), t.get_title().unwrap_or_default(), t.get_url()))
+            .collect();
+        let result = tab_rows_json(&op, &rows, tab.get_target_id());
+        snapshot(&tab, Some(result))
+    }
+}
+
+/// 把当前 tab 换成 `tab`；会话已经没了就报错（close 与本操作并发时会这样）。
+fn set_current_tab(tab: Arc<Tab>) -> Result<(), String> {
+    let mut state = BROWSER.lock().map_err(|_| "browser state poisoned")?;
+    match state.session.as_mut() {
+        Some(session) => {
+            session.tab = tab;
+            Ok(())
+        }
+        None => Err("浏览器已关闭".into()),
+    }
+}
+
+/// 标签页清单的结构化回执：`{op, current, tabs:[{tab,title,url,current}]}`。纯函数，有单测。
+fn tab_rows_json(op: &str, rows: &[(String, String, String)], current_id: &str) -> String {
+    let mut current = 0usize;
+    let tabs: Vec<serde_json::Value> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (id, title, url))| {
+            let is_current = id == current_id;
+            if is_current {
+                current = i;
+            }
+            serde_json::json!({ "tab": i, "title": title, "url": url, "current": is_current })
+        })
+        .collect();
+    serde_json::json!({ "op": op, "current": current, "count": tabs.len(), "tabs": tabs }).to_string()
+}
+
 /// Set the file(s) of a <input type=file> matching a CSS selector — so the agent can
 /// automate upload forms (which plain typing can't do). `paths` are absolute local paths.
 #[tauri::command]
@@ -3053,5 +3180,79 @@ mod tests {
         .unwrap();
 
         assert!(!store.lock().unwrap().launch_is_current(launch_generation));
+    }
+}
+
+#[cfg(test)]
+mod tab_rows_tests {
+    use super::tab_rows_json;
+
+    #[test]
+    fn 标签页回执_下标从零_当前那一个标出来() {
+        let rows = vec![
+            ("A".to_string(), "登录".to_string(), "https://x.io/login".to_string()),
+            ("B".to_string(), "邮箱".to_string(), "https://mail.io/".to_string()),
+        ];
+        let v: serde_json::Value = serde_json::from_str(&tab_rows_json("switch", &rows, "B")).unwrap();
+        assert_eq!(v["op"], "switch");
+        assert_eq!(v["current"], 1);
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["tabs"][0]["tab"], 0);
+        assert_eq!(v["tabs"][0]["current"], false);
+        assert_eq!(v["tabs"][1]["title"], "邮箱");
+        assert_eq!(v["tabs"][1]["current"], true);
+    }
+}
+
+#[cfg(test)]
+mod tab_ops_real_chrome {
+    //! `cargo test --lib -- --ignored tab_ops_real_chrome`：起一只临时 profile 的无头 Chrome，
+    //! 装进全局会话，把 list / new / switch / close 走一遍。默认 ignored：CI 上没有 Chrome。
+    use super::*;
+    use headless_chrome::LaunchOptionsBuilder;
+
+    fn install(browser: Browser, tab: Arc<Tab>) {
+        let mut state = BROWSER.lock().unwrap();
+        state.session = Some(Session { _browser: browser, tab });
+    }
+
+    fn parsed(state: &BrowserState) -> serde_json::Value {
+        serde_json::from_str(state.result.as_deref().unwrap_or("{}")).unwrap()
+    }
+
+    #[test]
+    #[ignore]
+    fn 标签页_开_切_关_全走一遍() {
+        let path = crate::capture::find_headless_browser().expect("本机没有 Chromium 系浏览器");
+        let dir = std::env::temp_dir().join(format!("mrday-tab-test-{}", std::process::id()));
+        let opts = LaunchOptionsBuilder::default()
+            .path(Some(std::path::PathBuf::from(&path)))
+            .headless(true)
+            .sandbox(false)
+            .user_data_dir(Some(dir.clone()))
+            .window_size(Some((1280, 900)))
+            .build()
+            .unwrap();
+        let browser = Browser::new(opts).expect("起不来无头 Chrome");
+        let tab = browser.new_tab().unwrap();
+        tab.navigate_to("about:blank").unwrap();
+        install(browser, tab);
+
+        let list = parsed(&tab_op("list", None, None).unwrap());
+        assert_eq!(list["count"], 2, "headless_chrome 起来自带一个 about:blank，再加我们开的那个：{list}");
+        let opened = parsed(&tab_op("new", None, Some("data:text/html,<title>second</title>hi")).unwrap());
+        assert_eq!(opened["count"], 3);
+        let cur = opened["current"].as_u64().unwrap() as usize;
+        assert_eq!(opened["tabs"][cur]["title"], "second", "新开的要成为当前：{opened}");
+        let back = parsed(&tab_op("switch", Some(1), None).unwrap());
+        assert_eq!(back["current"], 1);
+        let closed = parsed(&tab_op("close", Some(cur), None).unwrap());
+        assert_eq!(closed["count"], 2, "{closed}");
+        let err = tab_op("close", Some(99), None).err().expect("关不存在的标签页应当失败");
+        assert!(err.contains("没有第 99 个"), "{err}");
+        let err2 = tab_op("frob", None, None).err().expect("不认识的 op 应当失败");
+        assert!(err2.contains("list / new / switch / close"), "{err2}");
+        let _ = BROWSER.lock().unwrap().invalidate();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
