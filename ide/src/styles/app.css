@@ -10287,13 +10287,14 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   backdrop-filter: blur(10px);
   animation: ctp-fade .16s ease both;
 }
-/* 克制是这版的全部要点：白底、发丝线、严格对齐的规格详情；强调色只落在会员标签上。
-   阴影用 Ant 的 boxShadowSecondary 那套三层叠法——「大厂控制台」的质感来源之一。 */
+/* 克制是这版的全部要点：白底、发丝线、两级字重撑起层级。**没有任何一处把值套进彩色盒子**——
+   那是用装饰代替层级，也是「AI 味」的来源；国外大厂(Linear / Vercel / Stripe 那类)一律是
+   「灰标签 + 深色加粗值」。阴影用 Ant 的 boxShadowSecondary 三层叠法。 */
 .about-dialog {
   position: relative;
   margin: auto;
   flex: 0 0 auto;
-  width: min(440px, 92vw);
+  width: min(420px, 92vw);
   border: 1px solid #f0f0f0;
   border-radius: 12px;
   background: #fff;
@@ -10305,16 +10306,14 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 .about-dialog:focus { outline: none; }
 /* 关闭按钮：裸图标 + 悬停才出底，和 Ant / Element 的弹窗关闭一致。
-   这里**故意**不给常态底片：常驻的灰色圆角方块会在白底头部里浮成一块补丁（所有者原话
-   「太 AI 了」）。可发现性改由图标本身承担（#bfbfbf 在白底上清晰可见），可点性由上面
-   那条 z-index:5 保证——「按不动」那个老 bug 的真身是层级，不是有没有底片。 */
+   这里**故意**不给常态底片：常驻的灰色圆角方块会在白底头部里浮成一块补丁。可发现性由图标
+   自身颜色承担，可点性由下面那条 z-index:5 保证——「按不动」那个老 bug 的真身是层级。 */
 .about-dialog__close {
   position: absolute;
-  top: 14px;
-  right: 14px;
-  /* 5，不是 1 —— 这是「关闭按钮点不动」的真身：每一块内容都写 z-index:1 用来分层，
-     按钮当初也写 1，同级时 DOM 靠后的 hero 赢命中判定，点击全被它吃掉
-     （实测 elementFromPoint 打在按钮正中心返回的是 hero）。 */
+  top: 12px;
+  right: 12px;
+  /* 5，不是 1 —— 内容块都写 z-index:1 用来分层，按钮当初也写 1，同级时 DOM 靠后的 hero
+     赢命中判定，点击全被它吃掉（实测 elementFromPoint 打在按钮正中心返回的是 hero）。 */
   z-index: 5;
   width: 24px;
   height: 24px;
@@ -10334,67 +10333,62 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 /* :focus-visible 而不是 :focus。焦点要进弹窗（Esc、读屏都靠它），但鼠标点开时不该甩出一圈环。 */
 .about-dialog__close:focus { outline: none; }
 .about-dialog__close:focus-visible { outline: 2px solid #1677ff; outline-offset: 2px; }
+/* 头部压矮：40px 图标 + 17px 标题 + 一行小字，上下留白收到 18/16。原来是 52px 图标、
+   20px 标题、26/22 留白，整块一百多像素高，显得笨重。 */
 .about-dialog__hero {
   position: relative;
   z-index: 1;
-  padding: 26px 28px 22px;
+  padding: 18px 24px 16px;
   border-bottom: 1px solid #f0f0f0;
 }
 .about-dialog__brand {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding-right: 30px;
+  gap: 12px;
+  padding-right: 28px;
 }
 .about-dialog__logo {
   flex: 0 0 auto;
-  width: 52px;
-  height: 52px;
+  width: 40px;
+  height: 40px;
   border: 1px solid #f0f0f0;
-  border-radius: 12px;
+  border-radius: 10px;
   background: #fff;
   object-fit: cover;
 }
 .about-dialog__heading { min-width: 0; }
 .about-dialog__heading h2 {
-  display: inline-block;
+  display: inline;
   margin: 0;
-  font-size: 20px;
-  line-height: 1.3;
+  font-size: 17px;
+  line-height: 1.35;
   letter-spacing: -.2px;
   font-weight: 600;
   color: #262626;
-  vertical-align: middle;
 }
 .about-dialog__heading p {
-  margin: 7px 0 0;
+  margin: 3px 0 0;
   color: #8c8c8c;
-  font-size: 13px;
-  line-height: 1.6;
+  font-size: 12.5px;
+  line-height: 1.5;
 }
-/* 版本号是数据不是装饰：中性灰片、等宽数字，跟在产品名后面。 */
+/* 版本号也不套盒子：跟在产品名后面的一行灰字，等宽数字。 */
 .about-dialog__version {
   position: relative;
   z-index: 1;
-  display: inline-block;
   margin-left: 8px;
-  padding: 2px 7px;
-  border: 1px solid #f0f0f0;
-  border-radius: 4px;
-  background: #fafafa;
-  color: #8c8c8c;
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 1.5;
-  vertical-align: middle;
+  color: #bfbfbf;
+  font-size: 12.5px;
+  font-weight: 400;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
-/* 规格详情：一列，标签左、值右，靠发丝线分行——不是四张浮着的小卡片。 */
+/* 规格详情：一列，标签左、值右，靠发丝线分行。左右留白跟头部对齐（24px）。 */
 .about-dialog__grid {
   position: relative;
   z-index: 1;
   display: block;
-  padding: 4px 0 10px;
+  padding: 3px 0 8px;
 }
 .about-dialog__info {
   display: flex;
@@ -10402,44 +10396,30 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   justify-content: space-between;
   gap: 16px;
   min-width: 0;
-  padding: 11px 28px;
+  padding: 10px 24px;
 }
 .about-dialog__info + .about-dialog__info { border-top: 1px solid #f5f5f5; }
 .about-dialog__info span {
   flex: 0 0 auto;
   color: #8c8c8c;
   font-size: 13px;
+  font-weight: 400;
   line-height: 1.5;
 }
+/* 值统一深色加粗——会员那格（Ultra / Power / …）也走这一条，不再有金色小胶囊。 */
 .about-dialog__info strong {
   min-width: 0;
   color: #262626;
   font-size: 13.5px;
   line-height: 1.5;
-  font-weight: 500;
+  font-weight: 600;
   text-align: right;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 全场唯一的强调色。Ant 的扁平 gold tag —— 没有渐变，靠色板本身说话。 */
-.about-dialog__tag {
-  display: inline-block;
-  padding: 1px 8px;
-  border: 1px solid #ffe58f;
-  border-radius: 4px;
-  background: #fffbe6;
-  color: #d48806;
-  font-size: 12.5px;
-  font-style: normal;
-  font-weight: 500;
-  line-height: 1.6;
-}
-.about-dialog__tag--plain {
-  border-color: #f0f0f0;
-  background: #fafafa;
-  color: #8c8c8c;
-}
+/* 「未开通会员」「未登录」是缺席状态，不是一个值：退成灰字常规字重，别和真值抢注意力。 */
+.about-dialog__info strong[data-muted] { color: #8c8c8c; font-weight: 400; }
 
 /* ---- Signed desktop update dialog ---- */
 .ide-update-overlay {
@@ -15570,7 +15550,11 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 [data-theme="dark"] .about-dialog__heading p,
 .dark .about-dialog__heading p,
 [data-theme="dark"] .about-dialog__info span,
-.dark .about-dialog__info span { color: #9aa0a6; }
+.dark .about-dialog__info span,
+[data-theme="dark"] .about-dialog__version,
+.dark .about-dialog__version,
+[data-theme="dark"] .about-dialog__info strong[data-muted],
+.dark .about-dialog__info strong[data-muted] { color: #9aa0a6; }
 [data-theme="dark"] .about-dialog__hero,
 .dark .about-dialog__hero { border-bottom-color: rgba(255, 255, 255, 0.10); }
 [data-theme="dark"] .about-dialog__logo,
@@ -15578,26 +15562,8 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   border-color: rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.04);
 }
-[data-theme="dark"] .about-dialog__version,
-.dark .about-dialog__version {
-  background: rgba(255, 255, 255, 0.06);
-  border-color: rgba(255, 255, 255, 0.12);
-  color: #9aa0a6;
-}
 [data-theme="dark"] .about-dialog__info + .about-dialog__info,
 .dark .about-dialog__info + .about-dialog__info { border-top-color: rgba(255, 255, 255, 0.07); }
-[data-theme="dark"] .about-dialog__tag,
-.dark .about-dialog__tag {
-  background: rgba(250, 173, 20, .12);
-  border-color: rgba(250, 173, 20, .32);
-  color: #e8b339;
-}
-[data-theme="dark"] .about-dialog__tag--plain,
-.dark .about-dialog__tag--plain {
-  background: rgba(255, 255, 255, 0.05);
-  border-color: rgba(255, 255, 255, 0.12);
-  color: #9aa0a6;
-}
 [data-theme="dark"] .about-dialog__close,
 .dark .about-dialog__close {
   /* 常态同样不画底片（见浅色那条）。暗色下要防的是另一件事：图标别隐形 ——
