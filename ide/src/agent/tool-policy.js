@@ -395,6 +395,10 @@ defineTool("debug", {
     "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion",
     "generate_texture",
   ]) defineTool(t, GENERATOR);
+  // Office 文档：office_write / office_edit 真的往工作区落 xlsx / docx / pptx（edit 默认覆盖原文件），
+  // 和 genimage 同一族——审批一道门、只读模式一道门。office_read 纯读，走默认策略。
+  defineTool("office_write", { ...GENERATOR, readOnlyBlockedVerb: "生成 Office 文档并写进工作区" });
+  defineTool("office_edit", { ...GENERATOR, readOnlyBlockedVerb: "修改工作区里的 Office 文档" });
 }
 seed();
 

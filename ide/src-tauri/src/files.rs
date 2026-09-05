@@ -2018,6 +2018,54 @@ fn strip_xml(xml: &str) -> String {
     res
 }
 
+/// 写二进制文件（Office 文档等由前端库生成的字节流，base64 进来）。守卫和 write_text_file 一样：
+/// 必须在已注册的工作区内；落盘走同目录临时文件 + 原子替换，不会留下半个文件。
+#[tauri::command(async)]
+pub fn write_file_bytes(path: String, base64: String) -> Result<(), String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64.trim())
+        .map_err(|e| format!("base64 解码失败: {e}"))?;
+    write_workspace_bytes(&path, &bytes).map(|_| ())
+}
+
+/// 二进制落盘的公共路（write_file_bytes 和 office_xlsx 共用）：工作区守卫 → 建父目录 →
+/// 同目录临时文件 → 原子替换 → fsync 父目录。返回解析后的绝对路径。
+pub(crate) fn write_workspace_bytes(path: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
+    let resolved = require_inside_workspace(path, true)?;
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建不了目录 {}: {e}", parent.display()))?;
+    }
+    let tmp = resolved.with_file_name(format!(
+        ".{}.{}.tmp",
+        resolved.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("写临时文件失败: {e}"))?;
+    if let Err(error) = atomic_replace_file(&tmp, &resolved) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot atomically replace '{}': {error}", resolved.display()));
+    }
+    sync_parent_directory(&resolved);
+    Ok(resolved)
+}
+
+/// 读二进制文件回 base64（前端库要加载已有的 xlsx/docx/pptx 再改）。只读守卫；上限 64 MiB——
+/// 再大的表格前端库也吃不下，明说比吞掉强。
+#[tauri::command(async)]
+pub fn read_file_bytes(path: String) -> Result<String, String> {
+    use base64::Engine as _;
+    let resolved = require_inside_workspace(&path, false)?;
+    let meta = std::fs::metadata(&resolved).map_err(|e| format!("读不到 {}: {e}", resolved.display()))?;
+    const MAX: u64 = 64 * 1024 * 1024;
+    if meta.len() > MAX {
+        return Err(format!("{} 有 {} MiB，超过 64 MiB 上限，前端库加载不了；用 run_cmd 跑脚本处理", resolved.display(), meta.len() / 1024 / 1024));
+    }
+    let bytes = std::fs::read(&resolved).map_err(|e| format!("读取失败: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 /// Overwrite a file with new text content.
 #[tauri::command(async)]
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {

@@ -158,6 +158,10 @@ export const TOOL_ICONS = {
   generate_texture: '<rect x="3.5" y="3.5" width="17" height="17" rx="2"/><path d="M3.5 9.5h17"/><path d="M3.5 15h17"/><path d="M9.5 3.5v17"/><path d="M15 3.5v17"/>',
   search_game_assets: '<path d="M12 3l8 4v10l-8 4-8-4V7z"/><path d="M4 7l8 4 8-4"/><path d="M12 11v10"/>',
   download_asset: '<path d="M12 2.5l7.5 4v11l-7.5 4-7.5-4v-11z"/><path d="M12 9v6"/><path d="M9.3 12.3L12 15l2.7-2.7"/>',
+  // ── Office 文档：同一张纸，里面分别是表格 / 铅笔 / 放大镜 ──
+  office_write: FILE + '<path d="M8 12h8"/><path d="M8 15.5h8"/><path d="M11 12v6.5"/>',
+  office_edit: FILE + '<path d="M9 17.5l1-3 5.5-5.5 2 2-5.5 5.5z"/>',
+  office_read: FILE + '<circle cx="11" cy="14" r="2.5"/><path d="M13 16l2.5 2.5"/>',
 };
 
 /**
@@ -185,6 +189,7 @@ export const TOOL_FAMILY = {
   generate_music: "make", generate_voice: "make", auto_rig: "make",
   generate_motion: "make", generate_texture: "make",
   search_game_assets: "make", download_asset: "make",
+  office_write: "make", office_edit: "write", office_read: "read",
   // 补齐的 58 种（原来一律回落成中性灰）。分族的判据仍是"这一步在动什么"：
   // 动本地文件/知识 → read，动网络与外部服务 → net，跑起来 → run，在想/在造 → think/make。
   findsymbol: "read", semsearch: "read", search_tools: "read", recall: "read",

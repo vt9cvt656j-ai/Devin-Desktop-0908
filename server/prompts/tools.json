@@ -4433,5 +4433,126 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "office_read",
+      "description": "**Read an Excel / Word / PowerPoint file as structure, not flat text.** Excel: every sheet's size, merges, freeze panes, tables, and the cell grid with formulas (`{f, v}`), hyperlinks and dates — pick a sheet or a range and cap rows/cols for big files. Word: the heading tree, the full text and every table. PowerPoint: each slide's text with bullet levels, speaker notes and object counts. Use it to check what office_write produced, or to learn a file before office_edit. read_file only gives flat text for these formats.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the .xlsx / .docx / .pptx, relative to the workspace root"
+          },
+          "sheet": {
+            "type": "string",
+            "description": "Excel only: sheet name or 1-based index; omit for all sheets"
+          },
+          "range": {
+            "type": "string",
+            "description": "Excel only: A1-style window such as A1:H50"
+          },
+          "maxRows": {
+            "type": "integer",
+            "description": "Excel only: rows per sheet to return (default 200)"
+          },
+          "maxCols": {
+            "type": "integer",
+            "description": "Excel only: columns to return (default 50)"
+          },
+          "styles": {
+            "type": "boolean",
+            "description": "Excel only: also return numFmt / bold / fill per cell"
+          },
+          "maxSlides": {
+            "type": "integer",
+            "description": "PowerPoint only: slides to return (default 200)"
+          },
+          "maxChars": {
+            "type": "integer",
+            "description": "Word only: text cap (default 60000)"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "office_write",
+      "description": "**Create a real Office document from a JSON spec** — Excel (.xlsx), Word (.docx) or PowerPoint (.pptx) — saved into the workspace. Full feature set, not a toy. Excel: typed columns, formulas (dynamic arrays too), number formats, cell styles, merges, freeze panes, autofilter, tables, 14 kinds of conditional formatting, data-validation dropdowns, native charts (column / bar / line / area / pie / doughnut / scatter / radar / stock, stacked, combo, secondary axis, trendlines, data labels), images, sparklines, notes, text boxes, page setup, headers / footers, sheet protection. Word: headings, rich runs, multi-level lists, tables with merged cells, images with captions, headers / footers with page numbers, footnotes, table of contents, sections with landscape pages and columns. PowerPoint: layouts, master with footer / logo / page numbers, per-slide backgrounds and speaker notes, text boxes, bullet lists, images, shapes, tables and charts. The format follows the dest extension. **First call once with help:true (plus format) to get the complete field reference, then write the spec** — unknown keys are reported back, never silently dropped. office_edit changes an existing file; office_read checks the result.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "dest": {
+            "type": "string",
+            "description": "Save path relative to the workspace root, e.g. reports/Q3.xlsx — the extension picks the format. Required unless help:true"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "xlsx",
+              "docx",
+              "pptx"
+            ],
+            "description": "Needed only when dest has no extension, or together with help:true"
+          },
+          "spec": {
+            "type": "object",
+            "description": "The document spec (an object; see the field reference from help:true)"
+          },
+          "help": {
+            "type": "boolean",
+            "description": "true = return the complete spec reference for the format instead of writing anything"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "office_edit",
+      "description": "**Modify an existing Office file** in place, or save the result as dest. Excel: add or overwrite rows and cells (formulas, dates, links, notes), styles, merges, widths, freeze panes, filters, validations, conditional formats, images; add / delete / rename / copy sheets; insert or delete rows and columns — everything else in the file is preserved, except charts, sparklines and pivot tables, which cannot survive a save: the tool refuses and explains unless you pass dest (save a copy) or force:true. Word and PowerPoint: paragraph-aware find-and-replace that keeps all formatting, also in headers, footers and speaker notes. For structural rewrites, office_read the content and regenerate with office_write. help:true returns the edit field reference.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The existing .xlsx / .docx / .pptx, relative to the workspace root"
+          },
+          "dest": {
+            "type": "string",
+            "description": "Where to save; omit to overwrite path"
+          },
+          "spec": {
+            "type": "object",
+            "description": "Excel edits: { sheets: [{ name, rows, cells, ... }], ops: [{ op: \"deleteSheet\" | \"renameSheet\" | \"insertRows\" | \"deleteRows\" | \"clear\" | \"copySheet\" ... }] } — same vocabulary as office_write"
+          },
+          "ops": {
+            "type": "array",
+            "description": "Word / PowerPoint edits: [{ op: \"replace\", find, replace, all, regex, caseInsensitive, scope: \"all\" | \"body\" | \"notes\" }]",
+            "items": {
+              "type": "object"
+            }
+          },
+          "force": {
+            "type": "boolean",
+            "description": "Excel only: accept losing charts / sparklines / pivots when overwriting a file that has them"
+          },
+          "help": {
+            "type": "boolean",
+            "description": "true = return the edit field reference instead of editing"
+          }
+        },
+        "required": []
+      }
+    }
   }
 ]

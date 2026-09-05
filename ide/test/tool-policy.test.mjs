@@ -56,6 +56,8 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
     "game_scaffold", "web_scaffold", "download", "download_asset", "genimage", "generate_3d",
     "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion",
     "generate_texture",
+    // Office 文档落盘（xlsx / docx / pptx）。
+    "office_write", "office_edit",
     // 新增：真的会在磁盘上建目录（~/MrDayOne/<name>）并切换工作区。
     "createproject",
     // 新增：git worktree。它在 <root>/.mrdayone/worktrees/ 下面建目录、建分支，remove
@@ -110,6 +112,7 @@ test("approval set matches the pre-refactor literal exactly", () => {
     "genimage", "generate_3d", "generate_sound", "generate_music", "generate_voice",
     "generate_motion", "generate_texture", "auto_rig",
     "game_scaffold", "web_scaffold", "download_asset",
+    "office_write", "office_edit",
     // 新增（2026-08-17 审计）：这四个有真实外部副作用，却从来没登记进 REGISTRY——
     // 没登记 = 策略全取默认值 = needsApproval 恒 false，「改动前审批」开着也一次框都不弹。
     // browser 能跑任意 JS、读会话 cookie / localStorage、上传**本机绝对路径**的文件、
@@ -459,6 +462,8 @@ test("worktree 算改动工作区——它在 <root>/.mrdayone/worktrees 下面�
 // memory 会写盘，preview / demostart 会起服务，subagent / spawnmulti 会派出子智能体）。
 // 它们留在这里只表示"今天不问"，不表示"已确认不该问"。
 const NO_APPROVAL_TODAY = new Set([
+  // office_read 只读 Office 文件的结构，不落盘、不联网。
+  "office_read",
   "arxiv_search", "askuser", "awaitsubagent", "awwwards_search", "background_monitor",
   "bundlephobia_search", "capture_flows", "capture_stop", "clinical_trials_search",
   "codeberg_repo", "codrops_search", "crossref_search", "current_time", "cve_search", "debate",
