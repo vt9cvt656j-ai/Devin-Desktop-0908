@@ -10304,29 +10304,33 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   overflow: hidden;
 }
 .about-dialog:focus { outline: none; }
+/* 关闭按钮：裸图标 + 悬停才出底，和 Ant / Element 的弹窗关闭一致。
+   这里**故意**不给常态底片：常驻的灰色圆角方块会在白底头部里浮成一块补丁（所有者原话
+   「太 AI 了」）。可发现性改由图标本身承担（#bfbfbf 在白底上清晰可见），可点性由上面
+   那条 z-index:5 保证——「按不动」那个老 bug 的真身是层级，不是有没有底片。 */
 .about-dialog__close {
   position: absolute;
-  top: 12px;
-  right: 12px;
+  top: 14px;
+  right: 14px;
   /* 5，不是 1 —— 这是「关闭按钮点不动」的真身：每一块内容都写 z-index:1 用来分层，
      按钮当初也写 1，同级时 DOM 靠后的 hero 赢命中判定，点击全被它吃掉
      （实测 elementFromPoint 打在按钮正中心返回的是 hero）。 */
   z-index: 5;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
   border: none;
   border-radius: 6px;
-  /* 常态就给底色：一个「看不出能按」的按钮和一个「按不动」的按钮，用户感受是同一件事。 */
-  background: rgba(0, 0, 0, .04);
-  color: #8c8c8c;
+  background: transparent;
+  color: #bfbfbf;
   cursor: pointer;
-  transition: background .14s ease, color .14s ease;
+  transition: background .15s ease, color .15s ease;
 }
-.about-dialog__close:hover { background: rgba(0, 0, 0, .08); color: #262626; }
-.about-dialog__close:active { background: rgba(0, 0, 0, .12); }
+.about-dialog__close:hover { background: rgba(0, 0, 0, .06); color: #262626; }
+.about-dialog__close:active { background: rgba(0, 0, 0, .10); color: #262626; }
 /* :focus-visible 而不是 :focus。焦点要进弹窗（Esc、读屏都靠它），但鼠标点开时不该甩出一圈环。 */
 .about-dialog__close:focus { outline: none; }
 .about-dialog__close:focus-visible { outline: 2px solid #1677ff; outline-offset: 2px; }
@@ -10390,7 +10394,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   position: relative;
   z-index: 1;
   display: block;
-  padding: 4px 0;
+  padding: 4px 0 10px;
 }
 .about-dialog__info {
   display: flex;
@@ -10435,29 +10439,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   border-color: #f0f0f0;
   background: #fafafa;
   color: #8c8c8c;
-}
-/* 网关说明是次要信息，就按次要信息排：安静的灰字，不做成抢眼的彩色提示框。 */
-.about-dialog__desc {
-  position: relative;
-  z-index: 1;
-  margin: 0;
-  padding: 14px 28px 16px;
-  border-top: 1px solid #f0f0f0;
-  color: #8c8c8c;
-  font-size: 12.5px;
-  line-height: 1.75;
-}
-.about-dialog__foot {
-  position: relative;
-  z-index: 1;
-  margin: 0;
-  padding: 12px 28px;
-  border-top: 1px solid #f0f0f0;
-  background: #fafafa;
-  color: #bfbfbf;
-  font-size: 12px;
-  line-height: 1.5;
-  text-align: center;
 }
 
 /* ---- Signed desktop update dialog ---- */
@@ -15589,9 +15570,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 [data-theme="dark"] .about-dialog__heading p,
 .dark .about-dialog__heading p,
 [data-theme="dark"] .about-dialog__info span,
-.dark .about-dialog__info span,
-[data-theme="dark"] .about-dialog__desc,
-.dark .about-dialog__desc { color: #9aa0a6; }
+.dark .about-dialog__info span { color: #9aa0a6; }
 [data-theme="dark"] .about-dialog__hero,
 .dark .about-dialog__hero { border-bottom-color: rgba(255, 255, 255, 0.10); }
 [data-theme="dark"] .about-dialog__logo,
@@ -15607,14 +15586,6 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 [data-theme="dark"] .about-dialog__info + .about-dialog__info,
 .dark .about-dialog__info + .about-dialog__info { border-top-color: rgba(255, 255, 255, 0.07); }
-[data-theme="dark"] .about-dialog__desc,
-.dark .about-dialog__desc { border-top-color: rgba(255, 255, 255, 0.10); }
-[data-theme="dark"] .about-dialog__foot,
-.dark .about-dialog__foot {
-  background: rgba(255, 255, 255, 0.03);
-  border-top-color: rgba(255, 255, 255, 0.10);
-  color: #6f7378;
-}
 [data-theme="dark"] .about-dialog__tag,
 .dark .about-dialog__tag {
   background: rgba(250, 173, 20, .12);
@@ -15629,15 +15600,14 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 [data-theme="dark"] .about-dialog__close,
 .dark .about-dialog__close {
-  /* 底色必须跟着翻。浅色态是深色半透明，照搬到 #18181b 的卡片上等于隐形 ——
-     比全透明还糟，因为它连 hover 之前的存在感都没有。 */
-  background: rgba(255, 255, 255, 0.10);
-  color: #9aa0a6;
+  /* 常态同样不画底片（见浅色那条）。暗色下要防的是另一件事：图标别隐形 ——
+     #8c8c8c 压在 #18181b 的卡片上清晰可见，hover 再给一层白色半透明底。 */
+  color: #8c8c8c;
 }
 [data-theme="dark"] .about-dialog__close:hover,
-.dark .about-dialog__close:hover { background: rgba(255, 255, 255, 0.18); color: #e8eaed; }
+.dark .about-dialog__close:hover { background: rgba(255, 255, 255, 0.12); color: #e8eaed; }
 [data-theme="dark"] .about-dialog__close:active,
-.dark .about-dialog__close:active { background: rgba(255, 255, 255, 0.24); }
+.dark .about-dialog__close:active { background: rgba(255, 255, 255, 0.18); color: #e8eaed; }
 [data-theme="dark"] .about-dialog__close:focus-visible,
 .dark .about-dialog__close:focus-visible { outline-color: #8ab4f8; }
 /* 操作条：其余颜色都走主题变量，自己会翻；只有 hover 底色要单独给 ——
