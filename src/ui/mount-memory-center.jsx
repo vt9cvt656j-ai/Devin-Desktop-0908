@@ -19,6 +19,7 @@ export function openMemoryCenterIsland(props) {
     <MemoryCenter
       {...props}
       onSave={(project, global) => { close(host); props.onSave?.(project, global); }}
+      onSaveCore={(user, project) => { close(host); props.onSaveCore?.(user, project); }}
       onClose={() => { close(host); props.onClose?.(); }}
     />
   ));

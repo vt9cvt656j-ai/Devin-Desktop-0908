@@ -130,6 +130,11 @@ import { createLspManager } from "./lsp-client.js";
 import { parseProblems } from "./problem-matchers.js";
 import { createDapManager } from "./dap-client.js";
 import * as growth from "./growth.js";
+import { configureCoreMemory, coreMarkdownSection } from "./agent/core-memory.js";
+import { configureMemoryStats, memStat } from "./agent/memory-stats.js";
+import { configureAdaptiveBlock, _adaptivePromptBlock } from "./agent/adaptive-block.js";
+import { configureCoreCapture, _coreCaptureUtterance, syncCoreFromKg, promoteRememberedNote, coreImportIfEmpty, corePanelProps } from "./agent/core-capture.js";
+import { configureWorkflowMemory, wfPrune } from "./agent/workflow-memory.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
@@ -10950,6 +10955,8 @@ function setActiveWorkspaceRoot(path) {
   _agentContextCache = { root: "", ts: 0, data: "" };
   // Reconcile this workspace's memory with its durable real file (once per root) —
   // restores the knowledge graph if localStorage was cleared / lost.
+  // 全局库（用户层核心 + 跨项目笔记）原来从不从文件读回（同步只按项目根调）；启动后第一次进这里补一次。
+  if (inTauri && !_kgSyncedRoots.has("")) { _kgSyncedRoots.add(""); _kgSyncFromStore(""); }
   if (path && inTauri && !_kgSyncedRoots.has(path)) { _kgSyncedRoots.add(path); _kgSyncFromStore(path); _epSyncFromStore(path); _wfSyncFromStore(path); _idleRun(() => _seedProjectProfile(path)); }
   // Schedule a background symbol-index build for this root (idempotent — exits
   // fast if already built for the same root). Powers the `find_symbol` tool.
@@ -11070,6 +11077,8 @@ async function openFolder(path, owner = null) {
   // 项目记忆读回：本地存储为空时（换机器、清了应用数据、重装）从 .mrdayone/memory.md 恢复。
   // 不 await——它只影响后续轮次的记忆检索，不该让"打开文件夹"多等一次磁盘往返。
   void _importProjectMemoryFile(path);
+  // 核心那一节单独读回（本地为空才读）。放在调用点而不是函数体里：_importProjectMemoryFile 被测试按名抠取，多一个自由标识符就 ReferenceError。
+  if (inTauri && path) void coreImportIfEmpty(path, () => backend.readTextFile(_projectMemoryPath(path)));
   await renderWorkspaceRoots();
   preloadProjectModels(path);
   scheduleProjectCacheRefresh(path, "项目已打开");
@@ -28281,7 +28290,10 @@ async function _agentContextForQuery(baseContext, query, root, referenceTimeoutM
     const finalTokens = _estimateTokens(combined);
     if (finalTokens > maxTokens) combined = combined.slice(0, Math.floor(combined.length * (maxTokens / finalTokens))) + `\n...(context truncated to fit ${maxTokens} token budget)`;
   }
-  return combined + _memoryBlocks(memoryRoot, query || "", sizeState) + _projectJournalBlock(memoryRoot);
+  const _memBlock = _memoryBlocks(memoryRoot, query || "", sizeState);
+  // 「相关命中」的判据：常驻分段之前有没有列表行。只是读数，不参与任何判断。
+  try { memStat(/\n- /.test(String(_memBlock).split("[常驻长期约束")[0]) ? "retrieve.kg.hit" : "retrieve.kg.empty"); } catch {}
+  return combined + _memBlock + _projectJournalBlock(memoryRoot);
 }
 
 /** 指纹里最多纳入多少个一级子目录。见 `_agentRootFingerprint`。 */
@@ -31585,6 +31597,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // the recency slot so the agent reuses proven recipes for this project.
   const _expRoot = _identityRoot; // 经验/工作流也按会话身份存取，别跟着打开的文件漂
   const _expHint = (effectiveMode === "agent") ? (_workflowHintBlock(text, _expRoot) + _episodeHintBlock(text, _expRoot)) : "";
+  if (effectiveMode === "agent") { try { memStat(_expHint.includes("📚") ? "retrieve.ep.hit" : "retrieve.ep.empty"); memStat(_expHint.includes("💡") ? "retrieve.wf.hit" : "retrieve.wf.empty"); } catch {} }
   const _modeFrame = (effectiveMode !== "agent") ? _modeRuntimeGuidanceBlock(effectiveMode, text, _uiTurnEngineering) : "";
   // Put the user's ACTUAL request LAST, clearly delimited — recency = the model's
   // highest-attention slot. Burying the question in the MIDDLE of a big preamble
@@ -31636,6 +31649,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       // A high-confidence "not X, use Y" correction supersedes matching durable
       // memory immediately. Other preference signals keep the normal capture path.
       if (!_applyExplicitMemoryCorrection(_identityRoot, _lt)) _autoMemoryCapture(_identityRoot, _lt);
+      _coreCaptureUtterance(_identityRoot, _lt);
     }
   }
   saveChatHistory({ immediate: true }); // 立即刷盘：任务跑一半被中断/关软件也不丢用户刚发的这条
@@ -42335,13 +42349,16 @@ function _kgTokens(text) {
   }
   return out;
 }
+// 类型决定修剪权重和常驻名额。实测 136 条里 60 条被判 pitfall、多为交付/状态记录（老判据含 别|不能|避免）。
+// 改：状态/档案先判 fact；偏好/约定排在 pitfall 前；pitfall 只认真说出过错的词。老笔记由 syncCoreFromKg 重判一次（tv=3）。
 function _kgClassify(c) {
   const t = String(c || "");
-  if (/坑|bug|报错|失败|错误|崩溃|fix|pitfall|gotcha|不能|别|避免/i.test(t)) return "pitfall";
-  if (/命令|构建|build|测试|test|run|npm|cargo|pip|make|部署|deploy|启动/i.test(t)) return "command";
+  if (/^项目(?:环境|档案):|^〔跨轮规律〕|已完成|已交付|交付完成|已上线|已实现|已修复|已通过|完成：|完成:/.test(t)) return "fact";
+  if (/用户|喜欢|偏好|口味|prefer|一律用|以后.*用|别用|不要用|禁用|优先用|默认用|回复|回答用/i.test(t)) return "preference";
   if (/约定|规范|命名|风格|convention|目录结构|放在|统一/i.test(t)) return "convention";
+  if (/坑|报错|失败|错误|崩溃|panic|bug|pitfall|gotcha|会导致|导致.*(?:失败|错误|报错)|不能(?:直接|跨|同时)|必须先|否则/i.test(t)) return "pitfall";
+  if (/命令|构建|build|测试|test|run|npm|cargo|pip|make|部署|deploy|启动/i.test(t)) return "command";
   if (/架构|模块|依赖|architecture|module|结构|设计|数据流/i.test(t)) return "architecture";
-  if (/用户|喜欢|偏好|要求|prefer|想要|不要|口味/i.test(t)) return "preference";
   return "fact";
 }
 function _kgInsert(notes, content) {
@@ -42620,6 +42637,20 @@ function _applyExplicitMemoryCorrection(root, text) {
 // the user's home) — so memory is durable and survives even if localStorage is
 // cleared / hits a quota or permission error. localStorage stays the fast sync cache.
 const _KG_STORE = "memory-kg.json";
+// 核心记忆 / 计数器的存储注入：localStorage 同步缓存 + 复用 KG 的文件镜像队列（mirror 里的名字调用时才求值）。
+configureCoreMemory({
+  storage: (typeof localStorage !== "undefined") ? localStorage : null,
+  mirror: (key, entries) => (inTauri ? _kgStoreUpdate(async (st) => { await st.set(key, entries); }) : Promise.resolve()),
+  stat: (k) => memStat(k),
+});
+configureMemoryStats({ storage: (typeof localStorage !== "undefined") ? localStorage : null });
+configureCoreCapture({
+  kgLoad: (root) => _kgLoad(root),
+  kgSave: (root, notes) => _kgSave(root, notes),
+  kgClassify: (text) => _kgClassify(text),
+  invalidateContext: () => { _agentContextCache = { root: null, ts: 0, data: "" }; },
+});
+configureWorkflowMemory({ taskSim: (a, b) => _taskSim(a, b), taskWords: (t) => _taskWords(t) });
 let _kgStoreWriteQueue = Promise.resolve();
 function _kgStoreUpdate(mutator) {
   const job = _kgStoreWriteQueue.catch(() => {}).then(async () => {
@@ -42684,6 +42715,9 @@ async function _kgSyncFromStore(root) {
     if (JSON.stringify(merged) !== JSON.stringify(normalizedFileCorrections)) {
       await _kgCorrectionStoreSave(root, merged);
     }
+    // ── 核心记忆：文件 → 本地（本地为空时）；存量笔记按新规则重判一次类型并把约定/偏好升进核心 ──
+    // 只跑一次（tv=3 记在笔记上）。升格过的笔记打 core 标，检索侧不再把它当常驻带。
+    try { syncCoreFromKg(root, await s.get("core:" + (root || "_global"))); } catch (e) { console.warn("[core] sync failed:", e); }
   } catch (e) { console.warn("[kg] real-file sync failed:", e); }
 }
 // Auto-clean "垃圾记忆": keep each store bounded + high-signal. When over cap, drop the
@@ -42727,15 +42761,18 @@ function _projectMemoryPath(root) {
 }
 function _projectMemoryMarkdown(root) {
   const notes = _kgLoad(root);
-  if (!notes.length) return "";
+  // 核心记忆那一节排最前：每轮常驻的约束，人读文件也该第一眼看到。
+  const coreMd = (() => { try { return coreMarkdownSection(root); } catch { return ""; } })();
+  if (!notes.length && !coreMd) return "";
   const superseded = _kgSupersededIds(root);
   const live = notes.filter((note) => note && !superseded.has(note.id));
-  if (!live.length) return "";
+  if (!live.length && !coreMd) return "";
   const lines = [
     "# Mr. Day One 项目记忆",
     "",
     "<!-- 由 remember 工具维护。你可以直接编辑这个文件：本地记忆为空时（换机器/清数据/重装）会从这里读回。 -->",
   ];
+  if (coreMd) lines.push("", coreMd);
   for (const section of _PM_SECTIONS) {
     const picked = live
       .filter((note) => section.types.includes(note.type || "fact"))
@@ -42826,7 +42863,11 @@ function _kgRetrieve(root, query, K = 6, MAX = 13) {
   const q = new Set(_kgTokens(query));
   const byId = {};
   for (const n of notes) byId[n.id] = n;
-  const scored = notes.map((n) => [(n.tags || []).reduce((a, t) => a + (q.has(t) ? 1 : 0), 0), n]);
+  // 相关性按 IDF 加权：满库都有的双字（项目/文件）不再把泛泛的笔记顶到具体的前面。只用本库算，不引外部名字（被测试按名抠取）。
+  const _df = new Map();
+  for (const n of notes) for (const t of new Set(n.tags || [])) _df.set(t, (_df.get(t) || 0) + 1);
+  const _w = (t) => Math.log(1 + notes.length / (_df.get(t) || 1));
+  const scored = notes.map((n) => [(n.tags || []).reduce((a, t) => a + (q.has(t) ? _w(t) : 0), 0), n]);
   scored.sort((a, b) => b[0] - a[0] || b[1].created - a[1].created);
   const picked = new Map();
   // 真按相关性命中的那批。渲染侧要把它和下面几种"无条件塞进来的"分开标注——
@@ -42852,15 +42893,18 @@ function _kgRetrieve(root, query, K = 6, MAX = 13) {
   // 这道闸只该减少噪音，绝不该在它自己失败时改变检索结果。
   let _offStack = () => false;
   if (!root) { try { _offStack = _kgOffStackFor(); } catch {} }
+  // 名额 8 → 4，且排除已升进核心记忆的（n.core，核心块每轮常驻在系统提示里，再带就是进两次）。实测常驻 4.7 条/轮是最大噪音源。
   const _mustCarry = notes
-    .filter((n) => (n.type === "preference" || n.type === "convention" || n.type === "pitfall") && !_offStack(n))
+    .filter((n) => (n.type === "preference" || n.type === "convention" || n.type === "pitfall") && !n.core && !_offStack(n))
     .sort((a, b) => b.created - a.created)
-    .slice(0, 8);
+    .slice(0, 4);
   for (const n of _mustCarry) {
     if (picked.size >= MAX) break;
     if (!picked.has(n.id)) picked.set(n.id, n);
   }
+  // 顺链只从相关命中出发：常驻条的邻居和本轮同样无关（实测常驻砍到 4 后顺链反涨到 2.3 条/轮）。
   for (const n of [...picked.values()]) {
+    if (!relIds.has(n.id)) continue;
     for (const lid of (n.links || [])) {
       if (picked.size >= MAX) break;
       if (byId[lid] && !picked.has(lid)) picked.set(lid, byId[lid]);
@@ -43128,6 +43172,8 @@ function openMemoryPanel() {
     hasRoot: !!root,
     initialProject: text.project,
     initialGlobal: text.global,
+    // 核心记忆（Core 页）：initialCore / memoryStats / onSaveCore 由 agent/core-capture.js 装配。
+    ...corePanelProps(root, { mirrorProject: () => _scheduleProjectMemoryMirror(root), invalidateContext: () => { _agentContextCache = { root: null, ts: 0, data: "" }; }, toast: showToast }),
 
     // The graph stays imperative: _mcGlobeInit owns a WebGL context and its own animation loop,
     // which React should not be re-running on every keystroke. The island hands over a container
@@ -43185,6 +43231,7 @@ function openMemoryPanel() {
 }
 let _memoryGlobe = null;
 let _memoryGlobeRebuild = null;
+
 
 /**
  * Keep the running `messages` array from blowing past the context window on long
@@ -52411,7 +52458,11 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
     const memoryTexts = [String(task || ""), ...(Array.isArray(run._memoryReflectionTexts) ? run._memoryReflectionTexts : [])]
       .map((value) => String(value || "").trim()).filter(Boolean).slice(-5);
     const memorySource = memoryTexts.join("\n").slice(0, 1600);
-    const reviewMemory = memoryTexts.some((value) => _worthDistilling(value));
+    // 开闸原来只认 _worthDistilling 词表，实测 1274 条真实消息只开 1%、这条通道从没写过一条。放宽成：词表 ∨ 本轮有插话/纠正 ∨ 任务 ≥80 字。
+    // 代价为零（同一次收尾调用），接收侧的来源戳/去重/≤6 条/修剪都还在。开没开闸记在 run 上，调用点计数。
+    const _steered = Array.isArray(run._memoryReflectionTexts) && run._memoryReflectionTexts.length > 0;
+    const reviewMemory = memoryTexts.some((value) => _worthDistilling(value)) || _steered || String(task || "").length >= 80;
+    run._reflectStats = { opened: reviewMemory ? 1 : 0, accepted: 0 };
     const relatedMemory = reviewMemory ? _memoryReflectionContext(root, memorySource) : "(本轮没有长期记忆信号)";
     // 经验蒸馏写的是长期记忆：廉价模型提炼的套路/教训会长期污染后续每一轮注入。
     // 用户约定：选什么模型就全程用什么模型，不偷换廉价模型。
@@ -52428,9 +52479,9 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
     if (cluster) {
       const desc = cluster.map((e, i) => `任务${i + 1}：${e.task}\n做法：${e.approach || ""}`).join("\n\n");
       prompt += `另外，本项目里同类且都成功完成的任务及其做法：\n\n${desc}\n\n`
-        + `严格输出 JSON（不要任何别的字）：{"insight":"一句话≤60字可迁移经验（${insightAsk}）","workflow":{"name":"简短名称","when":"什么时候用(一句)","steps":["通用步骤1","步骤2"]},${memorySchema}}。workflow 的步骤 3–6 条、要通用可迁移、写清用哪些工具；归纳不出可复用工作流就把 workflow 设为 null。memory 只记录跨会话仍有用的偏好/规矩/项目事实；纠正用 correct + old_id，绝不能删除原始记忆。`;
+        + `严格输出 JSON（不要任何别的字）：{"insight":"一句话≤60字可迁移经验（${insightAsk}）","workflow":{"name":"简短名称","when":"什么时候用(一句)","steps":["通用步骤1","步骤2"]},${memorySchema}}。workflow 的步骤 3–6 条、要通用可迁移、写清用哪些工具；归纳不出可复用工作流就把 workflow 设为 null。memory 只记录跨会话仍有用的偏好/规矩/项目事实：优先记用户亲口表达的偏好（回复语言/长度/风格/工具选择/范围）和他纠正过你的地方；纯任务细节不记；没有就给 []。纠正用 correct + old_id，绝不能删除原始记忆。`;
     } else {
-      prompt += `严格输出 JSON（不要任何别的字）：{"insight":"一句话≤60字可迁移经验（${insightAsk}）",${memorySchema}}。不要复述任务、不要客套。memory 只记录跨会话仍有用的偏好/规矩/项目事实；纠正用 correct + old_id，绝不能删除原始记忆。`;
+      prompt += `严格输出 JSON（不要任何别的字）：{"insight":"一句话≤60字可迁移经验（${insightAsk}）",${memorySchema}}。不要复述任务、不要客套。memory 只记录跨会话仍有用的偏好/规矩/项目事实：优先记用户亲口表达的偏好（回复语言/长度/风格/工具选择/范围）和他纠正过你的地方；纯任务细节不记；没有就给 []。纠正用 correct + old_id，绝不能删除原始记忆。`;
     }
     // 6 秒这道超时，在**首字延迟就有 10 秒**的模型上是恒定失败的。
     //
@@ -52462,7 +52513,10 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
     const insight = String(parsed.insight || (looksLikeSentence ? bare : ""))
       .trim().replace(/^["「『]+|["」』]+$/g, "").slice(0, 160);
     if (insight) { const cur = _epLoad(root); const i = cur.findIndex((x) => x.id === ep.id); if (i >= 0) { cur[i].insight = insight; _epSave(root, cur); } }
-    if (reviewMemory) _applyMemoryReflectionOutput(root, memorySource, parsed.memory, session?.memory);
+    if (reviewMemory) {
+      const _acc = _applyMemoryReflectionOutput(root, memorySource, parsed.memory, session?.memory);
+      if (run._reflectStats) run._reflectStats.accepted = Array.isArray(_acc) ? _acc.length : 0;
+    }
     if (outcome !== "success" && insight && session?.memory?.recordCorrection) {
       session.memory.recordCorrection({
         kind: "reflection",
@@ -52486,7 +52540,7 @@ const _WORKFLOW_STORE = "memory-workflows.json";
 function _wfKey(root) { return "michael-ide.workflows:" + (root || "_global"); }
 function _wfLoad(root) { try { return JSON.parse(localStorage.getItem(_wfKey(root)) || "[]") || []; } catch { return []; } }
 function _wfSave(root, wfs) {
-  if (wfs.length > 40) wfs = wfs.slice(-40);
+  wfs = wfPrune(wfs, 40); // 近义合并 + 按命中淘汰（agent/workflow-memory.js）
   try { localStorage.setItem(_wfKey(root), JSON.stringify(wfs)); } catch {}
   if (inTauri) (async () => { try { const s = await loadStore(_WORKFLOW_STORE); await s.set("wf:" + (root || "_global"), wfs); await s.save(); } catch {} })();
 }
@@ -52505,7 +52559,11 @@ function _retrieveWorkflow(task, root) {
   const tw = _taskWords(task); if (!tw.size) return null;
   const ranked = wfs.map((w) => ({ w, s: _taskSim(tw, (w.name || "") + " " + (w.when || "") + " " + (w.episodes || []).join(" ")) }))
     .filter((x) => x.s >= 0.16).sort((a, b) => b.s - a.s);
-  return ranked.length ? ranked[0].w : null;
+  if (!ranked.length) return null;
+  // 命中计数：淘汰时按它排。只写 localStorage（和 KG 的 uses 同一个做法），不打文件镜像。
+  const w = ranked[0].w;
+  try { w.hits = (w.hits || 0) + 1; localStorage.setItem(_wfKey(root), JSON.stringify(wfs)); } catch {}
+  return w;
 }
 function _workflowHintBlock(task, root) {
   const w = _retrieveWorkflow(task, root);
@@ -52632,6 +52690,8 @@ function _criticRequestedToolSchemas(toolNames, toolRegistry, maxTools = 8) {
     if (_avgP > 0.7) dynamicMaxTools = 15;
     else if (_avgP > 0.45) dynamicMaxTools = 12;
   }
+  // BKT 之外再看用量/项目广度（growth.getExperienceTier）：所有者 862 轮 / 32 项目却因 BKT 0.42 拿最窄窗口。
+  if (dynamicMaxTools < 12) { try { if (growth.getExperienceTier() === "seasoned") dynamicMaxTools = 12; } catch {} }
   
   const out = [], seen = new Set();
   for (const rawName of toolNames) {
@@ -54883,6 +54943,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
                 if (session._demandLedger.length > 40) session._demandLedger.splice(0, session._demandLedger.length - 40);
               }
               if (!_applyExplicitMemoryCorrection(root, _sl)) _autoMemoryCapture(root, _sl);
+              _coreCaptureUtterance(root, _sl);
               run._memoryReflectionTexts = Array.isArray(run._memoryReflectionTexts) ? run._memoryReflectionTexts : [];
               run._memoryReflectionTexts.push(_sl);
             } catch {}
@@ -58836,6 +58897,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           attempts: run._nudgeAttempts || 0, suppressed: run._nudgeSuppressed || 0 };
       } catch {}
       try { await _recordEpisode(run, task, memoryRoot || root, _runOutcome, config, session); } catch {}
+      // 学习者模型的执行事实（growth.factsFromRun）+ 反思通道计数（_recordEpisode 被按名抠取，里面不能多引标识符）。
+      try {
+        run._growthFacts = growth.factsFromRun(run, _epLoad(memoryRoot || root), _runOutcome);
+        if (run._reflectStats?.opened) { memStat("reflect.opened"); if (run._reflectStats.accepted) memStat("reflect.accepted", run._reflectStats.accepted); }
+      } catch {}
       // 离线通道：攒够一批就在后台批量看一次历史，沉淀跨轮规律。不 await——它跟这一轮的
       // 交付无关，任何异常都不许冒泡进收尾。
       try { void _offlineDistillIfDue(memoryRoot || root, config); } catch {}
@@ -58878,7 +58944,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // vs shipped unverified — the beneficial-usage signal that counters deskilling.
     if (didMutate) {
       try { _perfPhase("growth:run-complete"); } catch {}
-      growth.signal("run-complete", { verified: didVerify && verificationPassed && uiVerificationPassed });
+      growth.signal("run-complete", { verified: didVerify && verificationPassed && uiVerificationPassed, ...(run._growthFacts || {}) });
     }
     saveChatHistory();
     // 内容到此为止 —— **先停表**，再去等结算。
@@ -63702,6 +63768,7 @@ async function _executeToolStepInner(step, call, root, run) {
       // "global" → the cross-project _global store (root ""), else the current project.
       const isGlobal = call.scope === "global";
       const ok = _kgAddNote(isGlobal ? "" : root, call.content);
+      if (ok) promoteRememberedNote(isGlobal ? "" : root, call.content); // 约束类同时升进核心记忆（agent/core-capture.js）
       // 项目记忆同步落盘到 .mrdayone/memory.md：不落盘的记忆等于只存在这台机器的浏览器里。
       // 不 await——落盘失败不该让"已记住"变成失败，文件只是持久层，内存那份已经生效了。
       if (ok && !isGlobal) void _mirrorProjectMemoryFile(root);
@@ -71795,6 +71862,13 @@ const ADAPTIVE_PROFILE_OPTIONS = {
 function _adaptiveOptionLabel(group, value) {
   return (ADAPTIVE_PROFILE_OPTIONS[group] || []).find(([v]) => v === value)?.[1] || String(value || "");
 }
+// 自适应块住在 agent/adaptive-block.js；四个事实从这里注入（root 是闭包，读时才取）。
+configureAdaptiveBlock({
+  loadProfile: () => _loadAdaptiveProfile(),
+  optionLabel: (group, value) => _adaptiveOptionLabel(group, value),
+  defaults: DEFAULT_ADAPTIVE_PROFILE,
+  root: () => String(rootPath || workspaceRoots[0] || ""),
+});
 
 function _normalizeAdaptiveProfile(raw) {
   const next = { ...DEFAULT_ADAPTIVE_PROFILE, ...(raw && typeof raw === "object" ? raw : {}) };
@@ -71826,27 +71900,6 @@ function _saveAdaptiveProfile(profile) {
 
 function _adaptiveEnabled() {
   return _loadAdaptiveProfile().enabled !== false;
-}
-
-// Static half of the adaptive profile — byte-stable across turns so it can live in
-// the SYSTEM prompt without breaking the upstream prompt-cache prefix. The per-query
-// preference-memory lines moved to _adaptiveMemoryBlock (injected in the per-turn
-// dynamic preamble at the user-message tail, same pattern as growth/context blocks).
-function _adaptivePromptBlock() {
-  const profile = _loadAdaptiveProfile();
-  if (profile.enabled === false) return "";
-  const memory = "";
-  return `\n\n【自适应用户档案】已开启。你要逐步贴近用户的真实工作方式，但这些只是偏好，不覆盖本轮明确指令；若本轮指令冲突，以用户本轮为准。
-回答风格：${_adaptiveOptionLabel("tone", profile.tone)}。${profile.tone === "warm" ? "（只影响措辞和解释密度，不影响结论：坏消息仍然先说、不稀释；用户说错了仍然当面说。）" : ""}
-细节密度：${_adaptiveOptionLabel("detail", profile.detail)}。
-执行节奏：${_adaptiveOptionLabel("autonomy", profile.autonomy)}。
-用户熟练度：${_adaptiveOptionLabel("skill", profile.skill)}。
-意图识别：${_adaptiveOptionLabel("intentMode", profile.intentMode)}。
-自适应理解规则：
-- 用户表达很短、很乱、带情绪，或只说“啊 / ？？ / 继续 / 这个 / 不是这个 / 没懂 / 怎么回事”时，先结合最近对话、当前 UI/截图、刚完成或失败的动作、打开文件和任务状态推断他精确指的是什么；置信高就直接处理，并用一句话说明你依据哪条上下文判断。
-- 用户明显不懂技术或概念时，自动降到新手可理解的说法：先说结论和下一步，再补最少必要解释；不要甩术语、不要让用户自己翻文档。
-- 用户纠正你（例如“不是这个”“要中文”“不要改界面”“别打包”）时，把它当成强自适应信号；后续同类任务优先遵守。若是跨项目长期偏好，并且当前模式有 remember 工具，可记为 global 偏好。**但这一条只对口味类纠正成立**（语言、风格、范围、要不要做某一步）。如果这次纠正本身断言了一个技术事实（版本、API 行为、某段代码怎么执行），先按真实性纪律用证据核对：证据相反就在第一句说清并给出文件:行或真实输出，然后照他的决定做——但不要把这条错误主张写进记忆，否则它会在此后每一轮被当成事实注入。
-- 只有上下文仍不足以唯一判断时，才问；问题必须给 2-3 个具体候选，不要泛泛问“你想做什么”。${memory}`;
 }
 
 // Per-query preference recall for the adaptive profile — CONTENT VARIES with the
