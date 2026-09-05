@@ -75570,12 +75570,11 @@ function showAboutDialog() {
     : t("about.memberNone");
   const planActive = !!(_michaelUser?.plan && _michaelUser.plan !== "none");
   const account = _michaelUser?.email || _loggedInEmail || t("about.notSignedIn");
-  const year = new Date().getFullYear();
   const overlay = document.createElement("div");
   overlay.className = "about-dialog-overlay";
   overlay.innerHTML = `
     <section class="about-dialog" role="dialog" aria-modal="true" aria-labelledby="aboutDialogTitle" tabindex="-1">
-      <button class="about-dialog__close" type="button" aria-label="${_escAttr(t("about.close"))}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+      <button class="about-dialog__close" type="button" aria-label="${_escAttr(t("about.close"))}"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
       <header class="about-dialog__hero">
         <div class="about-dialog__brand">
           <img class="about-dialog__logo" src="${_escAttr(appIconSrc())}" alt="Mr. Day One" />
@@ -75588,8 +75587,6 @@ function showAboutDialog() {
         <div class="about-dialog__info"><span>${_escHtml(t("about.membership"))}</span><strong><em class="about-dialog__tag${planActive ? "" : " about-dialog__tag--plain"}">${_escHtml(plan)}</em></strong></div>
         <div class="about-dialog__info"><span>${_escHtml(t("about.region"))}</span><strong>${_escHtml(country.flag)} ${_escHtml(country.name)}</strong></div>
       </div>
-      <p class="about-dialog__desc">${_escHtml(t("about.gateway"))}</p>
-      <div class="about-dialog__foot">${_escHtml(t("about.copyright", { year }))}</div>
     </section>`;
   const close = () => {
     window.removeEventListener("keydown", onKey);

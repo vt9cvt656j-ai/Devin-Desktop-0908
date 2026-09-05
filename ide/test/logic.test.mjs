@@ -31010,27 +31010,38 @@ test("关于弹窗：关闭按钮必须压在内容层之上，否则点不动",
     return zi ? Number(zi[1]) : 0;
   };
   const closeZ = z(".about-dialog__close");
-  for (const sel of [".about-dialog__hero", ".about-dialog__version",
-                     ".about-dialog__grid", ".about-dialog__desc", ".about-dialog__foot"]) {
+  for (const sel of [".about-dialog__hero", ".about-dialog__version", ".about-dialog__grid"]) {
     assert.ok(closeZ > z(sel),
       `关闭按钮 z-index=${closeZ} 没有高过 ${sel}(${z(sel)})——它会被盖住，点不动`);
   }
-  // 常态就要有底色：一个「看不出能按」的按钮和一个「按不动」的按钮，用户感受是同一件事。
+  // 常态底片是**刻意**去掉的：常驻的灰色圆角方块在白底头部里浮成一块补丁。可发现性改由
+  // 图标自身的颜色承担、反馈由 hover 底色承担 —— 这两样必须都在，否则又回到「看不出能按」。
+  // 而「按不动」那个老 bug 的真身是上面那条层级关系，跟有没有底片无关。
   const rule = APP_CSS_CODE.match(/\.about-dialog__close\s*\{([^}]*)\}/)[1];
-  assert.ok(!/background:\s*transparent/.test(rule), "关闭按钮常态又变回全透明了");
+  assert.match(rule, /color:\s*#[0-9a-f]{6}/i, "关闭按钮常态没给图标颜色，等于看不见");
+  const hover = APP_CSS_CODE.match(/\.about-dialog__close:hover\s*\{([^}]*)\}/);
+  assert.ok(hover && /background:\s*rgba?\(/.test(hover[1]),
+    "hover 没有底色反馈——常态又没底片，就真的看不出这是个按钮了");
 });
 
-test("关于弹窗：关闭按钮在暗色下也要有常态底色", () => {
-  // 浅色态的常态底是**深色**半透明；暗色主题原本只覆盖了字色，于是那层深底铺在
-  // #18181b 的卡片上等于隐形 —— 比改之前的全透明还糟，连 hover 前的存在感都没了。
+test("关于弹窗：关闭按钮在暗色下不能隐形", () => {
+  // 两个主题的常态都不画底片，所以暗色要防的变成了「图标本身隐形」：压在 #18181b 的
+  // 卡片上，灰度必须够亮才看得见；hover 的底色同理得是白色半透明，不能继承浅色态那层深色。
   const dark = APP_CSS_CODE.match(
     /\[data-theme="dark"\] \.about-dialog__close,\s*\.dark \.about-dialog__close\s*\{([^}]*)\}/);
   assert.ok(dark, "暗色下的关闭按钮规则不见了");
-  const bg = dark[1].match(/background:\s*rgba\(([^)]*)\)/);
-  assert.ok(bg, "暗色下没有给常态底色，会用到浅色态那层深色底");
-  const [r, g, b] = bg[1].split(",").map((n) => Number(n.trim()));
-  assert.ok(r > 200 && g > 200 && b > 200,
-    `暗色底色 rgb(${r},${g},${b}) 是深色——铺在深色卡片上看不见`);
+  const col = dark[1].match(/color:\s*#([0-9a-f]{6})/i);
+  assert.ok(col, "暗色下没给图标颜色，会用到浅色态那个更暗的灰");
+  const [r, g, b] = [0, 2, 4].map((i) => parseInt(col[1].slice(i, i + 2), 16));
+  assert.ok(r >= 0x80 && g >= 0x80 && b >= 0x80,
+    `暗色图标 #${col[1]} 太暗——压在 #18181b 的卡片上看不见`);
+  const hov = APP_CSS_CODE.match(
+    /\[data-theme="dark"\] \.about-dialog__close:hover,\s*\.dark \.about-dialog__close:hover\s*\{([^}]*)\}/);
+  const hbg = hov && hov[1].match(/background:\s*rgba\(([^)]*)\)/);
+  assert.ok(hbg, "暗色 hover 没有底色反馈");
+  const [hr, hg, hb] = hbg[1].split(",").map((n) => Number(n.trim()));
+  assert.ok(hr > 200 && hg > 200 && hb > 200,
+    `暗色 hover 底色 rgb(${hr},${hg},${hb}) 是深色——铺在深色卡片上看不见`);
 });
 
 test("关于弹窗：比窗口高的时候，顶端和关闭按钮仍然够得着", () => {
