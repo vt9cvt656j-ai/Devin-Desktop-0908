@@ -130,6 +130,9 @@ export function approvalLabel(call, deps = {}) {
     };
     case "createproject": return { title: "新建项目目录并切换工作区？", detail: `~/MrDayOne/${call.name || call.path || ""}` };
     case "genimage": return { title: "生成图片并写入工作区？", detail: `${call.prompt || ""}\n→ ${call.name || call.path || "(自动命名)"}` };
+    // office_write 新建 xlsx / docx / pptx；office_edit 默认覆盖原文件，另存时把两个路径都摆出来。
+    case "office_write": return { title: "生成 Office 文档并写入工作区？", detail: `→ ${call.dest || ""}` };
+    case "office_edit": return { title: "修改工作区里的 Office 文档？", detail: `${call.path || ""}${call.dest && call.dest !== call.path ? `\n→ ${call.dest}` : "（覆盖原文件）"}` };
     case "generate_3d": case "generate_texture": case "generate_motion": case "auto_rig":
       return { title: "生成素材并写入工作区？", detail: `${call.type} · ${(call.prompt || call.name || "").slice(0, 200)}` };
     case "generate_sound": case "generate_music": case "generate_voice":

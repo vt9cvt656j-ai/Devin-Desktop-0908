@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 142,
+  "count": 145,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -12,6 +12,7 @@
     "Files",
     "Git & GitHub",
     "Knowledge",
+    "Office documents",
     "Research",
     "Terminal & system",
     "Web & browser"
@@ -310,6 +311,11 @@
     {
       "name": "view_image",
       "group": "Knowledge",
+      "desktopOnly": true
+    },
+    {
+      "name": "office_read",
+      "group": "Office documents",
       "desktopOnly": true
     },
     {
@@ -630,6 +636,16 @@
     {
       "name": "generate_image",
       "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "office_write",
+      "group": "Office documents",
+      "desktopOnly": true
+    },
+    {
+      "name": "office_edit",
+      "group": "Office documents",
       "desktopOnly": true
     },
     {

@@ -255,6 +255,7 @@ import { webFetchNextStep } from "./agent/web-fetch-hint.js";
 import { automationNextStep } from "./agent/automation-hint.js";
 import { _AUTOMATION_METHODS, _COMPUTER_METHODS } from "./agent/automation-methods.js";
 import { runBrowserTask, taskModelConfig, automationBrowserCall, mergedBrowserNote, browserNavAction } from "./agent/browser-task.js";
+import { runOfficeStep } from "./agent/office-tool.js";
 
 // Global shared state store for sub-agent collaboration
 const _globalSharedStore = getSharedStore();
@@ -37102,7 +37103,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   let _galleryMode = false;
   try { _galleryMode = !inTauri && new URLSearchParams(location.search).get("play") === "tools"; } catch {}
   if (!inTauri && !_galleryMode) {
-    const desktopOnly = new Set(["mcp_server", "debug_control", "run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset",
+    const desktopOnly = new Set(["office_write", "office_edit", "office_read", "mcp_server", "debug_control", "run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset",
   // 这 40 个的执行器里都以 `if (!inTauri) return "[不可用] 只能在桌面 App 里用"` 开头，
   // 却一直照样把 schema 发给模型：网页版里模型手上摆着 arxiv_search、db_query、
   // gh_pr_view，选中一个就是一轮白烧，search_tools 也照样能把它们装进工具窗口、
@@ -38042,7 +38043,7 @@ const _STRICT_MUTATING_TOOL_NAMES = new Set([
   //   run_subagent  子智能体，能力上等于再开一整个会话
   "computer", "system", "run_subagent",
   // learn_design：它真的往工作区写两个文件，2026-08-25 才登记进 tool-policy。
-  "learn_design",
+  "learn_design", "office_write", "office_edit",
 ]);
 
 function _mutatingToolArgIssue(name, rawArgs) {
@@ -38910,6 +38911,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "decode_qr": return { type: "qr", path: args.path || args.file || args.image || args.image_path || "", dataUrl: args.data_url || args.dataUrl || args.image_data || "" };
     case "remote": return { type: "remote", op: (args.action || args.op || "status").toLowerCase(), url: args.url || args.host || args.address || "", token: args.token || args.key || "", root: args.root || args.path || args.dir || "" };
     case "generate_image": return { type: "genimage", prompt: args.prompt || "", dest: args.dest || args.path || "", width: args.width, height: args.height };
+    case "office_write": return { type: "office_write", dest: args.dest || args.path || "", format: args.format || "", spec: args.spec ?? args.document ?? args.workbook ?? args.presentation ?? null, help: args.help === true || args.help === "true" }; case "office_edit": return { type: "office_edit", path: args.path || args.file || args.src || "", dest: args.dest || "", format: args.format || "", spec: args.spec ?? args.changes ?? null, ops: Array.isArray(args.ops) ? args.ops : (Array.isArray(args.replacements) ? args.replacements : null), force: args.force === true || args.force === "true", help: args.help === true || args.help === "true" }; case "office_read": return { type: "office_read", path: args.path || args.file || "", format: args.format || "", sheet: args.sheet, range: args.range, maxRows: args.maxRows ?? args.max_rows, maxCols: args.maxCols ?? args.max_cols, styles: args.styles === true, maxSlides: args.maxSlides ?? args.max_slides, maxChars: args.maxChars ?? args.max_chars };
     case "design_board": return { type: "designboard", variants: args.variants || args.images || [], title: args.title || "" };
     case "db_query": return { type: "db", driver: (args.driver || "").trim(), url: args.url || "", query: args.query || args.sql || args.command || "", limit: args.limit };
     case "screenshot": return { type: "screenshot", url: args.url || "", width: args.width, height: args.height, frames: Number.isFinite(+args.frames) ? Math.min(Math.max(+args.frames, 2), 5) : 0, durationMs: Number.isFinite(+args.duration_ms) ? +args.duration_ms : undefined };
@@ -45916,7 +45918,7 @@ function _toolFailureKey(call, root = "") {
 const _toolCategoryMap = {
   read: "file", list: "file", write: "file", edit: "file", multiedit: "file",
   delete: "file", move: "file", mkdir: "file", copy: "file", format: "file",
-  readlogs: "file",
+  readlogs: "file", office_read: "file", office_edit: "file", office_write: "generation",
   // findfiles 归 search，不归 file：它是"按模式找出哪些文件存在"，失败原因跟 read/write
   // 那一类完全不同（找不到 ≠ 读不了），编排器按类别统计失败时混在一起会得出错的结论。
   // 这里原本 file 和 search 各写了一份，后一份静默覆盖前一份——行为一直是 search，
@@ -52643,6 +52645,7 @@ function _recLabel(call, root) {
     case "screenshot": return "截图";
     case "browser": return "浏览器 " + (call.action || "");
     case "genimage": return "生成图片 → " + (call.dest || "");
+    case "office_write": return (call.help ? "查看文档规格 " + (call.format || "") : "生成文档 → " + (call.dest || "")); case "office_edit": return "修改文档 " + (call.path || "") + (call.dest && call.dest !== call.path ? " → " + call.dest : ""); case "office_read": return "读取文档 " + (call.path || "");
     case "subagent": return "子智能体调研：" + (call.description || "");
     case "worker": return "并行 worker：" + (call.description || "");
     case "delete": return "删除 " + p;
@@ -59935,7 +59938,7 @@ function _toolStepActionLabel(call) {
     awaitsubagent: "等待子智能体", debate: "辩论决策",
     game_scaffold: "游戏脚手架", web_scaffold: "网站脚手架", learn_design: "学习设计体系", generate_3d: "3D 模型", generate_sound: "音效",
     generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画",
-    generate_texture: "纹理", search_game_assets: "资源搜索", download_asset: "下载资源", unknown: "未知工具",
+    generate_texture: "纹理", search_game_assets: "资源搜索", download_asset: "下载资源", unknown: "未知工具", office_write: "生成文档", office_edit: "修改文档", office_read: "读取文档",
   };
   // i18n first: `tool.action.<type>` carries the translated verb. The literal map above
   // stays as the fallback for any type that has no translation yet.
@@ -60111,7 +60114,7 @@ function _createToolStep(call) {
   }
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "debug" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "mcpconfig" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "debug" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "office_write" || call.type === "office_edit" || call.type === "office_read" || call.type === "mcp" || call.type === "mcpconfig" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -61486,7 +61489,7 @@ function _previewSimulateTool(call, res, vp, root) {
     case "memory": case "askuser": case "current_time": case "designboard": case "preview":
     // 这里原来还有一个 `case "computer"`，永远走不到：这个 switch 判的是 `call.type`，
     // 而映射层从不产出 type "computer"（`case "computer"` 返回的是 type "automation"）。
-    case "genimage": case "vizcompare": case "explain": case "worktree":
+    case "genimage": case "vizcompare": case "explain": case "worktree": case "office_write": case "office_edit": case "office_read":
     case "system": case "automation": case "readscreen": case "uiclick": case "remote":
     case "qr": case "capture_start": case "capture_flows": case "capture_stop": case "capture_replay":
     case "demostart": case "demostop": case "background_monitor": case "localdiscovery":
@@ -66488,6 +66491,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         return { type: "genimage", path: call.dest, content: `[失败] generate_image 出错（${_imgModel}）: ${msg}` };
       }
 
+    } else if (call.type === "office_write" || call.type === "office_edit" || call.type === "office_read") { return runOfficeStep(call, { inTauri, root: root || rootPath || workspaceRoots[0] || "", invoke: (cmd, args) => backend.invoke(cmd, args), resolve: _resolveRel, reloadDir, parentDir, escHtml: _escHtml, res, vp });
     } else if (call.type === "mcp") {
       const label = `${call.server || "?"}/${call.tool || call.mcpName || "?"}`;
       if (!inTauri) { _mcpCardSettle(vp, step, "MCP 只能在桌面 App 里用"); res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "mcp", path: label, content: "[不可用] MCP 外部工具只能在桌面 App 里用（要本地启动 MCP 服务进程）。" }; }

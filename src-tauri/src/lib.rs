@@ -36,6 +36,7 @@ mod lsp;
 mod marketplace;
 mod mcp;
 mod net;
+mod office_xlsx;
 mod process_util;
 // 自定义模型的上游线协议翻译（openai / anthropic / xai_responses）。
 mod protocol;
@@ -288,6 +289,9 @@ pub fn run() {
             tabular::read_table_file,
             repos::list_repositories,
             files::write_text_file,
+            files::write_file_bytes,
+            files::read_file_bytes,
+            office_xlsx::office_xlsx_write,
             files::write_text_file_if_unchanged,
             files::write_text_file_if_unchanged_hashed,
             files::delete_text_file_if_unchanged,
