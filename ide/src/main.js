@@ -133,7 +133,7 @@ import * as growth from "./growth.js";
 import { configureCoreMemory, coreMarkdownSection } from "./agent/core-memory.js";
 import { configureMemoryStats, memStat } from "./agent/memory-stats.js";
 import { configureAdaptiveBlock, _adaptivePromptBlock } from "./agent/adaptive-block.js";
-import { configureCoreCapture, _coreCaptureUtterance, syncCoreFromKg, promoteRememberedNote, coreImportIfEmpty, corePanelProps } from "./agent/core-capture.js";
+import { configureCoreCapture, _coreCaptureUtterance, syncCoreFromKg, promoteRememberedNote, coreImportIfEmpty, corePanelProps, promoteContractGoal } from "./agent/core-capture.js";
 import { configureWorkflowMemory, wfPrune } from "./agent/workflow-memory.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
@@ -52309,12 +52309,19 @@ function _retrieveEpisodes(task, root, k) {
 function _episodeHintBlock(task, root) {
   const rel = _retrieveEpisodes(task, root, 3);
   if (!rel.length) return "";
-  const lines = rel.map((e) => {
+  // 事实优先：没有 insight 就给「改了哪些文件 / 撞过什么墙」，而不是整段动作序列。实测 47% 的档案没
+  // insight，其中 68% 既没改文件也没撞墙（只读探索轮），它们的"经验"是中位 276 字的读取序列——
+  // 那种只在没有更有料的候选时才露面（单候选照旧渲染）。
+  const strip = (v) => String(v || "").replace(/(?:\/Users|\/home)\/[^\s→\/]+(?:\/[^\s→\/]+)*\/([^\s→\/]+)/g, "$1");
+  const informative = (e) => !!(e.insight || (e.files && e.files.length) || (e.walls && e.walls.length) || e.outcome !== "success");
+  const shown = rel.some(informative) ? rel.filter(informative) : rel;
+  const lines = shown.map((e) => {
     const tag = e.outcome === "failed" ? "⚠️坑" : e.outcome === "partial" ? "△" : "✓";
-    // 存量档案（2026-08-26 实测 1165 条里 693 条）的 approach 带着别人机器的绝对路径。
-    // 写入侧已经修了，读取侧再把历史那批的路径压成文件名——不丢事实，只丢噪音。
-    const fallback = String(e.approach || "").replace(/(?:\/Users|\/home)\/[^\s→\/]+(?:\/[^\s→\/]+)*\/([^\s→\/]+)/g, "$1");
-    return ("- " + tag + "「" + String(e.task || "").slice(0, 40) + "」：" + (e.insight || fallback)).slice(0, 220);
+    const facts = [];
+    if (e.files && e.files.length) facts.push("改了 " + e.files.slice(0, 3).map(strip).join(", ") + (e.files.length > 3 ? ` 等 ${e.files.length} 个` : ""));
+    if (e.walls && e.walls.length) facts.push("撞墙：" + e.walls.slice(0, 2).map((w) => String(w).slice(0, 60)).join("；"));
+    const body = e.insight || (facts.length ? facts.join("；") : strip(e.approach).slice(0, 120));
+    return ("- " + tag + "「" + String(e.task || "").slice(0, 40) + "」：" + body).slice(0, 220);
   });
   return "\n\n📚 **这个项目里你做过的类似任务（经验参考，以当前实际为准、别生搬）**：\n" + lines.join("\n");
 }
@@ -58900,6 +58907,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // 学习者模型的执行事实（growth.factsFromRun）+ 反思通道计数（_recordEpisode 被按名抠取，里面不能多引标识符）。
       try {
         run._growthFacts = growth.factsFromRun(run, _epLoad(memoryRoot || root), _runOutcome);
+        promoteContractGoal(memoryRoot || root, run.engineering, session?._intentState?.semantic, _runOutcome); // 项目级目标 → 项目核心
         if (run._reflectStats?.opened) { memStat("reflect.opened"); if (run._reflectStats.accepted) memStat("reflect.accepted", run._reflectStats.accepted); }
       } catch {}
       // 离线通道：攒够一批就在后台批量看一次历史，沉淀跨轮规律。不 await——它跟这一轮的
