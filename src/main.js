@@ -75583,8 +75583,8 @@ function showAboutDialog() {
       </header>
       <div class="about-dialog__grid">
         <div class="about-dialog__info"><span>${_escHtml(t("about.developer"))}</span><strong>Michael</strong></div>
-        <div class="about-dialog__info"><span>${_escHtml(t("about.account"))}</span><strong>${_escHtml(account)}</strong></div>
-        <div class="about-dialog__info"><span>${_escHtml(t("about.membership"))}</span><strong><em class="about-dialog__tag${planActive ? "" : " about-dialog__tag--plain"}">${_escHtml(plan)}</em></strong></div>
+        <div class="about-dialog__info"><span>${_escHtml(t("about.account"))}</span><strong${_michaelUser?.email || _loggedInEmail ? "" : ' data-muted="1"'}>${_escHtml(account)}</strong></div>
+        <div class="about-dialog__info"><span>${_escHtml(t("about.membership"))}</span><strong${planActive ? "" : ' data-muted="1"'}>${_escHtml(plan)}</strong></div>
         <div class="about-dialog__info"><span>${_escHtml(t("about.region"))}</span><strong>${_escHtml(country.flag)} ${_escHtml(country.name)}</strong></div>
       </div>
     </section>`;
