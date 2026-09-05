@@ -29,6 +29,7 @@ window.addEventListener("unhandledrejection", (e) => {
 
 import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js";
 import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
+import { recoveredDraftNotice, recoveredThinkingOpen } from "./agent/draft-recovery.js";
 import { applyLayoutDensity, viewportW, viewportH } from "./agent/layout-density.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
@@ -19289,7 +19290,9 @@ async function _renderMsgRange(session, from, to, options = {}) {
       if (body && m.role === "assistant" && m.reasoning && typeof m.reasoning === "string" && m.reasoning.trim()) {
         const card = document.createElement("div");
         card.className = "think-card";
-        card.dataset.open = "0";
+        // 一般历史里思考默认折叠；但崩溃恢复出来、正文为空的那条，思考是它唯一的实质内容，
+        // 默认展开（restoreChatHistory 打的 _recoveredThinkingOpen 标记），别让用户只看到一句提示。
+        card.dataset.open = m._recoveredThinkingOpen ? "1" : "0";
         card.innerHTML = _THINK_CARD_HTML("已思考");
         const tb = card.querySelector(".think-body");
         if (tb) { tb.dataset.rawText = m.reasoning; try { renderMarkdownInto(tb, m.reasoning, { streaming: false, highlighter: highlightCodeFinal }); } catch { tb.textContent = m.reasoning; } }
@@ -20832,14 +20835,24 @@ async function restoreChatHistory() {
           const _hasContent = !!(_draftText.trim() || _draftReasoning.trim() || _steps);
           if (_draftSession && _hasContent && !_already) {
             // 步骤清单排在叙述**前面**：被打断那轮「做了什么」比「说到哪」更要紧——用户看着满屏工具卡片消失、只剩两句话，正是这条修的现象。
+            const _hasText = !!_draftText.trim();
+            const _hasReason = !!_draftReasoning.trim();
+            // 提示语按「这轮到底生成出了什么」讲实话，并把内容指到它真正所在的位置；判断在
+            // draft-recovery.js（有单测）。原来一律写「以下为已生成的部分」——可被打断在写正文
+            // 之前时正文本就是空的，那句就指着一片空白让用户以为内容丢了。
+            const _notice = recoveredDraftNotice({ hasText: _hasText, hasReason: _hasReason, hasSteps: !!_steps });
             const _msg = {
               role: "assistant",
-              content: `⚠️（此回复在生成途中因软件重启被打断，以下为已生成的部分）\n\n`
+              content: `${_notice}\n\n`
                 + (_steps ? `${_steps}\n\n` : "")
                 + _draftText,
             };
-            // 思考（reasoning）也存了、也被渲染过，以前只拼 steps+text 把它丢了、「✓ 思考」只剩个勾。带上它，走 assistant.reasoning 老路渲染成可折叠思考块。
-            if (_draftReasoning.trim()) _msg.reasoning = _draftReasoning;
+            // 思考（reasoning）也存了、也被渲染过，以前只拼 steps+text 把它丢了、「✓ 思考」只剩个勾。带上它，走 assistant.reasoning 老路渲染成思考块。
+            if (_hasReason) {
+              _msg.reasoning = _draftReasoning;
+              // 正文为空时思考是这轮唯一的实质内容 → 让它默认展开（_renderMsgRange 认这个标记）。
+              if (recoveredThinkingOpen({ hasText: _hasText, hasReason: _hasReason })) _msg._recoveredThinkingOpen = true;
+            }
             _draftSession.memory.push(_msg);
             _draftSession._htmlSnapshot = ""; // 快照里没有这条；强制从持久历史重建可见窗口
             _restored++;
