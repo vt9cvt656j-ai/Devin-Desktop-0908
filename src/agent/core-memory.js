@@ -65,6 +65,8 @@ export function coreTokens(text) {
   }
   return out;
 }
+/** 两句话的相似度（0..1）。给宿主判「同一件事的新说法」用，判据和内部判重同一把尺子。 */
+export function coreSimilarity(a, b) { return jaccard(coreTokens(a), coreTokens(b)); }
 function jaccard(a, b) {
   if (!a.size || !b.size) return 0;
   let inter = 0;
@@ -218,8 +220,11 @@ export function renderCoreBlock(scope, opts = {}) {
     ? "本项目的目标、约定和禁忌，每轮常驻。"
     : "跨项目常驻的用户偏好与规矩。";
   const note = `带 ${CORE_AGENT_MARK} 的是你自己在运行中记下的，不是用户的规矩，权重分开；与本轮明确指令冲突时以指令为准。`;
-  const users = entries.filter((e) => e.source === "user" || e.source === "seed" || e.source === "promoted");
-  const agents = entries.filter((e) => e.source === "agent");
+  // 组内按种类排：目标是框架，放最前；然后规矩、偏好、事实。同种类内仍按写入时间。
+  const rank = { goal: 0, rule: 1, preference: 2, fact: 3 };
+  const byKind = (a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || a.created - b.created || a.id.localeCompare(b.id);
+  const users = entries.filter((e) => e.source === "user" || e.source === "seed" || e.source === "promoted").sort(byKind);
+  const agents = entries.filter((e) => e.source === "agent").sort(byKind);
   const lines = [
     ...users.map((e) => `- ${e.text}`),
     ...agents.map((e) => `- ${CORE_AGENT_MARK} ${e.text}`),

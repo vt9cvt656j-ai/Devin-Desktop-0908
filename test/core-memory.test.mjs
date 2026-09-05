@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import {
   configureCoreMemory, coreUpsert, coreActive, coreSupersede, coreReplaceAll,
   renderCoreBlock, corePromoteNote, shouldPromote, coreMarkdownSection, coreImportMarkdown,
-  coreStats, CORE_LIMITS, CORE_AGENT_MARK, coreKey,
+  coreStats, CORE_LIMITS, CORE_AGENT_MARK, coreKey, coreSimilarity,
 } from "../src/agent/core-memory.js";
 
 function fresh() {
@@ -72,6 +72,11 @@ test("渲染是纯函数：同一份条目逐字节相同；空的返回空串�
   assert.ok(r1.includes("【核心记忆·用户】"));
   assert.ok(r1.indexOf("- 不要用黄色") < r1.indexOf(`- ${CORE_AGENT_MARK} 读不到文件就用 rg 找`), "模型记的排到用户前面了");
   assert.doesNotMatch(r1, /\d{10,}|c[a-z0-9]{8,}/, "渲染里混进了时间戳或 id，前缀缓存每轮都会破");
+  // 组内按种类：目标最前，其次规矩、偏好、事实——目标是框架，读的人该第一眼看到。
+  coreUpsert("", { text: "金额用分存", kind: "fact", source: "user", created: 3 });
+  coreUpsert("", { text: "目标：做一个电影站", kind: "goal", source: "user", created: 4 });
+  const r3 = renderCoreBlock("");
+  assert.ok(r3.indexOf("目标：做一个电影站") < r3.indexOf("不要用黄色") && r3.indexOf("不要用黄色") < r3.indexOf("金额用分存"), `种类排序不对：\n${r3}`);
   // 项目块标题不同
   coreUpsert("/r", { text: "目标：做一个电影站", source: "user" });
   assert.ok(renderCoreBlock("/r").includes("【核心记忆·本项目】"));
@@ -122,4 +127,10 @@ test("镜像：每次持久化都调宿主的 mirror，键和 localStorage 一�
   assert.ok(mirrored.length >= 1 && mirrored[0][0] === coreKey(""));
   m.set(coreKey(""), "{not json");
   assert.deepEqual(coreActive(""), []);
+});
+
+test("coreSimilarity 和内部判重同一把尺子：同义高、换话题低", () => {
+  assert.ok(coreSimilarity("回复用中文", "回复用中文。") >= 0.8);
+  assert.ok(coreSimilarity("目标：做一个二手书交易网站", "目标：做一个二手书交易网站，先做首页") >= 0.5, "目标演进应判成同一件事");
+  assert.ok(coreSimilarity("目标：做一个电影站", "金额用分存") < 0.2);
 });

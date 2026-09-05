@@ -123,3 +123,23 @@ test("用户原话进核心：普通偏好新增；「以后不是 X，是 Y」�
   assert.deepEqual(active("").map((e) => e.text), ["以后回复不是用中文，是用英文"]);
   assert.ok(calls.stat.includes("capture.core.superseded"));
 });
+
+test("情景提示事实优先：没 insight 就给改了哪些文件；只读探索轮在有更有料的候选时不露面，单候选照旧", () => {
+  const hint = (eps) => load("_episodeHintBlock", { _retrieveEpisodes: () => eps })("改登录页", "/r");
+  const files = { outcome: "success", task: "改登录页", insight: "", files: ["/Users/x/proj/src/Login.tsx", "src/api/auth.ts"], approach: "读取 a → 读取 b → 编辑 c → 运行 $ npm test" };
+  const readOnly = { outcome: "success", task: "看看登录页", insight: "", approach: "读取 /Users/x/proj/src/App.tsx → 读取 README.md → list src" };
+  const withInsight = { outcome: "partial", task: "改登录页样式", insight: "先跑 npm test 再改样式", approach: "…" };
+  let out = hint([files]);
+  assert.match(out, /改了 Login\.tsx, src\/api\/auth\.ts/, "没 insight 时该给文件，不给动作序列");
+  assert.doesNotMatch(out, /读取 a → 读取 b/, "动作序列还是被注入了");
+  assert.doesNotMatch(out, /\/Users\//);
+  out = hint([readOnly, files, withInsight]);
+  assert.doesNotMatch(out, /看看登录页/, "有更有料的候选时，只读探索轮不该占位置");
+  assert.match(out, /先跑 npm test 再改样式/);
+  out = hint([readOnly]);
+  assert.match(out, /App\.tsx/, "单候选时只读轮照旧渲染（现有契约）");
+  assert.doesNotMatch(out, /\/Users\//);
+  // 撞墙也是事实
+  out = hint([{ outcome: "failed", task: "部署", insight: "", walls: ["run_cmd [timeout] ssh 连不上", "x"], approach: "…" }]);
+  assert.match(out, /撞墙：run_cmd \[timeout\] ssh 连不上/);
+});

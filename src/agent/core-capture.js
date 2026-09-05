@@ -9,7 +9,7 @@
 // KG 的读写 / 分类 / 上下文缓存失效由 configureCoreCapture 注入；名字原样保留，测试按名抠取。
 import { judgeDurableUtterance } from "./memory-signals.js";
 import { extractExplicitCorrection } from "../conversation-memory.js";
-import { coreUpsert, coreActive, coreSupersede, coreRestore, corePromoteNote, coreReplaceAll, coreImportMarkdown, coreStats, CORE_AGENT_MARK } from "./core-memory.js";
+import { coreUpsert, coreActive, coreSupersede, coreRestore, corePromoteNote, coreReplaceAll, coreImportMarkdown, coreStats, coreSimilarity, CORE_AGENT_MARK } from "./core-memory.js";
 import { memStat, memStats } from "./memory-stats.js";
 
 let _ccKgLoad = () => [];
@@ -108,4 +108,33 @@ export function corePanelProps(root, hooks = {}) {
       try { hooks.toast?.(root ? `核心记忆已保存：我的 ${u} 条，本项目 ${pc} 条` : `核心记忆已保存：我的 ${u} 条`); } catch {}
     },
   };
+}
+
+/** 意图裁决里说"这是项目级交付"的那几面旗。取自画像（run.engineering）上的布尔位。 */
+const PROJECT_SCOPE_FLAGS = ["projectScope", "fullWebsite", "fromZeroUiProject", "websiteDelivery", "productionReadiness"];
+
+/**
+ * 任务契约的耐久那一半 → 项目核心。
+ *
+ * 契约（goal / action / target / constraints / successCriteria）本来只活在会话里，新会话第一句
+ * 就忘了"这个仓库是要做成什么"。但**一轮的目标不等于项目的目标**：「修一下登录页的 bug」升进
+ * 核心之后会每轮当项目目标注入。所以只在裁决把这一轮判成**项目级**交付、且这轮做成时才升；
+ * 目标演进（相似 ≥0.5）时替换旧的，不并存。constraints 不升：多数是本轮的（"这次别改界面"）。
+ * 返回写进去的条目；不够格返回 null。
+ */
+export function promoteContractGoal(scope, profile, semantic, outcome) {
+  try {
+    if (outcome !== "success") return null;
+    const goal = String(semantic?.goal || "").replace(/\s+/g, " ").trim();
+    if (goal.length < 8 || goal.length > 200) return null;
+    if (!PROJECT_SCOPE_FLAGS.some((k) => !!profile?.[k])) return null;
+    const text = `目标：${goal}`;
+    const prior = coreActive(scope).filter((e) => e.kind === "goal");
+    const evolved = prior.find((e) => coreSimilarity(e.text, text) >= 0.5);
+    const r = evolved
+      ? coreSupersede(scope, evolved.id, text, "agent")
+      : coreUpsert(scope, { text, kind: "goal", source: "agent", confidence: 0.75 });
+    if (r) memStat("capture.core.goal");
+    return r;
+  } catch { return null; }
 }
