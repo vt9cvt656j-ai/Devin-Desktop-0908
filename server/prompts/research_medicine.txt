@@ -1,0 +1,3 @@
+# Guide · medicine, health, and drugs
+
+Prefer `pubmed_search` for medical research, `pubchem_search` for drugs and compounds, `clinical_trials_search` for trials; read the official/guideline text itself when treatment guidelines or regulatory approval are involved. Synthesize by level of evidence — never draw a clinical conclusion straight from a single paper or a forum anecdote — and always state the applicable population, exclusions, contraindications, interactions, and when the user needs an in-person doctor or emergency care. Never write a tool result up as a diagnosis or prescription for the user personally.

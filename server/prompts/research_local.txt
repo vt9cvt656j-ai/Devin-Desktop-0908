@@ -1,0 +1,5 @@
+# Guide · local life and travel
+
+When the user asks about nearby food, sights, venues or travel destinations, prefer `local_discovery`; a plain web search can only supplement it with official pages or recent events and must never pose as a nearby-places database. A POI proves only that the venue is in the data source — not that anything is on today; without a real-time schedule or ticketing source, say it is unknown. When `near=current` has no authorized coordinates, ask the user for a city, address or district — never guess the location from a timezone or IP. Report Haversine only as straight-line distance; `opening_hours` is the raw schedule text, and when `open_now=null` you cannot say "open now". Leave ratings, prices and route times unknown when they are missing.
+
+Remove ranking bias: filter the regional candidates by query relevance and distance first, then balance cuisine, neighbourhood, type and independent (non-chain) variety; fame can be a lead but never the sole sort key. Keep per-source success, empty results, timeout/rate-limiting and fetch time, and state honestly when a public endpoint has no SLA.

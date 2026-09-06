@@ -3,21 +3,21 @@
     "type": "function",
     "function": {
       "name": "read_file",
-      "description": "Read a file's contents. By default it reads the whole file in one go when it is at most 2500 lines (longer files come back paginated, about 1800 lines per page, and the result says so) — **prefer omitting offset/limit and just reading the whole file**; use offset/limit only when the file is too large for one read (the result says it was truncated) to continue through the part you have not covered. You can issue several tool calls in parallel in one reply: **speculatively reading every possibly-useful file in one parallel batch is always better** than reading one at a time. When investigating, evaluating, or reviewing and you find further relevant files you have not read (modules the entry point imports, build scripts, config): **read them and then conclude — never stop to ask the user \"shall I keep reading?\". The unread list you just produced is your reading queue, not a question to hand back.** Do not re-read a whole file you already read and that has not changed; re-read a range only when you need character-exact text for an edit and the exact original has fallen out of context. Before modifying an existing file you must have its current real version. It can also read the text layer of .pdf/.docx/.pptx/.xlsx (image-only scans need OCR).",
+      "description": "Read a file's contents. Files up to 2500 lines come back whole; longer files are paged (about 1800 lines per page) and the result says so. Omit offset/limit for a normal read; pass them only to continue a file the result marked truncated, or to re-fetch exact text for an edit when the original has left your context. Also reads the text layer of .pdf/.docx/.pptx/.xlsx (image-only scans need OCR).",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "Path relative to the workspace root, or an absolute path"
+            "description": "Path relative to the workspace root, or absolute."
           },
           "offset": {
             "type": "integer",
-            "description": "Starting line number (1-based). Provide only when the file is too large to read in one go"
+            "description": "1-based starting line; only to continue a truncated file."
           },
           "limit": {
             "type": "integer",
-            "description": "How many lines to read. Provide only when the file is too large to read in one go; omit = read the whole file at once"
+            "description": "Number of lines to read; omit to read the whole file."
           }
         },
         "required": [
@@ -30,17 +30,17 @@
     "type": "function",
     "function": {
       "name": "list_dir",
-      "description": "List the direct children of a directory on demand; use \".\" for the workspace root. When the IDE has already provided a project tree or symbol map, use that instead of re-scanning level by level; list a directory once only when the target location is unknown or the directory genuinely may have changed. Results include the resolved absolute path. Independent calls go in one reply: when several of these have arguments that do not depend on each other's results, send them together in one response rather than one per turn.",
+      "description": "List a directory's entries; \".\" is the workspace root. Results include the resolved absolute path. When the project tree already in your context shows the location, use that instead of listing level by level.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "Directory path (relative to the workspace root, or absolute)"
+            "description": "Directory path, relative to the workspace root or absolute."
           },
           "depth": {
             "type": "integer",
-            "description": "Recursion depth, default 1 (current level only); 0 = recurse all the way down"
+            "description": "Recursion depth, default 1 (current level only); 0 = recurse all the way down (capped at 10 levels and 500 lines)."
           }
         },
         "required": [
@@ -53,17 +53,17 @@
     "type": "function",
     "function": {
       "name": "search",
-      "description": "Locate text inside a single file or directory when the position is unknown, returning matching lines with context. When the target file is known, read_file directly; after a hit, read the target source to confirm the full context — never edit from a fragment alone. Defaults to literal; use regex only when you genuinely need pattern matching. Independent calls go in one reply: when several of these have arguments that do not depend on each other's results, send them together in one response rather than one per turn.",
+      "description": "Find lines matching text in one file or a directory tree, returned with surrounding context. Matching is literal by default; pass mode=\"regex\" for a pattern. Files over 2 MiB are skipped whole and the result says how many — read those with read_file offset/limit or grep them with run_cmd.",
       "parameters": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "Text to search for. **Literal by default** — every character is matched as-is, so \"function\\s+login\" would look for that exact text and find nothing. For a real pattern you must also pass mode=\"regex\"."
+            "description": "Text to find. **Literal by default** — every character is matched as-is, so \"function\\s+login\" finds only that exact text; set mode=\"regex\" for a real pattern."
           },
           "path": {
             "type": "string",
-            "description": "Optional, restrict to a single file or subdirectory (e.g. \"src/auth.ts\" or \"src/\")"
+            "description": "Optional: restrict to one file or subdirectory, e.g. \"src/auth.ts\" or \"src/\"."
           },
           "mode": {
             "type": "string",
@@ -71,11 +71,11 @@
               "literal",
               "regex"
             ],
-            "description": "Match mode, default literal"
+            "description": "literal (default) or regex."
           },
           "case_sensitive": {
             "type": "boolean",
-            "description": "Whether to match case, default false"
+            "description": "Match case; default false."
           }
         },
         "required": [
@@ -88,17 +88,17 @@
     "type": "function",
     "function": {
       "name": "find_files",
-      "description": "Find files by name or glob pattern — *.rs, main.js, src/**/*.ts — or just a substring of the filename. 【vs alternatives】Search by content with search; find a symbol's definition with find_symbol; when you know the exact path, read_file directly. Independent calls go in one reply: when several of these have arguments that do not depend on each other's results, send them together in one response rather than one per turn.",
+      "description": "Find files by name, glob or filename substring: *.rs, main.js, src/**/*.ts. Build and dependency directories are skipped entirely (node_modules, .git, dist, build, target, vendor, coverage, .venv, __pycache__, .cache and similar), so a pattern into them matches nothing — reach those files by path with read_file. For content use search; for a symbol's definition use find_symbol.",
       "parameters": {
         "type": "object",
         "properties": {
           "pattern": {
             "type": "string",
-            "description": "Filename or glob pattern"
+            "description": "Filename, glob pattern, or substring."
           },
           "limit": {
             "type": "integer",
-            "description": "Optional; max results (default 200, max 2000). Results are capped DURING traversal and sorted afterwards, so a truncated result is an arbitrary subset in directory order — not the alphabetically first N. When the answer says it was truncated, narrow the pattern to a subdirectory rather than assuming you saw everything."
+            "description": "Max results (default 200, max 2000). A truncated result is an arbitrary subset in traversal order, so narrow the pattern rather than assuming you saw everything."
           }
         },
         "required": [
@@ -111,13 +111,13 @@
     "type": "function",
     "function": {
       "name": "web_search",
-      "description": "General web-search fallback (the current desktop backend tries Google, Bing and DuckDuckGo in parallel and merges whatever actually comes back), returning a list of titles, URLs and snippets. Prefer tools closer to the question — the existing knowledge base, structured live sources, specialist databases, official documentation, package registries, GitHub and developer communities; use web_search only when no dedicated source applies or you need supplementary general-web evidence. Search snippets are only leads: read the original with web_fetch for any key conclusion and weigh it by source credibility — never treat a snippet, or this round's retrieved_at, as a current fact.",
+      "description": "Web search (Google, Bing and DuckDuckGo in parallel, merged) returning titles, URLs and snippets. Prefer a source closer to the question first — knowledge_search, package registries, official docs, GitHub, developer communities — and use this for general-web evidence. Snippets are leads: read the page with web_fetch before relying on a conclusion, and weigh it by source credibility.",
       "parameters": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "Search keywords (English is often more precise)"
+            "description": "Search keywords; English is often more precise."
           }
         },
         "required": [
@@ -288,13 +288,13 @@
     "type": "function",
     "function": {
       "name": "web_fetch",
-      "description": "Fetch a public web page and return its body text — for reading pages found by web_search, online documentation, API references, error messages and so on. http/https only. Intranet and localhost addresses ARE reachable — an internal wiki, a private docs site or a dev server on this machine can all be fetched; only link-local / cloud-metadata addresses (169.254.x.x) are refused. 【vs alternatives】To find a page use web_search; to call an API, send headers, or POST, use http_request.",
+      "description": "Fetch a public web page and return its body text: documentation, API references, pages found by web_search. http/https only; intranet and localhost addresses are reachable, link-local / cloud-metadata addresses (169.254.x.x) are refused. To send headers, POST, or call an API use http_request.",
       "parameters": {
         "type": "object",
         "properties": {
           "url": {
             "type": "string",
-            "description": "The full http/https URL"
+            "description": "The full http/https URL."
           }
         },
         "required": [
@@ -307,29 +307,19 @@
     "type": "function",
     "function": {
       "name": "update_plan",
-      "description": "Before you draft a plan you must already have looked at the real workspace contents (list_dir / read them), and any ambiguity about direction must already be settled with ask_user — never write \"read the directory/files to see what's there\" as step one, and never draft a plan while the user has not yet chosen a direction. Create or update a task's step-by-step plan — only for complex, multi-file, architecture-level work or outward side effects; a simple one-step change does not need the ceremony. Reading diagnostics, checking terminal logs, ls/find/cat/git status, restoring already-declared dependencies, and test/build verification also do not need a plan first. The number of steps follows the task's real complexity, with no fixed floor or ceiling; a complex write task covers verifiable work such as investigating and understanding the current state, making the change, and real verification, while a complex read-only investigation covers gathering evidence, cross-verifying it, and stating the conclusion's boundaries and uncertainty, without inventing implementation steps. Each step is specific but short, naming the action and the key file or command; mark a step in_progress before starting it and completed only once you hold real evidence, and add necessary work to the plan as you discover it. A step the user cancelled in the panel stays cancelled — never re-add it on your own. Scale the plan to the task in front of you, not to this description: most requests need no plan at all, and a plan that lists work the user did not ask for is worse than no plan. When a plan is warranted, name the key file, command or expected output at each step rather than a category of work. For a bug fix, start from the real symptom — reproduce it, or read the actual error, log or exit code — before proposing a cause. For scraping or API work, open the real page or endpoint and capture a real response before writing parsing logic. Domain checklists (containers, deployment, SEO, accessibility, boundary cases) apply only where the user's own request reaches them; do not add a step to satisfy this paragraph.",
+      "description": "Create or replace the task's step plan, shown to the user as a checklist. Use it for complex, multi-file or cross-module work; a simple one-step change does not need the ceremony, and neither do reading diagnostics, checking logs or running one verification. Draft it after looking at the real workspace, and after any question of direction is settled with ask_user. Scale the plan to the task in front of you, not to this description: most requests need no plan at all, and a plan that lists work the user did not ask for is worse than none. When a plan is warranted, name the key file, command or expected output at each step; mark a step in_progress when you start it and completed only once you hold real evidence; add work as you discover it. A complex write task covers investigating the current state, making the change and real verification; a complex read-only investigation covers gathering evidence, cross-verifying it, and stating the conclusion's boundaries and uncertainty, without inventing implementation steps. For a bug fix, start from the real symptom — reproduce it, or read the actual error, log or exit code — before proposing a cause. For scraping or API work, open the real page or endpoint and capture a real response before writing parsing logic. Domain checklists (containers, deployment, SEO, accessibility, boundary cases) apply only where the user's own request reaches them; do not add a step to satisfy this paragraph. A step the user cancelled stays cancelled. Once your changes have spread across three or more files and you still have no plan, land one before you touch the next file.",
       "parameters": {
         "type": "object",
         "properties": {
           "steps": {
             "type": "array",
-            "description": "The complete ordered step list (send all of it each time, not a delta)",
+            "description": "The complete ordered step list — send all of it each time, not a delta.",
             "items": {
               "type": "object",
               "properties": {
                 "content": {
                   "type": "string",
-                  "description": "What this step does — specific but short, understandable at a glance (naming the key technology/file)"
-                },
-                "kind": {
-                  "type": "string",
-                  "enum": [
-                    "investigate",
-                    "implement",
-                    "execute",
-                    "verify"
-                  ],
-                  "description": "What this step IS: investigate (read/search/analyse) / implement (write or change files) / execute (run, serve, deploy, watch) / verify (test, lint, build, browser-check). Declare it — the harness uses it to decide whether a tool result counts as finishing this step. Leave it out only if the step genuinely does not fit one of the four; an unlabelled step is never auto-completed, so it will just sit in progress until you mark it yourself."
+                  "description": "What the step does, specific and short, naming the key file or technology."
                 },
                 "status": {
                   "type": "string",
@@ -339,7 +329,17 @@
                     "completed",
                     "cancelled"
                   ],
-                  "description": "Status: pending / in_progress / completed / cancelled (a step the user cancelled stays cancelled)"
+                  "description": "pending / in_progress / completed / cancelled (a step the user cancelled stays cancelled)."
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "investigate",
+                    "implement",
+                    "execute",
+                    "verify"
+                  ],
+                  "description": "What the step is: investigate (read/search/analyse), implement (write or change files), execute (run/serve/deploy/watch) or verify (test/lint/build/browser check). The harness uses it to auto-complete the step from tool results; an unlabelled step is completed only when you mark it."
                 }
               },
               "required": [
@@ -347,6 +347,10 @@
                 "status"
               ]
             }
+          },
+          "plan_mode": {
+            "type": "boolean",
+            "description": "true asks the user to put THIS turn into Plan mode: file-writing and command tools are removed for the rest of the turn and you finish by presenting the plan, which they can run with one click. Only when the request is large or ambiguous enough that a written plan should come before building; if they decline, continue in Agent mode."
           }
         },
         "required": [
@@ -359,17 +363,17 @@
     "type": "function",
     "function": {
       "name": "ask_user",
-      "description": "**When you genuinely cannot tell what the user wants, ask them with this — do not guess and barrel ahead.** It shows a card in the conversation: the few **predicted options (buttons)** you supply, plus a **free-text box** (the user types their own requirement) and \"let the AI decide\". The user clicks one, types their own, or hands it back to you; you continue once you have their answer.\n**Use it only when the intent is genuinely ambiguous and the different readings would produce very different things** — e.g. the user asks to migrate the database and both an in-place migration and a rebuild are defensible; the user has two accounts/environments and you cannot tell which to target; two instructions in the same message contradict each other. A build request whose stack is unspecified is NOT ambiguous: \"build me a Telegram bot\" / \"build a login page\" → pick the mainstream library and a sensible default, build it, and state the choices in your summary. This tool is for decisions you genuinely cannot make on the user's behalf, not for \"which framework\".\n**Never ask about anything you can reasonably infer, or about mere implementation detail (which variable name, which file) — just do it.** Users hate being stopped for nothing. This tool is for \"what should I build\", not \"may I continue\".\n**Single vs multi: single-select (default) is for mutually exclusive roads — pick one. Set multi_select only when the options can all hold at once and you need the subset. See multi_select.**\n**Ordering rule: when the ambiguity is about direction, ask_user always comes before update_plan** — settle the direction, then plan. The system will never block your ask_user for \"there is no plan yet\".",
+      "description": "Ask the user a clarifying question with a card: your predicted options as buttons, a free-text box, and \"let the AI decide\"; you continue once they answer. Use it only when the readings of the request would produce materially different work and the workspace cannot settle it — migrate in place vs rebuild, which of two accounts or environments, two instructions that contradict each other. A build request whose stack is unspecified is NOT ambiguous: pick the mainstream library and a sensible default, build it, and state the choices in your summary. Do not ask about anything you can infer or about implementation detail; this is for what to build, not for permission to continue. Single vs multi: single-select (default) is for mutually exclusive roads — pick one; set multi_select only when the options can all hold at once and you need the subset. When the ambiguity is about direction, ask before update_plan.",
       "parameters": {
         "type": "object",
         "properties": {
           "question": {
             "type": "string",
-            "description": "The specific clarifying question to put to the user (one sentence)"
+            "description": "The clarifying question, one sentence."
           },
           "options": {
             "type": "array",
-            "description": "2-5 answers you predict, rendered as rows the user picks from; they can always ignore them and type their own. Each item is either a short string, or {label, description} when the labels alone do not separate the choices — the description line is what actually decides it (what gets lost, how long it takes)",
+            "description": "2–5 predicted answers, each a short string or {label, description} when the description is what separates them (what gets lost, how long it takes); the user can always type their own.",
             "items": {
               "type": [
                 "string",
@@ -379,15 +383,15 @@
           },
           "recommended": {
             "type": "integer",
-            "description": "Index of the recommended option (0-based); that option is highlighted as recommended"
+            "description": "0-based index of the recommended option, highlighted as such."
           },
           "multi_select": {
             "type": "boolean",
-            "description": "Single-select is the default and is right whenever the options are MUTUALLY EXCLUSIVE — only one road can be taken (migrate in place vs rebuild; target account A vs account B). Set this true ONLY when the options can hold AT THE SAME TIME and you genuinely need to know which subset: which of these checks to run, which of these files to include, which features to enable. Getting it wrong is not symmetric: an exclusive question drawn as multi-select lets the user tick two contradictory roads and hands you an answer that cannot be satisfied, so when unsure leave it off"
+            "description": "Single-select is the default and is right whenever the options are MUTUALLY EXCLUSIVE — only one road can be taken (migrate in place vs rebuild; account A vs account B). Set this true ONLY when the options can hold AT THE SAME TIME and you genuinely need the subset: which checks to run, which files to include, which features to enable. An exclusive question drawn as multi-select lets the user tick two contradictory roads, so when unsure leave it off."
           },
           "confirm_text": {
             "type": "string",
-            "description": "Confirmation for a dangerous operation: once set, the user must type this text exactly into the box to continue (e.g. DELETE)"
+            "description": "For a dangerous operation: the user must type this exact text to continue (e.g. DELETE)."
           }
         },
         "required": [
@@ -400,13 +404,13 @@
     "type": "function",
     "function": {
       "name": "run_subagent",
-      "description": "**Dispatch a read-only specialist to investigate in its own context and report back** — broad coverage or an independent perspective, without spending your own context on it. 【When to use】When the architecture, product, or security contract is still undecided: in staged_roles you first dispatch read-only roles such as architect/product/research/security to converge the architecture, product, evidence, and security contracts before anything is written (greenfield project, choosing or switching a stack, a change spanning subsystems). Also when several independent investigations can run at once and reading them serially would be much slower. 【When NOT to use】One focused question, or anything you could answer by reading a few files yourself: dispatching costs extra model round-trips and a sub-report is prose, not code — reading it yourself is both faster and better. A sub-report must give its evidence, the boundaries of its conclusion, the delivery contract, and the next step. 【vs alternatives】For parallel implementation that changes files use run_worker; to dispatch several read-only roles at once use spawn_multiple_agents; for a single focused investigation the main agent reading/searching directly is faster — do not dispatch.",
+      "description": "Dispatch a read-only specialist to investigate in its own context and report back — broad coverage or an independent perspective without spending your own context. 【When to use】When the architecture, product or security contract is still undecided: in staged_roles you first dispatch read-only roles such as architect/product/research/security to converge the contract before anything is written (a greenfield project, choosing or switching a stack, a change spanning subsystems); or when several independent investigations can run at once. 【When NOT to use】One focused question, or anything you could answer by reading a few files yourself: dispatching costs extra round trips and a sub-report is prose, not code — reading it yourself is both faster and better. A report must give its evidence, the boundaries of its conclusion, the delivery contract and the next step. For parallel implementation that changes files use run_worker; for several read-only roles at once use spawn_multiple_agents.",
       "parameters": {
         "type": "object",
         "properties": {
           "description": {
             "type": "string",
-            "description": "Short description of the subtask (3-6 words)"
+            "description": "Short description of the subtask (3–6 words)."
           },
           "role": {
             "type": "string",
@@ -423,17 +427,17 @@
               "design",
               "docs"
             ],
-            "description": "A read-only specialist perspective. When the architecture, product, or security boundary is undecided, use architect/product/security first to converge the contract; other roles investigate their domain."
+            "description": "A read-only specialist perspective. When the architecture, product or security boundary is undecided, use architect/product/security first to converge the contract; other roles investigate their domain."
           },
           "prompt": {
             "type": "string",
-            "description": "The complete, self-contained read-only task statement: the evidence to check, the contract to deliver, the paths/symbols involved, and the next step."
+            "description": "The complete, self-contained read-only task: the evidence to check, the contract to deliver, the paths/symbols involved, and the next step."
           },
           "tasks": {
             "type": "array",
             "minItems": 1,
             "maxItems": 4,
-            "description": "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4, each with its own card, merged into one report on completion. They run concurrently only at the top level, and only while the session-wide sub-agent slots are free (4 shared across the whole session); a sub-agent that dispatches its own tasks runs them one after another, so budget its timeout accordingly). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.",
+            "description": "Optional: several read-only subtasks in one call (up to 4, each with its own card, merged into one report). They run concurrently only at the top level and only while the session's 4 shared sub-agent slots are free; a sub-agent that dispatches its own tasks runs them one after another, so budget its timeout accordingly. Each entry is {role, task}; for a single subtask omit this and use prompt.",
             "items": {
               "anyOf": [
                 {
@@ -471,7 +475,7 @@
           },
           "wait": {
             "type": "boolean",
-            "description": "Optional, default false = background job: returns job#N immediately, the main agent keeps working, and the result is delivered when ready (or await it with await_subagent). true = wait synchronously for the result before continuing."
+            "description": "false (default) = background job: returns job#N immediately and the result is delivered when ready (or via await_subagent); true = wait for the result before continuing."
           }
         },
         "required": [
@@ -496,13 +500,13 @@
     "type": "function",
     "function": {
       "name": "await_subagent",
-      "description": "Wait for a background subagent job to finish and collect its result. Use it when you cannot continue without the sub-report; with no jobs running it returns a summary of the current job ledger. 【vs alternatives】To dispatch an investigation use run_subagent / spawn_multiple_agents.",
+      "description": "Wait for a background subagent job to finish and collect its result; with no jobs running it returns the current job ledger. To dispatch an investigation use run_subagent or spawn_multiple_agents.",
       "parameters": {
         "type": "object",
         "properties": {
           "job": {
             "type": "string",
-            "description": "The job number (e.g. 3) or all, default all"
+            "description": "The job number (e.g. 3) or all; default all."
           }
         },
         "required": []
@@ -643,17 +647,17 @@
     "type": "function",
     "function": {
       "name": "research_project",
-      "description": "Dispatch a read-only subagent to map the stack, core responsibilities, data flow and change entry points — only when the user explicitly asks for a full codebase onboarding map, or the task genuinely spans several unknown modules and the existing project tree and symbol map cannot pin down the entry point. Do not call it when the target file or module is already clear — read_file the relevant source and its callers directly — and do not treat it as a fixed preamble to every task. Optionally use focus to concentrate on one area (such as the authentication flow, the data layer, or build and release).",
+      "description": "Dispatch a read-only subagent to map a codebase: stack, core responsibilities, data flow and change entry points. For an explicit onboarding request, or when the task spans several unknown modules that the project tree and symbol map cannot place; when the target file or module is already clear, read it and its callers directly.",
       "parameters": {
         "type": "object",
         "properties": {
           "focus": {
             "type": "string",
-            "description": "Optional; the direction to dig into (e.g. \"the authentication flow\", \"the data layer\", \"build and deployment\"); omit = a whole-project overview"
+            "description": "Optional direction to dig into (e.g. \"the authentication flow\", \"the data layer\", \"build and deployment\"); omit for a whole-project overview."
           },
           "wait": {
             "type": "boolean",
-            "description": "Optional, default false = a background job returning job#N immediately; true = wait synchronously for the result."
+            "description": "false (default) = background job returning job#N immediately; true = wait for the result."
           }
         },
         "required": []
@@ -753,17 +757,17 @@
     "type": "function",
     "function": {
       "name": "recall_conversation",
-      "description": "Retrieve **the original text of earlier conversation that was compacted away in this session** (archived memory). When the context summary mentions an early decision, requirement or error without the detail, use this to find the actual words by keyword rather than guessing from the summary.",
+      "description": "Retrieve the original text of earlier conversation that was compacted away in this session. When the context summary mentions an early decision, requirement or error without the detail, search for the actual words by keyword rather than guessing from the summary.",
       "parameters": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "Search keywords (a filename, a fragment of the original requirement, an error keyword)"
+            "description": "Search keywords: a filename, a fragment of the original requirement, an error keyword."
           },
           "max_results": {
             "type": "integer",
-            "description": "Maximum entries to return, default 6"
+            "description": "Maximum entries to return, default 6."
           }
         },
         "required": [
@@ -776,13 +780,13 @@
     "type": "function",
     "function": {
       "name": "remember",
-      "description": "Write one piece of knowledge worth **remembering across sessions** into the memory knowledge graph (auto-tagged, auto-linked to older notes, recalled by task relevance, and auto-pruned — record freely, the graph filters for you). **Pick one of two scopes:** (1) **project** (default) = relevant only to the current project (stack / architecture decisions / directory and naming conventions / build, test and run commands / traps hit in this project plus root cause and fix); (2) **global** = **user-level knowledge that spans every project** (who the user is, preferences and taste, rules they repeat, general ways of working, lessons that carry across projects) — global memories are **loaded automatically for every project, every time**. **Make it a habit: every time you learn a reusable, valuable insight — especially a \"root cause + fix\" after hitting a trap, an explicit user preference, or an approach that keeps working — record one.** Write each as an atomic fact (one concept, short, self-contained); do not record one-off details.",
+      "description": "Save one atomic fact to the cross-session memory graph (auto-tagged, auto-linked, recalled by relevance, auto-pruned). scope project (default) = this project only: stack, architecture decisions, directory and naming conventions, build/test/run commands, traps hit here with root cause and fix. scope global = about the user across every project: identity, preferences, rules they repeat, ways of working; global memories load in every project. Record a root cause + fix after a trap, an explicit preference, or an approach that keeps working; one concept per entry, short and self-contained; skip one-off details.",
       "parameters": {
         "type": "object",
         "properties": {
           "content": {
             "type": "string",
-            "description": "The one atomic piece of knowledge to remember (one concept, short, self-contained)"
+            "description": "The one atomic fact to remember: one concept, short, self-contained."
           },
           "scope": {
             "type": "string",
@@ -790,7 +794,7 @@
               "project",
               "global"
             ],
-            "description": "project = current project only (default); global = user-level knowledge across all projects (preferences/identity/general lessons)"
+            "description": "project = current project only (default); global = user-level knowledge across all projects."
           }
         },
         "required": [
@@ -802,14 +806,33 @@
   {
     "type": "function",
     "function": {
+      "name": "load_guide",
+      "description": "Fetch one of the IDE's on-demand guides by id. The system prompt is deliberately short; the detailed discipline for each kind of work lives in guides that the IDE attaches by itself the first time you use a tool family (your first write_file / edit_file → writing; first git_commit or `git commit` → git; first browser / system call → automation; first run_subagent → collaboration_dispatch; first web or paper search → research; first write to a .tsx / .vue / .css / .html file → design). Call this ONLY when you want a guide EARLIER than that, or one that has no tool trigger. Ids: reasoning (the full reasoning discipline), reply_style (no flattery, how to sound like a person), answer_professional (evidence weighting, high-risk advice, formatting), debugging (reproduce → falsifiable hypothesis → root cause → re-run), scaffold_commands (init/CLI commands change across major versions), capture (get the real request with a browser capture), defects (the full defect and vulnerability catalogue), research_medicine / research_games / research_local / research_realtime / research_finance (domain source rules), engineering, writing, collaboration, collaboration_dispatch, automation, git, design, design_implementation, design_scaffold, design_content, design_data, design_review, design_motion. The guide arrives as a system note right after this call's result; never ask for the same id twice in one task, and never call it for a guide you can already see.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The guide id, exactly one of the ids listed in this description (e.g. \"git\", \"debugging\", \"reply_style\")"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "read_skill",
-      "description": "Read the FULL text of one skill from the user's installed skill library. The system prompt lists every available skill as `name: description`; when one of them matches the task at hand, call this to get its complete instructions and then follow them. Read-only, needs no authorization. Read only the skill you actually need — reading irrelevant ones wastes the context window. If a skill is already marked 常驻 its full text is already in the system prompt; do not re-read it.",
+      "description": "Read the full text of one skill from the user's installed library and follow it. The system prompt lists skills as name: description; read the one that matches the task, and only that one. A skill already marked 常驻 has its full text in the system prompt — do not re-read it. Read-only, needs no authorization.",
       "parameters": {
         "type": "object",
         "properties": {
           "name": {
             "type": "string",
-            "description": "The skill's name, exactly as listed in the available-skills catalogue"
+            "description": "The skill's name, exactly as listed in the available-skills catalogue."
           },
           "why": {
             "type": "string",
@@ -827,13 +850,13 @@
     "type": "function",
     "function": {
       "name": "get_diagnostics",
-      "description": "Read the editor/LSP live diagnostics for a file (errors and warnings), returning file:line:column, source/code, nearby code, likely cause and direction of the fix. It is a read-only evidence tool, not a command, and needs no extra authorization this round. When the user asks \"which files have bugs / why is this erroring / how do I fix this error\", reach for it first to read the errors that already exist; after changing code, use it as a quick self-check. Omit path to get diagnostics for every open file.",
+      "description": "Read the editor/LSP diagnostics for a file (errors and warnings) with file:line:column, source/code, nearby code and the likely direction of the fix; omit path for every open file. Read-only evidence. Use it first when the user asks why a file errors, and as a quick self-check after changing code.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "Optional; the file path to check. Omit to check every open file"
+            "description": "Optional file path; omit to check every open file."
           }
         }
       }
@@ -843,32 +866,32 @@
     "type": "function",
     "function": {
       "name": "read_logs",
-      "description": "Read the tail of the latest terminal output or of a log file. Use it to look straight at the cause when a backend/API/build fails; it is a read-only evidence tool, starts no new command, and needs no extra authorization this round. When the error output names an npm debug log or a .log/.out/.err path, pass that as path; with no path it aggregates the recent task terminals and the workspace's usual logs. 【vs alternatives】For the live state of a long-running task terminal use read_terminal; for live editor/LSP diagnostics use get_diagnostics.",
+      "description": "Read the tail of a log file or of recent task-terminal output — the first place to look when a backend, API or build fails. With no path it aggregates the recent task terminals and the workspace's usual logs; when an error names a .log/.out/.err path or an npm debug log, pass it as path. Read-only evidence, starts no command. For a running task's live state use read_terminal; for editor diagnostics use get_diagnostics.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "Optional; the log file whose tail to read"
+            "description": "Optional: the log file whose tail to read."
           },
           "paths": {
             "type": "array",
-            "description": "Optional; several log file paths",
+            "description": "Optional: several log file paths.",
             "items": {
               "type": "string"
             }
           },
           "name": {
             "type": "string",
-            "description": "Optional; the task name given to run_in_terminal"
+            "description": "Optional: the task name given to run_in_terminal."
           },
           "lines": {
             "type": "integer",
-            "description": "How many trailing lines to read, default 200"
+            "description": "How many trailing lines, default 200."
           },
           "include_terminal": {
             "type": "boolean",
-            "description": "Whether to include task terminal output as well, default true"
+            "description": "Include task terminal output as well, default true."
           }
         }
       }
@@ -878,7 +901,7 @@
     "type": "function",
     "function": {
       "name": "git_status",
-      "description": "Show the git repository status: current branch, and the staged / unstaged / untracked file lists. Use it to learn which files were touched, or before committing. 【vs alternatives】For the actual line-by-line difference use git_diff; for commit history use git_log.",
+      "description": "Show the repository status: current branch and the staged / unstaged / untracked file lists. For line-level changes use git_diff; for history use git_log.",
       "parameters": {
         "type": "object",
         "properties": {}
@@ -889,17 +912,17 @@
     "type": "function",
     "function": {
       "name": "git_diff",
-      "description": "Show the git diff of the changes (unified diff text). By default it shows unstaged working-tree changes against HEAD; staged=true shows the staged (--cached) ones; path limits it to a single file. Note: it does not show untracked new files — use git_status for those.",
+      "description": "Show the unified diff: unstaged working-tree changes against HEAD by default, staged=true for the staged (--cached) changes, path for a single file. Untracked new files do not appear — use git_status for those.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "Optional; show the diff for this file only"
+            "description": "Optional: show the diff for this file only."
           },
           "staged": {
             "type": "boolean",
-            "description": "true to see the staged changes"
+            "description": "true to see the staged changes."
           }
         }
       }
@@ -932,13 +955,13 @@
     "type": "function",
     "function": {
       "name": "git_log",
-      "description": "Show recent commit history **on the current branch** (short hash, author, time, message, branch/tag). Commits that live only on other branches do not appear here. 【When to use】To find what changed recently in a module, locate where a regression was introduced, or get the background of a commit git_blame pointed at. 【vs alternatives】To see who changed a specific line and in which commit, use git_blame; for current uncommitted changes use git_status/git_diff.",
+      "description": "Show recent commit history **on the current branch** (short hash, author, time, message, branch/tag); commits that live only on other branches do not appear. 【When to use】To see what changed recently in a module, find where a regression was introduced, or get the context of a commit git_blame pointed at. For who changed a specific line use git_blame; for uncommitted changes use git_status/git_diff.",
       "parameters": {
         "type": "object",
         "properties": {
           "count": {
             "type": "integer",
-            "description": "How many entries to return, default 20"
+            "description": "How many entries to return, default 20."
           }
         }
       }
@@ -1116,13 +1139,13 @@
     "type": "function",
     "function": {
       "name": "read_terminal",
-      "description": "Read the **latest output** and run state (running / exited) of a long-running task terminal started by run_in_terminal. It is a read-only evidence tool, starts no new command, and needs no extra authorization this round. After starting a dev server or watcher, use it a moment later to see the newly printed logs (compile result, errors, listening address) — these are your eyes on how the background task is actually doing, so do not just assume it succeeded. Omit name to read the most recently started one. 【When to use】After starting a long-running task such as a dev server or watcher, when you need to see its log output, confirm it is ready, or check its exit status. 【vs alternatives】For the tail of a log file use read_logs; to list every background task use list_terminals.",
+      "description": "Read the latest output and run state (running / exited) of a task terminal started by run_in_terminal; omit name for the most recent one. Read-only evidence, starts nothing. 【When to use】After starting a dev server or watcher, to see its logs, confirm it is ready or check its exit status. For a log file's tail use read_logs; to list all task terminals use list_terminals.",
       "parameters": {
         "type": "object",
         "properties": {
           "name": {
             "type": "string",
-            "description": "Terminal / task name (the name given to run_in_terminal); omit for the most recent one"
+            "description": "Terminal/task name given to run_in_terminal; omit for the most recent one."
           }
         }
       }
@@ -1132,7 +1155,7 @@
     "type": "function",
     "function": {
       "name": "list_terminals",
-      "description": "List every task terminal started by run_in_terminal and its state (running / exited). It is a read-only evidence tool, starts and stops nothing, and needs no extra authorization this round. Use it first when you need to know whether there are readable logs at all, then read the actual output with read_logs/read_terminal. 【When to use】When you are unsure which background tasks are running and want each one's status.",
+      "description": "List every task terminal started by run_in_terminal with its state (running / exited). Read-only evidence, starts and stops nothing. 【When to use】When you are unsure which background tasks exist or want each one's status before reading it with read_terminal or read_logs.",
       "parameters": {
         "type": "object",
         "properties": {}
@@ -1143,13 +1166,13 @@
     "type": "function",
     "function": {
       "name": "lsp_symbols",
-      "description": "List a file's code structure outline — the language service (LSP / Monaco TS) parses out functions, classes, methods, variables and other symbols with their line numbers. Faster than read_file for seeing a file's skeleton. Requires a language service for that language (JS/TS work out of the box; Python, Go, Rust and so on need their LSP installed). 【When to use】To get a quick sense of what a file exports and which functions and classes it holds, and to locate roughly where a symbol is. 【vs alternatives】To find a symbol's definition across the project use find_symbol; for its callers use lsp_references.",
+      "description": "List a file's code outline — functions, classes, methods, variables with line numbers — via the language service (JS/TS built in; Python, Go, Rust and others need their LSP installed). Faster than read_file for a file's skeleton. 【When to use】To see what a file exports and roughly where a symbol is. For a definition across the project use find_symbol; for callers use lsp_references.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "File path"
+            "description": "File path."
           }
         },
         "required": [
@@ -1162,21 +1185,21 @@
     "type": "function",
     "function": {
       "name": "find_symbol",
-      "description": "**Find a symbol across the whole project** — locate every definition of a function / class / interface / type / constant by name (file:line). It queries the workspace symbol index maintained in the background and **returns in milliseconds**, far faster than grepping the whole project. First choice in a large project for finding a definition, a name collision, or a duplicate implementation. Supports a kind filter (function/class/interface/type/enum/const/struct/trait/impl). The index is built in the background about 3 seconds after the IDE starts and covers JS/TS, Python, Rust, Go, Java/Kotlin, C/C++, Ruby, PHP and more. 【When to use】When you need a symbol's definition — faster and more precise than a full-text grep; to find its callers use lsp_references. 【vs alternatives】For callers use lsp_references; to search by meaning use semantic_search; for plain text matching use search.",
+      "description": "Find every definition of a symbol across the project by name (file:line) from the background symbol index, in milliseconds — faster than a full-text grep. Covers JS/TS, Python, Rust, Go, Java/Kotlin, C/C++, Ruby, PHP and more; the index builds about 3 seconds after the IDE starts. 【When to use】To locate a definition, a name collision or a duplicate implementation. For callers use lsp_references; for meaning use semantic_search; for plain text use search.",
       "parameters": {
         "type": "object",
         "properties": {
           "name": {
             "type": "string",
-            "description": "The symbol name (exact match; case-insensitive)"
+            "description": "The symbol name (exact match, case-insensitive)."
           },
           "kind": {
             "type": "string",
-            "description": "Optional; filter by symbol type: function / class / interface / type / enum / const / struct / trait / impl / method"
+            "description": "Optional filter: function / class / interface / type / enum / const / struct / trait / impl / method."
           },
           "limit": {
             "type": "integer",
-            "description": "Maximum number of results to return (default 20)"
+            "description": "Maximum results, default 20."
           }
         },
         "required": [
@@ -1189,21 +1212,21 @@
     "type": "function",
     "function": {
       "name": "knowledge_search",
-      "description": "**Query the platform's built-in professional knowledge base** — battle-tested best practices and common traps across specialist areas (front-end React/Next, back-end API design, database schema/indexing, application security, UI/UX design, DevOps deployment), distilled from senior experience. **When a domain task is unfamiliar or has to be right, look here first**: how to design a database schema, where a JWT should be stored, how to make UI look professional, how to use API status codes, how to prevent SQL injection or IDOR, how to write a Dockerfile, **which tool plus exact command to use to reverse-engineer or decompile a given format**, and so on. Follow the best practices you find rather than going from impressions. It now ALSO answers from this platform's own code corpus: the real exported signatures of published libraries (npm / PyPI / crates.io, extracted from the published package itself) and official documentation (MDN for the whole web platform, plus React / Vue / Svelte / TypeScript / Node / Rust / Astro / FastAPI). So it is the right first stop for \"what is this library's real API\" and \"what does the spec actually say\", not only for curated advice. Every passage is labelled by source: curated = distilled experience, real_api = the library's own declaration, official_docs = the official documentation. Prefer a labelled passage over recalling an API from memory: a signature you remember may belong to a different major version. It returns the few most relevant passages. This is faster and more focused than a web search (it is already curated), and a second spent here before you start avoids many traps and noticeably raises the quality of the result. 【**用什么语言写 query**——这条直接决定搜不搜得到】这个库是**按词匹配**的（BM25），不是语义匹配：query 和文档必须**用同一种语言的同一批词**。技术语料（MDN、React/Vue/Svelte/TypeScript/Node/Rust 官方文档、各语言包的导出签名）**是英文的**，所以查它时 query 要写**英文技术词**——哪怕你正在用中文跟用户对话。michael-design 是中文的，查它就写中文。实测：`why does my effect fire twice on mount` 命中正确小节；同一个问题写成「组件卸载时怎么取消订阅」不但没命中，还以更高的分数命中了完全无关的 `Billing & Subscription`——**它不会告诉你搜错了，只会给你一个高分的错答案**。拿不准就把中英文都写进去（\"useEffect cleanup 副作用清理\"）。",
+      "description": "Search the platform's curated knowledge base and code corpus: distilled best practices (React/Next, API design, database schema and indexing, application security, UI/UX, DevOps, reverse-engineering and decompilation tooling), the real exported signatures of published npm / PyPI / crates.io packages, and official docs (MDN for the web platform, plus React, Vue, Svelte, TypeScript, Node, Rust, Astro, FastAPI). Each passage is labelled curated / real_api / official_docs; prefer a labelled signature over one from memory, which may belong to another major version. Matching is lexical (BM25), so write the query in the corpus language: English technical terms for docs and APIs even when the conversation is in Chinese, Chinese for michael-design. A query in the wrong language returns a confident but unrelated hit — when unsure include both (\"useEffect cleanup 副作用清理\"). Returns the few most relevant passages; faster and more focused than a web search.",
       "parameters": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "What you are doing / the best practice you want to confirm, e.g. \"how to build a database index\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\", \"js deobfuscation\", \"radare2 disassembly\""
+            "description": "What you are doing or the practice to confirm, e.g. \"database index design\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\"."
           },
           "domain": {
             "type": "string",
-            "description": "Optional; restrict to a domain. **michael-design** is the design blueprint corpus — 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains, pass the one that matches the BUSINESS area (not the tech you happen to use — a hospital scheduling system is healthcare, not web-frontend): healthcare / finance / legal / security / penetration-testing / reverse-engineering / database / devops / gaming / data-ml / blockchain / iot-embedded / mobile / saas / ecommerce / education / marketing / backend-api / web-frontend / ui-ux / systems-programming. A wrong guess is safe: an unmatched domain falls back to searching everything rather than returning nothing."
+            "description": "Optional filter. **michael-design** is the design blueprint corpus — 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage: pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns. Otherwise pass the BUSINESS area, not the tech stack (a hospital scheduling system is healthcare, not web-frontend): healthcare / finance / legal / security / penetration-testing / reverse-engineering / database / devops / gaming / data-ml / blockchain / iot-embedded / mobile / saas / ecommerce / education / marketing / backend-api / web-frontend / ui-ux / systems-programming. An unmatched domain falls back to searching everything."
           },
           "top_k": {
             "type": "integer",
-            "description": "How many passages to return (default 6, maximum 20)"
+            "description": "Passages to return, default 6, maximum 20."
           }
         },
         "required": [
@@ -1272,7 +1295,7 @@
     "type": "function",
     "function": {
       "name": "probe_env",
-      "description": "**Ask the machine what it actually has, in one call.** Returns: OS/arch/shell, whether each of ~27 common toolchains is installed and at what version (node/npm/pnpm/yarn/bun/deno, python/pip/uv, cargo/rustc, go, java, docker, make/cmake/gcc, swift, ruby, php, psql, sqlite3, gh, rg, jq, ffmpeg), and the workspace's real state: is it a git repo, which branch, how many uncommitted files, which package managers the lockfiles prove are in use, which manifests exist, how many top-level entries. Takes well under a second. 【When to use】The moment reality surprises you: `command not found`, a build that fails for no visible reason, a project whose toolchain you are guessing at, or ANY point where you catch yourself about to probe the environment with run_cmd one command at a time. One call here replaces four or five round trips. Also call it before you tell the user 'X is not installed' — say it because you checked, not because a command failed. 【What it does NOT do】It reports facts, never advice. `found:false` with a `note` means the binary exists but is a stub (macOS ships a java shim that is always present and never works) — that is 'not installed', and the note is the system's own wording, useful for telling the user what to install.",
+      "description": "**Ask the machine what it actually has** in one call: OS/arch/shell; which of ~27 toolchains are installed and their versions (node/npm/pnpm/yarn/bun/deno, python/pip/uv, cargo/rustc, go, java, docker, make/cmake/gcc, swift, ruby, php, psql, sqlite3, gh, rg, jq, ffmpeg); and the workspace state (git repo and branch, uncommitted count, the package managers the lockfiles prove, manifests, top-level entries). Well under a second — call it on command not found, an unexplained build failure, or before telling the user something is not installed. found:false with a note means a stub binary (the macOS java shim); the note is the system's own wording.",
       "parameters": {
         "type": "object",
         "properties": {}
@@ -1312,13 +1335,13 @@
     "type": "function",
     "function": {
       "name": "view_image",
-      "description": "**Actually look at an image file that is already in the workspace** — a design mockup, a screenshot of a failure the user dropped in, a photo attached to a bug report, a rendered chart, an exported asset. The image is returned to you visually, the same way a screenshot is. 【When to use】Any time the answer depends on what an image CONTAINS: matching an implementation to a mockup, reading an error message that only exists as a screenshot, checking an exported asset. Do not guess from the filename. 【vs alternatives】read_file only reads TEXT and will fail on a .png; screenshot renders a live URL, not a file on disk; visual_compare needs both a design file AND a running URL — use this when you only want to see the image itself. Formats: png / jpg / webp / gif / svg / bmp / avif, up to 25 MB.",
+      "description": "**Actually look at an image file** already in the workspace (png / jpg / webp / gif / svg / bmp / avif, up to 25 MB): a mockup, a failure screenshot the user dropped in, an exported asset, a rendered chart. The image is returned to you visually, so decide from what it contains rather than from its filename. read_file only reads text; screenshot renders a live URL, not a file on disk.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "Path to the image, relative to the workspace root (or absolute inside it)"
+            "description": "Path to the image, relative to the workspace root (or absolute inside it)."
           }
         },
         "required": [
@@ -1331,29 +1354,29 @@
     "type": "function",
     "function": {
       "name": "screenshot",
-      "description": "Render an http/https URL in a headless browser and capture it — **the screenshot is sent straight back to you**. These are your eyes. Typical use: start a dev server with run_in_terminal, then screenshot its address (e.g. http://127.0.0.1:3000), inspect layout, alignment, spacing, palette, contrast, hierarchy and responsiveness from the image and improve them, then capture again — a look → change loop. **When working on animation, transitions or effects, pass frames=4** (2-5): it captures successive frames over a span of time and stitches them into one filmstrip, so you can actually see the animation in motion (a single still shows you nothing about it) and judge whether it is smooth, whether the easing is right, and whether it jumps or stutters before changing it. Requires a Chromium-based browser installed locally — Chrome, Edge, Brave or Chromium (it tells you if none is found).",
+      "description": "Render an http/https URL in a headless browser and return the screenshot to you. Start the dev server with run_in_terminal, screenshot its address, judge layout, spacing, contrast and hierarchy from the image, change, and capture again. For animation, transitions or effects pass frames (2–5) to get a filmstrip of successive frames. Requires a local Chromium-based browser (Chrome, Edge, Brave or Chromium).",
       "parameters": {
         "type": "object",
         "properties": {
           "url": {
             "type": "string",
-            "description": "The URL to capture, e.g. http://127.0.0.1:3000"
+            "description": "The URL to capture, e.g. http://127.0.0.1:3000."
           },
           "width": {
             "type": "integer",
-            "description": "Viewport width, default 1280"
+            "description": "Viewport width, default 1280."
           },
           "height": {
             "type": "integer",
-            "description": "Viewport height, default 800"
+            "description": "Viewport height, default 800."
           },
           "frames": {
             "type": "integer",
-            "description": "Filmstrip mode: how many frames (2-5) to stitch into one image to see the animation play out. Pass around 4 for animation/transitions/effects; leave it out for static layout"
+            "description": "Filmstrip mode: how many frames (2–5) to stitch into one image; around 4 for animation, omit for static layout."
           },
           "duration_ms": {
             "type": "integer",
-            "description": "Filmstrip mode: how long a span of the animation to cover (milliseconds, default 2400)"
+            "description": "Filmstrip mode: how long a span to cover, default 2400 ms."
           }
         },
         "required": [
@@ -1366,24 +1389,25 @@
     "type": "function",
     "function": {
       "name": "edit_file",
-      "description": "Make an exact replacement in an existing file: replace old_string with new_string. Prefer this for modifying an existing file. old_string must locate uniquely in the file (include enough context), otherwise it errors.",
+      "description": "Replace one exact occurrence of old_string with new_string in an existing file. old_string must locate uniquely — include enough surrounding lines to make it unique. Read the file before you change it: old_string has to match the current bytes on disk. Several changes in one file: multi_edit; a new file or full rewrite: write_file.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
-            "type": "string"
+            "type": "string",
+            "description": "File path, relative to the workspace root or absolute."
           },
           "old_string": {
             "type": "string",
-            "description": "The original text to replace; must match the file character for character"
+            "description": "The exact text to replace, character for character."
           },
           "new_string": {
             "type": "string",
-            "description": "The replacement text"
+            "description": "The replacement text."
           },
           "replace_all": {
             "type": "boolean",
-            "description": "When true, replace every match; by default only the single unique occurrence"
+            "description": "true replaces every occurrence; by default only the single unique one."
           }
         },
         "required": [
@@ -1398,16 +1422,17 @@
     "type": "function",
     "function": {
       "name": "multi_edit",
-      "description": "Make several exact replacements in the same file: edits is a list of {old_string, new_string, replace_all?} applied in order, atomically (if any one fails to locate, nothing is written and it errors). Use it for refactors or several changes in one file — faster and more reliable than firing multiple edit_file calls. Each old_string must still locate uniquely in the file as it stands at that point. 【vs alternatives】One change: edit_file. New file or full rewrite: write_file.",
+      "description": "Apply several exact replacements to one file in order, atomically: if any old_string fails to locate, nothing is written and it errors. Each old_string must locate uniquely in the file as it stands at that point in the sequence. Read the file before you change it: old_string has to match the current bytes on disk. One change: edit_file; a new file or full rewrite: write_file.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
-            "type": "string"
+            "type": "string",
+            "description": "File path, relative to the workspace root or absolute."
           },
           "edits": {
             "type": "array",
-            "description": "Ordered list of replacements",
+            "description": "Ordered replacements, each {old_string, new_string, replace_all?}.",
             "items": {
               "type": "object",
               "properties": {
@@ -1439,19 +1464,19 @@
     "type": "function",
     "function": {
       "name": "write_file",
-      "description": "Create a new file or rewrite one entirely. Use only for creation or a complete rewrite; for a local change use edit_file.",
+      "description": "Create a file or replace its entire content. Overwriting an existing file you have not read this run is blocked, and the block returns the current content; creating a new file needs no read. For a local change use edit_file.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
             "minLength": 1,
-            "description": "The exact file path confirmed this round; a relative path is always based on this task's workspace root"
+            "description": "File path, relative to the workspace root or absolute."
           },
           "content": {
             "type": "string",
             "minLength": 1,
-            "description": "The complete, non-empty UTF-8 file content to write — never omitted and never placeholder content"
+            "description": "The complete UTF-8 file content."
           }
         },
         "required": [
@@ -1466,12 +1491,13 @@
     "type": "function",
     "function": {
       "name": "run_cmd",
-      "description": "Run a command in the workspace that terminates, and return its exit code and output (installing dependencies, running tests, building, git, etc.). Use the syntax for the shell named in the environment block, NOT the syntax you would guess from the OS name. On Windows the backend prefers Git Bash and only falls back to cmd.exe when no bash is installed, so the environment block reports which one you actually got: shell=bash means POSIX syntax (ls/cat/grep, /tmp, nohup …&) is correct even though the OS is Windows; shell=cmd.exe means cmd syntax (dir/type/findstr, cd /d, start \"\" /b, %TEMP%). mac/Linux are always bash/zsh. **It is a pipe capture with no real terminal (TTY)**: full-screen and interactive programs — bubbletea/ncurses TUIs, vim/top, REPLs, or anything that reads /dev/tty, clears the screen, or waits for keystrokes — will fail here with errors like \"open /dev/tty\" or \"not a tty\". Those, like dev servers/watchers/listeners, go to run_in_terminal (the IDE's real PTY terminal) instead. Never start a service or watcher in the foreground here. 【vs alternatives】Dev servers, watchers, long-lived processes, and interactive/full-screen TUIs all use run_in_terminal — do not block on them with run_cmd.",
+      "description": "Run a command that terminates and return its exit code and output: installs, tests, builds, git, scripts. Use the syntax of the shell the environment block reports (shell=bash means POSIX syntax even on Windows; shell=cmd.exe means cmd syntax). It is a pipe capture with no real terminal (TTY), so anything that needs one — dev servers, watchers, REPLs, full-screen TUIs, programs that read /dev/tty — goes to run_in_terminal instead.",
       "parameters": {
         "type": "object",
         "properties": {
           "command": {
-            "type": "string"
+            "type": "string",
+            "description": "The command line to run."
           },
           "purpose": {
             "type": "string",
@@ -1483,11 +1509,11 @@
               "scaffold",
               "run"
             ],
-            "description": "What this command is for: explore = read-only probing; verify = a one-shot check such as build/test/typecheck/lint (the exit code is the conclusion); install = installing dependencies; mutate = will modify workspace files; scaffold = generates a project skeleton; run = run the app/script to see its behaviour. Declare it honestly. Note what the declaration does and does not buy you: mutate/scaffold re-arm the verification obligation on your word alone, but verify does NOT grant verification credit by declaring it. Credit comes from the command itself being a recognised check (build/test/typecheck/lint) that exits 0 — declaring purpose=verify on a bare `echo done` or `ls` records nothing. So run the project's real check."
+            "description": "What this command is for: explore = read-only probing; verify = a one-shot check (build/test/typecheck/lint) whose exit code is the conclusion; install = installing dependencies; mutate = modifies workspace files; scaffold = generates a project skeleton; run = runs the app or script to see its behaviour. Verification credit comes from the command itself being a recognised project check that exits 0, not from declaring verify."
           },
           "timeout_secs": {
             "type": "integer",
-            "description": "Optional; how long to allow before the command and its children are killed. Default is inferred from the command (60-600s; a bare command gets 240s), hard maximum 600s. Raise it for one-shot commands that are simply slow — a cold `cargo build --release`, `docker build .`, `make -j8`, a full integration script. Being killed at the default is NOT a sign you should move to run_in_terminal: that is for servers and watchers, and it does not give you an exit code."
+            "description": "Seconds before the command and its children are killed. Default is inferred from the command (60–600 s; a bare command gets 240 s), hard maximum 600. Raise it for slow one-shots such as a cold release build or docker build; being killed at the default is not a reason to move a one-shot to run_in_terminal, which is for servers and watchers and gives no exit code."
           }
         },
         "required": [
@@ -1500,14 +1526,14 @@
     "type": "function",
     "function": {
       "name": "delete_path",
-      "description": "Delete a file or directory inside the workspace (recursively). For cleanup and refactoring. Delete only what genuinely should be deleted, and confirm the path exists first. 【When to use】When cleaning up abandoned files, or removing an old module during a refactor.",
+      "description": "Delete a file or directory (recursively) inside the workspace. Confirm the path exists and is genuinely disposable first. 【When to use】Cleaning up abandoned files, or removing an old module during a refactor.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
             "minLength": 1,
-            "description": "Path of the file or directory to delete"
+            "description": "Path of the file or directory to delete."
           }
         },
         "required": [
@@ -1520,19 +1546,19 @@
     "type": "function",
     "function": {
       "name": "move_path",
-      "description": "Move or rename a file or directory inside the workspace (from → to). For refactoring and renaming. 【When to use】When renaming during a refactor, or reorganizing the directory structure.",
+      "description": "Move or rename a file or directory inside the workspace (from → to). 【When to use】Renaming during a refactor, or reorganizing the directory structure.",
       "parameters": {
         "type": "object",
         "properties": {
           "from": {
             "type": "string",
             "minLength": 1,
-            "description": "Source path"
+            "description": "Source path."
           },
           "to": {
             "type": "string",
             "minLength": 1,
-            "description": "Target path"
+            "description": "Target path."
           }
         },
         "required": [
@@ -1546,17 +1572,17 @@
     "type": "function",
     "function": {
       "name": "git_commit",
-      "description": "Commit changes. By default it stages everything first (equivalent to git add -A) and then commits; pass all=false to commit only what is already staged.",
+      "description": "Commit changes. By default it stages everything first (git add -A) and commits; all=false commits only what is already staged.",
       "parameters": {
         "type": "object",
         "properties": {
           "message": {
             "type": "string",
-            "description": "Commit message"
+            "description": "Commit message."
           },
           "all": {
             "type": "boolean",
-            "description": "Whether to stage all changes first, default true"
+            "description": "Stage all changes first, default true."
           }
         },
         "required": [
@@ -1634,14 +1660,14 @@
     "type": "function",
     "function": {
       "name": "create_dir",
-      "description": "Create a directory (including any missing parents). Note that write_file creates parent directories automatically, so this is generally needed only when you genuinely want an empty directory. 【When to use】When you genuinely need an empty directory.",
+      "description": "Create a directory, including missing parents. write_file already creates parent directories, so this is only for an empty directory you genuinely want. 【When to use】When you need an empty directory.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
             "minLength": 1,
-            "description": "Path of the directory to create"
+            "description": "Path of the directory to create."
           }
         },
         "required": [
@@ -1654,19 +1680,19 @@
     "type": "function",
     "function": {
       "name": "copy_path",
-      "description": "Copy a file or directory (recursively) to a new location (from → to). For scaffolding from a template, or backups. It errors if the target already exists. 【When to use】When scaffolding from a template, or backing a file up.",
+      "description": "Copy a file or directory (recursively) from → to; it errors if the target already exists. 【When to use】Scaffolding from a template, or backing a file up.",
       "parameters": {
         "type": "object",
         "properties": {
           "from": {
             "type": "string",
             "minLength": 1,
-            "description": "Source path"
+            "description": "Source path."
           },
           "to": {
             "type": "string",
             "minLength": 1,
-            "description": "Target path"
+            "description": "Target path."
           }
         },
         "required": [
@@ -1680,14 +1706,14 @@
     "type": "function",
     "function": {
       "name": "format_file",
-      "description": "Format an entire file using the language service (LSP / built-in TS); the result is written in an undoable way and shown as a diff. Use it to tidy formatting after changing code. When no formatting service is available, it suggests running prettier/rustfmt/gofmt via run_cmd instead. 【When to use】After changing code, to bring the formatting into line.",
+      "description": "Format a whole file with the language service (LSP / built-in TS); the result is written undoably and shown as a diff. Without a formatting service it suggests running prettier/rustfmt/gofmt via run_cmd. 【When to use】After changing code, to bring the formatting into line.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
             "minLength": 1,
-            "description": "The file to format"
+            "description": "The file to format."
           }
         },
         "required": [
@@ -1700,17 +1726,17 @@
     "type": "function",
     "function": {
       "name": "run_in_terminal",
-      "description": "Run a command in the IDE's **real terminal tab (a true PTY / TTY)** — **you start the user's program yourself; you do not hand them a command to type**. Two kinds belong here: (1) long-running / continuous processes (dev server, watcher, daemon, listener); (2) **interactive or full-screen programs that need a real terminal** — bubbletea/ncurses TUIs, REPLs, vim/top (run_cmd is a pipe with no TTY, so those fail there with /dev/tty errors). The program runs inside this tab and the user watches and interacts with it there directly. **For an interactive or TUI program, starting successfully and rendering its interface IS the delivery** — do not demand log output of yourself to verify it, and **never say \"this cannot run in a non-interactive environment\" and push the command onto the user's own terminal: this IDE terminal is a real terminal**. After starting, confirm it came up with read_logs/read_terminal (for a service, the logs/URL; for a TUI, the first rendered frame); to wait for readiness, poll in the background with background_monitor. You can call it several times in parallel to run several tasks (each in its own terminal tab). 【vs alternatives】One-shot non-interactive commands that terminate (installing dependencies, tests, builds, git) use run_cmd.",
+      "description": "Start a command in the IDE's real terminal tab (a true PTY / TTY) and keep it running: dev servers, watchers, daemons, and interactive or full-screen programs (REPLs, TUIs, vim/top) that fail in run_cmd's pipe. You start the user's program yourself here — this IDE terminal is a real terminal, so do not hand them a command to type. The program runs in its own tab where the user watches and interacts; for an interactive program, starting and rendering its interface is the delivery. Confirm it came up with read_terminal or read_logs, or wait for readiness with background_monitor. One-shot commands that terminate use run_cmd.",
       "parameters": {
         "type": "object",
         "properties": {
           "command": {
             "type": "string",
-            "description": "The command to keep running, e.g. npm run dev"
+            "description": "The command to keep running, e.g. npm run dev."
           },
           "name": {
             "type": "string",
-            "description": "Optional; a short name for this task/terminal"
+            "description": "Optional short name for this task/terminal."
           },
           "purpose": {
             "type": "string",
@@ -1722,7 +1748,7 @@
               "scaffold",
               "run"
             ],
-            "description": "What this command is for: verify = build/test/typecheck/lint (the exit code is the conclusion); run = start the app/service to see its behaviour; mutate/scaffold = will change workspace files; install = installing dependencies; explore = read-only probing. Declare it honestly. Note what the declaration does and does not buy you: mutate/scaffold re-arm the verification obligation on your word alone, but verify does NOT grant verification credit by declaring it. Credit comes from the command itself being a recognised check (build/test/typecheck/lint) that exits 0 — declaring purpose=verify on a bare `echo done` or `ls` records nothing. So run the project's real check."
+            "description": "What this command is for: explore = read-only probing; verify = a one-shot check (build/test/typecheck/lint) whose exit code is the conclusion; install = installing dependencies; mutate = modifies workspace files; scaffold = generates a project skeleton; run = runs the app or script to see its behaviour. Verification credit comes from the command itself being a recognised project check that exits 0, not from declaring verify."
           }
         },
         "required": [
@@ -1735,7 +1761,7 @@
     "type": "function",
     "function": {
       "name": "system",
-      "description": "**System-level control: jump between applications instantly and drive their menus directly — far faster than screenshotting to find an icon and clicking it (when control feels slow, use this).** It is the fast path for \"move freely between application interfaces\": it calls the system APIs rather than relying on vision. action: **open (open/switch to an app, needs name, e.g. Finder/Safari/Mail — brought to the front instantly, launched if not running)** / **menu (trigger an app's menu item directly, needs a path array such as [\"File\",\"New Window\"] or [\"Format\",\"Font\",\"Bold\"] — almost every feature of an application lives in its menus, and this goes straight there, skipping the whole click-menu-bar → screenshot → find-item → click-again loop; omit app to use the current frontmost one)** / **menu_items (list the real item names at one menu level: path=[] lists the top level File/Edit/…, path=[\"File\"] lists everything under the File menu — when unsure what a menu is called, look it up here first, then call menu)** / **apps (list running apps plus the current frontmost)** / **windows (list all window titles of an app, needs name)** / **focus (switch to an app and raise the window whose title contains title, needs name, title optional)** / **frontmost (report the current frontmost app and window)**. **Typical play: to drive an application → system open to switch to it → system menu_items to see the menus → system menu to invoke the feature directly; only for things not in a menu, fall back to read_screen + ui_click (computer's screen.capture when you need actual pixels).** Menu names must match exactly what the interface displays (including any ellipsis …). **macOS is fully supported (Accessibility permission). On Windows, launching / listing / activating apps and windows all work; MENUS go through UI Automation, which classic Win32 / WinForms / WPF apps expose well but many Electron, UWP and custom-drawn apps do not — if system menu returns 「找不到菜单项」 on such an app, that is the toolkit not exposing a menu bar, not a wrong path: switch to read_screen + ui_click, or computer coordinates. On Linux, open/list windows/switch/focus are supported (needs wmctrl + xdotool) and menus go through computer coordinates.**",
+      "description": "Application-level control through system APIs — faster than screenshots and pixel clicks. Actions: open switches to an app or launches it (name, e.g. Finder/Safari/Mail); menu triggers a menu item by path, e.g. [\"File\",\"New Window\"] or [\"Format\",\"Font\",\"Bold\"] (omit app for the frontmost); menu_items lists the real item names at one level (path [] = the top level); apps lists running apps and the frontmost; windows lists an app's window titles; focus raises the window whose title contains title; frontmost reports the current app and window. Typical flow: open → menu_items → menu; for what is not in a menu, read_screen + ui_click (or computer's screen.capture for real pixels). Menu names must match the interface exactly, including any ellipsis. macOS: full support (Accessibility permission). Windows: launching, listing and activating work; menus go through UI Automation, which Electron, UWP and custom-drawn apps often do not expose — 「找不到菜单项」 there means no menu bar is exposed, so switch to read_screen + ui_click or computer coordinates. Linux: open/windows/focus need wmctrl + xdotool; menus go through computer coordinates.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1750,30 +1776,30 @@
               "focus",
               "frontmost"
             ],
-            "description": "The system operation to perform"
+            "description": "The system operation to perform."
           },
           "name": {
             "type": "string",
-            "description": "For open/windows/focus: the app name (exactly as shown in Applications or the menu bar)"
+            "description": "For open/windows/focus: the app name exactly as shown in Applications or the menu bar."
           },
           "path": {
             "type": "array",
-            "description": "For menu/menu_items: the menu path array, e.g. [\"File\",\"New\"] / [\"Format\",\"Font\",\"Bold\"]. Pass [] to menu_items to list the top-level menus",
+            "description": "For menu/menu_items: the menu path, e.g. [\"File\",\"New\"]; pass [] to menu_items for the top-level menus.",
             "items": {
               "type": "string"
             }
           },
           "title": {
             "type": "string",
-            "description": "For focus (optional): the title of the window to raise (a substring is enough; omit for the first window)"
+            "description": "For focus (optional): the window title to raise (a substring is enough; omit for the first window)."
           },
           "app": {
             "type": "string",
-            "description": "For menu/menu_items (optional): the target app name; omit = the current frontmost app"
+            "description": "For menu/menu_items (optional): the target app; omit for the current frontmost app."
           },
           "background": {
             "type": "boolean",
-            "description": "For open (optional): true = launch in the background without stealing focus or interrupting the user (takes effect on macOS)"
+            "description": "For open (optional): launch in the background without stealing focus (macOS)."
           }
         },
         "required": [
@@ -1786,7 +1812,7 @@
     "type": "function",
     "function": {
       "name": "browser",
-      "description": "Drive a real browser and return screenshots, interactive nodes and visible text. **It runs on a persistent profile, so whatever has been signed into stays signed in** — this is the right entry point whenever the task needs a session that survives across runs, and it is why you should not reach for a fresh throwaway browser there. Be precise about whose session that is: it is THIS browser's own profile, signed into once here — not the session in the user's everyday browser. When the task specifically needs the account the user is already signed into in their OWN browser, see the third case below. If the user's own browser is running with remote debugging enabled, it attaches to that instead — their real session, their logins, no second window; the run itself tells you which happened. Otherwise it uses a separate profile, and it has to: a Chromium-based browser locks its own profile while it is running, and a debugging port can only be opened at launch — it cannot be added to a process that is already running. Handing over every saved password would also be far more access than the task needs. Which browser it drives is configurable (Chrome / Edge / Brave / Chromium); the run itself tells you which one it actually opened. If a site still shows a login wall, say so and let the user sign in once in this browser; it persists afterwards. **【browser 还是 automation：按目标在哪儿分，不靠猜】** Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) → use **browser**: it reads the DOM, targets by node number, and is far more reliable and cheaper than pixels. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page actively blocks CDP → use **automation**: it synthesises real OS mouse and keyboard events, which is the only thing that reaches non-web UI. **【第三种情况：目标就在用户自己那个浏览器里】** CDP 只作用于它自己启动的实例，或用户主动带调试端口启动的实例；用户双击打开的那个，调试端口是启动期参数、事后加不上，接管不了。所以任务是「在用户已登录的那个浏览器里操作」时不要用 browser——它只会再弹一个陌生的、没登录的窗口，这正是用户抱怨的行为。改走 automation：`system open` 把它切到前台，`read_screen` 读可访问性树（浏览器会把网页内容——链接、按钮、输入框、文本——连同坐标暴露给 AX，是结构化元素，不是对着截图猜），再用 ui_click 按 ref 直接执行 AX 动作——网页里的链接、按钮、输入框、下拉框都支持 AXPress，所以这条路根本不碰坐标，不存在点偏；坐标点击只留给没有 AX 动作的东西。登录态就是用户自己的。代价是靠坐标、窗口必须在前台、拿不到 DOM，所以可重复的页面验收仍然走 browser。判据是**要谁的登录态**：要用户的 → automation；不要 → browser。 Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser — re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. **【先想一下是谁要看】** If the point is for the USER to look at the page (showing them the dev server you just started, a deployed site, a doc, a link), use `open`: it hands the URL to **their own default browser** — their tabs, their logins, their extensions — and starts no automation session and no second Dock icon. It works even when their default browser is Safari or Firefox. You do not get to see the page that way, and that is the point. Use `navigate` and the rest only when YOU need to read the page, click through it, or verify it visually. Reaching for `navigate` just to show someone something is what makes an unfamiliar, logged-out automation window pop up for no reason. Supported: open, navigate, observe, viewport, click, dblclick, rightclick, longpress, type, clear, append, autofill/fill, hover, drag, slide, swipe, wheel, toggle/uncheck, select, focus/blur, press, scroll, wait, eval, screenshot, design, network, inspect, nodes, assert, check, batch, upload, cookies, storage and close. observe returns ready/active/iframe/shadow DOM/node state in structured form — on a complex page, observe/nodes first and then batch. check only performs a page health check; for checkboxes and switches use toggle + checked:true/false, or op:check/uncheck inside a batch. Browser sessions are sticky and reused by default: navigate/fresh will not close the browser for the sake of ceremony, and close only releases the task's hold on it — only close + force:true actually shuts it down. For complex UI, prefer batch: it uses real pointer/mouse events, dblclick/rightclick/longpress, hover, drag trajectories, dragging onto a target node or text, slider percent/value, wheel and scroll containers, custom select/combobox, focus/blur, clear/append, key combinations, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, candidate recovery, React/Vue native value setters, and DOM/URL settling after each action, and it reports failure reasons such as blockedBy/value_not_applied/option_not_found/candidates/expect_*. After an action you can pass expectText/expectSelector/expectUrl/expectValue as an acceptance check; if it is not met, execution stops and reports why. For sign-in, sign-up, search and admin forms, prefer autofill to fill fields in one go and read back invalid/missing, rather than guessing from a screenshot which field was missed. Before delivering UI, decide from the project itself whether mobile matters: a public-facing site, marketing page, landing page or H5 → run viewport and check twice, desktop and phone; an explicitly desktop context (internal admin, a desktop tool, or the user asking only for desktop) → test desktop only and say why when you wrap up. Prefer clicking and filling by the node number that nodes returns; without one, use target/role to locate semantically by aria-label, placeholder, label or visible text. After acting, verify state with assert, nodes or check; diagnose styling with inspect and network problems with network. Requires a Chromium-based browser installed locally (Chrome, Edge, Brave or Chromium — which one it uses is configurable). Unsure how many steps a page flow takes → action task with a goal: the tool observes, acts and re-observes by itself, up to max_steps rounds, and reports what it did plus the result (summary). Several pages at once — read a code in webmail, compare two pages — → tab (op list / new / switch / close; later actions target the current tab); back / forward / reload move through history.",
+      "description": "Drive a real Chromium-based browser (Chrome / Edge / Brave / Chromium, configurable) and return screenshots, numbered interactive nodes and visible text. It runs on a persistent profile — whatever was signed into here stays signed in — and sessions are sticky and reused by default: close only releases this task's hold, close with force:true actually shuts it down. Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) → this tool, which addresses elements by node number. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → automation, which synthesises real OS mouse and keyboard events. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser — re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. The account the user is already signed into in their OWN everyday browser is unreachable from here (a debugging port is a launch-time flag): use system open → read_screen → ui_click instead. To merely show the user a page (a dev server you started, a deployed site, a doc) use action open: it hands the URL to their default browser with no automation window, and you do not see it. Actions: mytabs, open, navigate, observe, viewport, click, dblclick, rightclick, longpress, type, clear, append, autofill/fill, hover, drag, slide, swipe, wheel, toggle/uncheck, select, focus/blur, press, scroll, wait, eval, screenshot, design, network, inspect, nodes, assert, check, batch, upload, cookies, storage, tab, back, forward, reload, task, close. Start with observe or nodes, then act by node; for multi-step interaction use batch — real pointer/mouse events, drag/slide/swipe/wheel, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, settling after each action, and expect* acceptance checks that stop and report why on failure; for sign-in, sign-up, search and admin forms use autofill and read back missing/invalid. Verify afterwards with assert, nodes or check; inspect for styling, network for requests. Before delivering UI, check both desktop and phone via viewport for a public-facing site; an explicitly desktop context needs desktop only. Unsure how many steps a page flow takes → action task with a goal: the tool observes, acts and re-observes by itself, up to max_steps rounds, and reports what it did plus the result (summary). Several pages at once — read a code in webmail, compare two pages — → tab (op list / new / switch / close; later actions target the current tab); back / forward / reload move through history.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1839,31 +1865,31 @@
               "reload",
               "tab"
             ],
-            "description": "The browser action to perform. **mytabs = look at what the user already has open in their OWN browser** (titles and URLs, macOS only, no automation window involved) — check this FIRST whenever the task touches a page the user might already be on, so you decide from what is actually open instead of reflexively launching a window. It returns titles and URLs only, never page text. **open = hand the URL to the USER'S OWN default browser for them to look at** — their tabs, their logins, their extensions; no automation session, no second Dock icon, works even if their default is Safari or Firefox. You do not see the page. Use it whenever the point is for the user to look (the dev server you just started, a deployed site, a doc, a link); use navigate and the rest only when YOU need to read, click or verify the page. observe = structured observation of the page (ready/active/iframe/shadow/nodes); check only performs a page health check; for checkboxes and switches use toggle + checked:true/false (or batch op:check/uncheck). For sequential or complex operations prefer batch (real pointer/mouse events, dblclick/rightclick/longpress, hover, drag/slide/swipe, wheel, focus/blur, clear/append, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, candidate recovery, native setters, settling after each action, expect* acceptance checks); for forms prefer autofill/fill (fields={email,password,...}, optionally submit:true/submitText to submit, returning filled/missing/invalid with the validation reason). upload sends a file to an <input type=file>: use selector to pick the file input and path/paths for the absolute local file path. task = give the goal in plain language (goal, optional url, max_steps): the tool observes, acts and re-observes by itself, up to max_steps rounds, and reports what it did and the result — use it when you do not know how many steps a page flow takes. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. back / forward / reload move through history."
+            "description": "The browser action to perform. mytabs = look at what the user already has open in their OWN browser (titles and URLs only, macOS, no automation window) — check it first when the task touches a page they may already be on. open = hand the URL to the USER'S OWN default browser for them to look at; you do not see the page. observe = structured page state (ready/active/iframe/shadow/nodes). check only performs a page health check; checkboxes and switches use toggle with checked, or batch op check/uncheck. upload sends a file to an <input type=file>: selector picks the input, path/paths the absolute local file path. task = give the goal in plain language (goal, optional url, max_steps): the tool observes, acts and re-observes by itself, up to max_steps rounds, and reports what it did and the result — use it when you do not know how many steps a page flow takes. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. back / forward / reload move through history."
           },
           "url": {
             "type": "string",
-            "description": "For open / navigate: the URL. `open` hands it to the user's own default browser for them to look at; `navigate` drives the automation browser so you can read and act on the page."
+            "description": "For open / navigate: the URL. open hands it to the user's own browser; navigate drives the automation browser so you can read and act on the page."
           },
           "width": {
             "type": "integer",
-            "description": "For viewport: viewport width, e.g. 1440 on desktop, 390 on a phone"
+            "description": "For viewport: width, e.g. 1440 on desktop, 390 on a phone."
           },
           "height": {
             "type": "integer",
-            "description": "For viewport: viewport height, e.g. 900 on desktop, 844 on a phone"
+            "description": "For viewport: height, e.g. 900 on desktop, 844 on a phone."
           },
           "mobile": {
             "type": "boolean",
-            "description": "For viewport: whether to emulate a mobile device"
+            "description": "For viewport: emulate a mobile device."
           },
           "device_scale_factor": {
             "type": "number",
-            "description": "For viewport: device scale factor, default 1"
+            "description": "For viewport: device scale factor, default 1."
           },
           "fresh": {
             "type": "boolean",
-            "description": "For navigate: true = isolated semantics; within the same task and origin the current browser is kept and reused automatically rather than being closed on a whim"
+            "description": "For navigate: true = isolated session semantics; within the same task and origin the current browser is reused."
           },
           "mode": {
             "type": "string",
@@ -1871,137 +1897,137 @@
               "headed",
               "isolated"
             ],
-            "description": "Optional semantic hint: headed = headed interaction (default); isolated = pair with fresh=true for an isolated session. For genuinely headless static rendering, use screenshot."
+            "description": "headed (default) or isolated (pair with fresh=true). For headless static rendering use the screenshot tool."
           },
           "force": {
             "type": "boolean",
-            "description": "For close: only true actually shuts the browser down; by default close just releases the task's hold and leaves the browser open for reuse"
+            "description": "For close: true actually shuts the browser down; by default close only releases this task's hold and leaves the browser open for reuse."
           },
           "paths": {
             "type": "array",
-            "description": "For upload: absolute local paths of the files to upload (several allowed); for a single file you can use path instead",
+            "description": "For upload: absolute local paths of the files (several allowed); a single file can use path.",
             "items": {
               "type": "string"
             }
           },
           "fields": {
             "type": "object",
-            "description": "For autofill: fill the form by field meaning, e.g. {\"email\":\"demo@example.com\",\"password\":\"123456\"}, {\"search\":\"keyword\"}, {\"title\":\"...\",\"content\":\"...\"}. Inputs are identified by label/placeholder/name/type/autocomplete, and missing/invalid are returned."
+            "description": "For autofill: the form's fields by meaning, e.g. {\"email\":\"demo@example.com\",\"password\":\"123456\"} or {\"search\":\"keyword\"}; inputs are matched by label/placeholder/name/type/autocomplete, and missing/invalid are returned."
           },
           "submit": {
             "type": "boolean",
-            "description": "For autofill: whether to click/submit the form once it is filled"
+            "description": "For autofill: submit the form after filling."
           },
           "submitText": {
             "type": "string",
-            "description": "For autofill with submit: the submit button's text, e.g. Sign in / Submit / Save; omit to find the usual submit button automatically"
+            "description": "For autofill with submit: the submit button's text, e.g. Sign in / Submit / Save; omit to find it automatically."
           },
           "steps": {
             "type": "array",
-            "description": "For batch: the array of steps to run in sequence, each {op,node/index/selector/target/role,text/value/option,key,button,clickCount,modifiers,amount,dx,dy,x,y,toX,toY,toNode/toIndex/toSelector/toTarget,percent,duration,checked,clear,append,absent,expectText/expectSelector/expectUrl/expectValue/expectAbsent,ms}. op supports observe, click/tap/dblclick/rightclick/longpress, hover, type/fill/input/clear/append, select/choose (native select plus shadcn/Radix combobox/listbox), toggle/check/uncheck, drag (can drop onto a target node, text or selector), slide (slider, percent/value), swipe, wheel, focus/blur, press (supports Meta+K / Control+Shift+P), scroll, wait (absent=true waits for disappearance). Example: [{op:\"observe\"},{op:\"type\",target:\"Email\",text:\"a@b.com\",expectValue:\"a@b.com\"},{op:\"slide\",role:\"slider\",percent:80},{op:\"drag\",target:\"Card\",toTarget:\"Done column\"},{op:\"rightclick\",target:\"File\"},{op:\"press\",key:\"Meta+K\"},{op:\"wait\",target:\"Saved\",ms:1200,expectText:\"Saved\"}]. Getting node numbers from nodes first is the most reliable; you can also use target:\"Save\" to locate by accessible name or visible text. batch runs many steps at once, detects occlusion, waits for changes, and returns the reason for any failure.",
+            "description": "For batch: steps run in sequence, each {op, node/index/selector/target/role, text/value/option, key, button, clickCount, modifiers, amount, dx, dy, x, y, toX, toY, toNode/toIndex/toSelector/toTarget, percent, duration, checked, clear, append, absent, expectText/expectSelector/expectUrl/expectValue/expectAbsent, ms}. op: observe, click/tap/dblclick/rightclick/longpress, hover, type/fill/input/clear/append, select/choose (native select and shadcn/Radix combobox/listbox), toggle/check/uncheck, drag (onto a node, text or selector), slide (percent/value), swipe, wheel, focus/blur, press (Meta+K, Control+Shift+P), scroll, wait (absent=true waits for disappearance). A node number from nodes is the most reliable target; target:\"Save\" locates by accessible name or visible text. Example: [{op:\"observe\"},{op:\"type\",target:\"Email\",text:\"a@b.com\",expectValue:\"a@b.com\"},{op:\"drag\",target:\"Card\",toTarget:\"Done column\"},{op:\"wait\",target:\"Saved\",ms:1200,expectText:\"Saved\"}].",
             "items": {
               "type": "object"
             }
           },
           "node": {
             "type": "integer",
-            "description": "For click/type (preferred): the node number i from the nodes listing"
+            "description": "For click/type (preferred): the node number from the nodes listing."
           },
           "index": {
             "type": "integer",
-            "description": "For click/type: the number in the screenshot's element list (the red digits)"
+            "description": "For click/type: the number in the screenshot's element list (the red digits)."
           },
           "selector": {
             "type": "string",
-            "description": "For click/type/wait (fallback): a CSS selector. **Text matching is also supported**: :has-text(\"Download\"), text=\"2.1.1.exe\" and :contains(\"Sign in\") all work (the system locates by visible text and polls until it renders). But **the most reliable route is nodes → node=i**; a selector is only the fallback when there is no node number. For inspect/assert (optional): the element to examine"
+            "description": "For click/type/wait (fallback): a CSS selector; text forms work too — :has-text(\"Download\"), text=\"2.1.1.exe\", :contains(\"Sign in\") — polling until it renders. nodes → node=i is the reliable route. For inspect/assert: the element to examine."
           },
           "target": {
             "type": "string",
-            "description": "For click/type/wait (semantic fallback): the target's visible text, aria-label, placeholder, label or name, e.g. Save, Email, Search"
+            "description": "For click/type/wait (semantic fallback): the target's visible text, aria-label, placeholder, label or name, e.g. Save, Email, Search."
           },
           "role": {
             "type": "string",
-            "description": "For click/type/wait (semantic fallback): a role hint for the target, such as button/textbox/link/tab/slider/switch/checkbox"
+            "description": "For click/type/wait (semantic fallback): a role hint such as button/textbox/link/tab/slider/switch/checkbox."
           },
           "text": {
             "type": "string",
-            "description": "For type: the text to enter; for click/wait it can serve as the target text; for assert: the text to look for (confirming it appears/is visible)"
+            "description": "For type: the text to enter; for click/wait it can serve as the target text; for assert: the text that must appear."
           },
           "key": {
             "type": "string",
-            "description": "For press: the key name, e.g. Enter"
+            "description": "For press: the key name, e.g. Enter."
           },
           "amount": {
             "type": "integer",
-            "description": "For scroll/wheel: scroll distance in pixels, positive = down, negative = up (e.g. 600 / -600)"
+            "description": "For scroll/wheel: pixels, positive = down, negative = up (e.g. 600 / -600)."
           },
           "ms": {
             "type": "integer",
-            "description": "For wait: milliseconds to wait (used when no selector is given, default 1500)"
+            "description": "For wait: milliseconds (default 1500 when no selector is given)."
           },
           "script": {
             "type": "string",
-            "description": "For eval: the JavaScript to run"
+            "description": "For eval: the JavaScript to run."
           },
           "value": {
             "type": "string",
-            "description": "For slide/select: the slider's target value or the select option's value"
+            "description": "For slide/select: the slider's target value or the select option's value."
           },
           "option": {
             "type": "string",
-            "description": "For select/choose: the option text or value to choose"
+            "description": "For select/choose: the option text or value."
           },
           "percent": {
             "type": "number",
-            "description": "For slide/drag: target percentage 0-100, commonly used for sliders"
+            "description": "For slide/drag: target percentage 0-100, typically for sliders."
           },
           "checked": {
             "type": "boolean",
-            "description": "For toggle/check/uncheck: the expected switch or checkbox state"
+            "description": "For toggle/check/uncheck: the expected switch or checkbox state."
           },
           "x": {
             "type": "number",
-            "description": "For drag/hover/click: start x; 0-1 means a relative position inside the element, otherwise viewport pixels"
+            "description": "For drag/hover/click: start x; 0-1 means a relative position inside the element, otherwise viewport pixels."
           },
           "y": {
             "type": "number",
-            "description": "For drag/hover/click: start y; 0-1 means a relative position inside the element, otherwise viewport pixels"
+            "description": "For drag/hover/click: start y; 0-1 means a relative position inside the element, otherwise viewport pixels."
           },
           "toX": {
             "type": "number",
-            "description": "For drag/swipe: end x; 0-1 means a relative position inside the element, otherwise viewport pixels"
+            "description": "For drag/swipe: end x; 0-1 means a relative position inside the element, otherwise viewport pixels."
           },
           "toY": {
             "type": "number",
-            "description": "For drag/swipe: end y; 0-1 means a relative position inside the element, otherwise viewport pixels"
+            "description": "For drag/swipe: end y; 0-1 means a relative position inside the element, otherwise viewport pixels."
           },
           "toNode": {
             "type": "integer",
-            "description": "For drag: the drop target's node number (the i returned by nodes)"
+            "description": "For drag: the drop target's node number."
           },
           "toIndex": {
             "type": "integer",
-            "description": "For drag: the drop target's screenshot number"
+            "description": "For drag: the drop target's screenshot number."
           },
           "toSelector": {
             "type": "string",
-            "description": "For drag: the drop target's CSS/text selector"
+            "description": "For drag: the drop target's CSS/text selector."
           },
           "toTarget": {
             "type": "string",
-            "description": "For drag: the drop target's visible text, aria-label, placeholder or name"
+            "description": "For drag: the drop target's visible text, aria-label, placeholder or name."
           },
           "dx": {
             "type": "number",
-            "description": "For drag/swipe/wheel/scroll: horizontal offset or scroll amount"
+            "description": "For drag/swipe/wheel/scroll: horizontal offset or scroll amount."
           },
           "dy": {
             "type": "number",
-            "description": "For drag/swipe/wheel/scroll: vertical offset or scroll amount"
+            "description": "For drag/swipe/wheel/scroll: vertical offset or scroll amount."
           },
           "duration": {
             "type": "integer",
-            "description": "For drag/swipe/slide: the action's duration in milliseconds, default about 420"
+            "description": "For drag/swipe/slide: duration in milliseconds, default about 420."
           },
           "button": {
             "type": "string",
@@ -2010,54 +2036,54 @@
               "middle",
               "right"
             ],
-            "description": "For click/dblclick/rightclick: the mouse button, default left"
+            "description": "For click/dblclick/rightclick: the mouse button, default left."
           },
           "clickCount": {
             "type": "integer",
-            "description": "For click: how many clicks; dblclick defaults to 2"
+            "description": "For click: number of clicks; dblclick defaults to 2."
           },
           "modifiers": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "For click/press: modifier keys, e.g. [\"Meta\"], [\"Control\",\"Shift\"]; you can also write Meta+K in key"
+            "description": "For click/press: modifier keys, e.g. [\"Meta\"], [\"Control\",\"Shift\"]; Meta+K in key also works."
           },
           "clear": {
             "type": "boolean",
-            "description": "For type/fill: clear before typing; action=clear forces a clear"
+            "description": "For type/fill: clear before typing; action=clear forces a clear."
           },
           "append": {
             "type": "boolean",
-            "description": "For type/fill: append to the existing value; action=append forces an append"
+            "description": "For type/fill: append to the existing value; action=append forces an append."
           },
           "absent": {
             "type": "boolean",
-            "description": "For wait: true means wait for the target to disappear / not exist"
+            "description": "For wait: true waits for the target to disappear / not exist."
           },
           "expect": {
             "type": "string",
-            "description": "Acceptance check after the action: shorthand equivalent to expectText; if that text is not seen the action fails and reports why"
+            "description": "Acceptance check after the action: shorthand for expectText; if that text is not seen the action fails and reports why."
           },
           "expectText": {
             "type": "string",
-            "description": "Acceptance check after the action: page text / toast / status copy that must appear"
+            "description": "Acceptance check after the action: page text, toast or status copy that must appear."
           },
           "expectSelector": {
             "type": "string",
-            "description": "Acceptance check after the action: a CSS selector that must exist; combine with expectAbsent=true to verify disappearance"
+            "description": "Acceptance check after the action: a CSS selector that must exist; with expectAbsent=true, one that must have disappeared."
           },
           "expectUrl": {
             "type": "string",
-            "description": "Acceptance check after the action: the current URL must contain this fragment"
+            "description": "Acceptance check after the action: the current URL must contain this fragment."
           },
           "expectValue": {
             "type": "string",
-            "description": "Acceptance check after the action: the target input's (or currently focused element's) value must contain this"
+            "description": "Acceptance check after the action: the target input's (or focused element's) value must contain this."
           },
           "expectAbsent": {
             "type": "boolean",
-            "description": "Acceptance check after the action: true means the element expectSelector points at must not exist / must have disappeared"
+            "description": "Acceptance check after the action: true means the element expectSelector points at must not exist / must have disappeared."
           },
           "goal": {
             "type": "string",
@@ -2117,13 +2143,13 @@
     "type": "function",
     "function": {
       "name": "stop_terminal",
-      "description": "Stop / close a task terminal started by run_in_terminal (ending its process). Use it when a dev server or watcher is no longer needed, or to restart with a different command. Omit name to stop the most recently started one. 【When to use】When a background task is no longer needed, or a port conflict means an old process has to be killed. 【vs alternatives】To read output without stopping anything, use read_terminal.",
+      "description": "Stop a task terminal started by run_in_terminal, ending its process; omit name for the most recent one. 【When to use】When a server or watcher is no longer needed, must be restarted with a different command, or is holding a port. To read output without stopping anything use read_terminal.",
       "parameters": {
         "type": "object",
         "properties": {
           "name": {
             "type": "string",
-            "description": "Terminal / task name to stop; omit for the most recent one"
+            "description": "Terminal/task name to stop; omit for the most recent one."
           }
         }
       }
@@ -2133,32 +2159,32 @@
     "type": "function",
     "function": {
       "name": "http_request",
-      "description": "Call any HTTP API — the key capability for using online tools and services. method = GET/POST/PUT/PATCH/DELETE/HEAD, with optional headers and body; returns the status code, response headers and response body (text, up to 5MB). Typical uses: (1) test the local service you just started (http://127.0.0.1:<port>/api — send a request and see the real response); (2) call a public API (GitHub, weather, exchange rates, maps, any REST service); (3) fire a webhook. ⚠️ localhost and the LAN are allowed (so you can test your own service), but link-local and cloud metadata addresses (169.254.x.x) are blocked; only http/https are supported. 【vs alternatives】To read a web page's text use web_fetch (simpler); to find a page use web_search.",
+      "description": "Send an HTTP request (GET/POST/PUT/PATCH/DELETE/HEAD) with optional headers and body; returns the status code, response headers and body text (up to 5 MB). For testing a service you started (http://127.0.0.1:<port>/…), calling any REST API, or firing a webhook. localhost and the LAN are allowed; link-local and cloud-metadata addresses (169.254.x.x) are blocked; http/https only. To read a page as text use web_fetch; to find pages use web_search.",
       "parameters": {
         "type": "object",
         "properties": {
           "method": {
             "type": "string",
-            "description": "HTTP method, e.g. GET, POST, PUT, DELETE"
+            "description": "HTTP method, e.g. GET, POST, PUT, DELETE."
           },
           "url": {
             "type": "string",
-            "description": "A full http/https URL, which may be http://127.0.0.1:<port>/path"
+            "description": "A full http/https URL, e.g. http://127.0.0.1:<port>/path."
           },
           "headers": {
             "type": "object",
-            "description": "Optional; request header key/value pairs, e.g. {\"Authorization\":\"Bearer xxx\",\"Content-Type\":\"application/json\"}",
+            "description": "Optional request headers, e.g. {\"Authorization\":\"Bearer xxx\",\"Content-Type\":\"application/json\"}.",
             "additionalProperties": {
               "type": "string"
             }
           },
           "body": {
             "type": "string",
-            "description": "Optional; the request body (for POST/PUT etc.; to send JSON, pass a JSON string)"
+            "description": "Optional request body; to send JSON pass a JSON string."
           },
           "timeout_secs": {
             "type": "integer",
-            "description": "Optional; timeout in seconds, default 30, maximum 120"
+            "description": "Timeout in seconds, default 30, maximum 120."
           }
         },
         "required": [
@@ -2367,7 +2393,7 @@
     "type": "function",
     "function": {
       "name": "db_query",
-      "description": "**Query and operate a database directly** — MySQL / PostgreSQL / SQLite (SQL) and Redis (commands) are supported. Work from real data instead of guessing: inspect a table's structure, read rows, check a single record, run a migration, look at cache keys. Results are echoed back to you as a **table**. SELECT/SHOW/DESCRIBE and friends return columns and rows; INSERT/UPDATE/DELETE return the affected row count; the timeout is 20s and at most 500 rows come back by default. ⚠️ The connection string, and whether writes are allowed, come from the user — never connect to an external database on your own initiative. Be careful with writes (changing or deleting data, migrations); when unsure, SELECT first and look. If a date, decimal, json or similar special type shows up as <typename>, CAST it to text in the SQL. 【When to use】To confirm a table's structure or the real data, query it directly (SHOW TABLES and so on) — more accurate than guessing the schema from migration files.",
+      "description": "Query or operate a database directly — MySQL/MariaDB, PostgreSQL, SQLite, MSSQL, MongoDB, Redis, ClickHouse, Elasticsearch — and get the result as a table: SELECT/SHOW/DESCRIBE return columns and rows, writes return the affected count; 20 s timeout, 500 rows by default. The connection string and write permission come from the user — never connect to an external database on your own initiative, and SELECT first when unsure about a write. Cast date/decimal/json values to text if they show as <typename>. 【When to use】To confirm a table's structure or real data (SHOW TABLES and so on) instead of guessing the schema from migration files.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2384,19 +2410,19 @@
               "clickhouse",
               "elastic"
             ],
-            "description": "Database type"
+            "description": "Database type."
           },
           "url": {
             "type": "string",
-            "description": "Connection string: for MySQL/PostgreSQL pass DATABASE_URL; for SQLite use sqlite:///abs/path.db or sqlite://relative.db; for Redis use redis://host:6379/0"
+            "description": "Connection string: DATABASE_URL for MySQL/PostgreSQL; sqlite:///abs/path.db or sqlite://relative.db; redis://host:6379/0."
           },
           "query": {
             "type": "string",
-            "description": "The SQL statement, or a Redis command line (e.g. GET key, KEYS user:*, HGETALL h)"
+            "description": "The SQL statement, or a Redis command line (e.g. GET key, KEYS user:*, HGETALL h)."
           },
           "limit": {
             "type": "integer",
-            "description": "Maximum rows to return (default 500, maximum 2000)"
+            "description": "Maximum rows to return (default 500, maximum 2000)."
           }
         },
         "required": [
@@ -2592,21 +2618,21 @@
     "type": "function",
     "function": {
       "name": "github_search",
-      "description": "Search repositories, code or issues through the GitHub API, returning the metadata and links from this API response. updated_at is not proof of a recent commit, a release, or continued maintenance; a repository's quality and compatibility still need its source, releases and issues read, and verification in the current project.",
+      "description": "Search GitHub repositories, code or issues through the API; returns the metadata and links of that response. updated_at is not proof of a recent commit, a release or maintenance — judge a repository from its source, releases and issues, and verify in the current project.",
       "parameters": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "Search terms; GitHub search syntax is supported"
+            "description": "Search terms; GitHub search syntax is supported."
           },
           "search_type": {
             "type": "string",
-            "description": "Search type, default repositories"
+            "description": "repositories (default), code or issues."
           },
           "max_results": {
             "type": "integer",
-            "description": "How many to return, default 10, maximum 30"
+            "description": "How many to return, default 10, maximum 30."
           }
         },
         "required": [
@@ -2619,17 +2645,17 @@
     "type": "function",
     "function": {
       "name": "github_repo",
-      "description": "Read a given GitHub repository's real contents. ONE call = ONE action. 【Order】Start with `overview` (description / language / stars / default_branch). For \"what is this project / what is it for\", `overview` plus at most one `readme` call is the whole answer — stop there and answer; do not enumerate directories to answer a purpose question. Only reach for `tree`/`file` when the README is missing or the question is about implementation or a specific behaviour, and name the files you intend to read before reading them. 【tree lists ONE directory level】`tree` calls GitHub /contents: subdirectories come back as bare names with no children, so drilling folder-by-folder costs one HTTP round trip per folder. 【Budget】These requests are rate-limited; a repository is not a filesystem you can crawl for free.",
+      "description": "Read a GitHub repository's real contents, one action per call: overview (description, language, stars, default branch), readme, tree, file, releases, issues, pulls. For what a project is or does, overview plus readme is the whole answer. tree lists one directory level (subdirectories come back as bare names), so each level costs a request; requests are rate-limited — name the files you intend to read before drilling.",
       "parameters": {
         "type": "object",
         "properties": {
           "owner": {
             "type": "string",
-            "description": "Repository owner/org, e.g. vercel"
+            "description": "Repository owner/org, e.g. vercel."
           },
           "repo": {
             "type": "string",
-            "description": "Repository name, e.g. next.js"
+            "description": "Repository name, e.g. next.js."
           },
           "action": {
             "type": "string",
@@ -2642,19 +2668,19 @@
               "issues",
               "pulls"
             ],
-            "description": "What to read, default overview"
+            "description": "What to read, default overview."
           },
           "path": {
             "type": "string",
-            "description": "For tree/file: a path inside the repository, e.g. packages/next/src/server"
+            "description": "For tree/file: a path inside the repository, e.g. packages/next/src/server."
           },
           "branch": {
             "type": "string",
-            "description": "Optional branch/tag/SHA; omit for the default branch"
+            "description": "Optional branch/tag/SHA; omit for the default branch."
           },
           "max_results": {
             "type": "integer",
-            "description": "How many tree/releases/issues/pulls entries to return, default 20, maximum 100"
+            "description": "How many tree/releases/issues/pulls entries, default 20, maximum 100."
           }
         },
         "required": [
@@ -2957,7 +2983,7 @@
     "type": "function",
     "function": {
       "name": "current_time",
-      "description": "Get the current real date and time (year, month, day, weekday, hour, minute, second, timezone, Unix timestamp). Call it when you need to know today's date, the weekday, or the current time — do not guess from memory. The current time only tells you when this request was made; it does not prove that a web page, paper, price, version, market quote, or rule is current. A dynamic fact still requires reading the publication date, update time, version number, observation time, or quote time from the corresponding source.",
+      "description": "Get the current date and time (date, weekday, time, timezone, Unix timestamp) instead of guessing. It only says when this request was made; whether a page, price, version or rule is current still comes from that source's own publication or update time.",
       "parameters": {
         "type": "object",
         "properties": {}
@@ -3328,13 +3354,13 @@
     "type": "function",
     "function": {
       "name": "package_search",
-      "description": "**Search for a package or library and check version compatibility** — package information from npm, crates.io, PyPI, HuggingFace, pub.dev (Flutter), Conda, CocoaPods (iOS) and Hex (Elixir). For npm, passing an exact package name also returns registry metadata: dist-tags.latest, recent versions, engines, peerDependencies, dependencies and deprecated. Before editing package.json, choosing a version, or resolving a peer-dependency conflict, you must check here — do not guess a version from memory.",
+      "description": "Look up a package in npm (default), PyPI, crates.io, HuggingFace, pub.dev, Conda, CocoaPods, Hex, Maven, NuGet, Packagist, RubyGems, Homebrew, Docker Hub or cdnjs. An exact npm name also returns dist-tags.latest, recent versions, engines, peerDependencies, dependencies and deprecated. Check here before editing package.json, choosing a version or resolving a peer-dependency conflict, instead of guessing a version from memory.",
       "parameters": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "Package name or search term; for npm version and compatibility checks pass the exact package name, e.g. 'axios' / '@vitejs/plugin-react' / 'tsx'"
+            "description": "Package name or search term; for npm version and compatibility checks pass the exact name, e.g. 'axios' / '@vitejs/plugin-react' / 'tsx'."
           },
           "ecosystem": {
             "type": "string",
@@ -3355,11 +3381,11 @@
               "dockerhub",
               "cdnjs"
             ],
-            "description": "Ecosystem: npm (default) / pypi / crates / huggingface / dart / conda / cocoapods / hex. pypi supports exact package names only"
+            "description": "npm (default) / pypi / crates / huggingface / dart / conda / cocoapods / hex / maven / nuget / packagist / rubygems / homebrew / dockerhub / cdnjs. pypi accepts exact package names only."
           },
           "max_results": {
             "type": "integer",
-            "description": "How many to return, default 8"
+            "description": "How many to return, default 8."
           }
         },
         "required": [
@@ -3448,21 +3474,21 @@
     "type": "function",
     "function": {
       "name": "read_screen",
-      "description": "Read the accessibility elements the frontmost application actually exposes (role, name, value, whether it is enabled, and screen coordinates). **A browser is one of those applications, and its tree includes the rendered page** — links, buttons, form fields and text, each with real screen coordinates. That is how you operate the user's own already-running browser, the one CDP cannot attach to: bring it to the front, read it here, then act by ref with ui_click — page links, buttons, text fields and dropdowns all expose real AX actions, so the reliable path involves no coordinates at all. Fall back to coordinate clicking only for what exposes no action. When the result is empty, do not guess why — the tool names the cause (missing permission / the read did not complete / every window minimized / the app genuinely exposes nothing). Only the last one means a retry is pointless; the rest are fixable, usually by bringing the window to the front and reading again. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node. **By default this reads the frontmost app — pass `app` (or `pid`) to read one that is NOT in front**, which is what you want whenever the front window is Mr. Day One itself, or when you must not steal focus from what the user is doing. ui_click then acts on that same app without bringing it forward.",
+      "description": "Read the accessibility tree of an application: role, name, value, enabled state and screen coordinates of each element. A browser exposes its rendered page too (links, buttons, fields, text), which is how you operate the user's own already-running browser: read here, then act by ref with ui_click — nothing with an AX action needs coordinates. By default it reads the frontmost app; pass app or pid to read one that is not in front (for instance when the front window is Mr. Day One) without stealing focus. An empty result names its cause (permission missing / read incomplete / windows minimized / the app exposes nothing); only the last means a retry is pointless.",
       "parameters": {
         "type": "object",
         "properties": {
           "ocr": {
             "type": "boolean",
-            "description": "Set true only when the frontmost application has no accessibility tree; may require Screen Recording permission. Cannot be combined with app/pid — OCR photographs the screen, so it only ever covers the frontmost window."
+            "description": "true = macOS on-screen text recognition for an app with no accessibility tree (may need Screen Recording permission); an OCR ref is not an actionable AX node, and it covers only the frontmost window, so it cannot combine with app/pid."
           },
           "app": {
             "type": "string",
-            "description": "Read THIS application instead of whichever one is in front. Match is exact-name-first, then case-insensitive substring (\"Chrome\" finds \"Google Chrome\"). If nothing matches you get an error naming the problem — it never silently falls back to the frontmost app. Use system window.list to see exact names."
+            "description": "Read this application instead of the frontmost: exact name first, then case-insensitive substring (\"Chrome\" finds \"Google Chrome\"). No match is an error, never a silent fallback; system window.list shows exact names."
           },
           "pid": {
             "type": "integer",
-            "description": "Read the app with this process id. Wins over app when both are given."
+            "description": "Read the app with this process id; wins over app when both are given."
           }
         },
         "required": []
@@ -3902,17 +3928,17 @@
     "type": "function",
     "function": {
       "name": "automation",
-      "description": "**【browser 还是 automation：按目标在哪儿分，不靠猜】** Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) → use **browser**: it reads the DOM, targets by node number, and is far more reliable and cheaper than pixels. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page actively blocks CDP → use **automation**: it synthesises real OS mouse and keyboard events, which is the only thing that reaches non-web UI. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser — re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. Desktop automation RPC: real mouse and keyboard, a CDP browser, and record/replay. Use it as a state machine: confirm the precondition first (URL, window, node, sign-in state), then perform the action, then verify the postcondition with browser.content / browser.eval / screenshot / the recorder result — issuing a click or some typing is not the same as succeeding. Call system.init before anything else the first time. A coordinate click is mouse.click{x,y,button} — it moves and clicks in one call, and the reply carries the position it actually acted at, so compare that against your target instead of trusting a bare ok status. mouse.move{x,y} then mouse.click{button} works too and mouse.move only returns once the pointer has really arrived. There is no desktop.click or desktop.type. When a selector goes stale, re-read the page/nodes; when navigation is slow, wait and then check the URL/DOM; when sign-in, a captcha or a system permission blocks you, state the specific blocker and continue via background monitoring. **Choosing which browser to drive is a real decision, not a default.** browser.start takes profile: \"isolated\" (default — a clean throwaway browser instance, no cookies, no logins) or \"session\" (a persistent profile that keeps whatever it has signed into). Pick from the task: scraping a public page, checking your own dev server, or anything where a fresh state is safer → isolated. Anything that needs the user to be signed in — their dashboard, their account, posting on their behalf, reading their inbox — → session, because a blank browser just hits a login wall. If session still shows a login wall, start it again with headless=false so the user can sign in once; that sign-in persists for later runs. For the account the user is already signed into in their OWN everyday browser, neither these browser.* methods nor the separate `browser` tool can reach it — CDP attaches only to instances it launched itself. That case goes through system open → read_screen → ui_click instead; the `browser` tool's description spells it out. Never assume a fresh browser is fine just because it starts faster. Available methods: system.init / mouse.move / mouse.click / mouse.double_click / mouse.position / mouse.drag{from_x,from_y,to_x,to_y} / mouse.scroll{delta_y} / sleep{ms} / keyboard.type{text} / keyboard.press{key} / keyboard.combo{keys:[\"mod\",\"s\"]}（**mod = 本平台的主修饰键**：mac 上是 Cmd，Windows 上是 Ctrl。写 \"cmd\" 等价于 mod；只有真想按 Windows 键时才写 \"win\"——在 Windows 上把 cmd 当 Win 键会按出系统搜索框，而回执照样报成功） / keyboard.down{key} / keyboard.up{key} / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list / window.list / window.activate{title} / window.minimize{title} / window.restore{title}（minimize 和 restore 都会**回读确认**才返回，不是发完就说成功）/ screen.info / **screen.capture** / clipboard.get / clipboard.set{text} / keyboard.paste{text}. **screen.capture{x,y,width,height} 拍的是真实屏幕像素**（四个都不给＝整屏），这是看见原生应用、游戏、视频、PDF 的唯一办法；同名单里的 browser.screenshot 拍的是 CDP 浏览器里那个页面，两者不能互相替代——要看用户屏幕上有什么就用 screen.capture，别在这份清单里找不到就以为没有。 Before driving another application, find its window with window.list and bring it to the front with window.activate. Read screen.info first and check its input_permission field: when it says denied, macOS silently discards every synthetic mouse and keyboard event — the calls still return ok while nothing happens on screen, so switch to browser automation, shell or file tools and tell the user to grant Accessibility in System Settings. Also note: screen.info, read_screen, window.list and mouse.move all speak the SAME coordinate space — screen points, origin top-left. Pass those numbers straight through; NEVER multiply by scale_factor (it only tells you whether the display is Retina, it is not a conversion factor — scaling a click sends it to twice the intended position, off-screen, and the click silently hits nothing). Paste long text via the clipboard with keyboard.paste rather than typing it key by key. The browser.* methods here are routed to the browser tool — there is one browser and one sign-in state, so call browser directly.",
+      "description": "Desktop automation RPC: real OS mouse and keyboard events, a CDP browser, and record/replay. Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) → the browser tool, which addresses elements by node number and is more reliable and cheaper than pixels. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → this tool. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser — re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. Call system.init before anything else the first time. Use it as a state machine: confirm the precondition first (URL, window, node, sign-in state), then perform the action, then verify the postcondition with browser.content / browser.eval / screen.capture or the recorder result — issuing a click or some typing is not the same as succeeding. When a selector goes stale, re-read the page/nodes; when navigation is slow, wait and then check the URL/DOM; when sign-in, a captcha or a system permission blocks you, state the specific blocker and continue via background monitoring. Read screen.info first: when input_permission says denied, macOS silently discards every synthetic mouse and keyboard event while the calls still return ok — switch to browser, shell or file tools and tell the user to grant Accessibility in System Settings. screen.info, read_screen, window.list and mouse.move share one coordinate space (screen points, origin top-left): pass those numbers straight through and never multiply by scale_factor. Methods: system.init / mouse.move / mouse.click{x,y,button} (moves and clicks in one call and reports the position it acted at) / mouse.double_click / mouse.position / mouse.drag{from_x,from_y,to_x,to_y} / mouse.scroll{delta_y} / sleep{ms} / keyboard.type{text} / keyboard.press{key} / keyboard.combo{keys:[mod,s]} (mod = Cmd on macOS, Ctrl on Windows; write win only for the Windows key) / keyboard.down / keyboard.up / keyboard.paste{text} (use it for long text) / browser.* (browser.start, goto, click, type, wait, eval, screenshot, content, close — routed to the browser tool: there is one browser and one sign-in state, so call browser directly) / recorder.save / recorder.replay / recorder.list / window.list / window.activate{title} / window.minimize{title} / window.restore{title} (both confirmed by read-back) / screen.info / screen.capture{x,y,width,height} (real screen pixels, the whole screen when all four are omitted — the only way to see native apps, games, video or PDFs; browser.screenshot captures only the CDP page) / clipboard.get / clipboard.set{text}. browser.start profile: isolated (default, a clean throwaway instance) for public pages and your own dev server; session (persistent, keeps its sign-ins) when the task needs the user signed in — if it still hits a login wall, start again with headless=false so the user signs in once. The account in the user's own everyday browser is unreachable from any CDP instance: go through system open → read_screen → ui_click. Before driving another application, find its window with window.list and bring it to the front with window.activate. The browser.* methods here are routed to the browser tool — there is one browser and one sign-in state, so call browser directly.",
       "parameters": {
         "type": "object",
         "properties": {
           "method": {
             "type": "string",
-            "description": "The name of the real RPC method to call, e.g. browser.goto / mouse.move / recorder.replay"
+            "description": "The RPC method to call, e.g. browser.goto / mouse.move / recorder.replay."
           },
           "params": {
             "type": "object",
-            "description": "The parameter object for that method; follow the method's own description"
+            "description": "The method's parameter object, as described for that method."
           }
         },
         "required": [
@@ -4000,13 +4026,13 @@
     "type": "function",
     "function": {
       "name": "background_monitor",
-      "description": "**Whenever a step needs the user to do something by hand or depends on an external condition, you must call this tool: first tell the user what to do (paste the link, give the command, list the steps), then immediately park in the background and wait automatically, so that when the condition is met you resume and carry on without the user having to come back and say \"done\".** Typical cases: a verification code is needed → tell the user to enter it and monitor the result; something must be installed → give the install command and monitor `which xxx` returning 0; a service must be started → give the start command and monitor the port; the user must act in a browser → give the link and monitor the outcome with capture/url/file. **Prefer the check types that detect automatically (port/file/command/url/capture/screen) — manual is the last resort, because it makes the user come back and tell you they are done.** When what you asked for leaves no file, port or request behind — dismiss this dialog, finish this login, flip that switch — use `screen`: it watches the app's on-screen text and resumes the moment your pattern appears.",
+      "description": "Park in the background until a condition is met, then resume automatically — for any step that waits on the user or an external event: tell the user what to do (the link, the command, the steps), then monitor. Prefer checks that detect on their own (port / file / command / url / capture / screen); manual makes the user come back and say done. When the awaited action leaves no file, port or request behind (dismiss a dialog, finish a login, flip a switch), use screen: it watches an app's on-screen text for pattern.",
       "parameters": {
         "type": "object",
         "properties": {
           "message": {
             "type": "string",
-            "description": "Tell the user what is being waited on (shown in the chat)"
+            "description": "What is being waited on, shown in the chat."
           },
           "check_type": {
             "type": "string",
@@ -4019,23 +4045,23 @@
               "port",
               "screen"
             ],
-            "description": "manual = wait for the user to click continue; file = wait for a file to appear (with file_pattern, wait for its contents to match); capture = watch captured traffic for pattern; command = re-run a command until it exits 0; url = re-request a URL until it answers 2xx or 3xx (a redirect counts as reachable); port = wait for a port to be listening; screen = watch an application's on-screen UI text until `pattern` shows up (macOS accessibility tree). **screen is what you use when the thing you asked the user to do has no file, port or request behind it** — a dialog they must dismiss, a login they must finish, a switch they must flip, a progress bar reaching Done. Set `app` to the application to watch. It reads without stealing focus and WITHOUT invalidating any ref you got from read_screen."
+            "description": "manual = wait for the user to click continue; file = a file appears (with file_pattern, its contents match); capture = captured traffic matches pattern; command = re-run a command until it exits 0; url = re-request a URL until it answers 2xx or 3xx (a redirect counts as reachable); port = a port is listening; screen = an app's on-screen UI text (macOS accessibility tree) contains pattern — set app; it reads without stealing focus and keeps read_screen refs valid."
           },
           "pattern": {
             "type": "string",
-            "description": "capture: keyword/regex to match; file: file path; command: shell command; url: full URL; port: port number such as 3000"
+            "description": "capture: keyword/regex; file: file path; command: shell command; url: full URL; port: port number such as 3000; screen: text or regex to wait for."
           },
           "file_pattern": {
             "type": "string",
-            "description": "file type only: match on file content (keyword or regex); once set, it checks not just that the file exists but that its contents contain this pattern"
+            "description": "file type only: match on file content (keyword or regex) rather than mere existence."
           },
           "app": {
             "type": "string",
-            "description": "screen type only: which application's UI to watch (name match, e.g. \"Safari\"). Omit to watch whichever app is in front, which is rarely what you want — while you wait, the front app is often Mr. Day One itself."
+            "description": "screen type only: which application's UI to watch (name match, e.g. \"Safari\"). Omit to watch the front app — usually Mr. Day One itself while you wait, so set it."
           },
           "timeout": {
             "type": "integer",
-            "description": "Timeout in seconds, default 300"
+            "description": "Timeout in seconds, default 300."
           }
         },
         "required": [
@@ -4078,13 +4104,13 @@
     "type": "function",
     "function": {
       "name": "spawn_multiple_agents",
-      "description": "**Dispatch several role-based subagents concurrently in one call** (asynchronous and in the background, while the main flow continues). Suited to a large task needing several perspectives at once: research-type roles (research/security/architect and so on) gather evidence independently and their results are delivered when ready, or you can join them with await_subagent. With shared_store collaboration enabled, each subagent's findings are broadcast to the others automatically, avoiding duplicated research. ⚠️ Do not use it for a single focused investigation — the main agent reading directly is faster; for parallel implementation that writes files use run_worker.",
+      "description": "Dispatch 2–5 role-based read-only subagents concurrently in the background while you continue; results arrive when ready or via await_subagent. With shared_store collaboration each agent's findings are broadcast to the others, avoiding duplicated research. Not for a single focused investigation — reading directly is faster; for parallel implementation that writes files use run_worker.",
       "parameters": {
         "type": "object",
         "properties": {
           "task": {
             "type": "string",
-            "description": "The overall task description (shared background for every agent)"
+            "description": "The overall task description, shared background for every agent."
           },
           "agents": {
             "type": "array",
@@ -4120,7 +4146,7 @@
                 "focus"
               ]
             },
-            "description": "2-5 parallel subagent definitions"
+            "description": "2–5 parallel subagent definitions, each {role, focus}."
           },
           "collaboration": {
             "type": "string",
@@ -4128,7 +4154,7 @@
               "shared_store",
               "independent"
             ],
-            "description": "Default shared_store = findings are broadcast between agents; independent = fully isolated"
+            "description": "shared_store (default) = findings are broadcast between agents; independent = fully isolated."
           }
         },
         "required": [
@@ -4142,7 +4168,7 @@
     "type": "function",
     "function": {
       "name": "computer",
-      "description": "Desktop mouse, keyboard, window, screen-information and clipboard operations. It is the stable compatibility entry point onto automation, suited to driving non-browser native applications; for browser pages prefer browser — **except when the target is the user's own already-running browser**, which CDP cannot attach to (the debugging port is a launch-time argument and cannot be added to a live process). There the path is: bring it to the front with system open, read its accessibility tree with read_screen (a browser exposes its page content — links, buttons, fields, text — as real AX nodes), then act on those nodes by ref with ui_click, which presses the actual element rather than a screen position. Use this tool's mouse and keyboard for what has no AX action of its own: native dialogs, drag-and-drop, and key combinations. Get the real state first with window.list / screen.info, then perform the action, then verify it with read_screen (nodes) or screen.capture (real pixels). The separate `screenshot` tool only renders an http/https URL in a headless browser and can never see a native app.",
+      "description": "Desktop mouse, keyboard, window, screen and clipboard operations for native (non-browser) applications. Get the real state first with window.list / screen.info, act, then verify with read_screen (nodes) or screen.capture (real pixels). Elements that expose an accessibility action are better driven by read_screen + ui_click; use these for what has none — native dialogs, drag-and-drop, key combinations. For web pages use browser, except the user's own already-running browser, which is reached via system open → read_screen → ui_click. The separate screenshot tool only renders an http/https URL and never sees a native app.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -4175,11 +4201,11 @@
               "window.minimize",
               "window.restore"
             ],
-            "description": "The real desktop action name screen.capture 拍下**真实屏幕像素**并把图回传给你看（不给 x/y/width/height 就是整屏；四个要么都给要么都不给）——这是唯一能看到原生应用/游戏/视频/PDF 的方式，浏览器截图看不到它们。"
+            "description": "The desktop action. screen.capture returns real screen pixels as an image (the whole screen when x/y/width/height are all omitted; give all four or none) — the only way to see native apps, games, video or PDFs."
           },
           "params": {
             "type": "object",
-            "description": "Action parameters. Clicks take {x,y} (omit to click where the pointer already is), {button:\"left|right|middle\"} and {keys:[\"cmd\",\"shift\"]} to hold modifiers for the duration of the click — that is how you do shift-click to range-select, cmd-click to multi-select or open in a new tab, and alt-drag to copy. mouse.triple_click selects a whole line/paragraph. mouse.down/up are a held press you release yourself: use them for sliders, rubber-band selection and dragging between applications. mouse.scroll takes {delta_y} (positive scrolls down) plus optional {delta_x}, and optional {x,y} — scrolling applies to whatever is under the pointer, so pass the coordinates of the pane you mean. keyboard.hold takes {key, ms} (default 500, capped at 10000) for a real long-press. keyboard.combo takes {keys:[...]}. screen.displays lists every monitor with its rectangle in the same global coordinate space, which is how you reach a second screen — screen.info only ever describes the main one. Others: {title}, {text}."
+            "description": "Action parameters. Clicks: {x,y} (omit to click where the pointer is), {button:\"left|right|middle\"}, {keys:[\"cmd\",\"shift\"]} to hold modifiers for the click (shift-click range select, cmd-click multi-select or open in a new tab, alt-drag copy). mouse.triple_click selects a line/paragraph. mouse.down/up hold a press you release yourself (sliders, rubber-band selection, dragging between applications). mouse.scroll: {delta_y} (positive = down), optional {delta_x} and {x,y} for the pane under the pointer. keyboard.hold: {key, ms} (default 500, max 10000). keyboard.combo: {keys:[...]}. screen.displays lists every monitor in the same global coordinates (screen.info describes only the main one). Others: {title}, {text}."
           }
         },
         "required": [
@@ -4192,14 +4218,14 @@
     "type": "function",
     "function": {
       "name": "think",
-      "description": "Record a short internal reasoning conclusion within this round, to clarify the goal, the assumptions and the next step before acting. Write only conclusions directly relevant to the current user request, and do not treat it as a reply addressed to the user.",
+      "description": "Record a decision: the conclusion, its evidence and the next concrete action. Skip it when the next step is obvious.",
       "parameters": {
         "type": "object",
         "properties": {
           "thought": {
             "type": "string",
             "minLength": 1,
-            "description": "A short reasoning conclusion for the current decision"
+            "description": "Conclusion → evidence → action, not a monologue."
           }
         },
         "required": [
@@ -4212,21 +4238,21 @@
     "type": "function",
     "function": {
       "name": "package_source",
-      "description": "**Read the REAL API of a dependency as installed on this machine** — resolves the package inside the project's node_modules / site-packages and returns its installed version plus actual source. Two modes: without `symbol` you get `name@installedVersion`, the real on-disk path and the list of exported names; with `symbol` you get the definition body (signature + surrounding doc comment). 【When to use】BEFORE writing any call into a third-party library whose exact API you are not certain about — a signature you remember may belong to a different major version than the one installed here. This is the only tool that reads the version this project actually locked. 【How it differs】`package_search` answers \"does it exist / what versions / deprecated?\" from the registry and returns NO signatures. context7 (if connected) answers \"how do the official docs describe it?\". This one answers \"what is actually on disk\". Typical order: package_search → package_source → context7. 【Not installed? Still answerable】When the package is not on this machine, this tool now falls back to the gateway's OWN code corpus, which holds the real exported declarations (signature + doc comment) extracted from the package's published tarball; if that package is not indexed yet it is fetched and indexed on the spot. So \"not installed\" is no longer a dead end — but the result is the PUBLISHED version's API, not the version this project locks, and the reply says which. 【Note】Ordinary search / find_files / semantic_search deliberately skip node_modules, so they can never answer this — use this tool instead of trying to grep dependencies.",
+      "description": "Read a dependency's real API as installed in this project (node_modules / site-packages): without symbol you get name@installedVersion, the on-disk path and the exported names; with symbol, the definition with its signature and doc comment. Use it before writing a call into a third-party library whose exact API you are not certain of — a remembered signature may belong to another major version; this is the only tool that reads the version this project locks. When the package is not installed it falls back to the gateway's corpus of published declarations (fetched and indexed on the spot if needed) and says which version it is showing. package_search answers existence/versions from the registry and returns no signatures; search and find_files skip node_modules by design.",
       "parameters": {
         "type": "object",
         "properties": {
           "package": {
             "type": "string",
-            "description": "Package name as imported, e.g. 'zod' / '@tanstack/react-query' / 'pydantic'"
+            "description": "Package name as imported, e.g. 'zod' / '@tanstack/react-query' / 'pydantic'."
           },
           "symbol": {
             "type": "string",
-            "description": "Optional. Exported function / class / type to look up; omit for an overview of what the package exports"
+            "description": "Optional exported function / class / type to look up; omit for an overview of what the package exports."
           },
           "root": {
             "type": "string",
-            "description": "Optional workspace root when several are open"
+            "description": "Optional workspace root when several are open."
           }
         },
         "required": [
@@ -4268,28 +4294,28 @@
     "type": "function",
     "function": {
       "name": "save_skill",
-      "description": "Save a procedure you just worked out as a SKILL, so it survives past this run. Writes `~/.mrdayone/skills/<name>/SKILL.md` — the user's own skill library, which is exactly what this IDE scans, so read_skill can fetch its full text immediately and it appears in your available-skills catalogue from the next turn on. Skills are GLOBAL: they are available in every project, and no workspace needs to be open. Reach for it when you had to figure something out that will be needed again: a build/deploy sequence, an API you reverse-engineered from docs, a file format you wrote a parser for, a workaround with a non-obvious gotcha. Write the steps, the real commands and the traps — not a summary of what you did. Do NOT use it to store findings about this one task, to leave notes for the user, or in place of your reply. 【vs alternatives】read_skill reads an existing skill; something true only of THIS project (its stack, its conventions, a trap you hit here) belongs in remember, not in a skill; a one-off script belongs in the repo via write_file.",
+      "description": "Save a procedure as a reusable skill at ~/.mrdayone/skills/<name>/SKILL.md — the library this IDE scans; read_skill can fetch it immediately and it appears in your skills catalogue from the next turn. Skills are GLOBAL: available in every project, and no workspace needs to be open. For something you had to figure out and will need again — a build/deploy sequence, an API reverse-engineered from docs, a file format you wrote a parser for, a workaround with a non-obvious gotcha: write the ordered steps, the real commands and the traps, for a future run with none of your current context. Findings about only this task, notes for the user, or your reply do not belong here; something true only of THIS project (its stack, its conventions, a trap you hit here) belongs in remember; a one-off script goes into the repo with write_file.",
       "parameters": {
         "type": "object",
         "properties": {
           "name": {
             "type": "string",
-            "description": "Skill name, short and task-shaped (e.g. \"deploy-gateway\"). Becomes the directory name; it is how you and the user refer to it later."
+            "description": "Skill name, short and task-shaped (e.g. \"deploy-gateway\"); becomes the directory name and how you and the user refer to it later."
           },
           "description": {
             "type": "string",
-            "description": "One line, in the user's language. This is the ONLY thing you see in the catalogue later, so it must say when to reach for this skill — the trigger, not the topic."
+            "description": "One line, in the user's language, saying when to reach for this skill — the trigger, not the topic. It is the only thing visible in the catalogue."
           },
           "body": {
             "type": "string",
-            "description": "The skill's full instructions in Markdown: the ordered steps, the exact commands, the paths, what to verify, and the gotchas you hit. Written for a future run that has none of your current context."
+            "description": "The full instructions in Markdown: ordered steps, exact commands, paths, what to verify, and the gotchas you hit."
           },
           "allowed_tools": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Optional. Tool names this skill needs (e.g. [\"run_cmd\",\"read_file\"]). Leave it out unless you mean to NARROW capability: while a skill declaring this is resident, tools outside the list are refused."
+            "description": "Optional tool names this skill needs (e.g. [\"run_cmd\",\"read_file\"]). Only to NARROW capability: while a skill declaring this is resident, tools outside the list are refused."
           },
           "why": {
             "type": "string",

@@ -1,0 +1,4 @@
+# Loaded per task: multi-role collaboration
+
+- **Parallelizing is your decision, not something the system does for you**: when the plan contains two or more genuinely independent domain blocks (different domains, non-overlapping file ownership, no ordering dependency), dispatch them in parallel yourself with `run_subagent` (multi-task) or `run_worker` instead of waiting through them one at a time. Conversely, when it is a single domain or the contracts are not settled, just do it yourself, or dispatch a read-only role first to converge the evidence — do not parallelize for its own sake. Both the judgement and the timing are yours.
+- Follow `orchestrationMode`, `roleNeeds` and `coordinationRisks` from this round's intent contract, and use only the minimum sufficient set of roles; do not grow the team on your own from the user's phrasing. The dispatch rules arrive with your first `run_subagent` / `run_worker` call.

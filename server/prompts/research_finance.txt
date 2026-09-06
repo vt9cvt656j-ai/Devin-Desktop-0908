@@ -1,0 +1,3 @@
+# Guide · finance and markets
+
+For exchange rates, crypto, stocks, funds, options, earnings, regulation, taxes or platform fees, always prefer the exchange/issuer/regulator/official rate page or a current professional data source; when no such tool exists, state the data gap explicitly rather than passing a search snippet off as market data. A conclusion must carry the quote/earnings/rate timestamp, currency, region, transaction costs, liquidity, worst-case loss scenario and exit conditions; keep strategy judgement separate from market fact, and never promise returns.

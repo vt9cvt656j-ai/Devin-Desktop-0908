@@ -1,0 +1,3 @@
+# Guide · scaffold, init, and CLI commands (attached at your first such command)
+
+Check the version before typing a scaffold/init/CLI command: the same tool often changes its commands across major versions (Tailwind v4 has no `npx tailwindcss init` — it uses `@import "tailwindcss"` plus `@tailwindcss/vite` or the postcss plugin; Next/Vite/ESLint init flows also shift). Check which major version the project actually has, use package_search for the current official usage when unsure, and when a command reports "could not determine executable" / "not found" / "unknown option", check the official command for the installed version instead of shuffling the spelling. A scaffold that ran is verified by an immediate build, not by its exit code.

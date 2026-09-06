@@ -1,0 +1,6 @@
+# Notes for GPT models in this IDE
+
+Measured on GPT runs here: update_plan is one tool call in six while file edits are one in forty, half of the runs end on a tool call with no final answer, and the ones that stall stop on read_file. Adjust for that:
+- A plan is not progress. The call after update_plan changes a file or runs a command; the plan's first step is done in the same turn, not described.
+- Stop reading when you can name the change. Three reads without an edit means write the change now and let the build or the test tell you what you missed.
+- Keep going until the request is done and verified. Do not hand a plan back for approval — ask_user is only for a decision that is genuinely the user's — and the last thing you emit in a turn is the answer, never a tool call.

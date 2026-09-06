@@ -1,81 +1,207 @@
 {
-  "version": 2,
+  "version": 3,
+  "core": ["system_invariants", "agent_core", "truth_core", "answer_core"],
   "modes": {
-    "chat": [
-      "chat",
-      "truthfulness",
-      "answer_quality"
-    ],
-    "plan": [
-      "plan",
-      "truthfulness",
-      "answer_quality"
-    ],
-    "explorer": [
-      "explorer",
-      "truthfulness",
-      "answer_quality"
-    ],
-    "reviewer": [
-      "reviewer",
-      "defect_hunting",
-      "truthfulness",
-      "answer_quality"
-    ]
+    "chat": ["system_invariants", "chat", "truth_core", "truth_sources", "no_flattery", "answer_core", "voice"],
+    "plan": ["system_invariants", "plan", "tool_batching", "truth_core", "truth_sources", "no_flattery", "answer_core", "answer_professional"],
+    "explorer": ["system_invariants", "explorer", "tool_batching", "truth_core", "no_flattery", "answer_core", "answer_professional"],
+    "reviewer": ["system_invariants", "reviewer", "defect_hunting", "tool_batching", "truth_core", "no_flattery", "answer_core"]
   },
-  "agent": {
-    "base": [
-      "agent_core",
-      "reasoning",
-      "truthfulness",
-      "answer_quality"
-    ],
-    "engineering": [
-      "agent_engineering"
-    ],
-    "defects": [
-      "defect_hunting"
-    ],
-    "collaboration": [
-      "agent_collaboration"
-    ],
-    "research": [
-      "agent_research"
-    ],
-    "automation": [
-      "agent_automation"
-    ],
-    "git": [
-      "git_guide"
-    ]
-  },
-  "design": {
-    "base": [
-      "design_core",
-      "design_tokens"
-    ],
-    "implementation": [
-      "design_implementation",
-      "design_components",
-      "design_engineering"
-    ],
-    "scaffold": [
-      "design_scaffold"
-    ],
-    "content": [
-      "design_content"
-    ],
-    "data": [
-      "design_data"
-    ],
-    "review": [
-      "design_verification"
-    ],
-    "verification": [
-      "design_verification"
-    ],
-    "motion": [
-      "design_motion"
-    ]
-  }
+  "modules": [
+    {
+      "id": "engineering",
+      "title": "工程实现与验证",
+      "files": ["engineering_core"],
+      "head": { "flags": ["engineering"], "unjudged_default": true },
+      "pull": "code, config, builds, tests, deployment: how to read, change and verify an engineering task"
+    },
+    {
+      "id": "writing",
+      "title": "写代码",
+      "files": ["writing"],
+      "tail": { "tools": ["write_file", "edit_file", "multi_edit"] },
+      "pull": "maintainability defaults, configuration as a deliverable, contract table before writing, comment the why"
+    },
+    {
+      "id": "debugging",
+      "title": "排错",
+      "files": ["debugging"],
+      "head": { "flags": ["debug"] },
+      "pull": "fixing a bug: reproduce, falsifiable hypothesis, root cause, re-run the failing path"
+    },
+    {
+      "id": "scaffold_commands",
+      "title": "脚手架与 CLI 命令",
+      "files": ["scaffold_commands"],
+      "tail": { "commands": ["npx ", "npm create", "pnpm create", "yarn create", "bun create", "cargo new", "cargo init", "create-next-app", "create-vite", "tailwindcss init", "django-admin startproject", "rails new", "dotnet new", "flutter create", "shadcn"] },
+      "pull": "scaffold / init / CLI commands change across major versions: check the installed version before typing them"
+    },
+    {
+      "id": "capture",
+      "title": "抓真实请求",
+      "files": ["capture"],
+      "head": { "flags": ["network_capture"] },
+      "tail": { "tools": ["capture_start", "capture_flows", "capture_replay"] },
+      "pull": "getting the real request, session or signature with a browser capture instead of guessing"
+    },
+    {
+      "id": "defects",
+      "title": "缺陷分类目录",
+      "files": ["defect_hunting"],
+      "head": { "flags": ["defects"] },
+      "pull": "the full defect and vulnerability class catalogue for a deep audit or project-wide debugging pass"
+    },
+    {
+      "id": "defects_write",
+      "title": "写安全敏感面",
+      "derived": "defect_classes_writing",
+      "head": { "flags": ["defects_write"], "not_flags": ["defects"] }
+    },
+    {
+      "id": "collaboration",
+      "title": "多角色协作",
+      "files": ["collaboration_decide"],
+      "head": { "flags": ["collaboration"] },
+      "pull": "when to parallelize work across sub-roles, and when not to"
+    },
+    {
+      "id": "collaboration_dispatch",
+      "title": "派发子角色",
+      "files": ["collaboration_dispatch"],
+      "tail": { "tools": ["run_subagent", "run_worker"] },
+      "pull": "staged vs parallel roles, self-contained sub-tasks, merging sub-role reports"
+    },
+    {
+      "id": "research",
+      "title": "调研与外部证据",
+      "files": ["research_core", "truth_sources"],
+      "head": { "flags": ["research"] },
+      "tail": { "tools": ["web_search", "web_fetch", "developer_community_search", "github_search", "stackoverflow_search", "hackernews_search", "package_search", "mdn_search", "wiki_search", "cve_search", "arxiv_search", "crossref_search", "openalex_search", "bundlephobia_search", "codrops_search", "smashingmag_search", "awwwards_search"] },
+      "pull": "research depth, source choice, freshness sweep, time fields, and when to stop searching"
+    },
+    {
+      "id": "research_medicine",
+      "title": "医学与药物",
+      "files": ["research_medicine"],
+      "head": { "flags": ["domain_healthcare"] },
+      "tail": { "tools": ["pubmed_search", "clinical_trials_search", "pubchem_search"] },
+      "pull": "medical, health and drug questions: evidence levels and what never to write up as a diagnosis"
+    },
+    {
+      "id": "research_games",
+      "title": "游戏与游戏开发",
+      "files": ["research_games"],
+      "head": { "flags": ["domain_gaming"] },
+      "tail": { "tools": ["steam_search", "search_game_assets"] },
+      "pull": "game prices, patches and game-development sources"
+    },
+    {
+      "id": "research_local",
+      "title": "本地生活与出行",
+      "files": ["research_local"],
+      "tail": { "tools": ["local_discovery"] },
+      "pull": "nearby places and travel: what a POI proves, opening hours, distances, ranking bias"
+    },
+    {
+      "id": "research_realtime",
+      "title": "实时数据",
+      "files": ["research_realtime"],
+      "tail": { "tools": ["live_environment"] },
+      "pull": "weather, air, ocean, earthquakes, quotes, flights and parcels: which are real results and which are lookup entries"
+    },
+    {
+      "id": "research_finance",
+      "title": "金融与市场",
+      "files": ["research_finance"],
+      "head": { "flags": ["domain_finance"] },
+      "pull": "rates, crypto, stocks, fees and regulation: official sources, timestamps, costs and risk boundaries"
+    },
+    {
+      "id": "automation",
+      "title": "浏览器与桌面自动化",
+      "files": ["agent_automation"],
+      "head": { "flags": ["automation"] },
+      "tail": { "tools": ["browser", "automation", "system", "ui_click", "read_screen", "background_monitor"] },
+      "pull": "driving web pages and desktop apps as a small state machine, recovering by changing strategy"
+    },
+    {
+      "id": "git",
+      "title": "Git 工作流",
+      "files": ["git_guide"],
+      "head": { "flags": ["git"] },
+      "tail": { "tools": ["git_commit", "git_branch", "git_push", "git_pull", "git_stash", "git_stash_pop", "git_clone", "gh_pr_create", "gh_pr_reply"], "commands": ["git commit", "git push", "git pull", "git checkout", "git switch", "git branch", "git merge", "git rebase", "git stash", "git add", "git reset", "git cherry-pick", "git tag", "gh pr"] },
+      "pull": "branches, verified commits, conventional messages, precise staging, PRs, conflicts, cleanup"
+    },
+    {
+      "id": "design",
+      "title": "界面设计核心",
+      "files": ["design_core", "design_tokens"],
+      "head": { "modes": ["agent", "plan"], "flags": ["design"] },
+      "tail": { "tools": ["write_file", "edit_file", "multi_edit"], "files": ["*.tsx", "*.jsx", "*.vue", "*.svelte", "*.astro", "*.html", "*.css", "*.scss", "*.less"] },
+      "pull": "michael-design category, colour decision chain, layout and the numeric token layer for any visible UI"
+    },
+    {
+      "id": "design_implementation",
+      "title": "界面实现",
+      "files": ["design_implementation", "design_components", "design_engineering"],
+      "head": { "modes": ["agent", "plan"], "flags": ["design_implementation"], "requires": ["design"] },
+      "tail": { "tools": ["write_file", "edit_file", "multi_edit"], "files": ["*.tsx", "*.jsx", "*.vue", "*.svelte", "*.astro", "*.html", "*.css", "*.scss", "*.less"], "requires": ["design"] },
+      "pull": "implementing real UI: components, tokens, icons, typography, states, accessibility, performance"
+    },
+    {
+      "id": "design_scaffold",
+      "title": "前端脚手架",
+      "files": ["design_scaffold"],
+      "head": { "modes": ["agent", "plan"], "flags": ["design_scaffold"], "requires": ["design"] },
+      "tail": { "commands": ["create-vite", "npm create vite", "pnpm create vite", "create-next-app", "shadcn"], "requires": ["design"] },
+      "pull": "starting a UI project from zero: the default stack and the five wiring steps"
+    },
+    {
+      "id": "design_content",
+      "title": "内容与真实媒体",
+      "files": ["design_content"],
+      "head": { "modes": ["agent", "plan"], "flags": ["design_content"], "requires": ["design"] },
+      "pull": "real content and media for a full site: assets, avatars, placeholders, mockups"
+    },
+    {
+      "id": "design_data",
+      "title": "数据与业务状态",
+      "files": ["design_data"],
+      "head": { "modes": ["agent", "plan"], "flags": ["design_data"], "requires": ["design"] },
+      "pull": "deciding the data strategy of a UI product before coding"
+    },
+    {
+      "id": "design_review",
+      "title": "界面验收",
+      "files": ["design_verification"],
+      "head": { "modes": ["agent", "plan"], "flags": ["design_review", "design_verification"], "requires": ["design"] },
+      "tail": { "tools": ["browser"], "requires": ["design"] },
+      "pull": "the real-browser verification matrix and stop conditions for UI work"
+    },
+    {
+      "id": "design_motion",
+      "title": "动效",
+      "files": ["design_motion"],
+      "head": { "modes": ["agent", "plan"], "flags": ["design_motion"], "requires": ["design"] },
+      "pull": "scroll storytelling, section entrances, micro-interactions, reduced-motion fallbacks"
+    },
+    {
+      "id": "reasoning",
+      "title": "推理纪律（完整版）",
+      "files": ["reasoning"],
+      "pull": "the full reasoning discipline: task contract, evidence branches, build-me-an-X, taste decisions"
+    },
+    {
+      "id": "reply_style",
+      "title": "回答风格",
+      "files": ["no_flattery", "voice"],
+      "pull": "no flattery or softening, and how to sound like a person rather than a chatbot"
+    },
+    {
+      "id": "answer_professional",
+      "title": "专业回答",
+      "files": ["answer_professional"],
+      "pull": "reply strategy, evidence weighting, high-risk advice boundaries, formatting"
+    }
+  ]
 }

@@ -1,0 +1,7 @@
+# Notes for DeepSeek models in this IDE
+
+Measured on DeepSeek runs here: over half of all tool calls are run_cmd, one run in four repeats the same tool four or more times in a row (nearly always run_cmd), and visible output per step is the longest of any model. Adjust for that:
+- Read with the structural tools, not the shell: read_file, list_dir, find_files, search and find_symbol return exact text in one call; a chain of cat / grep / ls through run_cmd costs a model turn per command and gets truncated. run_cmd is for building, testing, running and installing — and independent commands go in one call chain.
+- A failed command is evidence, not a retry cue: read its output, change the command or the code, then run again. An identical call with identical arguments is stopped by the IDE after five rounds.
+- Between tool calls, write nothing the user needs to read: no announcing the next step, no restating what a tool returned. Reasoning stays in the thinking channel.
+- The turn ends with the answer: after the last tool result, say what changed, what was verified and what is open. A turn that ends on a tool call is a failed turn.

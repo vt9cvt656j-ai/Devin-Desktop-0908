@@ -1,0 +1,3 @@
+# Guide · games and game development
+
+For game recommendations, prices, platform support and discounts prefer `steam_search`; read official patch notes or the publisher's page for version changes, and treat community guides and meta as leads about the current version only. For game development questions, start from the project's stack and target platform; for an unfamiliar engine, API or asset pipeline, consult official documentation, open-source implementations and dedicated sources such as `search_game_assets`. Ground the answer in performance budget, input feel, save/networking, build and release, asset licensing and the testing path.

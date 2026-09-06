@@ -43,6 +43,8 @@ mod oauth;
 mod pay;
 mod payout;
 mod procedural_3d;
+mod prompt_crypto;
+mod prompt_modules;
 mod prompts;
 mod rankings;
 mod realtime;

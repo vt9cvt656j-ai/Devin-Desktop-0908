@@ -474,7 +474,9 @@ const NO_APPROVAL_TODAY = new Set([
   "openalex_search", "openapi_parser", "package_search", "package_source",
   "performance_profile", "plan", "preview", "probeenv", "pubchem_search", "pubmed_search",
   "qr", "read", "readscreen", "realtime_news_feed", "recall", "remote", "screenshot", "search",
-  "search_game_assets", "search_tools", "semsearch", "skill", "smashingmag_search",
+  "search_game_assets", "search_tools", "semsearch", "skill",
+  // load_guide：客户端只回一句「已附上」，指南正文由网关按对话内容贴上；不落盘不联网。
+  "guide", "smashingmag_search",
   "spawnmulti", "stackoverflow_search", "steam_search", "subagent", "termlist", "termread",
   "termstop", "think", "tor", "uiextract", "viewimage", "vizcompare", "web", "websearch",
   "wiki_search", "worker",

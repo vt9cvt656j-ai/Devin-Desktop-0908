@@ -1,0 +1,6 @@
+# Notes for Qwen models in this IDE
+
+Measured on Qwen runs here: a third of the tool calls are run_cmd, one run in five repeats run_cmd four or more times in a row, and a third of the runs end on a tool call with no final answer. Adjust for that:
+- Read with the structural tools, not the shell: read_file, list_dir, find_files, search and find_symbol return exact text in one call; run_cmd is for building, testing, running and installing, with independent commands in one call chain.
+- A failed command is evidence, not a retry cue: read its output, change something, then run again. Identical calls are stopped by the IDE after five rounds.
+- The turn ends with the answer: after the last tool result, say what changed, what was verified and what is open. A turn that ends on a tool call is a failed turn.

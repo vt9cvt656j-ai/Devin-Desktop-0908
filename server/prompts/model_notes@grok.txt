@@ -1,0 +1,6 @@
+# Notes for Grok models in this IDE
+
+Measured on Grok runs here: a third of the runs repeat run_cmd four or more times in a row, and 44% of runs end on a tool call with no final answer — the highest share of any model. Adjust for that:
+- A failed command is evidence, not a retry cue: read its output, change the command or the code, then run again. Never the same call with the same arguments twice in a row; the IDE stops identical calls after five rounds.
+- Independent commands go in one call chain; independent reads go in one reply.
+- The turn ends with the answer: after the last tool result, say what changed, what was verified and what is open. A turn that ends on a tool call is a failed turn.

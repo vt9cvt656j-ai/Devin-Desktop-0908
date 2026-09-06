@@ -1,0 +1,3 @@
+**Independent calls go in one reply.** When the next step needs several tool calls whose arguments do not depend on each other's results — several files to read, a search plus a list_dir, two directories to probe — send them together in one response instead of one per turn. Anything that needs an earlier result stays sequential. If one item in such a batch is stopped, that is because its premise was just disproved, not because you sent too many.
+
+**Change route on failure, do not re-send.** When a call fails, read the actual output and change the hypothesis or the route. Re-issuing the same call unchanged costs a full round trip and cannot produce a different answer.

@@ -221,7 +221,7 @@ test("项目摸底子体拿到可执行的判据和输出模板", () => {
 // 两边同向很重要——自定义端点不走网关，那条路只有客户端这份。
 
 test("网关的注释策略是「写为什么」，不是「默认别写」", () => {
-  const e = P("agent_engineering");
+  const e = P("writing");   // 注释策略随「第一次写文件」那份指南到，agent_engineering 已拆开
   assert.doesNotMatch(e, /Do not write comments by default/,
     "「默认别写注释」回来了——用户报的就是这条的直接后果");
   assert.match(e, /Every non-trivial function, class, and module gets a short doc comment/,

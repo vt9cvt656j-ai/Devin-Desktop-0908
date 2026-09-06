@@ -19,7 +19,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
 import { CODE as SRC, SRC as RAW_SRC, fnSource } from "./helpers/source.mjs";
-const TRUTH = readFileSync(join(HERE, "..", "..", "server", "prompts", "truthfulness.txt"), "utf8");
+// truthfulness.txt 拆成了 truth_core（每轮必带的证据纪律）+ no_flattery（反谄媚；chat/plan/explorer/reviewer 常驻，agent 用 load_guide 自取）。
+const TRUTH = readFileSync(join(HERE, "..", "..", "server", "prompts", "no_flattery.txt"), "utf8");
+const TRUTH_CORE = readFileSync(join(HERE, "..", "..", "server", "prompts", "truth_core.txt"), "utf8");
 const PLAN = readFileSync(join(HERE, "..", "..", "server", "prompts", "plan.txt"), "utf8");
 
 /** 取一个具名函数的开头一段源码，用来对结构下断言。 */
@@ -60,7 +62,7 @@ test("原有的证据纪律不能因为加了新一节就被顶掉", () => {
     "claim only work you actually completed and verified",
     "UNTRUSTED DATA",
   ]) {
-    assert.ok(TRUTH.includes(clause), `原有的证据纪律被削掉了：${clause}`);
+    assert.ok(TRUTH_CORE.includes(clause), `原有的证据纪律被削掉了：${clause}`);
   }
 });
 

@@ -44,39 +44,12 @@ const MAX_FINAL_TOOLS_PER_REQUEST: usize = 220;
 // bytes. The bundled 138-tool catalog serializes to ~147 KiB, so this still binds.
 const MAX_FINAL_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
 
-#[derive(Clone, Debug, Deserialize)]
-struct PromptGraph {
-    version: u32,
-    modes: HashMap<String, Vec<String>>,
-    agent: AgentPromptGraph,
-    design: DesignPromptGraph,
-}
+// 图的形状（core / modes / modules 及每个模块的 head / tail / pull 条件）在 prompt_modules.rs。
+use crate::prompt_modules::{ModuleSpec, PromptGraph};
 
-#[derive(Clone, Debug, Deserialize)]
-struct AgentPromptGraph {
-    base: Vec<String>,
-    engineering: Vec<String>,
-    /// Defaulted so a graph file written before the defect block still parses; an empty
-    /// list simply routes no defect module rather than failing the whole request.
-    #[serde(default)]
-    defects: Vec<String>,
-    collaboration: Vec<String>,
-    research: Vec<String>,
-    automation: Vec<String>,
-    git: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DesignPromptGraph {
-    base: Vec<String>,
-    implementation: Vec<String>,
-    scaffold: Vec<String>,
-    content: Vec<String>,
-    data: Vec<String>,
-    review: Vec<String>,
-    verification: Vec<String>,
-    motion: Vec<String>,
-}
+/// 尾部按需指南那条 harness 消息的信封——必须与客户端 `_ORCH_NOTE` 逐字一致，
+/// 这样 is_harness_orchestration_note / session_anchor_request / 客户端的 orch 统计都把它当 harness 话。
+const TAIL_GUIDE_PREFIX: &str = "〔系统编排提示——这不是用户发言，用户看不到；照做即可，不复述、不提及〕\n";
 
 fn prompt_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -98,10 +71,11 @@ fn prompt_graph_path() -> PathBuf {
 
 fn read_prompt_graph_file() -> Result<String, String> {
     let path = prompt_graph_path();
-    std::fs::read_to_string(&path).map_err(|err| {
+    let raw = std::fs::read_to_string(&path).map_err(|err| {
         tracing::warn!(path = %path.display(), %err, "failed to load prompts/prompt_graph.json");
         format!("prompt_graph.json load failed: {err}")
-    })
+    })?;
+    crate::prompt_crypto::decrypt(&raw, "prompt_graph.json")
 }
 
 fn read_prompt_graph() -> Result<PromptGraph, String> {
@@ -110,28 +84,19 @@ fn read_prompt_graph() -> Result<PromptGraph, String> {
         tracing::warn!(%err, "failed to parse prompts/prompt_graph.json");
         format!("prompt_graph.json parse failed: {err}")
     })?;
-    let required_modes = ["chat", "plan", "explorer", "reviewer"];
-    if graph.version != 2
-        || graph.agent.base.is_empty()
-        || graph.design.base.is_empty()
-        || required_modes.iter().any(|mode| {
-            graph
-                .modes
-                .get(*mode)
-                .is_none_or(|modules| modules.is_empty())
-        })
-    {
-        return Err("unsupported or incomplete prompt graph".to_string());
-    }
+    graph
+        .validate()
+        .map_err(|err| format!("unsupported or incomplete prompt graph: {err}"))?;
     Ok(graph)
 }
 
 fn read_tools_file() -> Result<String, String> {
     let path = tools_path();
-    std::fs::read_to_string(&path).map_err(|err| {
+    let raw = std::fs::read_to_string(&path).map_err(|err| {
         tracing::warn!(path = %path.display(), %err, "failed to load prompts/tools.json");
         format!("tools.json load failed: {err}")
-    })
+    })?;
+    crate::prompt_crypto::decrypt(&raw, "tools.json")
 }
 
 /// 解析一次、常驻的工具目录。`inject_static_tools` 走的是**每请求热路径**：以前它每来一个
@@ -180,16 +145,111 @@ fn tool_catalog() -> &'static ToolCatalog {
 }
 
 /// Read one prompt file, with path-traversal protection (name must be [A-Za-z0-9_]).
+/// 提示词按模型家族分版本：`prompts/<name>@<family>.txt` 存在就用它，否则用默认那份。
+///
+/// Codex 给每个模型一份提示词（gpt-5.2 那份 3,500 词、gpt-5-codex 那份 1,100 词），Cursor 按每个
+/// 前沿模型分别调提示词和工具——同一份提示词对所有模型一视同仁，是这套 harness 输掉的地方之一。
+/// 家族只从 body.model 猜；猜不出就 None（默认版）。文件不存在也回默认版，所以加一份变体
+/// 是纯增量，删掉它就静默回到默认——不会因为少一个文件让请求失败。
+fn prompt_family(body: &serde_json::Value) -> Option<&'static str> {
+    let model = body.get("model").and_then(|m| m.as_str())?.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| model.contains(n));
+    Some(if has(&["claude", "opus", "sonnet", "haiku", "fable", "mythos"]) {
+        "claude"
+    } else if has(&["deepseek"]) {
+        "deepseek"
+    } else if has(&["glm", "zhipu"]) {
+        "glm"
+    } else if has(&["grok"]) {
+        "grok"
+    } else if has(&["gemini"]) {
+        "gemini"
+    } else if has(&["kimi", "moonshot"]) {
+        "kimi"
+    } else if has(&["qwen"]) {
+        "qwen"
+    } else if has(&["gpt", "codex", "o1-", "o3-", "o4-"]) {
+        "openai"
+    } else {
+        return None;
+    })
+}
+
+fn read_prompt_for(name: &str, family: Option<&str>) -> Result<String, String> {
+    if let Some(family) = family {
+        let name_ok = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let family_ok = !family.is_empty() && family.chars().all(|c| c.is_ascii_lowercase());
+        if name_ok && family_ok {
+            let filename = format!("{name}@{family}.txt");
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts").join(&filename);
+            if path.is_file() {
+                let raw = std::fs::read_to_string(&path).map_err(|err| {
+                    tracing::warn!(prompt = %filename, %err, "failed to load prompt variant");
+                    format!("prompt {filename} load failed: {err}")
+                })?;
+                return crate::prompt_crypto::decrypt(&raw, &filename);
+            }
+        }
+    }
+    read_prompt(name)
+}
+
+/// 按模型家族追加的短备注：`prompts/model_notes@<family>.txt`。
+///
+/// 和 `read_prompt_for` 的整块替换不同，这一块是**纯增量**：没有默认版本，缺文件就什么都不加。
+/// 内容只写「这个家族在这套 harness 里量出来的失败形状 + 对应的做法」（生产 30 天读数，
+/// 2026-09-05：DeepSeek/Qwen/Grok 的 run_cmd 连打、GLM 的假工具名、GPT 的只规划不动手），
+/// 上限 1.5KB——它是脚注，不是第二份提示词；基座五块对所有模型仍然逐字节相同。
+const MODEL_NOTES_MODULE: &str = "model_notes";
+
+fn read_family_notes(family: Option<&str>) -> Option<String> {
+    let family = family?;
+    if family.is_empty() || !family.chars().all(|c| c.is_ascii_lowercase()) {
+        return None;
+    }
+    let filename = format!("{MODEL_NOTES_MODULE}@{family}.txt");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts").join(&filename);
+    if !path.is_file() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let text = crate::prompt_crypto::decrypt(&raw, &filename).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// 家族变体文件（`<模块>@<家族>.txt`）的文件名，排好序。只喂 `ide_prompts` 的版本哈希：
+/// 变体改了而哈希不变，诊断接口就会把两次部署报成同一版。
+fn prompt_variant_files() -> Vec<String> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+    let mut out: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.contains('@') && n.ends_with(".txt"))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
 fn read_prompt(name: &str) -> Result<String, String> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         tracing::warn!(prompt = name, "rejected invalid prompt name");
         return Err("invalid prompt name".to_string());
     }
     let path = prompt_path(name);
-    std::fs::read_to_string(&path).map_err(|err| {
+    let raw = std::fs::read_to_string(&path).map_err(|err| {
         tracing::warn!(prompt = name, path = %path.display(), %err, "failed to load prompt file");
         format!("prompt {name} load failed: {err}")
-    })
+    })?;
+    let filename = format!("{name}.txt");
+    crate::prompt_crypto::decrypt(&raw, &filename)
 }
 
 /// 正在**写**安全敏感面时该给的那几类，不是整张审计表。
@@ -236,16 +296,64 @@ pub(crate) fn defect_classes_for_writing() -> Result<String, String> {
     Ok(out)
 }
 
+/// 一个目录模块的正文：文件按顺序拼接；`derived` 的那一个由代码生成（写码切片）。
+fn module_text(spec: &ModuleSpec, family: Option<&str>) -> Result<String, String> {
+    let mut out = String::new();
+    if let Some(derived) = spec.derived.as_deref() {
+        out.push_str(&derived_prompt_text(&spec.id, derived)?);
+    }
+    for name in &spec.files {
+        let text = read_prompt_for(name, family)?;
+        if text.trim().is_empty() {
+            return Err(format!("prompt graph module {name} is empty"));
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&text);
+    }
+    Ok(out)
+}
+
+fn derived_prompt_text(id: &str, derived: &str) -> Result<String, String> {
+    match derived {
+        "defect_classes_writing" => defect_classes_for_writing(),
+        other => Err(format!("prompt module {id} names an unknown derived source {other}")),
+    }
+}
+
+/// 把一个头模块追加进系统提示；派生正文按派生名去重，文件按文件名去重（两个模块共用一个文件
+/// 只发一次，design_review 的 verification 就是这样）。
+fn append_module_text(
+    spec: &ModuleSpec,
+    sys: &mut String,
+    blocks: &mut Vec<String>,
+    family: Option<&str>,
+) -> Result<(), String> {
+    if let Some(derived) = spec.derived.as_deref() {
+        if !blocks.iter().any(|loaded| loaded == derived) {
+            let text = derived_prompt_text(&spec.id, derived)?;
+            if !sys.is_empty() {
+                sys.push_str("\n\n");
+            }
+            sys.push_str(&text);
+            blocks.push(derived.to_string());
+        }
+    }
+    append_prompt_modules(&spec.files, sys, blocks, family)
+}
+
 fn append_prompt_modules(
     names: &[String],
     sys: &mut String,
     blocks: &mut Vec<String>,
+    family: Option<&str>,
 ) -> Result<(), String> {
     for name in names {
         if blocks.iter().any(|loaded| loaded == name) {
             continue;
         }
-        let text = read_prompt(name)?;
+        let text = read_prompt_for(name, family)?;
         if text.trim().is_empty() {
             return Err(format!("prompt graph module {name} is empty"));
         }
@@ -1310,6 +1418,77 @@ fn extract_real_user_request(text: &str) -> Option<String> {
         return None;
     }
     Some(text.to_string())
+}
+
+/// Strip the dynamic preamble from the **latest** user message and push it as
+/// a trailing system message.
+///
+/// Old clients prepend `_contextPreamble` (time, demand ledger, memory, project
+/// context — typically 3–12 KB) in front of the user's actual text, separated
+/// by a canonical `━━━…📌` boundary.  `sess.memory` on the client stores only
+/// the raw text, so the next request re-sends this message WITHOUT the preamble.
+/// The upstream prefix cache sees a different byte sequence → prefix breaks at
+/// this message every single turn.
+///
+/// Fix: detect the boundary, split preamble from request, keep only the request
+/// in the user message, and push the preamble as a trailing system message.  The
+/// model still receives all the context; and when the message becomes historical,
+/// it matches what `sess.memory` will send.
+///
+/// New clients that already send clean messages (no boundary marker) are
+/// unaffected — the function is a no-op.
+fn strip_user_preamble_to_trailing(body: &mut serde_json::Value) {
+    let msgs = match body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        Some(m) if !m.is_empty() => m,
+        _ => return,
+    };
+
+    let last_user_idx = match msgs.iter().rposition(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("user")
+    }) {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    // Only handle string content.  Multimodal arrays are rare on the
+    // preamble-carrying path; skip for safety.
+    let content = match msgs[last_user_idx].get("content").and_then(|c| c.as_str()) {
+        Some(c) => c.to_string(),
+        None => return,
+    };
+
+    let boundaries: &[&str] = &[
+        USER_REQUEST_BOUNDARY_PREFIX,
+        LEGACY_CN_USER_REQUEST_BOUNDARY_PREFIX,
+        LEGACY_USER_REQUEST_BOUNDARY_PREFIX,
+    ];
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for prefix in boundaries {
+        for (index, _) in content.match_indices(prefix) {
+            found.push((index, prefix.len()));
+        }
+    }
+    if found.len() != 1 {
+        return; // no marker (new client) or ambiguous → leave unchanged
+    }
+
+    let (boundary_index, boundary_len) = found[0];
+    let preamble = content[..boundary_index].trim();
+    if preamble.is_empty() {
+        return;
+    }
+
+    let marked_tail = &content[boundary_index + boundary_len..];
+    let request = match marked_tail.split_once("\n\n") {
+        Some((_, req)) if !req.is_empty() => req,
+        _ => return,
+    };
+
+    msgs[last_user_idx]["content"] = serde_json::Value::String(request.to_string());
+    msgs.push(serde_json::json!({
+        "role": "system",
+        "content": preamble,
+    }));
 }
 
 /// Prefer the most recent explicitly-marked original request or real-time user steering over
@@ -3643,8 +3822,13 @@ fn looks_like_ui_data_task(q: &str) -> bool {
 /// knowledge 语料目录、随运营增删，列在这里只会漂移。
 const IDE_SEMANTIC_PROFILE_FLAGS: &[&str] = &[
     "engineering",
+    // 「还没有任何模型裁决落定」。客户端第一发不再等裁决（2026-09-05），这一位让网关在
+    // 请求原文像工程任务时按原文兜底挂工程块，而不是让第一发裸着出门。裁决一落定它就消失。
+    "unjudged",
     "defects",
     "defects_write",
+    // 这一轮在修一条具体的报错/故障（客户端 p.bug || p.debugProject）：挂排错因果链那一块。
+    "debug",
     "research",
     "official",
     "community",
@@ -3975,120 +4159,71 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         return Ok(());
     }
     let graph = read_prompt_graph()?;
+    let family = prompt_family(body);
     let mut sys = String::new();
     if mode == "agent" {
-        append_prompt_modules(&graph.agent.base, &mut sys, &mut prompt_blocks)?;
+        append_prompt_modules(&graph.core, &mut sys, &mut prompt_blocks, family)?;
     } else {
         let modules = graph
             .modes
             .get(mode)
             .ok_or_else(|| format!("unsupported IDE prompt mode: {mode}"))?;
-        append_prompt_modules(modules, &mut sys, &mut prompt_blocks)?;
+        append_prompt_modules(modules, &mut sys, &mut prompt_blocks, family)?;
     }
-
-    // The IDE has already resolved intent from conversation + workspace evidence. User text below
-    // is reserved for retrieval queries and never reclassified into Prompt Graph modules.
-    let engineering_intent = mode == "agent" && semantic("engineering");
-    let collaboration_intent = mode == "agent" && semantic("collaboration");
-    let research_intent = mode == "agent" && semantic("research");
-    let automation_intent = mode == "agent" && semantic("automation");
-    let git_intent = mode == "agent" && semantic("git");
-    // A deep defect hunt needs the class catalogue the reviewer subagent has always had and the
-    // main agent never did. Routed on its own flag rather than folded into `engineering`, because
-    // it is a heavy block and most engineering turns are building something, not auditing it.
-    let defects_intent = mode == "agent" && semantic("defects");
-    // 正在**写**安全敏感面（登录/支付/上传/权限/租户）时给的是切片，不是整表。
-    // 两条互斥：审计走 defects 拿全表，写码走 defects_write 拿其中那五类。
-    let defects_write_intent = mode == "agent" && !defects_intent && semantic("defects_write");
-
-    if mode == "agent" {
-        if engineering_intent {
-            append_prompt_modules(&graph.agent.engineering, &mut sys, &mut prompt_blocks)?;
-        }
-        if defects_intent {
-            append_prompt_modules(&graph.agent.defects, &mut sys, &mut prompt_blocks)?;
-        }
-        if defects_write_intent {
-            let slice = defect_classes_for_writing()?;
-            if !sys.is_empty() {
-                sys.push_str("\n\n");
-            }
-            sys.push_str(&slice);
-            prompt_blocks.push("defect_classes_writing".to_string());
-        }
-        if collaboration_intent {
-            append_prompt_modules(&graph.agent.collaboration, &mut sys, &mut prompt_blocks)?;
-        }
-        if research_intent {
-            append_prompt_modules(&graph.agent.research, &mut sys, &mut prompt_blocks)?;
-        }
-        if automation_intent {
-            append_prompt_modules(&graph.agent.automation, &mut sys, &mut prompt_blocks)?;
-        }
-        if git_intent {
-            append_prompt_modules(&graph.agent.git, &mut sys, &mut prompt_blocks)?;
+    // 家族备注紧跟基座（只在有工具的模式；chat 没有工具，备注说的全是工具循环）。
+    // 位置在基座之后、专项模块之前：一条会话里模型不变，前缀照样稳定。
+    if mode != "chat" {
+        if let Some(notes) = read_family_notes(family) {
+            sys.push_str("\n\n");
+            sys.push_str(&notes);
+            prompt_blocks.push(MODEL_NOTES_MODULE.to_string());
         }
     }
 
+    // 语义画像 → 模块目录。旗标只是键：挂什么、什么顺序、和谁互斥、要求谁先在，全在
+    // prompt_graph.json 每个模块的 head 条件里（prompt_modules::head_modules），这里不再一条
+    // 旗标一个 if——线上量出来的病都是「某一块挂在不该挂的任务上」，调判据该是改一行 JSON。
+    // 用户文本仍然只留给检索，不做任何词表分类。
+    //
+    // 裁决没落定（unjudged）时的工程兜底也在目录里（engineering.head.unjudged_default）；
+    // 这个变量只为遥测留着——「第一发裸着出门」那次事故要能在日志里认出来。
+    let engineering_fallback = mode == "agent" && semantic("unjudged") && !semantic("engineering");
+    // MICHAEL_UI_GUIDE 仍是运维开关：`0` 关掉整个设计套件，`always` 强制挂上；没有词表路径。
     let ui_env = std::env::var("MICHAEL_UI_GUIDE").ok();
-    // UI 设计体系（shadcn/ui + Tailwind 调色板 + 令牌契约）是重块，只在这轮真的在做界面/
-    // 前端/视觉时注入。此前它对 agent/plan 无条件常驻，导致修 Rust 后端、跑命令、改算法的
-    // 任务也被整套前端设计宪法污染，既跑偏又白烧上下文，还让非 UI 请求的系统前缀不稳定。
-    // The semantic design flag works for greenfield and existing sites. `always`/`0` remain
-    // operational overrides; there is no legacy prose or x-ide-ui classification path.
-    let ui_intent = ui_env.as_deref() != Some("0")
-        && (ui_env.as_deref() == Some("always")
-            || ((mode == "agent" || mode == "plan") && semantic("design")));
-    if ui_intent {
-        let design_review_intent = semantic("design_review");
-        let design_implementation_intent = semantic("design_implementation");
-        let design_scaffold_intent = semantic("design_scaffold");
-        let design_content_intent = semantic("design_content");
-        let design_data_intent = semantic("design_data");
-        let design_motion_intent = semantic("design_motion");
-
-        append_prompt_modules(&graph.design.base, &mut sys, &mut prompt_blocks)?;
-        if design_implementation_intent {
-            append_prompt_modules(&graph.design.implementation, &mut sys, &mut prompt_blocks)?;
+    let mut routing_flags: HashSet<String> = semantic_profile.iter().cloned().collect();
+    match ui_env.as_deref() {
+        Some("0") => routing_flags.retain(|flag| !flag.starts_with("design")),
+        Some("always") => {
+            routing_flags.insert("design".to_string());
         }
-        if design_scaffold_intent {
-            append_prompt_modules(&graph.design.scaffold, &mut sys, &mut prompt_blocks)?;
-        }
-        if design_content_intent {
-            append_prompt_modules(&graph.design.content, &mut sys, &mut prompt_blocks)?;
-        }
-        if design_data_intent {
-            append_prompt_modules(&graph.design.data, &mut sys, &mut prompt_blocks)?;
-        }
-        if design_review_intent {
-            append_prompt_modules(&graph.design.review, &mut sys, &mut prompt_blocks)?;
-        }
-        if design_motion_intent {
-            append_prompt_modules(&graph.design.motion, &mut sys, &mut prompt_blocks)?;
-        }
-        if semantic("design_verification") {
-            append_prompt_modules(&graph.design.verification, &mut sys, &mut prompt_blocks)?;
-        }
-        // UI work gets a compact michael-design entry point. The full library remains available
-        // through knowledge_search; injecting a few concise blueprints avoids 100KB+ prompt bloat
-        // while still anchoring the model in the operator's curated design corpus.
-        if std::env::var("MICHAEL_AUTO_KNOWLEDGE").ok().as_deref() != Some("0") {
-            // 前缀缓存纪律：蓝图块在系统提示里，query 必须会话内粘性稳定——取【最早】
-            // 命中 UI 意图的用户消息（没有就取最早的非空用户消息），而不是最新一条。
-            // 之前取最新请求：用户每说一句话命中就变、系统提示就变，整条会话缓存全废。
-            let design_query = anchor_request.clone().filter(|q| !q.trim().is_empty())
-                .or_else(|| Some(DESIGN_KNOWLEDGE_FALLBACK_QUERY.to_string()));
-            let knowledge_scope = if semantic("design_knowledge_full") {
-                DesignKnowledgeScope::Full
-            } else {
-                DesignKnowledgeScope::Focused
-            };
-            if let Some(block) = design_knowledge_block(design_query.as_deref(), knowledge_scope) {
-                sys.push_str("\n\n");
-                sys.push_str(&block);
-                prompt_blocks.push("design_knowledge".to_string());
-                tracing::info!(mode, "auto-injecting compact michael-design blueprint");
-            }
+        _ => {}
+    }
+    let mut loaded_modules: HashSet<String> = HashSet::new();
+    for spec in crate::prompt_modules::head_modules(&graph, mode, &routing_flags) {
+        append_module_text(spec, &mut sys, &mut prompt_blocks, family)?;
+        loaded_modules.insert(spec.id.clone());
+    }
+    // UI work gets a compact michael-design entry point. The full library remains available
+    // through knowledge_search; injecting a few concise blueprints avoids 100KB+ prompt bloat
+    // while still anchoring the model in the operator's curated design corpus.
+    if loaded_modules.contains("design")
+        && std::env::var("MICHAEL_AUTO_KNOWLEDGE").ok().as_deref() != Some("0")
+    {
+        // 前缀缓存纪律：蓝图块在系统提示里，query 必须会话内粘性稳定——取【最早】
+        // 命中 UI 意图的用户消息（没有就取最早的非空用户消息），而不是最新一条。
+        // 之前取最新请求：用户每说一句话命中就变、系统提示就变，整条会话缓存全废。
+        let design_query = anchor_request.clone().filter(|q| !q.trim().is_empty())
+            .or_else(|| Some(DESIGN_KNOWLEDGE_FALLBACK_QUERY.to_string()));
+        let knowledge_scope = if semantic("design_knowledge_full") {
+            DesignKnowledgeScope::Full
+        } else {
+            DesignKnowledgeScope::Focused
+        };
+        if let Some(block) = design_knowledge_block(design_query.as_deref(), knowledge_scope) {
+            sys.push_str("\n\n");
+            sys.push_str(&block);
+            prompt_blocks.push("design_knowledge".to_string());
+            tracing::info!(mode, "auto-injecting compact michael-design blueprint");
         }
     }
     // 推理纪律已移入 prompts/reasoning.txt，并挂在 agent.base 上 —— 也就是**每个 agent
@@ -4164,18 +4299,102 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
             }
         }
     }
-    // Runtime date and adaptive coaching change independently of the Prompt Graph. Put them in
-    // the latest user turn so the system prefix remains byte-stable and cacheable.
+    // ── 尾部按需指南 ──────────────────────────────────────────────────────────
+    //
+    // 头里只挂运行开始就知道的旗标；**执行事实**（第一次写文件、第一次提交、第一次开浏览器、
+    // 第一次派子体、模型自己 load_guide）决定的那些块，贴在命中的那一串工具结果后面，
+    // 作为一条 harness 消息（和客户端的提醒同一个信封）。位置和正文由对话内容唯一决定
+    // （prompt_modules::plan_tail），所以同一段历史每次装配逐字节相同，上游前缀缓存不断；
+    // 历史被折叠/摘要时它跟着历史一起变，不需要任何服务端状态。chat 没有工具调用，自然为空。
+    let mut tail_guide_count = 0usize;
+    let mut tail_guide_bytes = 0usize;
+    if mode != "chat" {
+        let plans = body
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .map(|messages| crate::prompt_modules::plan_tail(&graph, mode, messages, &loaded_modules))
+            .unwrap_or_default();
+        let mut inserts: Vec<(usize, String)> = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            let mut titles: Vec<&str> = Vec::new();
+            let mut text = String::new();
+            for id in &plan.modules {
+                let Some(spec) = graph.module(id) else { continue };
+                let body_text = module_text(spec, family)?;
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&body_text);
+                titles.push(if spec.title.is_empty() { spec.id.as_str() } else { spec.title.as_str() });
+                prompt_blocks.push(format!("tail:{id}"));
+            }
+            if !plan.unknown.is_empty() {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&format!(
+                    "〔没有名为 {} 的指南。可用的指南 id：{}〕",
+                    plan.unknown.join(" / "),
+                    crate::prompt_modules::pullable_ids(&graph).join(", ")
+                ));
+            }
+            let label = if titles.is_empty() {
+                "〔按需指南〕".to_string()
+            } else {
+                format!("〔按需指南·{}〕", titles.join("、"))
+            };
+            let content = format!("{TAIL_GUIDE_PREFIX}{label}\n\n{text}");
+            tail_guide_count += 1;
+            tail_guide_bytes += content.len();
+            inserts.push((plan.anchor, content));
+        }
+        if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            // 从后往前插，前面的锚点不受影响。
+            for (anchor, content) in inserts.into_iter().rev() {
+                let at = anchor.min(messages.len());
+                messages.insert(at, serde_json::json!({ "role": "user", "content": content }));
+            }
+        }
+    }
+    // Runtime date, region, and adaptive coaching are pushed as a TRAILING system message
+    // instead of being prepended to the latest user turn.
+    //
+    // Why: prepending changed the latest user message's content. On the NEXT request that
+    // message became historical (the client sends the original text from memory, without
+    // the prepended context), so the upstream prefix cache broke at that position — every
+    // single turn. Moving the context to a separate trailing message keeps user messages
+    // byte-identical across requests: the prefix now extends through the previous turn's
+    // user message instead of stopping one message short.
+    //
+    // The system prompt at position 0 remains untouched (byte-stable, cacheable).
+    // Anthropic's converter at line ~9082 folds mid-array system messages into user turns,
+    // so this also works on the Anthropic protocol path.
     let mut runtime_context = vec![user_local_time_block_at(headers, chrono::Utc::now())];
-    // 安装源指引只在 agent 模式注入（chat/explorer 不装包）；地区 24h 恒定，随日期块走
-    // 最新 user 消息通道，不碰系统前缀缓存。
     if mode == "agent" && ide_region(headers).as_deref() == Some("cn") {
         runtime_context.push(REGION_MIRROR_BLOCK_CN.to_string());
     }
     if let Some(growth) = growth_context {
         runtime_context.push(growth);
     }
-    prepend_runtime_context_to_latest_user(body, &runtime_context.join("\n\n"));
+    let ctx_text = runtime_context.join("\n\n");
+    if !ctx_text.trim().is_empty() {
+        if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            msgs.push(serde_json::json!({ "role": "system", "content": ctx_text.trim() }));
+        }
+    }
+    // ── 前缀缓存：剥离最新 user 消息中的动态前导 ──────────────────────────
+    //
+    // 老客户端把 _contextPreamble（时间、需求账本、记忆、决策帧、项目上下文等 3–12 KB）
+    // 拼在 user 消息正文前面，以 ━━━━…📌 boundary 与用户原文分开。sess.memory 只存
+    // 原文——于是下一轮这条消息变成历史时，上游收到的和缓存的版本**逐字节不同**，
+    // 从这条起整段前缀失效。
+    //
+    // 修法和上面 runtime_context 同理：把前导剥出来、挪到消息数组尾部的 system 消息。
+    // 模型照样看到上下文，而 user 消息只留原文——下轮 sess.memory 发出来的一模一样。
+    //
+    // 只在检测到 boundary marker 时才触发；新客户端不带 marker，此处是 no-op。
+    strip_user_preamble_to_trailing(body);
+
     let prompt_bytes = sys.len();
     // 推理检查点只以系统消息形式出现一次（见上，属于稳定前缀）。此前还会把一行检查点
     // 追加到最后一条 user 消息末尾——每轮都改写 user 正文，破坏消息哈希与上游 prompt
@@ -4258,6 +4477,8 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     let ide_run = ide_run_telemetry(headers);
     tracing::info!(
         mode,
+        prompt_family = family.unwrap_or("default"),
+        engineering_fallback,
         prompt_blocks = ?prompt_blocks,
         requested_tool_count,
         candidate_tool_count,
@@ -4284,6 +4505,10 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         step_kind = %ide_run.2,
         orch_msg_count,
         orch_bytes,
+        // 尾部按需指南这一轮贴了几条、多少字节（正文不进日志）。头里的块在 prompt_blocks，
+        // 尾部的以 `tail:<id>` 记在同一个列表里。
+        tail_guide_count,
+        tail_guide_bytes,
         "assembled IDE prompt request"
     );
     record_agent_trace(AgentTraceInput {
@@ -4304,23 +4529,30 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
 /// Static prompt blobs migrated out of the client. Order is fixed so the version
 /// hash is stable for identical content.
 const PROMPT_NAMES: &[&str] = &[
+    // 必须（agent core）
+    "system_invariants",
     "agent_core",
-    "reasoning",
-    "agent_engineering",
+    "truth_core",
+    "answer_core",
+    // 按需模块
+    "engineering_core",
+    "writing",
+    "debugging",
+    "scaffold_commands",
+    "capture",
     "defect_hunting",
-    "agent_collaboration",
-    "agent_research",
+    "collaboration_decide",
+    "collaboration_dispatch",
+    "research_core",
+    "truth_sources",
+    "research_medicine",
+    "research_games",
+    "research_local",
+    "research_realtime",
+    "research_finance",
     "agent_automation",
-    "truthfulness",
-    "answer_quality",
-    "chat",
-    "plan",
-    "explorer",
-    "reviewer",
+    "git_guide",
     "design_core",
-    // 数值层。知识库给的是蓝本与配色，字体族/字号阶/4px 间距网格/圆角/阴影/动效时长这些
-    // 具体数字它没有——缺了这一层，模型只能凭印象编间距和阴影，页面就是"说不出哪里不对
-    // 但就是难看"。这份文件本来就写好了，只是从没被挂进任何 prompt 集合。
     "design_tokens",
     "design_implementation",
     "design_components",
@@ -4330,10 +4562,19 @@ const PROMPT_NAMES: &[&str] = &[
     "design_engineering",
     "design_motion",
     "design_verification",
-    // tail (subagent task/system prompts, git guide, small inline utility prompts)
+    "reasoning",
+    "no_flattery",
+    "voice",
+    "answer_professional",
+    // 模式
+    "chat",
+    "plan",
+    "explorer",
+    "reviewer",
+    "tool_batching",
+    // 客户端组装的任务模板（服务端只做版本核对）
     "subagent_system",
     "worker_system",
-    "git_guide",
     "research_prompt",
     "design_research_prompt",
     "next_action",
@@ -4414,6 +4655,16 @@ pub async fn ide_prompts(
             map.insert((*name).to_string(), serde_json::Value::String(text));
         }
     }
+    for file in prompt_variant_files() {
+        let raw = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts").join(&file))
+            .unwrap_or_default();
+        let text = crate::prompt_crypto::decrypt(&raw, &file).unwrap_or_default();
+        file.hash(&mut hasher);
+        text.hash(&mut hasher);
+        if full {
+            map.insert(file.trim_end_matches(".txt").to_string(), serde_json::Value::String(text));
+        }
+    }
     let graph_text = read_prompt_graph_file().unwrap_or_default();
     graph_text.hash(&mut hasher);
     if full {
@@ -4441,6 +4692,84 @@ pub async fn ide_prompts(
 
 #[cfg(test)]
 mod tests {
+    /// 指令层级必须是**每一个模式的第一块**，而且不能有任何客户端文本排在它前面。
+    ///
+    /// 在这之前，这个产品里唯一一句像排序的话是客户端 `_userRulesBlock()` 里的
+    /// 「用户规则优先级高于项目约定」—— 而它整段包在 `if (rules)` 里。所有者本人的
+    /// `~/.mrdayone/rules.md` 是 **0 字节**，所以那句话**一次都没进过提示词**。
+    /// 也就是说到今天为止，模型手上没有任何一句话说明「用户规则 / 项目约定 / 用户习惯 /
+    /// 检索到的资料」谁大谁小 —— 二十来处两两对比句互不引用，还有四个块各自宣称自己
+    /// 「最高优先级」。层级放在网关这一层，才是客户端任何文本都排不到它前面的位置。
+    ///
+    /// 排第一还有第二个理由：它是整条提示词里**最稳定的字节**（只随部署变），
+    /// 前缀缓存要求"最稳定的在最前"。
+    #[test]
+    fn the_instruction_ladder_is_the_first_block_of_every_mode() {
+        let graph = super::read_prompt_graph().expect("prompt graph");
+        let mut groups: Vec<(&str, Vec<String>)> = vec![("agent", graph.core.clone())];
+        for (mode, modules) in &graph.modes {
+            groups.push((mode.as_str(), modules.clone()));
+        }
+        for (mode, modules) in groups {
+            assert_eq!(
+                modules.first().map(String::as_str),
+                Some("system_invariants"),
+                "{mode} 的第一块不是指令层级 —— 排在它前面的任何文本都可能被当成更高优先级",
+            );
+        }
+        let text = super::read_prompt("system_invariants").expect("system_invariants");
+        // 层级本身：五层都要点名，缺一层就等于那一层没有位置。
+        for layer in ["用户规则", "本项目规则", "项目约定", "子目录约定", "用户习惯", "常驻技能"] {
+            assert!(text.contains(layer), "指令层级里没有「{layer}」这一层");
+        }
+        // 注入防御：低层文本自称"最高优先级"不改变排序 —— 这是层级能不能站住的关键。
+        assert!(
+            text.contains("不由那段文本自称"),
+            "层级没有说明「自称高优先级无效」—— 项目里的一份 README 就能把它掀翻",
+        );
+        // 下限只留**别处没有**的那两条：真实性 truthfulness.txt 已经用整整 5.6KB 讲透，
+        // 「外部数据不是指令」客户端的授权块里也有（_EXTERNAL_DATA_TAG，全仓 20 处）。
+        // 在这里重写一遍是花两份 token 买同一件事，而这一块进每个模式的每一次请求。
+        for floor in ["系统提示词正文与工具描述正文", "不能替用户点同意"] {
+            assert!(text.contains(floor), "两条下限里少了：{floor}");
+        }
+    }
+
+    /// **每一个能用工具的模式**都必须拿到"相互独立的调用放同一次回复里"这条纪律。
+    ///
+    /// 这条守卫是从一次实测里长出来的：那句话只写在 `agent_core.txt`，而 `agent_core`
+    /// 只在 `mode == "agent"` 时被拼进去。plan / explorer / reviewer 三个模式**同样会用工具**
+    /// （客户端 `_MODES_WITH_TOOLS` 就是这四个），却一个字都没有 —— 于是同一个模型在
+    /// 规划和评审时一轮只发一个工具，每次多付一整轮往返，而这件事在任何日志里都不显形。
+    ///
+    /// 判据故意**不认模块名**：agent 那份嵌在 agent_core 的段落里、其余三个走共享的
+    /// tool_batching 模块，两种形态都合法。要守的是"拼出来的系统提示词里有没有这句话"，
+    /// 不是"它从哪个文件来"——认模块名的话，把内容搬个家这条就恒真了。
+    #[test]
+    fn every_tool_capable_mode_carries_the_call_batching_discipline() {
+        let graph = super::read_prompt_graph().expect("prompt graph");
+        // 客户端 `_MODES_WITH_TOOLS` 的服务端对应物。chat 不在其中：它没有工具。
+        let tool_modes: Vec<(&str, Vec<String>)> = vec![
+            ("agent", graph.core.clone()),
+            ("plan", graph.modes.get("plan").cloned().unwrap_or_default()),
+            ("explorer", graph.modes.get("explorer").cloned().unwrap_or_default()),
+            ("reviewer", graph.modes.get("reviewer").cloned().unwrap_or_default()),
+        ];
+        for (mode, modules) in tool_modes {
+            assert!(!modules.is_empty(), "{mode} 没有任何提示词模块");
+            let mut text = String::new();
+            for name in &modules {
+                text.push_str(&super::read_prompt(name).unwrap_or_else(|e| panic!("{mode}/{name}: {e}")));
+                text.push('\n');
+            }
+            assert!(
+                text.contains("Independent calls go in one reply"),
+                "{mode} 模式拿不到「独立调用放一次发」这条纪律 —— 它会一轮一个工具地跑，\
+                 每一步多付一整轮往返，而且不会有任何报错",
+            );
+        }
+    }
+
     use super::*;
 
     fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
@@ -4587,16 +4916,93 @@ mod tests {
         );
     }
 
+    // ── strip_user_preamble_to_trailing ────────────────────────────────────
+
+    #[test]
+    fn strip_user_preamble_moves_context_to_trailing_system() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": wrapped_user_request(
+                    "date: 2026-09-04\nproject context here",
+                    "fix the redirect bug"
+                )},
+            ]
+        });
+        strip_user_preamble_to_trailing(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3, "should add one trailing system message");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "fix the redirect bug");
+        assert_eq!(msgs[2]["role"], "system");
+        let ctx = msgs[2]["content"].as_str().unwrap();
+        assert!(ctx.contains("project context here"), "preamble should move to trailing");
+    }
+
+    #[test]
+    fn strip_user_preamble_is_noop_for_clean_messages() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "just a plain question"},
+            ]
+        });
+        strip_user_preamble_to_trailing(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "no marker → no change");
+        assert_eq!(msgs[1]["content"], "just a plain question");
+    }
+
+    #[test]
+    fn strip_user_preamble_handles_legacy_cn_boundary() {
+        let wrapped = format!(
+            "时间上下文\n\n{LEGACY_CN_USER_REQUEST_BOUNDARY_PREFIX}\n\n修复登录重定向"
+        );
+        let mut body = serde_json::json!({
+            "messages": [{"role": "user", "content": wrapped}]
+        });
+        strip_user_preamble_to_trailing(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"], "修复登录重定向");
+        assert_eq!(msgs[1]["role"], "system");
+    }
+
+    #[test]
+    fn strip_user_preamble_only_touches_last_user_message() {
+        let old_user = wrapped_user_request("old context", "first question");
+        let new_user = wrapped_user_request("new context", "second question");
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": old_user},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": new_user},
+            ]
+        });
+        strip_user_preamble_to_trailing(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        // First user message is HISTORICAL — not touched (it's from sess.memory, already raw)
+        assert!(msgs[0]["content"].as_str().unwrap().contains("old context"),
+            "historical user message should not be modified");
+        // Last user message has preamble stripped
+        assert_eq!(msgs[2]["content"], "second question");
+    }
+
     #[test]
     fn bundled_prompts_are_not_empty() {
         for name in [
             "agent_core",
-            "agent_engineering",
-            "agent_collaboration",
-            "agent_research",
+            "truth_core",
+            "answer_core",
+            "engineering_core",
+            "writing",
+            "collaboration_decide",
+            "collaboration_dispatch",
+            "research_core",
+            "truth_sources",
             "agent_automation",
-            "truthfulness",
-            "answer_quality",
+            "no_flattery",
+            "voice",
+            "answer_professional",
             "chat",
             "plan",
             "explorer",
@@ -4620,7 +5026,7 @@ mod tests {
     #[test]
     fn prompt_graph_is_valid_and_every_module_is_versioned() {
         let graph = read_prompt_graph().expect("prompt graph should load");
-        assert_eq!(graph.version, 2);
+        assert_eq!(graph.version, crate::prompt_modules::GRAPH_VERSION);
         for mode in ["chat", "plan", "explorer", "reviewer"] {
             assert!(
                 graph
@@ -4630,30 +5036,27 @@ mod tests {
                 "production mode is missing from prompt graph: {mode}"
             );
         }
-        let mut groups = vec![
-            &graph.agent.base,
-            &graph.agent.engineering,
-            &graph.agent.collaboration,
-            &graph.agent.research,
-            &graph.agent.automation,
-            &graph.agent.git,
-            &graph.design.base,
-            &graph.design.implementation,
-            &graph.design.scaffold,
-            &graph.design.content,
-            &graph.design.data,
-            &graph.design.review,
-            &graph.design.verification,
-            &graph.design.motion,
-        ];
-        groups.extend(graph.modes.values());
-        for name in groups.into_iter().flatten() {
+        let mut names: Vec<String> = graph.core.clone();
+        names.extend(graph.modes.values().flatten().cloned());
+        names.extend(graph.modules.iter().flat_map(|m| m.files.iter().cloned()));
+        for name in names {
             assert!(
                 PROMPT_NAMES.contains(&name.as_str()),
                 "graph module is missing from version catalog: {name}"
             );
-            let text = read_prompt(name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            let text = read_prompt(&name).unwrap_or_else(|err| panic!("{name}: {err}"));
             assert!(!text.trim().is_empty(), "graph module is empty: {name}");
+        }
+        // 每个模块至少有一条路能到模型（head / tail / pull），派生源取得出来。
+        for m in &graph.modules {
+            assert!(
+                m.head.is_some() || m.tail.is_some() || m.pull.is_some(),
+                "{} has no head, tail or pull route — it can never reach the model",
+                m.id
+            );
+            if let Some(derived) = &m.derived {
+                derived_prompt_text(&m.id, derived).unwrap_or_else(|err| panic!("{}: {err}", m.id));
+            }
         }
     }
 
@@ -4763,10 +5166,11 @@ mod tests {
     fn design_tokens_is_actually_injected_for_ui_work() {
         assert!(PROMPT_NAMES.contains(&"design_tokens"));
         let graph = read_prompt_graph().expect("prompt graph");
+        let design = graph.module("design").expect("design module");
         assert!(
-            graph.design.base.iter().any(|m| m == "design_tokens"),
-            "design_tokens 必须挂在 design.base 上，否则只有特定子意图才拿得到：{:?}",
-            graph.design.base
+            design.files.iter().any(|m| m == "design_tokens"),
+            "design_tokens 必须挂在 design 模块上，否则只有特定子意图才拿得到：{:?}",
+            design.files
         );
         let text = read_prompt("design_tokens").expect("design_tokens.txt");
         // 钉的是"数值层确实在场"，不是具体某个数字——改版式不该让这条误红。
@@ -5137,6 +5541,9 @@ mod tests {
             "python_discussions",
             "swift_forums",
             "kotlin_discussions",
+            // 意图契约里的编排形状（collaboration_dispatch.txt 用反引号点名），不是工具。
+            "staged_roles",
+            "parallel_roles",
         ];
         let ignore: HashSet<&str> = NON_TOOL_TOKENS.iter().copied().collect();
 
@@ -5188,8 +5595,21 @@ mod tests {
             "agent",
             "agent_lite",
             "agent_core",
-            "agent_engineering",
-            "agent_research",
+            "truth_core",
+            "answer_core",
+            "engineering_core",
+            "writing",
+            "debugging",
+            "scaffold_commands",
+            "capture",
+            "collaboration_decide",
+            "collaboration_dispatch",
+            "research_core",
+            "research_medicine",
+            "research_games",
+            "research_local",
+            "research_realtime",
+            "research_finance",
             "agent_automation",
             "design_core",
             "design_implementation",
@@ -5317,15 +5737,15 @@ mod tests {
                 .unwrap_or("")
                 .to_string()
         };
+        // 2026-09-05 描述重写后的现行措辞：先靠近问题的源、片段只是线索、结论要读原文。
         let web = description_for("web_search");
-        assert!(web.contains("General web-search fallback"));
-        assert!(web.contains("specialist databases"));
-        assert!(web.contains("never treat a snippet, or this round's retrieved_at, as a current fact"));
+        assert!(web.contains("Prefer a source closer to the question first"));
+        assert!(web.contains("Snippets are leads"));
+        assert!(web.contains("read the page with web_fetch"));
 
         let current_time = description_for("current_time");
-        assert!(current_time.contains("only tells you when this request was made"));
-        assert!(current_time.contains("does not prove that a web page, paper, price, version, market quote, or rule is current"));
-        assert!(current_time.contains("observation time, or quote time"));
+        assert!(current_time.contains("It only says when this request was made"));
+        assert!(current_time.contains("still comes from that source's own publication or update time"));
     }
 
     #[test]
@@ -5346,7 +5766,7 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap();
         assert!(description.contains("a simple one-step change does not need the ceremony"));
-        assert!(description.contains("investigating and understanding the current state, making the change, and real verification"));
+        assert!(description.contains("investigating the current state, making the change and real verification"));
         assert!(description.contains("a complex read-only investigation"));
         assert!(description.contains("without inventing implementation steps"));
     }
@@ -5408,7 +5828,9 @@ mod tests {
     ///    不是收尾贴一张体检表——固定模板会训练读者跳过恰恰最要紧的那句保留。
     #[test]
     fn research_is_expected_and_status_templates_are_banned() {
-        let t = read_prompt("truthfulness").expect("truthfulness prompt should load");
+        let t = read_prompt("truth_sources").expect("truth_sources prompt should load")
+            + "\n"
+            + &read_prompt("truth_core").expect("truth_core prompt should load");
         assert!(
             !t.contains("look up current sources only for facts that change"),
             "研究规则又退回成「只查会变的事实」——模型会凭记忆写 API"
@@ -5433,7 +5855,10 @@ mod tests {
 
     #[test]
     fn truthfulness_policy_rejects_partial_success_claims() {
-        let policy = read_prompt("truthfulness").expect("truthfulness prompt should load");
+        // 证据纪律现在拆成两层：truth_core 每轮都在，truth_sources 随 research 旗标或第一次搜索到。
+        let policy = read_prompt("truth_core").expect("truth_core prompt should load")
+            + "\n"
+            + &read_prompt("truth_sources").expect("truth_sources prompt should load");
         for required in [
             "verified fact",
             "does NOT mean \"the integration works\"",
@@ -5668,17 +6093,29 @@ mod tests {
             .expect("assembled request should start with a system prompt");
         assert!(system.contains("Truthfulness and evidence discipline"));
         assert!(system.contains("Professional answer synthesis"));
-        assert!(system.contains("low-moralizing and abuse-boundary rules"));
+        // 原来这里钉的是「low-moralizing and abuse-boundary rules」那句 —— 它只是
+        // answer_quality 这一层的**存在性标记**，不是规则本身。而那一整句是一条
+        // **悬空引用**：它说「见上面 truthfulness 那节」，可全部提示词里 moralizing
+        // 只出现在它自己身上，被指向的规则一个字都不存在 —— 等于每轮花 token 让模型
+        // 去套用一条它看不见的规则。2026-09-02 删掉了那句。
+        // 这一层的存在性由同文件另外四个标记继续守着（下面几行 + Professional answer synthesis）。
+        // 若那条纪律确实还需要，得**把规则写出来**，不能靠一句指针。
+        assert!(system.contains("Deliver something that actually works"));
         assert!(system.contains("input/output/state/error/caller contract"));
-        assert!(system.contains("Time anchoring and freshness"));
-        assert!(system.contains("what the consensus is"));
-        assert!(system.contains("current project facts"));
+        // 证据加权 / 时间锚定那几条搬进了 answer_professional：plan/explorer 模式常驻，agent 按需自取。
+        let professional = read_prompt("answer_professional").unwrap();
+        assert!(professional.contains("Time anchoring and freshness"));
+        assert!(professional.contains("what the consensus is"));
+        assert!(professional.contains("current project facts"));
+        assert!(!system.contains("# Professional synthesis: strategy"), "agent 核心不该背这一块");
         assert!(!system.contains("# Loaded per task: research, community, and current facts"));
+        // 头部一条系统提示 + 用户那条 + 尾部一条运行时上下文；再多就是重复注入。
         assert_eq!(
             body["messages"].as_array().map_or(0, Vec::len),
-            2,
+            3,
             "the server must inject one system prompt, not duplicate the same prompt"
         );
+        assert_eq!(body["messages"][2]["role"], "system");
         let names = body["tools"]
             .as_array()
             .expect("assembled request should contain tools")
@@ -6028,7 +6465,11 @@ mod tests {
             );
         }
         let graph = read_prompt_graph().expect("prompt graph should load");
-        let serialized = serde_json::to_string(&graph.modes).unwrap();
+        let mut serialized = serde_json::to_string(&graph.modes).unwrap();
+        serialized.push_str(&graph.core.join(","));
+        for m in &graph.modules {
+            serialized.push_str(&m.files.join(","));
+        }
         assert!(!serialized.contains("agent_lite"));
         assert!(!serialized.contains("design_system"));
     }
@@ -6037,20 +6478,40 @@ mod tests {
     fn agent_graph_has_a_small_stable_base_and_explicit_specializations() {
         let graph = read_prompt_graph().expect("prompt graph should load");
         assert_eq!(
-            graph.agent.base,
-            vec!["agent_core", "reasoning", "truthfulness", "answer_quality"]
+            graph.core,
+            vec!["system_invariants", "agent_core", "truth_core", "answer_core"]
         );
-        assert_eq!(graph.agent.engineering, vec!["agent_engineering"]);
-        assert_eq!(graph.agent.collaboration, vec!["agent_collaboration"]);
-        assert_eq!(graph.agent.research, vec!["agent_research"]);
-        assert_eq!(graph.agent.automation, vec!["agent_automation"]);
-        assert_eq!(graph.agent.git, vec!["git_guide"]);
+        let files = |id: &str| graph.module(id).unwrap_or_else(|| panic!("module {id}")).files.clone();
+        let flags = |id: &str| {
+            graph
+                .module(id)
+                .and_then(|m| m.head.as_ref())
+                .map(|h| h.flags.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(files("engineering"), vec!["engineering_core"]);
+        assert_eq!(flags("engineering"), vec!["engineering"]);
+        assert!(
+            graph.module("engineering").unwrap().head.as_ref().unwrap().unjudged_default,
+            "裁决没落定时工程块要按默认挂上，否则第一发又裸着出门"
+        );
+        assert_eq!(files("collaboration"), vec!["collaboration_decide"]);
+        assert_eq!(flags("collaboration"), vec!["collaboration"]);
+        assert_eq!(files("research"), vec!["research_core", "truth_sources"]);
+        assert_eq!(flags("research"), vec!["research"]);
+        assert_eq!(files("automation"), vec!["agent_automation"]);
+        assert_eq!(flags("automation"), vec!["automation"]);
+        assert_eq!(files("git"), vec!["git_guide"]);
+        assert_eq!(flags("git"), vec!["git"]);
 
         let core = read_prompt("agent_core").unwrap();
         assert!(core.contains("autonomous execution agent"));
         assert!(core.contains("Choose tools by need"));
         assert!(!core.contains("# michael-design core"));
         assert!(!core.contains("# Loaded per task: engineering implementation, debugging, and verification"));
+        // 必须层的体积是「提示词减到几 KB」那条要求的直接读数：只许减不许增。
+        let core_bytes: usize = graph.core.iter().map(|name| read_prompt(name).unwrap().len()).sum();
+        assert!(core_bytes <= 10_240, "agent core grew to {core_bytes} bytes — 必须层只许减不许增（现状 ≈9.7KB，其中 1.2KB 是指令层级）");
 
         let mut sys = String::new();
         let mut blocks = Vec::new();
@@ -6058,6 +6519,7 @@ mod tests {
             &["module_that_does_not_exist".to_string()],
             &mut sys,
             &mut blocks,
+            None,
         )
         .expect_err("a missing graph module must fail closed");
         assert!(error.contains("module_that_does_not_exist"));
@@ -6500,18 +6962,24 @@ mod tests {
     #[test]
     fn ui_contract_is_split_across_graph_routed_michael_design_modules() {
         let graph = read_prompt_graph().expect("prompt graph should load");
-        // design_tokens 与 design_core 一起进 base：知识库给蓝本与配色，数值层（字号阶、
-        // 4px 间距网格、圆角、阴影、动效时长）只在这份文件里，两者缺一不可。
-        assert_eq!(graph.design.base, vec!["design_core", "design_tokens"]);
+        let files = |id: &str| graph.module(id).unwrap_or_else(|| panic!("module {id}")).files.clone();
+        assert_eq!(files("design"), vec!["design_core", "design_tokens"]);
         assert_eq!(
-            graph.design.implementation,
+            files("design_implementation"),
             vec![
                 "design_implementation",
                 "design_components",
                 "design_engineering"
             ]
         );
-        assert_eq!(graph.design.verification, vec!["design_verification"]);
+        assert_eq!(files("design_review"), vec!["design_verification"]);
+        let review = graph.module("design_review").unwrap().head.as_ref().unwrap();
+        assert!(review.flags.iter().any(|f| f == "design_review") && review.flags.iter().any(|f| f == "design_verification"));
+        for id in ["design_implementation", "design_scaffold", "design_content", "design_data", "design_review", "design_motion"] {
+            let head = graph.module(id).unwrap().head.as_ref().unwrap();
+            assert_eq!(head.requires, vec!["design"], "{id} 必须要求 design 先在，否则子层会脱离核心单独出现");
+            assert_eq!(head.modes, vec!["agent", "plan"], "{id} 的设计层要对 agent 和 plan 都开");
+        }
 
         let core = read_prompt("design_core").unwrap();
         let components = read_prompt("design_components").unwrap();
@@ -6520,11 +6988,6 @@ mod tests {
         assert!(core.contains("michael-design"));
         assert!(components.contains("Lucide"));
         assert!(components.contains("semantic classes"));
-        // 钉的是「两个视口都要求验」这件事，不是某一种写法。
-        // 判据经历过两次演进：先是 `1440x900` 改成 `browser viewport(width:1440, height:900)`，
-        // 断言还找旧字面量所以红了；这次进一步从两个**精确像素点**改成**区间**——项目真实断点
-        // 是 1280 或 1024 时，逼模型去量一个这个产品根本不存在的宽度，学到的只会是"先补两次
-        // 仪式性调用换学分"。判据于是换成区间与档位本身，具体数字怎么演进都不影响。
         for wanted in ["1200 or wider", "500 or narrower", "mobile:true"] {
             assert!(
                 verification.contains(wanted),
@@ -7186,20 +7649,23 @@ mod tests {
         assert!(system.contains("不能证明当前 API 或社区现状"));
         assert!(system.contains("# Reasoning discipline"));
         assert!(!system.contains("Teach to the person"));
-        let latest_user = messages
+        // 运行时上下文（时间/地区/教学深度）是一条**尾部** system 消息，不再拼进最后一条
+        // user：拼进去的话下一轮那条 user 变成历史时和缓存里的版本逐字节不同，前缀从它断掉。
+        // 这条请求带 📌 边界，老客户端的前导也会被剥成一条尾部 system，所以尾部可能不止一条。
+        let trailing: Vec<&serde_json::Value> = messages
             .iter()
             .rev()
-            .find(|message| message["role"] == "user")
-            .and_then(|message| message["content"].as_str())
-            .expect("latest user message should remain present");
-        assert!(latest_user.contains("Teach to the person"));
+            .take_while(|message| message["role"] == "system")
+            .collect();
+        assert!(!trailing.is_empty(), "trailing runtime context should be present");
+        assert!(trailing.iter().any(|m| m["content"].as_str().unwrap_or("").contains("Teach to the person")));
         assert_eq!(
             messages
                 .iter()
                 .filter(|message| message["role"] == "system")
                 .count(),
-            1,
-            "stable orchestration content belongs in one leading system message"
+            1 + trailing.len(),
+            "one leading system prompt plus the trailing context messages, nothing in between"
         );
         let assistant_index = messages
             .iter()
@@ -7734,11 +8200,12 @@ mod tests {
                 "messages": [{"role": "user", "content": "帮我初始化一个 React 项目并安装依赖"}]
             });
             assemble_into(&headers, &mut body);
+            // 地区镜像指引跟着运行时上下文走：尾部那条 system 消息。
             body["messages"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|m| m["role"] == "user")
+                .filter(|m| m["role"] == "system")
                 .next_back()
                 .unwrap()["content"]
                 .as_str()
@@ -7875,8 +8342,8 @@ mod tests {
     fn prompt_catalog_versions_every_routed_prompt_block() {
         for required in [
             "agent_core",
-            "agent_engineering",
-            "agent_research",
+            "engineering_core",
+            "research_core",
             "agent_automation",
             "design_core",
             "design_implementation",
@@ -7925,6 +8392,12 @@ mod tests {
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap().to_string();
             assert!(system.contains("autonomous execution agent"), "{m}");
+            // 2026-09-05 起唯一允许按模型不同的是家族备注块（model_notes@<family>.txt）；
+            // 剥掉它之后，图装配出来的基座必须逐字节相同——按模型分版本不等于各写一份。
+            let system = match super::read_family_notes(super::prompt_family(&body)) {
+                Some(notes) => system.replace(&format!("\n\n{notes}"), ""),
+                None => system,
+            };
             if let Some(expected) = &expected {
                 assert_eq!(
                     &system, expected,
@@ -7934,6 +8407,79 @@ mod tests {
                 expected = Some(system);
             }
         }
+    }
+
+    /// 按模型家族追加的备注块：有文件才加、只加在工具模式、紧跟基座、有上限、只加一次。
+    /// 家族名必须是 prompt_family 认得的，否则那份文件永远读不到（ide 那边 prompt-coverage 也守着）。
+    #[test]
+    fn model_family_notes_are_optional_short_and_follow_the_base() {
+        let samples = [
+            ("claude", "claude-opus-5"),
+            ("deepseek", "deepseek-v4-pro"),
+            ("glm", "glm-5.3"),
+            ("grok", "grok-4.6"),
+            ("gemini", "gemini-3-pro"),
+            ("kimi", "kimi-k2-thinking"),
+            ("qwen", "qwen3.8-max"),
+            ("openai", "gpt-5.6-sol"),
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let mut seen = 0usize;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix(&format!("{}@", super::MODEL_NOTES_MODULE)) else {
+                continue;
+            };
+            let family = rest.strip_suffix(".txt").expect("variant files end with .txt");
+            let (_, model) = samples
+                .iter()
+                .find(|(f, _)| *f == family)
+                .unwrap_or_else(|| panic!("{name}: family `{family}` is not one prompt_family can return"));
+            seen += 1;
+            let notes = super::read_family_notes(Some(family)).expect("notes file is readable and non-empty");
+            assert!(
+                notes.len() <= 1500,
+                "{name}: {} bytes — family notes are a footnote, not a second prompt",
+                notes.len()
+            );
+            assert!(
+                notes.starts_with("# Notes for "),
+                "{name}: must start with the `# Notes for` heading the base-equality test strips on"
+            );
+            for mode in ["agent", "plan", "explorer", "reviewer"] {
+                let mut headers = HeaderMap::new();
+                headers.insert("x-ide-mode", mode.parse().unwrap());
+                let mut body = serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "你好"}]
+                });
+                assemble_into(&headers, &mut body);
+                let system = body["messages"][0]["content"].as_str().unwrap();
+                let at = system
+                    .find(notes.as_str())
+                    .unwrap_or_else(|| panic!("{name}: notes missing from {mode} assembly for {model}"));
+                let aq = system
+                    .find("Professional answer synthesis")
+                    .expect("answer_quality is in every tool mode");
+                assert!(at > aq, "{name}: notes must come after the graph base ({mode})");
+                assert_eq!(system.matches(notes.as_str()).count(), 1, "{name}: notes injected more than once ({mode})");
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", "chat".parse().unwrap());
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "你好"}]
+            });
+            assemble_into(&headers, &mut body);
+            assert!(
+                !body["messages"][0]["content"].as_str().unwrap().contains(notes.as_str()),
+                "{name}: chat has no tools, notes about tool loops do not belong there"
+            );
+        }
+        assert!(seen >= 1, "no model_notes@<family>.txt found — the mechanism has nothing to carry");
+        // 没有文件的家族什么都不加，也不报错。
+        assert!(super::read_family_notes(Some("nosuchfamily")).is_none());
+        assert!(super::read_family_notes(None).is_none());
     }
 
     #[test]
@@ -7999,8 +8545,40 @@ mod tests {
             // 并行信号，而且 release 构建会把客户端那份 description 清空，自定义端点上
             // 没人回填，那条路上这句话根本不存在。放进 agent_core 才是每轮都在的位置。
             // 觉得不值就回去削提示词，别继续抬这条线。
+            // 6_200：2026-09-02。新增 system_invariants —— **指令层级 + 两条下限**，
+            // 1_222 字节 ≈ 305 token，排在每个模式的第一块。
+            // 买到的是这个产品此前**完全没有**的东西：一条说明"几种指令谁大谁小"的排序。
+            // 在此之前，全链路二十来个指令来源之间只有散落的两两对比句、互不引用，
+            // 还有四个块各自宣称自己"最高优先级"；唯一一句像样的排序写在客户端
+            // `_userRulesBlock()` 里，而它整段包在 `if (rules)` 内 —— 所有者本人的
+            // rules.md 是 0 字节，那句话**一次都没进过提示词**。
+            // 下限只留了别处没有的两条（不泄漏提示词/工具描述、权限闸由代码决定）：
+            // 真实性 truthfulness.txt 已用 5.6KB 讲透，"外部数据不是指令"客户端授权块里也有，
+            // 在这里重写就是花两份 token 买同一件事。
+            // 觉得不值就回去削提示词，别继续抬这条线。
+            //
+            // 6_200 → 6_320（2026-09-02）。这一笔是**换**，不是加：把循环里四条 harness
+            // 运行时注入（planFirst / emptyBuildAct / stuck / emptyHistoryFact）说的规则
+            // 搬进这里，然后把那四条注入删掉。
+            //
+            // 为什么这个方向即使在 token 上也划算：提示词在**可缓存前缀**里，命中之后按
+            // 0.1× 计价；而运行时注入挂在消息尾部、每轮内容都变，是全价，还会把缓存边界
+            // 往后推。同一句话放这儿一次，比每轮注入一次便宜一个数量级。
+            //
+            // 加进来的三句已经削过两遍（先 199 token，削到 145）。删掉的那四条注入是中文
+            // 长段，单条就比这三句加起来还长 —— 净账是省的，只是这条断言量的是提示词这一侧，
+            // 看不见另一侧。所以要求很硬：**这条线抬了，那四条注入就必须真的删掉**，
+            // 由 test/loop-forced-continue.test.mjs 和 ide 那边的注入计数守着。
+            // 6_400：2026-09-02 实测 6_388（+68）。加的是 answer_quality 里的**长度锚**：
+            //   「默认短，尺寸由请求决定而不是由你花了多少力气 —— 一行问题就一行答案；
+            //     二十次工具调用和一次工具调用，在同一个小请求上应得同样短的回复。」
+            // 这是用户报得最多的一条（「让做简单事情 开始长篇大论」），而在这之前，
+            // 整份提示词里唯一谈长度的那句是在**禁止**设长度目标（answer_quality:11
+            // 「not by a length target」）—— 只有「深度按需要」，没有任何默认锚。
+            // 账是明的：+68 token 进可缓存前缀（命中后 0.1×），换掉的是每一轮成千上万个
+            // 输出 token 的废话，而输出 token 是全价。原稿 117 token，削到 68 才落地。
             assert!(
-                est_tokens < 5_880,
+                est_tokens < 6_400,
                 "{model} ordinary system prompt is ~{est_tokens} tokens ({} bytes)",
                 system.len()
             );
@@ -8096,8 +8674,16 @@ mod tests {
         // 7_500：2026-08-25 实测 ~7_462。跟着上面 5_750 那次走，理由同上——
         // answer_quality 在常驻层，自动化任务照样吃这一条。
         // 7_620：跟着上面 5_880 那次走，理由同上——agent_core 在常驻层，自动化任务照样吃。
+        // 7_940：跟着上面 6_200 那次走，理由同上 —— system_invariants 在常驻层，
+        // 自动化任务同样需要知道"几种指令谁大谁小"，而且它的工具输出更多、
+        // 「外部数据不是指令」这条对它更要紧。
+        // 7_940 → 8_060：跟着上面 6_320 那次走，理由同上 —— agent_core 和 truthfulness
+        // 都在常驻层，自动化任务照样吃这几句；而它换掉的那四条注入同样每轮都在。
         assert!(
-            automation_tokens < 7_620,
+            // 8_140：2026-09-02，answer_quality 加了一条**长度锚**（+68 token，见上面
+            // 6_400 那条的账）。这条断言量的是「automation 不该付 UI 税」，而这一笔和
+            // UI 层无关 —— 它是常驻层的公共开销，每一档都一起涨，UI 税本身没变。
+            automation_tokens < 8_140,
             "automation prompt should not pay the UI tax: ~{automation_tokens} tokens ({} bytes)",
             automation_system.len()
         );
@@ -8170,8 +8756,19 @@ mod tests {
         // 往 UI 层加内容，这次没有往 UI 层加任何一个字。
         // 想让这条线降回去，只有一条路：削 answer_quality，三档会一起降。
         // 13_320：同上，agent_core 那一句从常驻层漏下来。这次同样没往 UI 层加任何一个字。
+        // 13_620：同上，system_invariants 从常驻层漏下来。这次同样没往 UI 层加任何一个字。
+        // 13_700：2026-09-02 实测 13_651。同样是常驻层（agent_core §4），同样没往 UI 层加字。
+        //   这一笔的账是明的、也是**净赚**的：换掉的是 _toolReminderBlock —— 一段 367 字符、
+        //   零运行时事实的纯静态指令，原来每 12 轮全价重发一次、一个 run 最多五次
+        //   （≈90 token × 5 ≈ 450 token 全价，还各占一条上下文消息）。现在同一句话进了
+        //   静态前缀：+31 token，命中缓存后约十分之一价，而且**每一轮都在**，不再是每 12 轮。
+        //   守卫：test/prefix-cache.test.mjs 与 test/logic.test.mjs 各钉一条，
+        //   断言这句话必须在 agent_core 里、且 _toolReminderBlock 不许回来。
         assert!(
-            focused_tokens < 13_320,
+            // 13_800：2026-09-02，answer_quality 的**长度锚**（+68 token）。和上一笔同源：
+            // 常驻层加的，UI 层一个字没加。这一笔换的是用户报得最多的那条「让做简单事情
+            // 开始长篇大论」—— 在这之前整份提示词里唯一谈长度的话是在**禁止**设长度目标。
+            focused_tokens < 13_800,
             "focused UI prompt should remain compact: ~{focused_tokens} tokens ({} bytes)",
             focused_system.len()
         );
@@ -8268,8 +8865,35 @@ mod tests {
         // 这 265 字节和上面 5_750 / 7_500 / 13_200 是同一批：answer_quality 那次修订
         // 最终落盘的版本比当时量的草稿又长了 1_329 字节，而它在常驻层，四档一起吃。
         // 下一次撞线之前，先做这两件事之一：修 greenfield 判定，或者削 answer_quality。
+        // 72_400：2026-09-02。这 1_222 字节是 system_invariants（指令层级），在常驻层，
+        // 四档一起涨。同样没往 UI 层加任何一个字。
+        // 72_400 → 72_800（2026-09-02）。**这是第三笔欠账，前两笔仍然没还。**
+        //
+        // 这 488 净字节是一笔**换**：把循环里四条 harness 运行时注入（planFirst /
+        // emptyBuildAct / stuck / emptyHistoryFact）说的规则搬进常驻层，然后删掉那四条注入。
+        // 方向上是省的 —— 提示词在可缓存前缀里（命中后 0.1×），运行时注入在消息尾部、
+        // 每轮内容都变、全价，还把缓存边界往后推。但这条断言只量提示词这一侧。
+        //
+        // 上面那句「先修 greenfield 判定，或者削 answer_quality」我做了后者的一部分：
+        // 删掉了 answer_quality 里一条 91 字节的**悬空引用**（「Apply the low-moralizing
+        // and abuse-boundary rules from the truthfulness discipline above」——而全部提示词里
+        // moralizing 只出现在它自己身上，被指向的规则一个字都不存在，等于每轮花 token
+        // 让模型去套用它看不见的规则）。那是真缺陷，删得对，但只抵了 91 字节。
+        //
+        // **greenfield 判定那笔债仍然一分没还。** 记在这里，别再被埋掉。
+        //
+        // 73_100：2026-09-02 实测 73_016（+216 字节，agent_core §4 那句「工具窗口会变、
+        // 早先看到的清单不是上限」）。这一笔和上面几笔性质**不同**：它不是从别处漏下来的，
+        // 是一次**明账搬迁**——换掉的 _toolReminderBlock 是 367 字节、零运行时事实的纯静态
+        // 指令，原来每 12 轮全价重发、一个 run 最多五次（≈1_835 字节全价，外加五条上下文
+        // 消息）。搬进可缓存前缀后 +216 字节、命中后 0.1×，而且每一轮都在。净省。
+        // 这一笔**不抵** greenfield 那笔债，那笔照旧欠着。
         assert!(
-            build_system.len() < 71_000,
+            // 73_400：2026-09-02，answer_quality 的长度锚（+322 字节）。同上：常驻层，
+            // UI 层一个字没加，这一笔照旧**不抵** greenfield 那笔债（那笔已经在客户端
+            // 还掉了 —— fromZeroUiProject 多认 architectureMode === "design_new" 这条腿，
+            // 缺口本来就不在提示词这边）。
+            build_system.len() < 73_400,
             "full UI prompt should remain bounded: {} bytes",
             build_system.len()
         );
@@ -8381,6 +9005,193 @@ mod tests {
                 "split runtime contract lost: {marker}"
             );
         }
+    }
+
+    fn tail_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert("x-ide-semantic-profile", "2.5:engineering".parse().unwrap());
+        headers
+    }
+
+    fn assembled_messages(headers: &HeaderMap, messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        let mut body = serde_json::json!({ "model": "gpt-5.5", "messages": messages });
+        super::assemble_into(headers, &mut body).expect("assemble");
+        body["messages"].as_array().unwrap().clone()
+    }
+
+    fn guide_messages(messages: &[serde_json::Value]) -> Vec<String> {
+        messages
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .filter_map(|m| m["content"].as_str())
+            .filter(|c| c.contains("〔按需指南"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn tail_guides_attach_after_the_first_matching_tool_run_and_keep_the_prefix_stable() {
+        let headers = tail_headers();
+        let base = vec![
+            serde_json::json!({"role": "user", "content": "把改动提交一下"}),
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "git_status", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": "git_commit", "arguments": "{\"message\":\"feat: x\"}"}}
+            ]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "clean"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c2", "content": "ok"}),
+            serde_json::json!({"role": "user", "content": format!("{TAIL_GUIDE_PREFIX}[本轮交付事实] x")}),
+        ];
+        let out = assembled_messages(&headers, base.clone());
+        // 0 系统提示 · 1 user · 2 assistant · 3/4 两条工具结果 · 5 指南 · 6 客户端提醒 · 7 尾部运行时上下文
+        assert_eq!(out[0]["role"], "system");
+        assert!(!out[0]["content"].as_str().unwrap().contains("# Git workflow"), "git 没在旗标里，不该进头");
+        assert_eq!(out[3]["role"], "tool");
+        assert_eq!(out[4]["role"], "tool");
+        assert_eq!(out[4]["tool_call_id"], "c2", "工具结果的相邻性不能被指南打断");
+        let guide = out[5]["content"].as_str().expect("guide is a text message");
+        assert_eq!(out[5]["role"], "user");
+        assert!(guide.starts_with(TAIL_GUIDE_PREFIX), "指南要用和客户端提醒同一个信封，否则模型会当成外部数据");
+        assert!(guide.contains("〔按需指南·Git 工作流〕"));
+        assert!(guide.contains("# Git workflow"));
+        assert!(is_harness_orchestration_note(guide), "session_anchor_request 必须能认出它不是用户的话");
+        assert_eq!(out[6]["content"].as_str().unwrap(), base[4]["content"].as_str().unwrap());
+        assert_eq!(out.len(), 8, "{:?}", out.iter().map(|m| m["role"].clone()).collect::<Vec<_>>());
+        assert_eq!(guide_messages(&out).len(), 1, "同一个模块整条对话只投递一次");
+
+        // 对话再长一截：前面每一条逐字节不变——这是尾部投递不打碎上游前缀缓存的判据。
+        let mut grown = base.clone();
+        grown.push(serde_json::json!({"role": "assistant", "content": "提交好了"}));
+        grown.push(serde_json::json!({"role": "user", "content": "再推上去"}));
+        let out2 = assembled_messages(&headers, grown);
+        assert_eq!(&out2[..7], &out[..7], "历史增长后指南的位置或正文变了，前缀缓存从那一条起全断");
+        assert_eq!(guide_messages(&out2).len(), 1);
+
+        // 旗标里本来就有 git：进头，尾部不再贴。
+        let mut with_flag = HeaderMap::new();
+        with_flag.insert("x-ide-mode", "agent".parse().unwrap());
+        with_flag.insert("x-ide-semantic-profile", "2.5:engineering,git".parse().unwrap());
+        let out3 = assembled_messages(&with_flag, base.clone());
+        assert!(out3[0]["content"].as_str().unwrap().contains("# Git workflow"));
+        assert!(guide_messages(&out3).is_empty(), "头里已经有的模块不许再贴到尾部");
+    }
+
+    #[test]
+    fn load_guide_attaches_the_requested_guide_and_lists_ids_for_unknown_ones() {
+        let headers = tail_headers();
+        let call = |id: &str, name: &str| serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+            {"id": id, "type": "function", "function": {"name": "load_guide", "arguments": format!("{{\"id\":\"{name}\"}}")}}
+        ]});
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "写个回复"}),
+            call("g1", "reply_style"),
+            serde_json::json!({"role": "tool", "tool_call_id": "g1", "content": "〔已附上〕"}),
+            call("g2", "nope"),
+            serde_json::json!({"role": "tool", "tool_call_id": "g2", "content": "〔已附上〕"}),
+        ];
+        let out = assembled_messages(&headers, messages);
+        let guides = guide_messages(&out);
+        assert_eq!(guides.len(), 2, "{:?}", out.iter().map(|m| m["role"].clone()).collect::<Vec<_>>());
+        assert!(guides[0].contains("# No flattery, and no softening"));
+        assert!(guides[0].contains("How to sound like a person, not a chatbot"));
+        assert!(guides[1].contains("没有名为 nope 的指南"));
+        assert!(guides[1].contains("git") && guides[1].contains("reasoning"), "要把可用 id 列出来");
+        assert_eq!(out[3]["role"], "tool");
+        assert_eq!(out[4]["role"], "user", "指南紧跟在 load_guide 的结果之后");
+    }
+
+    #[test]
+    fn writing_guide_arrives_with_the_first_write_and_design_only_for_ui_files() {
+        let headers = tail_headers();
+        let write = |path: &str| vec![
+            serde_json::json!({"role": "user", "content": "改一下"}),
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "w1", "type": "function", "function": {"name": "write_file", "arguments": format!("{{\"path\":\"{path}\",\"content\":\"x\"}}")}}
+            ]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "w1", "content": "written"}),
+        ];
+        let rust = guide_messages(&assembled_messages(&headers, write("src/lib.rs")));
+        assert_eq!(rust.len(), 1);
+        assert!(rust[0].contains("# Guide · writing code"));
+        assert!(!rust[0].contains("# michael-design core"), "写 .rs 不是界面工作");
+
+        let ui = guide_messages(&assembled_messages(&headers, write("src/App.tsx")));
+        assert_eq!(ui.len(), 1, "同一串工具结果后面只放一条合并的指南消息");
+        assert!(ui[0].contains("# Guide · writing code"));
+        assert!(ui[0].contains("# michael-design core"), "写 .tsx 要把设计核心带上");
+        assert!(ui[0].contains("# michael-design implementation entry"), "design_implementation 要求 design 先在——同一次调用里按目录顺序先后到");
+    }
+
+    #[test]
+    fn chat_mode_never_gets_tail_guides() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "chat".parse().unwrap());
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "git_commit", "arguments": "{}"}}
+            ]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
+        ];
+        assert!(guide_messages(&assembled_messages(&headers, messages)).is_empty());
+    }
+
+    #[test]
+    fn load_guide_description_names_every_pullable_module() {
+        let graph = read_prompt_graph().unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&read_tools_file().unwrap()).unwrap();
+        let description = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.pointer("/function/name").and_then(|v| v.as_str()) == Some(crate::prompt_modules::LOAD_GUIDE_TOOL))
+            .and_then(|t| t.pointer("/function/description"))
+            .and_then(|v| v.as_str())
+            .expect("tools.json carries load_guide");
+        for id in crate::prompt_modules::pullable_ids(&graph) {
+            assert!(description.contains(id), "load_guide 的描述里没有 {id}——模型不知道它能自取这一份");
+        }
+    }
+
+    #[test]
+    fn graph_head_flags_are_all_on_the_wire_protocol() {
+        let graph = read_prompt_graph().unwrap();
+        for m in &graph.modules {
+            let Some(head) = &m.head else { continue };
+            for flag in head.flags.iter().chain(head.not_flags.iter()) {
+                assert!(
+                    IDE_SEMANTIC_PROFILE_FLAGS.contains(&flag.as_str()) || is_semantic_domain_flag(flag),
+                    "{}: 旗标 {flag} 不在线协议白名单里，客户端发了也会被 ide_semantic_profile 丢掉",
+                    m.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_prompt_file_is_core_mode_module_or_documented_legacy() {
+        const LEGACY: &[&str] = &[
+            "agent", "agent_lite", "design_system", "ui_design_flow", "ui_design_guide",
+            "next_action", "compact", "research_prompt", "design_research_prompt",
+            "edit_rewrite", "edit_transform", "subagent_system", "worker_system",
+        ];
+        let graph = read_prompt_graph().unwrap();
+        let mut routed: HashSet<String> = graph.core.iter().cloned().collect();
+        routed.extend(graph.modes.values().flatten().cloned());
+        routed.extend(graph.modules.iter().flat_map(|m| m.files.iter().cloned()));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let mut orphans = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            let Some(stem) = name.strip_suffix(".txt") else { continue };
+            if stem.starts_with(&format!("{MODEL_NOTES_MODULE}@")) || LEGACY.contains(&stem) || routed.contains(stem) {
+                continue;
+            }
+            orphans.push(stem.to_string());
+        }
+        orphans.sort();
+        assert!(orphans.is_empty(), "这些提示词文件运行时到不了模型：{orphans:?}");
     }
 
 }
@@ -9038,6 +9849,7 @@ mod semantic_profile_source_tests {
         let _ = super::assemble_into(&h, &mut again);
         assert_ne!(again, once, "没有幂等头时也不组装了？那这道闸测的是别的东西");
     }
+
     /// 同样的输入调两次，装配出来的必须**逐字节相同**。
     ///
     /// # 为什么这条值得单独存在

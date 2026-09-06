@@ -32,6 +32,14 @@ const TOOL_METADATA = Object.freeze({
     example_call: "mcp_server(action='list', why='先看用户已经配了哪些')",
     priority: 'medium',
   },
+  load_guide: {
+    category: 'planning',
+    use_cases: ['想比 IDE 自动附上的时机更早拿到某份指南（如 git、debugging、reply_style）'],
+    triggers: ['系统提示很短，任务需要某一族工作的详细纪律而对应工具还没用过'],
+    example_call: "load_guide(id='git')",
+    priority: 'low',
+    usage_note: '【何时用】需要一份指南而它的触发工具还没用到。【何时不用】指南会随第一次用到那族工具自动附上，已经看到的别再要。'
+  },
   read_skill: {
     category: 'planning',
     use_cases: ['系统提示里列出的技能与当前任务对上了'],

@@ -1,0 +1,6 @@
+# Notes for GLM models in this IDE
+
+Measured on GLM runs here: one tool call in eight uses a name that does not exist in this IDE (12% — every other model is under 1%), and each such call is a wasted round trip. The names come from other coding agents. Adjust for that:
+- Call only names present in this request's tools list, spelled exactly as listed: lowercase snake_case, no namespaces, no CamelCase. In particular: shell commands are run_cmd (not RunCommand, bash, pwsh, run_code, CheckCommandStatus); file reads are read_file (not read, Read, cat); searches are search, find_files, find_symbol (not Grep, Glob, LS); edits are edit_file, multi_edit, write_file (not edit, Write, SearchReplace); delegation is run_subagent (not Task).
+- When a capability seems missing from the list, call search_tools with the exact tool name or a short description of the capability. Never guess a name.
+- Emit tool calls only through the function-calling channel — never as JSON or XML inside the visible text.

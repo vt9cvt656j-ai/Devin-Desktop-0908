@@ -1,49 +1,47 @@
-# Prompt graph
+# Prompt graph (v3)
 
 Every production IDE request is assembled from `prompt_graph.json`. The graph and its modules are
 required deployment artifacts; a missing or invalid graph fails the request instead of restoring a
-monolithic prompt.
+monolithic prompt. The runtime lives in `src/prompt_modules.rs` (the data model and the head/tail
+conditions) and `src/prompts.rs` (`assemble_into`, the only place that reads the graph).
 
-## Runtime layers
+## Two layers: 必须 and 按需
 
-- Chat/plan/explorer/reviewer: declared explicitly under `modes`
-- Base: `agent_core.txt`, `reasoning.txt`, `truthfulness.txt`, `answer_quality.txt`
-- Engineering: `agent_engineering.txt`
-- Research: `agent_research.txt`
-- Browser/desktop automation: `agent_automation.txt`
-- Git: `git_guide.txt`
-- UI base: `design_core.txt`
-- UI implementation entry: `design_implementation.txt`
-- UI components/tokens/icons/type: `design_components.txt`
-- New-project framework wiring: `design_scaffold.txt`
-- Content and real media: `design_content.txt`
-- Persistent data and business states: `design_data.txt`
-- UI engineering/accessibility/performance: `design_engineering.txt`
-- UI review: `design_verification.txt`
-- UI implementation verification: `design_verification.txt`
-- Motion/full-site work: `design_motion.txt`
+- **core** — what every agent request carries, in order: `system_invariants` (the instruction
+  ladder and the two floors), `agent_core` (identity, execution contract, reasoning discipline),
+  `truth_core`, `answer_core`. ≈ 9 KB / ≈ 2.3k tokens. The size is pinned by a test; it only shrinks.
+- **modes** — chat / plan / explorer / reviewer each list their own blocks (they reuse `truth_core`,
+  `truth_sources`, `no_flattery`, `answer_core`, `answer_professional`, `voice`).
+- **modules** — everything else, one record each, delivered by one of three routes:
+  - `head`: injected into the system prompt when the client's semantic profile carries one of
+    `flags` (and none of `not_flags`, and every module in `requires` is already in the head).
+    `modes` defaults to `["agent"]`; the design layer also opens for `plan`. `unjudged_default`
+    loads the module while the intent verdict has not landed (engineering only). Head modules
+    ride the client's sticky, grow-only profile, so the system prefix stays byte-stable in a session.
+  - `tail`: attached as one harness message (the client's `〔系统编排提示…〕` envelope, label
+    `〔按需指南·<title>〕`) right after the first tool run that matches `tools` (exact or `prefix_*`),
+    `files` (path arguments ending in `*.tsx` etc.), or `commands` (substrings of a `run_cmd` /
+    `run_in_terminal` command). `requires` must already be delivered. The position and text are a
+    pure function of the conversation, so the upstream prefix cache is never broken by a mid-session
+    load, and nothing is stored server-side. A module is delivered once per conversation.
+  - `pull`: the model calls `load_guide {id}` (tools.json); the guide is attached after that call's
+    result. The one-line `pull` text is what the tool description tells the model about the guide.
+- `derived` names a code-generated body (`defect_classes_writing`) instead of files.
 
-Intent is sticky across a bounded conversation window, so follow-ups such as "continue" keep the
-same module set and upstream prompt-cache prefix. Browser automation that merely opens or logs into
-a website does not activate UI design modules unless the request also asks for design work.
+Runtime additions that are not modules: the model-family notes (`model_notes@<family>.txt`, after
+the core), the michael-design blueprint packet (when the `design` module is in the head), the
+bounded engineering knowledge block (engineering flag), and the trailing runtime context.
 
-UI routing is scope-aware. A focused component/style change loads base + implementation +
-components + engineering + verification and a small two-hit design evidence packet. A full site
-also loads scaffold, content/media, data, motion, and a larger bounded blueprint packet. Product
-category nouns such as finance, health, restaurant, travel, portfolio, or game do not activate the
-research prompt unless the user actually asks to research, search, compare current facts, or find
-evidence.
+## Change rules
+
+1. Add or reorder modules in `prompt_graph.json`; head order is prompt order.
+2. Add every routed `.txt` module to `PROMPT_NAMES` in `src/prompts.rs` so prompt versions change.
+3. A new head flag must also be in `IDE_SEMANTIC_PROFILE_FLAGS` (wire allow-list) and emitted by
+   the client's `_ideSemanticProfile`; a new pullable id must appear in the `load_guide` description.
+4. Keep module selection stable across follow-up turns; never put per-turn content into the head.
+5. Add new runtime detail to the narrowest module and extend the strength-contract tests.
+6. Run `cargo test prompts -- --test-threads=1`, then the full server test suite.
 
 `knowledge/michael-design/` remains the full design corpus. UI assembly injects a bounded set of
 relevant excerpts and leaves deeper retrieval to `knowledge_search`; the corpus files are not
 rewritten or duplicated into prompts.
-
-## Change rules
-
-1. Add or reorder modules in `prompt_graph.json`.
-2. Add every routed `.txt` module to `PROMPT_NAMES` in `src/prompts.rs` so prompt versions change.
-3. Keep module selection stable across follow-up turns and avoid duplicating rules in multiple
-   runtime modules.
-4. Add new runtime detail to the narrowest routed module and extend the strength-contract test.
-5. Never add a monolithic fallback path; graph/module failures must stay visible.
-6. Run `cargo test prompts::tests -- --test-threads=1`, then the full server test suite.

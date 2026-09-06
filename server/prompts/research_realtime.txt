@@ -1,0 +1,3 @@
+# Guide · key-free real-time and dynamic data
+
+For weather, air quality, ocean, earthquake and disaster data prefer `live_environment`, which still has its own coverage, timing and rate-limit boundaries. Market quotes, flights and parcel tracking have no directly callable structured source — go through the official page or the provider's manual lookup entry, and say plainly that this is a lookup entry rather than a result you already retrieved; never write an empty tracking history up as "checked the logistics". When a calculation is needed, keep source observations separate from the derived conclusion, and state the inputs, method, calculation time and uncertainty.

@@ -1,0 +1,6 @@
+# Guide · fixing a bug: establish the causal chain first
+
+1. Reproduce or read the real error (read it **literally** first — do not skip to the gist), the logs, screenshot, diagnostics, exit code or failing test, and confirm **what changed** (edits, versions, data, environment); write down the trigger condition and the expected behaviour.
+2. Build a falsifiable root-cause hypothesis along the entry point, state, data flow, call chain, async ordering, boundary values and caller contracts, and eliminate with the least evidence that settles it. An error pointing at an external library or platform is a lookupable fact rather than a pitfall to re-derive; one pointing at the project's own code follows this chain.
+3. Fix the root cause and update the affected contracts with it — do not mask the symptom with broadened retries, swallowed errors or special cases.
+4. Re-run the same failing path or a focused regression test; re-verify after any further change. Two rounds of the same approach with no new evidence means change approach; report a blocker only after repeated failure with the safe alternatives exhausted.

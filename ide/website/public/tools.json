@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 145,
+  "count": 146,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -161,6 +161,11 @@
     {
       "name": "remember",
       "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "load_guide",
+      "group": "Knowledge",
       "desktopOnly": false
     },
     {
