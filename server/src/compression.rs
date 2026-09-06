@@ -1241,6 +1241,165 @@ pub fn assemble(msgs: &[Msg], plan: &Plan, summaries: &[String]) -> Vec<Msg> {
     out
 }
 
+// ── Stage 0：旧工具输出折叠（不花钱、确定性、前缀稳定）──────────────────────────────
+//
+// 分段摘要只在对话超过窗口预算时才启动；在那之前，旧的 read_file / run_cmd 原文一轮轮
+// 原样带着（生产实测请求 p50 400KB、第 16 步以后模型输入 116k token），而客户端在网关线路上
+// 刻意不折（`_trimMessagesIfHuge` 早返回），等的就是这一层。规则照客户端 Tier 1/2 的棘轮：
+//   · 最近 FOLD_KEEP_LAST_TOOL_RESULTS 条工具结果逐字保留；
+//   · 边界只按 FOLD_STEP 的整倍数推进——同一段历史在连续几轮里折出的字节完全相同，上游
+//     前缀缓存只在边界推进那一轮失效一次；
+//   · 折叠是纯函数：同样的消息列表永远折出同样的桩，网关不需要跨请求状态；
+//   · 可重取的工具（read_file / search / git_* …）桩里写明「重新调用取回」；不可重取的
+//     （run_cmd 之类）保留首行、关键报错行和末行。
+/// 最近多少条工具结果逐字保留。
+pub const FOLD_KEEP_LAST_TOOL_RESULTS: usize = 8;
+/// 折叠边界每次推进的步长（条）。
+pub const FOLD_STEP: usize = 8;
+/// 短于这个字数的结果不值得折（桩本身就要 200-400 字）。
+pub const FOLD_MIN_CHARS: usize = 600;
+/// 桩里每一行截到多长。
+const FOLD_LINE_CHARS: usize = 80;
+/// 桩里最多带几条关键行。
+const FOLD_KEY_LINES: usize = 3;
+/// 桩的固定前缀；再次折叠时靠它认出「已经是桩」。
+pub const FOLD_STUB_PREFIX: &str = "[已折叠较早的 ";
+
+/// 客户端 `_REFETCHABLE` 的镜像：再调一次同名工具就能原样取回结果的那些。
+const REFETCHABLE_TOOLS: &[&str] = &[
+    "read_file", "list_dir", "search", "find_files", "git_diff", "git_log", "git_status",
+    "git_blame", "git_stash_list", "git_conflicts", "web_fetch", "web_search",
+    "get_diagnostics", "lsp_symbols", "lsp_definition", "lsp_references",
+    "read_logs", "read_terminal", "list_terminals",
+];
+
+pub fn is_refetchable_tool(name: &str) -> bool {
+    REFETCHABLE_TOOLS.contains(&name)
+}
+
+/// 一次折叠的账。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FoldStats {
+    /// 消息列表里一共几条工具结果。
+    pub tool_results: usize,
+    /// 这一轮的折叠边界（前几条工具结果在折叠范围内）。
+    pub boundary: usize,
+    /// 真正被替换成桩的条数。
+    pub folded: usize,
+    pub chars_before: usize,
+    pub chars_after: usize,
+}
+
+fn fold_clip_line(line: &str, max: usize) -> String {
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else {
+        let mut s: String = collapsed.chars().take(max).collect();
+        s.push('…');
+        s
+    }
+}
+
+fn fold_is_key_line(line: &str) -> bool {
+    let l = line.to_lowercase();
+    [
+        "error", "fail", "panic", "exception", "traceback", "warning", "exit code", "denied",
+        "not found", "cannot", "unresolved", "✗", "❌", "错误", "失败", "异常", "找不到", "拒绝",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
+/// 把一条工具结果折成桩。`name` 是发出这次调用的工具名。
+pub fn fold_stub(name: &str, content: &str) -> String {
+    let n = content.chars().count();
+    let head = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| fold_clip_line(l, FOLD_LINE_CHARS))
+        .unwrap_or_default();
+    let key: Vec<String> = content
+        .lines()
+        .filter(|l| fold_is_key_line(l))
+        .take(FOLD_KEY_LINES)
+        .map(|l| fold_clip_line(l, FOLD_LINE_CHARS))
+        .collect();
+    let digest = if key.is_empty() {
+        String::new()
+    } else {
+        format!("\n关键行: {}", key.join(" | "))
+    };
+    if is_refetchable_tool(name) {
+        format!("{FOLD_STUB_PREFIX}{name} 结果（原 {n} 字）：{head}…{digest}\n需要完整内容就重新调用 {name} 取回。]")
+    } else {
+        let tail = content
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| fold_clip_line(l, FOLD_LINE_CHARS))
+            .unwrap_or_default();
+        format!("{FOLD_STUB_PREFIX}{name} 输出（原 {n} 字）：{head}…{digest}\n末行: {tail}\n这条不可重取；要细节就按当时的命令重跑。]")
+    }
+}
+
+/// 把最近 `keep_last` 条之外的旧工具结果折成桩；边界按 `step` 的整倍数推进。
+///
+/// 只动 `role == "tool"` 且 `content` 是纯字符串的消息；带图片/多段内容的一律不碰。
+pub fn fold_stale_tool_outputs(messages: &mut [serde_json::Value], keep_last: usize, step: usize) -> FoldStats {
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for m in messages.iter() {
+        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(calls) = m.get("tool_calls").and_then(|c| c.as_array()) else { continue };
+        for c in calls {
+            if let (Some(id), Some(name)) = (
+                c.get("id").and_then(|v| v.as_str()),
+                c.pointer("/function/name").and_then(|v| v.as_str()),
+            ) {
+                names.insert(id.to_string(), name.to_string());
+            }
+        }
+    }
+    let tool_idx: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .map(|(i, _)| i)
+        .collect();
+    let step = step.max(1);
+    let boundary = (tool_idx.len().saturating_sub(keep_last) / step) * step;
+    let mut stats = FoldStats { tool_results: tool_idx.len(), boundary, ..FoldStats::default() };
+    for &i in tool_idx.iter().take(boundary) {
+        let content = match messages[i].get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        if content.starts_with(FOLD_STUB_PREFIX) {
+            continue;
+        }
+        let chars = content.chars().count();
+        if chars <= FOLD_MIN_CHARS {
+            continue;
+        }
+        let name = messages[i]
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .and_then(|id| names.get(id).cloned())
+            .or_else(|| messages[i].get("name").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or_else(|| "工具".to_string());
+        let stub = fold_stub(&name, &content);
+        stats.chars_before += chars;
+        stats.chars_after += stub.chars().count();
+        stats.folded += 1;
+        if let Some(obj) = messages[i].as_object_mut() {
+            obj.insert("content".to_string(), serde_json::Value::String(stub));
+        }
+    }
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1928,5 +2087,89 @@ mod entitlement_tests {
         assert_eq!(Tier::M5.capacity_for_native(1_000_000), 6_000_000);
         // And the case that must not regress: a small window still gets the full headline.
         assert_eq!(Tier::M1.capacity_for_native(200_000), 1_200_000);
+    }
+
+    // ── stage 0：旧工具输出折叠 ──────────────────────────────────────────────
+    fn fold_transcript(n_tools: usize, chars_each: usize) -> Vec<serde_json::Value> {
+        let mut v = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "do it"}),
+        ];
+        for k in 0..n_tools {
+            let id = format!("call_{k}");
+            let name = if k % 2 == 0 { "read_file" } else { "run_cmd" };
+            v.push(serde_json::json!({"role": "assistant", "content": null,
+                "tool_calls": [{"id": id, "type": "function", "function": {"name": name, "arguments": "{}"}}]}));
+            let body = format!("header line {k}\nplain\nError: boom {k}\n{}\nlast line {k}", "x".repeat(chars_each));
+            v.push(serde_json::json!({"role": "tool", "tool_call_id": id, "content": body}));
+        }
+        v
+    }
+    fn folded_count(v: &[serde_json::Value]) -> usize {
+        v.iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .filter(|m| m.get("content").and_then(|c| c.as_str()).is_some_and(|c| c.starts_with(FOLD_STUB_PREFIX)))
+            .count()
+    }
+
+    #[test]
+    fn stage0_keeps_last_eight_and_advances_in_steps_of_eight() {
+        for (n, expect) in [(8usize, 0usize), (15, 0), (16, 8), (23, 8), (24, 16), (40, 32)] {
+            let mut v = fold_transcript(n, 1_000);
+            let stats = fold_stale_tool_outputs(&mut v, FOLD_KEEP_LAST_TOOL_RESULTS, FOLD_STEP);
+            assert_eq!(stats.boundary, expect, "n={n}");
+            assert_eq!(stats.folded, expect, "n={n}");
+            assert_eq!(folded_count(&v), expect, "n={n}");
+            // 最近 8 条一定还是原文
+            let tools: Vec<&serde_json::Value> = v.iter().filter(|m| m["role"] == "tool").collect();
+            for m in tools.iter().rev().take(8) {
+                assert!(!m["content"].as_str().unwrap().starts_with(FOLD_STUB_PREFIX));
+            }
+        }
+    }
+
+    #[test]
+    fn stage0_stub_carries_name_length_head_key_lines_and_refetch_hint() {
+        let mut v = fold_transcript(16, 1_000);
+        fold_stale_tool_outputs(&mut v, 8, 8);
+        let first = v[3]["content"].as_str().unwrap(); // call_0 → read_file
+        assert!(first.starts_with("[已折叠较早的 read_file 结果（原 "), "{first}");
+        assert!(first.contains("header line 0"), "{first}");
+        assert!(first.contains("关键行: Error: boom 0"), "{first}");
+        assert!(first.contains("重新调用 read_file 取回"), "{first}");
+        let second = v[5]["content"].as_str().unwrap(); // call_1 → run_cmd（不可重取）
+        assert!(second.starts_with("[已折叠较早的 run_cmd 输出（原 "), "{second}");
+        assert!(second.contains("末行: last line 1"), "{second}");
+        assert!(second.contains("不可重取"), "{second}");
+        assert!(second.chars().count() < 400, "桩太长：{}", second.chars().count());
+    }
+
+    #[test]
+    fn stage0_is_deterministic_and_prefix_stable_when_messages_append() {
+        let mut a = fold_transcript(20, 1_000);
+        let mut b = fold_transcript(23, 1_000); // 同一段历史多了三轮
+        fold_stale_tool_outputs(&mut a, 8, 8);
+        fold_stale_tool_outputs(&mut b, 8, 8);
+        // 边界都在 8：a 的整个消息序列是 b 的前缀，逐字节相同
+        for (i, m) in a.iter().enumerate() {
+            assert_eq!(m, &b[i], "第 {i} 条在追加后变了——上游前缀缓存会碎");
+        }
+        // 再折一次不改变任何东西（幂等）
+        let snapshot = a.clone();
+        let again = fold_stale_tool_outputs(&mut a, 8, 8);
+        assert_eq!(again.folded, 0);
+        assert_eq!(a, snapshot);
+    }
+
+    #[test]
+    fn stage0_skips_short_results_stubs_and_nontext_content() {
+        let mut v = fold_transcript(16, 100); // 每条 ~130 字，低于 FOLD_MIN_CHARS
+        let stats = fold_stale_tool_outputs(&mut v, 8, 8);
+        assert_eq!(stats.folded, 0);
+        let mut v = fold_transcript(16, 1_000);
+        v[3]["content"] = serde_json::json!([{"type": "text", "text": "x".repeat(2000)}, {"type": "image_url", "image_url": {"url": "data:..."}}]);
+        let stats = fold_stale_tool_outputs(&mut v, 8, 8);
+        assert_eq!(stats.folded, 7, "带图片的那条不能动");
+        assert!(v[3]["content"].is_array());
     }
 }

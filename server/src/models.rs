@@ -20964,7 +20964,22 @@ async fn apply_michael_compression(
     if plan.compress.is_empty() {
         // 没有新段要压。带了前缀就必须把摘要拼回去，否则这一轮历史凭空消失。
         if carried.summaries.is_empty() {
-            return Ok(None); // 没超窗口，一分钱不花，body 未被改动
+            // 没超窗口：不花钱摘要，但把最近 8 条之外的旧工具输出确定性折成桩（边界每 8 条推进
+            // 一次，前缀跨轮稳定）。此前这一档什么都不做，旧的 read_file / run_cmd 原文一轮轮原样
+            // 带着；客户端在网关线路上刻意不折（_trimMessagesIfHuge 早返回），等的就是这里。
+            let stats = body
+                .get_mut("messages")
+                .and_then(|m| m.as_array_mut())
+                .map(|arr| mc::fold_stale_tool_outputs(arr.as_mut_slice(), mc::FOLD_KEEP_LAST_TOOL_RESULTS, mc::FOLD_STEP))
+                .unwrap_or_default();
+            if stats.folded > 0 {
+                tracing::info!(
+                    %uid, model = %model_id, folded = stats.folded, tool_results = stats.tool_results,
+                    chars_before = stats.chars_before, chars_after = stats.chars_after,
+                    "michael-compression: stage-0 folded stale tool outputs"
+                );
+            }
+            return Ok(None); // 没超窗口，一分钱不花（只折了旧工具输出）
         }
         let base_projected = carried_budget + plan.raw_tokens;
         if base_projected > budget {
