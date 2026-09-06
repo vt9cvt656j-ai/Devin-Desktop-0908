@@ -354,6 +354,9 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 // learn_design 会往工作区写 reference/<slug>-design-system.md 和
                 // <slug>-tokens.css 两个文件，还会清掉「空工作区」标记。
                 | "learn_design"
+                // office_write / office_edit 往工作区落 xlsx / docx / pptx（edit 默认覆盖原文件）。
+                | "office_write"
+                | "office_edit"
                 | "ui_click"
                 | "db_query"
                 | "remote"
