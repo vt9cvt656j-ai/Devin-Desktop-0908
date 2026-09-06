@@ -1035,7 +1035,7 @@ test("施工请求不许被降级成反问：六处判题链和授权底线都�
   assert.match(askGw, /A build request whose stack is unspecified is NOT ambiguous/);
 
   // 开发者工具不应限制用户能开发什么。
-  const truth = P("truthfulness.txt");
+  const truth = P("truth_core.txt");   // 证据纪律的必带层（truthfulness.txt 已拆分）
   assert.match(truth, /ordinary engineering/,
     "必须明确开发工作是正当工程活");
   assert.match(truth, /Do not judge the user/,
@@ -1107,12 +1107,11 @@ test("every semantic flag the client declares is one the gateway accepts and rou
   // is always allowed.
   const KNOWN_INERT = new Set([
     "official", "community", "collaboration_staged", "collaboration_parallel",
-    "existing_project", "existing_website", "network_capture",
+    "existing_project", "existing_website",
   ]);
   const graph = JSON.parse(readFileSync(join(HERE, "../../server/prompts/prompt_graph.json"), "utf8"));
-  const routed = new Set([
-    ...Object.keys(graph.agent), ...Object.keys(graph.design), ...Object.keys(graph.modes),
-  ]);
+  // v3：旗标由 prompt_graph.json 的模块条目消费（head.flags / not_flags）。
+  const routed = new Set(graph.modules.flatMap((m) => [...(m.head?.flags || []), ...(m.head?.not_flags || [])]));
   const consumed = (flag) => routed.has(flag) || new RegExp(`semantic\\("${flag}"\\)`).test(rust);
   for (const flag of clientFlags) {
     if (KNOWN_INERT.has(flag)) continue;

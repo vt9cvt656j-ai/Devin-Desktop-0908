@@ -67,7 +67,6 @@ const RETIRED = {
 const RESERVED_FLAGS = {
   official: "researchMode=official 的细分，agent_research 目前不按官方/社区分层",
   community: "researchMode=community 的细分，同上",
-  network_capture: "抓包意图，captureMode 已在工具层生效，但没有对应的提示词模块",
   collaboration_staged: "staged_roles 的细分，agent_collaboration 目前不区分编排形状",
   collaboration_parallel: "parallel_roles 的细分，同上",
   existing_project: "brownfield 信号，架构纪律目前写在 agent_engineering 里，没有单独模块",
@@ -179,10 +178,8 @@ test("客户端算出来的每个语义旗标，服务端都得有消费者，�
   assert.ok(flags.length > 15, `只解析出 ${flags.length} 个旗标——正则失效了`);
 
   const consumed = new Set([...RUST.matchAll(/semantic\("([a-z0-9_]+)"\)/g)].map((m) => m[1]));
-  const graphKeys = new Set([
-    ...Object.keys(GRAPH.agent || {}),
-    ...Object.keys(GRAPH.design || {}),
-  ]);
+  // v3：旗标的消费者是 prompt_graph.json 里模块条目的 head.flags / not_flags。
+  const graphKeys = new Set((GRAPH.modules || []).flatMap((m) => [...(m.head?.flags || []), ...(m.head?.not_flags || [])]));
 
   const dead = flags.filter((f) => !consumed.has(f) && !graphKeys.has(f) && !(f in RESERVED_FLAGS));
   assert.deepEqual(dead, [],
@@ -203,7 +200,8 @@ test("回答质量模块要管「怎么说话」，不只管「说什么」", ()
   // 补之前 answer_quality.txt 只有 13 行，全是内容质量（先给结论、要证据、别假装完成），
   // **关于语气一个字都没有**。唯一沾边的是客户端那条禁令（不许寒暄/不许列功能菜单），
   // 是个否定规则，没有正面标准——于是"像人"这件事没有任何地方负责。
-  const text = readFileSync(join(PROMPT_DIR, "answer_quality.txt"), "utf8");
+  // 语气规范拆进了 voice.txt：chat 常驻；agent 每轮带 answer_core 里的压缩版，整份用 load_guide 自取。
+  const text = readFileSync(join(PROMPT_DIR, "voice.txt"), "utf8");
 
   assert.match(text, /How to sound like a person, not a chatbot/,
     "语气规范不见了——没有它，回答就退回模板腔");
@@ -237,11 +235,16 @@ test("回答质量模块要管「怎么说话」，不只管「说什么」", ()
     "坏消息先说，这是「像人」里最难也最要紧的一条");
   assert.match(text, /Name things concretely/, "要求具体名词，否则会退回「相关内容」这种泛指");
 
-  // 它必须真的每轮都送到：answer_quality 挂在所有模式的 base 上。
-  assert.ok(GRAPH.agent.base.includes("answer_quality"),
-    "answer_quality 不在 agent.base 上，语气规范就不是每轮都送");
+  // chat 每轮带整份；其余模式和 agent 每轮带 answer_core（里面有「像邻桌同事那样说」那句压缩版），
+  // 整份靠 load_guide 自取——这是「必须 / 按需」两层的刻意分工。
+  assert.ok(GRAPH.modes.chat.includes("voice"), "chat 模式没挂 voice——聊天会退回模板腔");
+  assert.ok(GRAPH.core.includes("answer_core"), "answer_core 不在 agent core 上");
   for (const mode of ["chat", "plan", "explorer", "reviewer"]) {
-    assert.ok((GRAPH.modes[mode] || []).includes("answer_quality"),
-      `${mode} 模式没挂 answer_quality——那个模式说话会退回模板腔`);
+    assert.ok((GRAPH.modes[mode] || []).includes("answer_core"),
+      `${mode} 模式没挂 answer_core——那个模式说话会退回模板腔`);
   }
+  const core = readFileSync(join(PROMPT_DIR, "answer_core.txt"), "utf8");
+  assert.match(core, /colleague at the next desk/, "压缩版少了正面标准");
+  assert.ok((GRAPH.modules || []).some((m) => m.id === "reply_style" && m.files.includes("voice") && m.pull),
+    "voice 要能被 agent 用 load_guide 自取");
 });

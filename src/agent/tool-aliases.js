@@ -29,6 +29,7 @@ export const _TOOL_ALIASES = {
   awaitsubagent: "await_subagent", wait_subagent: "await_subagent", waitsubagent: "await_subagent",
   runworker: "run_worker",
   updateplan: "update_plan", plan: "update_plan", todo: "update_plan", todowrite: "update_plan", todo_write: "update_plan", set_plan: "update_plan", write_todos: "update_plan",
+  loadguide: "load_guide", get_guide: "load_guide", read_guide: "load_guide", fetch_guide: "load_guide", guide: "load_guide",
   readskill: "read_skill", skill: "read_skill", load_skill: "read_skill", use_skill: "read_skill", get_skill: "read_skill", open_skill: "read_skill",
   getdiagnostics: "get_diagnostics", diagnostics: "get_diagnostics", diag: "get_diagnostics", lint: "get_diagnostics", check_errors: "get_diagnostics", get_errors: "get_diagnostics", problems: "get_diagnostics",
   generateimage: "generate_image", genimage: "generate_image", gen_image: "generate_image", image_gen: "generate_image", create_image: "generate_image", make_image: "generate_image", draw_image: "generate_image", text_to_image: "generate_image",

@@ -53,8 +53,8 @@ function transportAccepts(header) {
 /** 网关的选块判据：mode == "agent" && semantic_profile 里有 "engineering"。 */
 function gatewayBlocksFor(mode, header) {
   const flags = new Set(String(header || "").replace(/^2\.5:/, "").split(",").filter(Boolean));
-  const blocks = [...PROMPT_GRAPH.agent.base];
-  if (mode === "agent" && flags.has("engineering")) blocks.push(...PROMPT_GRAPH.agent.engineering);
+  const blocks = [...PROMPT_GRAPH.core];
+  if (mode === "agent" && flags.has("engineering")) blocks.push(...PROMPT_GRAPH.modules.find((m) => m.id === "engineering").files);
   return blocks;
 }
 
@@ -66,17 +66,19 @@ test("转运层与网关判据没有漂：本文件模拟的那两道门就是�
     "桌面端不再发 x-ide-semantic-profile 头了");
 
   // ② 网关的选块判据（prompts.rs）。这是「agent_engineering 到底什么时候挂」的唯一真源。
-  assert.match(GATEWAY_RS, /let engineering_intent = mode == "agent" && semantic\("engineering"\);/,
-    "网关的 engineering 判据变了——客户端发的旗标名必须跟着改，否则整层又是黑的");
-  assert.match(GATEWAY_RS, /append_prompt_modules\(&graph\.agent\.engineering, &mut sys, &mut prompt_blocks\)\?;/,
-    "engineering 分支不再装载 graph.agent.engineering");
+  // v3：判据在 prompt_graph.json 的模块条目里（head.flags），装配器只跑一个通用循环。
+  assert.match(GATEWAY_RS, /crate::prompt_modules::head_modules\(&graph, mode, &routing_flags\)/,
+    "网关不再按目录条件装头模块——客户端发的旗标名就没人消费了");
+  const engineering = PROMPT_GRAPH.modules.find((m) => m.id === "engineering");
+  assert.deepEqual(engineering.head.flags, ["engineering"], "engineering 模块的旗标判据变了——客户端发的旗标名必须跟着改");
+  assert.equal(engineering.head.unjudged_default, true, "裁决没落定时工程块要按默认挂上");
 
   // ③ 生产日志里那四块，就是 graph 里的 agent.base——「画像空 = 只剩基础四块」得到复核。
   // system_invariants 是**指令层级**，2026-09-02 加的，排在每个模式的第一块：
   // 它是全系统唯一一条说明"几种指令谁大谁小"的排序，客户端任何文本都不该排到它前面。
-  assert.deepEqual(PROMPT_GRAPH.agent.base,
-    ["system_invariants", "agent_core", "reasoning", "truthfulness", "answer_quality"]);
-  assert.deepEqual(PROMPT_GRAPH.agent.engineering, ["agent_engineering"]);
+  assert.deepEqual(PROMPT_GRAPH.core,
+    ["system_invariants", "agent_core", "truth_core", "answer_core"]);
+  assert.deepEqual(engineering.files, ["engineering_core"]);
 });
 
 test("端到端：快通道旗标落地 → 请求头 → 网关真的挂上 agent_engineering", () => {
@@ -86,7 +88,7 @@ test("端到端：快通道旗标落地 → 请求头 → 网关真的挂上 age
   // 出发时：没有任何旗标。这正是坏掉的那一版每一轮的样子。
   const atSend = stable(session, semanticProfile({ intentSource: "pending" }));
   assert.equal(atSend, "2.5:");
-  assert.deepEqual(gatewayBlocksFor("agent", atSend), PROMPT_GRAPH.agent.base,
+  assert.deepEqual(gatewayBlocksFor("agent", atSend), PROMPT_GRAPH.core,
     "空画像下网关只挂基础四块——这就是生产日志里的那一行");
 
   // 快通道在第一个模型回合期间落定（模型自己声明的旗标，不是词表猜的）。
@@ -99,15 +101,15 @@ test("端到端：快通道旗标落地 → 请求头 → 网关真的挂上 age
   assert.ok(transportAccepts(config.ideSemanticProfile),
     `头没通过 ai.rs 的校验，等于整个头不发：${config.ideSemanticProfile}`);
   const blocks = gatewayBlocksFor("agent", config.ideSemanticProfile);
-  assert.ok(blocks.includes("agent_engineering"),
-    `agent_engineering 仍然没挂上：profile=${config.ideSemanticProfile} blocks=${blocks.join(",")}`);
+  assert.ok(blocks.includes("engineering_core"),
+    `engineering_core 仍然没挂上：profile=${config.ideSemanticProfile} blocks=${blocks.join(",")}`);
 
   // 幂等：同一个 run 只写一次，不会每个循环边界都重算一遍。
   assert.equal(applyFast(run, config, session), false);
 
   // 粘性：会话拿到过一次，之后每一轮（哪怕那一轮画像算出来是空的）都还带着。
   const laterTurn = stable(session, semanticProfile({ intentSource: "pending" }));
-  assert.ok(gatewayBlocksFor("agent", laterTurn).includes("agent_engineering"),
+  assert.ok(gatewayBlocksFor("agent", laterTurn).includes("engineering_core"),
     "会话级单调并集断了——第二轮又掉回基础四块");
 });
 
@@ -185,8 +187,8 @@ test("执行事实同样走单调并集，且没有新事实时不重写请求�
 
   const run = { _writeLedger: [{ path: "src/a.js", ok: true }] };
   assert.equal(applyExec(run, config, session), true);
-  assert.ok(gatewayBlocksFor("agent", config.ideSemanticProfile).includes("agent_engineering"),
-    "落过盘的一轮仍然没能让 agent_engineering 挂上");
+  assert.ok(gatewayBlocksFor("agent", config.ideSemanticProfile).includes("engineering_core"),
+    "落过盘的一轮仍然没能让 engineering_core 挂上");
   assert.ok(transportAccepts(config.ideSemanticProfile));
   // 同样的事实第二次不再重写——旗标已经在并集里了。
   assert.equal(applyExec(run, config, session), false);

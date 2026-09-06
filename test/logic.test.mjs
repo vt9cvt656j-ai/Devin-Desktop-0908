@@ -144,7 +144,8 @@ const SERVER_PROMPT_WORKER = readFileSync(join(HERE, "../../server/prompts/worke
 const SERVER_PROMPT_RESEARCH = readFileSync(join(HERE, "../../server/prompts/research_prompt.txt"), "utf8");
 const SERVER_PROMPT_DESIGN = readFileSync(join(HERE, "../../server/prompts/design_research_prompt.txt"), "utf8");
 const SERVER_PROMPT_REASONING = readFileSync(join(HERE, "../../server/prompts/reasoning.txt"), "utf8");
-const SERVER_PROMPT_ANSWER_QUALITY = readFileSync(join(HERE, "../../server/prompts/answer_quality.txt"), "utf8");
+// answer_quality 拆成了 answer_core（每轮必带）+ answer_professional（plan/explorer 常驻，agent 用 load_guide 自取）+ voice（chat）。
+const SERVER_PROMPT_ANSWER_QUALITY = readFileSync(join(HERE, "../../server/prompts/answer_professional.txt"), "utf8");
 const SERVER_PROMPT_GRAPH = JSON.parse(readFileSync(join(HERE, "../../server/prompts/prompt_graph.json"), "utf8"));
 const TAURI_CONFIG = JSON.parse(readFileSync(join(HERE, "../src-tauri/tauri.conf.json"), "utf8"));
 const TAURI_PACKAGE_CONFIG = JSON.parse(readFileSync(join(HERE, "../src-tauri/tauri.package.conf.json"), "utf8"));
@@ -10738,10 +10739,12 @@ test("server prompts preserve prompt rescue and maintainability baselines", () =
     "a model turn must not resume reasoning after answer or tool output starts");
   assert.match(SERVER_PROMPT_ANSWER_QUALITY, /simple greeting, identity, or general-knowledge question[\s\S]*in one pass/i,
     "simple questions need one considered answer rather than a canned or repeated turn");
-  assert.ok(SERVER_PROMPT_GRAPH.modes.chat.includes("answer_quality"),
-    "gateway-routed lightweight chat must receive response ordering from the Prompt Graph");
-  assert.ok(SERVER_PROMPT_GRAPH.agent.base.includes("answer_quality"),
-    "gateway-routed agent turns must receive the same response ordering from the Prompt Graph");
+  assert.ok(SERVER_PROMPT_GRAPH.modes.plan.includes("answer_professional"),
+    "plan 模式常驻专业合成层（回复策略/证据加权）");
+  assert.ok(SERVER_PROMPT_GRAPH.core.includes("answer_core"),
+    "gateway-routed agent turns must receive the compact answer core from the Prompt Graph");
+  assert.ok(SERVER_PROMPT_GRAPH.modules.some((m) => m.id === "answer_professional" && m.pull),
+    "agent 模式的专业合成层要能用 load_guide 自取");
   assert.doesNotMatch(extractFn("sendPrompt"), /_agentLightTurn \? _RESPONSE_ORDER_TUNING/,
     "the client must not resend the server-owned response-order block on lightweight L0 turns");
 });
@@ -21638,6 +21641,7 @@ test("子体的「门」和「钥匙」两张表要对得上（有门没钥匙 =
     ["termread", "read_terminal"],
     ["logs", "read_logs"],
     ["skill", "read_skill"],
+    ["guide", "load_guide"],
   ]) {
     if (has(types, type)) {
       assert.ok(has(tools, tool),
@@ -22024,7 +22028,7 @@ test("orchestration is the model's decision (harness no longer auto-dispatches o
     "the profile-driven orchestration nudges must be gone");
 
   // 2. The capability is not lost — the parallelize-yourself decision lives in the prompt.
-  const collab = readFileSync(join(HERE, "../../server/prompts/agent_collaboration.txt"), "utf8");
+  const collab = readFileSync(join(HERE, "../../server/prompts/collaboration_decide.txt"), "utf8");
   assert.match(collab, /Parallelizing is your decision/,
     "agent_collaboration.txt must put the parallelization decision on the model");
   assert.match(collab, /run_subagent|run_worker/,
@@ -26723,7 +26727,7 @@ test("提示词里引用的工具名、网关 tools.json、IDE 注册表三者�
     `网关 tools.json 宣告了 IDE 没有实现的工具（模型调用即失败）：\n  ${phantom.join("\n  ")}`);
 
   // 提示词里点名的工具必须两边都真实存在
-  const engineering = readFileSync(join(HERE, "../../server/prompts/agent_engineering.txt"), "utf8");
+  const engineering = readFileSync(join(HERE, "../../server/prompts/engineering_core.txt"), "utf8");
   for (const name of ["read_file", "edit_file", "multi_edit", "write_file",
                       "find_files", "search", "get_diagnostics", "git_diff", "run_cmd"]) {
     if (!engineering.includes(name)) continue;
@@ -27214,7 +27218,7 @@ test("the always-injected prompt demands real, working delivery — no mocks or 
   // the client fallback (_HUMAN_EVIDENCE_FALLBACK), never in the gateway prompts the model reads.
   // agent.base = [agent_core, reasoning, truthfulness, answer_quality] — answer_quality carries it
   // now, so it reaches EVERY agent task, not just detected-engineering ones.
-  const aq = readFileSync(join(HERE, "../../server/prompts/answer_quality.txt"), "utf8");
+  const aq = readFileSync(join(HERE, "../../server/prompts/answer_core.txt"), "utf8");
   assert.match(aq, /mock/i, "must forbid mock implementations by name");
   assert.match(aq, /example\.com/, "must forbid fabricated placeholder URLs by name");
   assert.match(aq, /real interfaces\/endpoints\/URLs/i, "must require real endpoints/URLs");
@@ -27224,8 +27228,8 @@ test("the always-injected prompt demands real, working delivery — no mocks or 
 
   // And it is on the always-injected base, not a task block that may or may not fire.
   const graph = JSON.parse(readFileSync(join(HERE, "../../server/prompts/prompt_graph.json"), "utf8"));
-  assert.ok(graph.agent.base.includes("answer_quality"),
-    "answer_quality must be in agent.base so the real-delivery directive is always injected");
+  assert.ok(graph.core.includes("answer_core"),
+    "answer_core must be in the agent core so the real-delivery directive is always injected");
 });
 
 test("a model-run verifier that exits 0 earns verification credit", () => {

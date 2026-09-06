@@ -143,6 +143,7 @@ export const TOOL_ICONS = {
   // ── 想 ───────────────────────────────────────────────────────────────
   think: '<path d="M12 3.5a4 4 0 0 0-4 4v.4A3.6 3.6 0 0 0 6.4 14 3.6 3.6 0 0 0 10 17.5h2"/><path d="M12 3.5a4 4 0 0 1 4 4v.4A3.6 3.6 0 0 1 17.6 14 3.6 3.6 0 0 1 14 17.5h-2"/><path d="M12 3.5v17"/>',
   skill: '<path d="M12 3l1.9 4.4 4.6.4-3.5 3.1 1.1 4.6L12 13.1 7.9 15.5l1.1-4.6L5.5 7.8l4.6-.4z"/><path d="M18.5 17.5l.9 2 2 .9-2 .9-.9 2-.9-2-2-.9 2-.9z"/>',
+  guide: '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5z"/><path d="M4 20.5V5.5"/><path d="M9 8h7"/><path d="M9 12h5"/>',
   memory: '<path d="M6 4h11a2 2 0 0 1 2 2v14l-6.5-3.5L6 20z"/><path d="M9.5 9h6"/>',
   askuser: '<path d="M20 15a3 3 0 0 1-3 3H9l-4.5 3.5V6a3 3 0 0 1 3-3h9.5a3 3 0 0 1 3 3z"/><path d="M10.2 8.8a2 2 0 1 1 2.8 2.2c-.7.4-1 .8-1 1.5"/><path d="M12 15h.01"/>',
   genimage: '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><circle cx="8.8" cy="9.8" r="1.6"/><path d="M20.5 15.5l-4.5-4.5L6 20"/>',
@@ -183,7 +184,7 @@ export const TOOL_FAMILY = {
   web: "net", websearch: "net", http: "net", download: "net", browser: "net",
   screenshot: "net", computer: "net", remote: "net", mcp: "net", qr: "net",
   db: "net", git: "net", gh: "net",
-  think: "think", skill: "think", memory: "think", askuser: "think",
+  think: "think", skill: "think", guide: "think", memory: "think", askuser: "think",
   genimage: "think", subagent: "think", plan: "think", updateplan: "think",
   game_scaffold: "make", generate_3d: "make", generate_sound: "make",
   generate_music: "make", generate_voice: "make", auto_rig: "make",

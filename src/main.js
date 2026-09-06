@@ -24784,7 +24784,7 @@ function _skillAllowedTools() {
 /** 工具调用落到 allowed-tools 白名单里的哪个名字上。技能里写的是 Claude Code 那套
  *  名字（Read / Grep / Bash…），这里的工具名是 read_file / grep / run_cmd，做一次映射。 */
 const _SKILL_TOOL_ALIASES = {
-  read: ["read_file", "read_skill", "list_dir"],
+  read: ["read_file", "read_skill", "load_guide", "list_dir"],
   write: ["write_file", "apply_patch", "edit_file", "multi_edit", "create_dir"],
   edit: ["apply_patch", "edit_file", "write_file", "multi_edit"],
   bash: ["run_cmd", "run_command", "terminal", "run_in_terminal"],
@@ -26503,7 +26503,7 @@ function _ideSemanticProfile(profile) {
   // 不可信输入→危险汇聚点 / 鉴权授权会话 / 业务滥用 / 并发与失败路径 / 密钥与暴露，
   // 5,964 字符而不是 9,393；「深挖审计」的抬头、内存底层、和「确认漏洞之后怎么办」都去掉，
   // 因为这一轮是在写不是在查。两条旗互斥：审计走 defects 拿全表，写码走这条拿五类。
-  add("defects_write", p.securityRisk && !p.explicitReadOnly);
+  add("defects_write", p.securityRisk && !p.explicitReadOnly); add("debug", p.bug || p.debugProject); // 排错因果链那一块：修具体报错、整项目排查都算
   add("collaboration", p.orchestrationMode === "staged_roles" || p.orchestrationMode === "parallel_roles");
   add("collaboration_staged", p.orchestrationMode === "staged_roles");
   add("collaboration_parallel", p.orchestrationMode === "parallel_roles");
@@ -37599,7 +37599,7 @@ agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_use
   // Every Agent turn has the registry discovery entry point, including conversational
   // turns whose profile happens to be answer-only. It is still bounded by the payload
   // window and does not expose the complete catalog in the prompt.
-  if (!out.some((tool) => tool?.function?.name === "search_tools")) out.push(_SEARCH_TOOLS_SCHEMA);
+  if (!out.some((tool) => tool?.function?.name === "search_tools")) out.push(_SEARCH_TOOLS_SCHEMA); if (!out.some((tool) => tool?.function?.name === "load_guide")) { const _lg = all.find((t) => t?.function?.name === "load_guide"); if (_lg) out.push(_lg); } // 按需指南的自取入口常驻，网关回填描述
   return out;
 }
 // Identifier-shaped input can be an explicit tool-name request. Exact registered
@@ -38726,7 +38726,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "worktree": return { type: "worktree", action: String(args.action || "list"), name: String(args.name || ""), path: String(args.path || args.dest || "") };
     case "remember": return { type: "memory", path: (args.scope === "global" ? "全局记忆" : "项目记忆"), content: args.content || "", scope: args.scope === "global" ? "global" : "project" };
     case "recall_conversation": return { type: "recall", query: args.query || args.q || args.keyword || "", limit: Number.isFinite(+args.max_results) ? Math.max(1, Math.min(20, +args.max_results)) : 6 };
-    case "read_skill": return { type: "skill", name: String(args.name || args.skill || args.id || ""), why: String(args.why || args.reason || args.purpose || "").replace(/\s+/g, " ").trim().slice(0, 200) };
+    case "read_skill": return { type: "skill", name: String(args.name || args.skill || args.id || ""), why: String(args.why || args.reason || args.purpose || "").replace(/\s+/g, " ").trim().slice(0, 200) }; case "load_guide": return { type: "guide", name: String(args.id || args.name || args.guide || "").trim().toLowerCase().replace(/-/g, "_") };
     case "save_skill": {
       const _slug = String(args.name || "").trim().toLowerCase().replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
       const _tools = Array.isArray(args.allowed_tools) ? args.allowed_tools.map((t) => String(t || "").trim()).filter(Boolean)
@@ -47600,7 +47600,7 @@ function _tauriSearchInvokeArgs(call) {
 // db queries and terminal reads — so a turn that batches many such calls finishes in
 // one round-trip. Every workspace-writing tool, including asset generation, stays
 // strictly sequential even when two calls happen to name different destinations.
-const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "recall", "termread", "termlist", "logs", "search_tools", "skill", "current_time", "localdiscovery", "liveenvironment", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
+const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "recall", "termread", "termlist", "logs", "search_tools", "skill", "guide", "current_time", "localdiscovery", "liveenvironment", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
   // 下面这几个本来就在 `_READ_TYPES`（子体的只读类型表，本仓库自己认定的"这些只读"）里，
   // 却漏在这份并行判据外——于是它们被无谓地串行化：语义检索、找符号、看图、探环境、
   // 抽 UI、读屏，每一个都得等前一个跑完。两份手写名单漂了，这是第 N 次。
@@ -50133,7 +50133,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 否则就是"看得见打不开的钥匙"（read_logs / read_skill 已经这么漂过一次，
   // test/logic.test.mjs 里那条对账测试就是为此加的）。
   // git 和 gh 是单 type 多 op，类型放行之后另有 _GIT_READ_OPS / _GH_READ_OPS 二次把关。
-  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_hover", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "live_environment", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codrops_search", "crossref_search", "cve_search", "developer_community_search", "github_search", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "smashingmag_search", "stackoverflow_search", "steam_search", "wiki_search", "search_game_assets", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo", "git_show", "git_conflicts", "git_stash_list", "gh_pr_view", "gh_pr_review_comments", "gh_actions_log", "view_image", "ui_extract", "read_screen", "read_terminal", "list_terminals", "think", "recall_conversation", "current_time", "probe_env"];
+  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_hover", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "live_environment", "read_skill", "load_guide", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codrops_search", "crossref_search", "cve_search", "developer_community_search", "github_search", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "smashingmag_search", "stackoverflow_search", "steam_search", "wiki_search", "search_game_assets", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo", "git_show", "git_conflicts", "git_stash_list", "gh_pr_view", "gh_pr_review_comments", "gh_actions_log", "view_image", "ui_extract", "read_screen", "read_terminal", "list_terminals", "think", "recall_conversation", "current_time", "probe_env"];
   // 这张表必须和上面 _READ_TOOLS 里每个名字的**类型**一一对上。
   //
   // 名字进 _READ_TOOLS 决定"模型看得见"，类型进 _READ_TYPES 决定"派发时放不放行"——
@@ -50142,7 +50142,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 就这么漂了：子智能体的工具清单里明晃晃列着它们，一调就是 [BLOCKED]，
   // 于是它要么反复重试，要么绕远路用 run_cmd 去 cat 日志。
   // test/logic.test.mjs 里有一条测试拿 _mapToolCall 把两张表逐个对账，别再漂。
-  const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "screenshot", "liveenvironment", "git", "logs", "skill", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codeberg_repo", "codrops_search", "crossref_search", "current_time", "cve_search", "developer_community_search", "gh", "gitee_repo", "github_repo", "github_search", "gitlab_repo", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "readscreen", "recall", "search_game_assets", "smashingmag_search", "stackoverflow_search", "steam_search", "termlist", "termread", "think", "uiextract", "viewimage", "wiki_search", "probeenv"];
+  const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "screenshot", "liveenvironment", "git", "logs", "skill", "guide", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codeberg_repo", "codrops_search", "crossref_search", "current_time", "cve_search", "developer_community_search", "gh", "gitee_repo", "github_repo", "github_search", "gitlab_repo", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "readscreen", "recall", "search_game_assets", "smashingmag_search", "stackoverflow_search", "steam_search", "termlist", "termread", "think", "uiextract", "viewimage", "wiki_search", "probeenv"];
   // 只读的 git op。type 级放行之后按 op 二次把关（见下面 _gitOpBlocked）。
   // show/conflicts/stash_list 都只读：git show 看历史提交，conflicts 列冲突文件，
   // stash_list 列储藏——三个都不动工作树，也不写远端。
@@ -59928,7 +59928,7 @@ function _toolStepActionLabel(call) {
   const labels = {
     write: "写入", edit: "编辑", multiedit: "批量编辑", read: "读取", list: "列目录", cmd: "运行",
     search: "搜索", find: "查找", web: "抓取", websearch: "联网搜索", search_tools: "查找工具",
-    memory: "记忆", think: "思考", skill: "读取技能", delete: "删除", move: "移动", diag: "诊断", git: "Git", gh: "GitHub",
+    memory: "记忆", think: "思考", skill: "读取技能", guide: "加载指南", delete: "删除", move: "移动", diag: "诊断", git: "Git", gh: "GitHub",
     lsp: "LSP", findsymbol: "查找符号", semsearch: "语义搜索", knowledge: "知识检索", mkdir: "建目录",
     copy: "复制", format: "格式化", termtask: "终端任务", termread: "读终端", termlist: "终端列表",
     termstop: "停止终端", http: "HTTP", tor: "Tor", download: "下载", mcp: "MCP", demostart: "录制中",
@@ -66493,7 +66493,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         return { type: "genimage", path: call.dest, content: `[失败] generate_image 出错（${_imgModel}）: ${msg}` };
       }
 
-    } else if (call.type === "office_write" || call.type === "office_edit" || call.type === "office_read") { return runOfficeStep(call, { inTauri, root: root || rootPath || workspaceRoots[0] || "", invoke: (cmd, args) => backend.invoke(cmd, args), resolve: _resolveRel, reloadDir, parentDir, escHtml: _escHtml, res, vp });
+    } else if (call.type === "office_write" || call.type === "office_edit" || call.type === "office_read") { return runOfficeStep(call, { inTauri, root: root || rootPath || workspaceRoots[0] || "", invoke: (cmd, args) => backend.invoke(cmd, args), resolve: _resolveRel, reloadDir, parentDir, escHtml: _escHtml, res, vp }); } else if (call.type === "guide") { const _gid = String(call.name || "").trim(); res.textContent = _gid ? `指南 ${_gid}` : "缺少指南 id"; return _gid ? { type: "guide", path: _gid, content: `〔指南 ${_gid} 已由 IDE 附在这条结果之后〕` } : { type: "guide", path: "", ok: false, failure: { attempted: true, code: "guide_id_missing" }, content: "[失败] load_guide 需要 id，可用的 id 见工具描述" };
     } else if (call.type === "mcp") {
       const label = `${call.server || "?"}/${call.tool || call.mcpName || "?"}`;
       if (!inTauri) { _mcpCardSettle(vp, step, "MCP 只能在桌面 App 里用"); res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "mcp", path: label, content: "[不可用] MCP 外部工具只能在桌面 App 里用（要本地启动 MCP 服务进程）。" }; }
@@ -71853,7 +71853,7 @@ const DEFAULT_ADAPTIVE_PROFILE = {
   tone: "direct",
   detail: "balanced",
   autonomy: "proactive",
-  skill: "auto",
+  skill: "auto", guide: "auto",
   intentMode: "infer",
 };
 const ADAPTIVE_PROFILE_OPTIONS = {
