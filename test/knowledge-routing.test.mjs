@@ -241,7 +241,9 @@ test("裁决提示词必须把 domain 讲清楚并出现在输出形状里，否
   for (const name of ["healthcare", "reverse-engineering", "michael-design"]) {
     assert.ok(ask.slice(0, 4000).includes(name), `domain 的枚举说明里缺 ${name}`);
   }
-  const shapes = [...SRC.matchAll(/"designMode":"michael_design_2_5_existing"[^}]*/g)].map((m) => m[0]);
+  // 定位锚是工程对象的开头，不是示例里某个字段的取值：示例 2026-09-06 改成了中性形状
+  // （designMode none / solo），弱模型照抄示例时抄到的才不是整套设计律。
+  const shapes = [...SRC.matchAll(/"engineering":\{"projectState":"existing","deliverySurface":"[^}]*/g)].map((m) => m[0]);
   assert.ok(shapes.length >= 2, `只找到 ${shapes.length} 份输出形状——合成那份和拆问工程半那份都要有`);
   for (const shape of shapes) {
     assert.match(shape, /"domain":"/, "有一份输出形状里没有 domain，模型照着它输出就永远不带这个字段");
