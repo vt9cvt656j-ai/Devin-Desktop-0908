@@ -175,6 +175,8 @@ import { configureWorkflowMemory, wfPrune } from "./agent/workflow-memory.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
+import { automationNeed, automationAllowed, automationBlockedReceipt, offerToVerifySuggestion } from "./agent/automation-need.js";
+import { LIVE_WATCH_STORE_KEY, WATCH_SOURCES, normalizeLiveWatchConfig, normalizeRule, resolveWatchPolicy, detectTerminalError, detectPreviewError, detectCaptureFailure, makeWatchEvent, newWatchState, matchRules, decideFire, composeWatchNotice, describeWatchEventForUser, stripAnsi as _watchStripAnsi } from "./agent/live-watch.js";
 import {
   addHidden, chipBeside, chipPadMove, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
   planExplorerDrop, planMove, topLevelOf,
@@ -5985,6 +5987,8 @@ window.addEventListener("message", (ev) => {
       msg: String(d.msg == null ? "" : d.msg).slice(0, 600),
       src: String(d.src || "").slice(0, 200),
     });
+    // 实时监听：error 级的交给它去判要不要自动开一轮修（agent/live-watch.js）。
+    try { _liveWatchPreviewLog(d); } catch {}
     return;
   }
   if (d.__mrdayone === "preview-picked") {
@@ -21832,7 +21836,8 @@ function addMessage(role, text, forSession, attachments = [], options = {}) {
   // 说的话。图标复用工具卡那套 Lucide 几何。所有者：「不要让他给我 IDE 直接用用户视角发消息」。
   if (options.notice) {
     wrap.className = "msg notice";
-    const _nIcon = options.notice.source === "background_monitor" ? "background_monitor" : "think";
+    if (options.notice.source === "live_watch") wrap.classList.add("notice--watch");
+    const _nIcon = (options.notice.source === "background_monitor" || options.notice.source === "live_watch") ? "background_monitor" : "think";
     wrap.innerHTML = `<span class="notice__ic" aria-hidden="true">${_toolIconSvg(_nIcon)}</span><span class="notice__t"></span>`;
     const _nText = wrap.querySelector(".notice__t");
     _nText.textContent = String(text || "");
@@ -25275,7 +25280,8 @@ function _ideSemanticProfile(profile) {
   // 数据"来判，缺席时不点。
   add("design_data", p.uiProject && ["local", "server", "inspect_existing", "undecided"].includes(p.dataStrategy));
   add("design_motion", p.motionDesignRequired || p.advancedMotionRequired || p.motionChoreographyRequired || p.fullWebsite);
-  add("design_verification", p.ui && p.workspaceAction === "modify");
+  // 设计验收模块（起 dev server、桌面+手机矩阵）只在用户要求看 / 测页面时挂：档位 none 的一轮不挂。
+  add("design_verification", p.ui && p.workspaceAction === "modify" && !!p.automationNeed && p.automationNeed !== "none");
   add("design_knowledge_full", p.fullWebsite || p.designMode === "michael_design_2_5_greenfield" || p.changeScope === "project" || p.changeScope === "system");
   // 领域旗标：22 个专业语料域里，此前只有 michael-design 有专属触发路径，另外 21 个是
   // 路由孤儿——4.3MB 语料摆在那里，没有任何旗标能把一个任务指过去。这条旗标就是那条路由。
@@ -28082,6 +28088,12 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
   const picks = [];
   const task = String(run.task || "").slice(0, 60);
 
+  // 改过界面、但用户这一轮没要求看：把「要不要在浏览器里看一眼」交回给他（自动化按需）。
+  if (typeof offerToVerifySuggestion === "function" && run.automationNeed === "none" && (run.uiTouched || Number(run.automationBlocked || 0) > 0)) {
+    const _offer = offerToVerifySuggestion({ devServerUrl: run.devServerUrl || "", uiTouched: true });
+    if (_offer) picks.push({ ...(_offer), label: run.automationNeedReason === "not_asked" && Number(run.automationBlocked || 0) > 0 ? `${_offer.label}（刚才拦下了 ${run.automationBlocked} 次自动化）` : _offer.label });
+  }
+
   // 场景 1:失败→根据 failureCategory 给出针对性建议
   if (run.outcome === "failed" && run.failureCategory) {
     const map = {
@@ -28918,8 +28930,11 @@ function _queueNotice(sess, text, meta = {}) {
   };
   // 形状照 Claude Code 的 task-notification：先两行结构化的「任务 / 状态」，再是正文。
   const head = [meta.task ? `任务：${String(meta.task)}` : "", meta.status ? `状态：${String(meta.status)}` : ""].filter(Boolean).join("\n");
-  const body = "〔IDE 后台通知 · 不是用户发的消息〕\n" + (head ? head + "\n" : "") + t
-    + "\n（用户没有说话，这是 IDE 在后台等到结果后自动续上的。接着做你之前在做的事；别向用户转述这条通知，也别问他接下来做什么。）";
+  const _isWatch = String(meta.kind || "") === "watch";
+  const body = (_isWatch ? "〔IDE 实时监听 · 不是用户发的消息〕\n" : "〔IDE 后台通知 · 不是用户发的消息〕\n") + (head ? head + "\n" : "") + t
+    + (_isWatch
+      ? "\n（用户没有说话，这是 IDE 在他使用应用时发现问题后自动发起的。处理完用一两句话告诉用户发生了什么、改了哪里；别把这条通知本身复述给他。）"
+      : "\n（用户没有说话，这是 IDE 在后台等到结果后自动续上的。接着做你之前在做的事；别向用户转述这条通知，也别问他接下来做什么。）");
   // 戴编排信封：和循环里其它 harness 注入同一个形状（test/logic.test.mjs 有一条按结构扫的断言）。
   // steer 项另带 body：循环里那句 push 要自己拼 _ORCH_NOTE，才过得了那条结构扫描。
   const content = _ORCH_NOTE + body;
@@ -30325,6 +30340,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         task: text,
         engineering: _turnEngineeringResolved,
         intentState: _turnIntentState,
+        // IDE 自己续上的一轮（后台监控 / 实时监听）：自动化档位据此定（实时监听 = diagnostic）。
+        notice: opts.notice || null,
         skillsBlock,
         billingTasks: _turnBillingTasks,
         taskStartedAt: _taskStartedAt,
@@ -35883,6 +35900,28 @@ const _PROFILE_TOOL_GRANTS = [
     when: (p) => !!p.capture || p.browserGoal === "network_capture",
     tools: ["capture_start"] },
 ];
+/** 档位 ≠ none 时进窗口的那几族。browser 也在：用户报告的多半是页面上的问题。 */
+const _AUTOMATION_NEED_TOOLS = ["read_screen", "ui_click", "computer", "screenshot", "browser"];
+
+/**
+ * 算这一轮的自动化档位并记到 run / 画像 / 会话上。返回档位。
+ * 画像上也记一份（automationNeed）：提示词模块（design_verification）和收尾契约按它判，
+ * 它们只拿得到画像，拿不到 run。
+ */
+function _computeAutomationNeed(run, text, notice = null) {
+  if (typeof automationNeed !== "function") return "requested";
+  const sess = run?.session || null;
+  const prev = String(sess?._automationNeed || "none");
+  const r = automationNeed({ text: String(text || ""), profile: run?.engineering || null, prevLevel: prev, notice });
+  if (run) {
+    run._automationNeed = r.level;
+    run._automationNeedReason = r.reason;
+    if (run.engineering && typeof run.engineering === "object") run.engineering.automationNeed = r.level;
+  }
+  if (sess) sess._automationNeed = r.level;
+  return r.level;
+}
+
 function _profileGrantedTools(profile) {
   const p = profile || {};
   const out = [];
@@ -35953,10 +35992,10 @@ agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_use
             //     工具」（下面那条注释就是这条规矩的原文）。
             // 两个都不给子体（不在 _READ_TOOLS 里）：只读子体本来就不写文件、不注册服务。
             "save_skill", "mcp_server",
-            // 桌面三件套：生产 30 天 0 调用、本机情景档案 0 条——不是没人要操作桌面，是它们
-            // 只在分类器标 desktopAutomation 时才进窗口，而「帮我点一下那个弹窗」这类话分类器
-            // 十有八九标不出来。三个合计约 5KB；进窗口 ≠ 每轮都用，判断权仍在模型。
-            "read_screen", "ui_click", "computer",
+            // 桌面三件套 2026-09-06 进过开局窗口，2026-09-07 撤回：所有者「用户没要求也全跑」。
+            // 它们改由**档位**授予（_AUTOMATION_NEED_TOOLS）——用户原话里有「点一下 / 打开 / 看看 /
+            // 操作」这类要求、或报告了运行时问题、或裁决声明了自动化，就进窗口；纯写代码的一轮不进。
+            // 「帮我点一下那个弹窗」这类话由 automation-need.js 的词表认，不再指望分类器。
             // background_monitor 和 get_diagnostics 进窗口，理由和上面 github_repo 那条
             // 逐字相同：**文案点名的工具必须在手里**。
             //
@@ -49461,7 +49500,8 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   for (const kind of p.externalObligations || []) _finishChecks.push(`${_finishEffectLabels[kind] || kind}（核对远端/后置状态）`);
   if (p.needsOfficialResearch) _finishChecks.push("已取得官方/维护方真实证据（注册表/仓库/官方文档正文，搜索标题不算）");
   if (p.needsCommunityResearch) _finishChecks.push("已取得开发者社区真实证据（原帖正文，搜索标题不算）");
-  if (p.ui || p.uiProject) _finishChecks.push("改过前端就用真实浏览器验过受影响的点（首次交付=桌面+手机完整矩阵，之后只验受影响点）");
+  // 浏览器验收只在用户要求了（或报告了运行时问题）时是义务：档位记在画像的 automationNeed 上。
+  if ((p.ui || p.uiProject) && p.automationNeed && p.automationNeed !== "none") _finishChecks.push("改过前端就用真实浏览器验过受影响的点（首次交付=桌面+手机完整矩阵，之后只验受影响点）");
   if (_finishChecks.length || p.applies) {
     // 这里原来写着「改过代码时收尾会自动跑本项目探测到的验证命令」——**那是假的**。
     // `_runApprovedVerification` 只有定义、零调用点（见 62535 及 23301/47901 两处注释），
@@ -51165,6 +51205,7 @@ function _applyLateIntentIfLanded(run, config, task, session, body, isLive, mess
   }
   if (!late || late.intentSource !== "ai") return false;
   run.engineering = late;
+  if (typeof _computeAutomationNeed === "function") _computeAutomationNeed(run, run._originalText || "", run._notice || null);
   // 模型判过了：这一位一置，_sessionStableSemanticProfile 就不再往请求头里放 unjudged——
   // 否则裁决明明落地了，网关还按「没判」的模式级默认走，说不是工程的也撤不下工程块。
   if (session && typeof session === "object") { try { session._semanticProfileFromModel = true; } catch {} }
@@ -51267,6 +51308,7 @@ function _applyFastRouteBehaviorIfLanded(run) {
   merged.explicitReadOnly = false;
   run._fastRouteBehaviorApplied = true;
   run.engineering = merged;
+  if (typeof _computeAutomationNeed === "function") _computeAutomationNeed(run, run._originalText || "", run._notice || null);
   return true;
 }
 
@@ -51346,7 +51388,7 @@ function _applyExecutionFactProfile(run, config, session) {
   return true;
 }
 
-async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot = "", session, mode, task, engineering = null, intentState = null, skillsBlock = "", billingTasks = [], taskStartedAt = Date.now(), timeline = null }) {
+async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot = "", session, mode, task, engineering = null, intentState = null, notice = null, skillsBlock = "", billingTasks = [], taskStartedAt = Date.now(), timeline = null }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
   // session/root 先解析：意图画像要读本会话刚确认的语义帧，必须拿到真 session。
   session = session || _currentSession();
@@ -51391,6 +51433,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   run.skillsBlock = skillsBlock;
   run.stack = _projectStacks.get(root) || null;
   run.engineering = _engineeringProfile;
+  // 自动化「要不要跑」的档位（agent/automation-need.js）：按用户原话 + 裁决声明算，记在 run 上；
+  // 会话记上一轮的档位供「继续」沿用。浏览器 / 截图 / 桌面自动化的放行、界面验收的义务都读它。
+  run._notice = notice || null;
+  if (typeof _computeAutomationNeed === "function") _computeAutomationNeed(run, task, run._notice);
   // 验收契约：条目来自裁决算好的成功判据，且跨 run 累积。
   //
   // 原来是 `_extractRequirementsChecklist(task)`——一个纯文本切分器，只按换行、项目符号、
@@ -51564,6 +51610,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 声明装载：画像说这轮要操作桌面/浏览器/抓包，就把那一族**加进**窗口。
     // 进签名，这样画像迟到落地（_applyLateIntentIfLanded）时会真的重算一次。
     const _granted = _profileGrantedTools(run.engineering);
+    // 档位放行（agent/automation-need.js）：用户要求了、或报告了只有运行时才看得见的问题，
+    // 才把浏览器 / 桌面 / 截图那几族装进窗口——纯写代码的一轮里它们不在手边，也就不会被顺手拿来「验收」。
+    if (run._automationNeed && run._automationNeed !== "none") {
+      for (const t of _AUTOMATION_NEED_TOOLS) if (!_granted.includes(t)) _granted.push(t);
+    }
     const signature = `${run.mode || "agent"}:${run.mcpToolCache?.length || 0}:${_granted.join(",")}`;
     if (signature === _toolProfileSignature) return false;
     _toolProfileSignature = signature;
@@ -52496,6 +52547,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               _steerSemanticText,
               session._intentState,
             );
+            // 插话可能就是「去浏览器里看看」：档位按原话 + 插话一起重算，只会往上升。
+            if (typeof _computeAutomationNeed === "function") _computeAutomationNeed(run, `${run._originalText || ""}\n${_steerSemanticText}`, run._notice || null);
             if (_steerVerdict) _commitAiIntentState(session, _steerVerdict, _steerSemanticText, _steerIntentContext);
             config.ideSemanticProfile = _sessionStableSemanticProfile(session, _ideSemanticProfile(run.engineering));
             run._steeredWorkspaceRequired = !!run.engineering.explicitWorkspaceMutation;
@@ -55716,7 +55769,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
 
       // 兜底自动验证搬到了收尾那一刻（_autoVerifyNow，Stop-hook 形状）：批次中途跑整套测试
       // 会打断模型自己的节奏，而它想收尾的那一刻才是「没验证就放行」真正发生的地方。
-      if (uiVerifyNudges < 2 && _live() && run.mode === "agent"
+      // 档位 none（用户没要求看页面）：不追加「这一版没人在浏览器里看过」——那句话就是「写完网站非要跑
+      // 自动化」的来路之一；要不要看，由用户在结局卡片上决定。
+      if (uiVerifyNudges < 2 && _live() && run.mode === "agent" && run._automationNeed !== "none"
           && _implOps > 0 && _uiVerifiedAtImplOps < _implOps && _lastUiNudgeAtImplOps < _implOps) {
         const _uiChanged = items
           .filter((it) => it.call && _WORKSPACE_MUTATING_TYPES.has(it.call.type) && it.call.path
@@ -56181,10 +56236,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         || _verifiedAtImplOps === _implOps
         || (Array.isArray(run._executionEvidence)
           && run._executionEvidence.some((e) => _evidenceCertifies(e, _implOps)));
-      if (run.engineering?.ui && didMutate) {
+      if (run.engineering?.ui && didMutate && run._automationNeed !== "none") {
         uiVerificationPassed = _uiVerifiedAtImplOps === _implOps;
       } else {
-        // Non-UI work has no browser obligation.
+        // Non-UI work has no browser obligation. 用户没要求看页面的界面改动同样没有：
+        // 要不要在浏览器里验，由他在结局卡片上决定（agent/automation-need.js）。
         uiVerificationPassed = true;
       }
       // 这两条是**记账**，不是拦截，所以不该被"模型末尾问了句话"豁免掉。
@@ -56213,7 +56269,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         verificationPassed = false;
         run._incompleteReason ||= "code_delivered_unverified";
       }
-      if (run.engineering?.ui && didMutate && !uiVerificationPassed) {
+      if (run.engineering?.ui && didMutate && run._automationNeed !== "none" && !uiVerificationPassed) {
         run._incompleteReason ||= "ui_verification_missing";
       }
       // 尝试写了、没落盘：这是**用户侧**唯一的出口。模型那边已经在交付事实里收到这条
@@ -56374,6 +56430,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     session._lastRunState = {
       outcome: _runOutcome, mode: _normalizeAiMode(session?.mode || _currentAiMode),
       outcomeCause: _partialCause,
+      // 自动化档位与「这轮改过界面、有没有 dev server」：结局卡片据此给「在浏览器里检查一下」的选项。
+      automationNeed: String(run._automationNeed || ""),
+      automationNeedReason: String(run._automationNeedReason || ""),
+      // 模型这一轮想跑自动化被拦了几次：拦过就更该把「在浏览器里检查一下」的选项给用户。
+      automationBlocked: Number(run._automationBlocked || 0),
+      uiTouched: !!(run.engineering?.ui && didMutate),
+      devServerUrl: String(run._devServer?.url || ""),
       task: String(task || "").replace(/\s+/g, " ").trim().slice(0, 700),
       result: String(summaryText || finalErr || "").replace(/\s+/g, " ").trim().slice(0, 1000),
       incompleteReason: String(run._incompleteReason || (hitCap ? "iteration_limit" : "")).slice(0, 260),
@@ -65590,6 +65653,21 @@ async function _executeToolStep(step, call, root, run) {
   // 已把 context7 查询参数预填在 run 上；模型对那个工具发空参数调用即点头，这里代填。
   // 同样必须在授权检查之前——确认框里给用户看的得是真实查询参数。IDE 从不自己发起。
   if (typeof _depDocsCandidateFill === "function") _depDocsCandidateFill(run, call);
+  // ── 自动化按需 ────────────────────────────────────────────────────────
+  // 这一轮用户没要求打开 / 查看 / 操作页面或应用、也没报告运行时问题（档位 none）→ 浏览器、截图、
+  // 桌面自动化不跑（agent/automation-need.js）。所有者：「写完了网站你非要跑全自动化，用户也没提及」。
+  // 放在授权检查之前：这不是用户拒绝，是压根没被要求，不该弹框让他来拒。
+  if (run && run._automationNeed === "none" && typeof automationAllowed === "function" && !automationAllowed("none", call)) {
+    let _devUrl = "";
+    try { _devUrl = String(run._devServer?.url || (typeof _runOwnedDevServerUrl === "function" ? _runOwnedDevServerUrl(run) : "") || ""); } catch {}
+    const _receipt = automationBlockedReceipt(call, { devServerUrl: _devUrl });
+    run._automationBlocked = (run._automationBlocked || 0) + 1;
+    try {
+      const res = step?.querySelector?.(".atc-result");
+      if (res) { res.className = "atc-result atc-result--blocked"; res.textContent = "用户没要求自动化，未执行"; }
+    } catch {}
+    return { type: call.type, path: String(call.action || call.method || ""), content: _receipt, failure: { code: "automation_not_requested", attempted: false } };
+  }
   // ── 唯一权限检查点 ──────────────────────────────────────────────────────
   // 每个工具调用都必经此处（主循环批量调度、内联渲染、子智能体都走这个函数），
   // 所以授权判定只需要插在这一个地方。放在失败记忆之前：被拒绝是用户的决定，
@@ -66859,10 +66937,317 @@ const _CAPTURE_CAP = 3000;
 // 「一直在监听但没等到条件」，模型据此去排查用户没登录/没走代理，而实际上一次都没检查过。
 let _captureTotal = 0;
 
+
+// ── 实时监听 ──────────────────────────────────────────────────────────────────
+//
+// 用户**用**自己做的东西的时候，IDE 盯着运行时：预览页面的控制台、dev server 终端、抓包里的失败请求、
+// 桌面应用界面上的文字（按规则）。出了问题就走后台监控那条现成的路（_queueNotice + _drainFollowups）
+// 自动开一轮去修，不等用户把报错贴回来。纯逻辑在 agent/live-watch.js（判错 / 去重 / 限流 / 规则 / 拼通知），
+// 这里只管四个源头的接线、策略、UI。
+//
+// 所有者 2026-09-07：「实时监听最有用，用户用的过程中出现问题或者出现 xxx 内容，他能够全自动去帮用户
+// 去改内容、优化内容、操作，而不是傻傻等着用户一直手动反馈。」
+const _liveWatch = { cfgCache: {}, state: null, askBar: null, askTimer: null, screenTimer: null, btn: null, panel: null, uiBound: false };
+
+function _liveWatchRoot() {
+  try { return String(_currentSession()?.project || rootPath || workspaceRoots[0] || "").replace(/\/+$/, ""); } catch { return ""; }
+}
+function _liveWatchStoreKey(root = _liveWatchRoot()) { return `${LIVE_WATCH_STORE_KEY}:${root || "_global"}`; }
+function _liveWatchConfig(root = _liveWatchRoot()) {
+  const key = _liveWatchStoreKey(root);
+  if (_liveWatch.cfgCache[key]) return _liveWatch.cfgCache[key];
+  let raw = null;
+  try { raw = JSON.parse(localStorage.getItem(key) || "null"); } catch { raw = null; }
+  const cfg = normalizeLiveWatchConfig(raw);
+  _liveWatch.cfgCache[key] = cfg;
+  return cfg;
+}
+function _liveWatchSaveConfig(cfg, root = _liveWatchRoot()) {
+  const key = _liveWatchStoreKey(root);
+  const norm = normalizeLiveWatchConfig(cfg);
+  _liveWatch.cfgCache[key] = norm;
+  try { localStorage.setItem(key, JSON.stringify(norm)); } catch {}
+  _liveWatchSyncTimers();
+  _liveWatchRenderBadge();
+  return norm;
+}
+function _liveWatchState() {
+  if (!_liveWatch.state) _liveWatch.state = newWatchState();
+  return _liveWatch.state;
+}
+function _liveWatchPolicy() {
+  let autonomy = "proactive";
+  try { autonomy = String(_loadAdaptiveProfile()?.autonomy || "proactive"); } catch {}
+  return resolveWatchPolicy(_liveWatchConfig(), autonomy);
+}
+/** 这个来源现在盯不盯：策略不是 off，且来源开着；用户明确写的规则不受来源开关影响。 */
+function _liveWatchWants(source) {
+  if (_liveWatchPolicy() === "off") return false;
+  const cfg = _liveWatchConfig();
+  if (cfg.sources[source]) return true;
+  return cfg.rules.some((r) => r.enabled !== false && (r.source === source || r.source === "any"));
+}
+
+/** 所有源头的汇合点：规则匹配 → 去重限流 → 自动开一轮 / 先提示 / 只记录。 */
+function _liveWatchEvent(ev, ctx = {}) {
+  const cfg = _liveWatchConfig();
+  const policy = _liveWatchPolicy();
+  const rule = matchRules(cfg.rules, ev);
+  if (!rule && !cfg.sources[ev.source]) return;
+  const d = decideFire(_liveWatchState(), ev, cfg, policy);
+  _liveWatchRenderBadge();
+  if (_liveWatch.panel && !_liveWatch.panel.hidden) _liveWatchRenderPanel();
+  if (!d.fire) return;
+  const sess = _currentSession();
+  if (!sess) return;
+  const notice = composeWatchNotice(ev, {
+    rule,
+    tail: ctx.tail || "",
+    previewUrl: (typeof _preview === "object" && _preview) ? String(_preview.url || "") : "",
+    terminalLabel: ctx.terminalLabel || "",
+    workspaceRoot: _liveWatchRoot(),
+  });
+  if (d.reason === "auto") _liveWatchDispatch(sess, notice, ev);
+  else _liveWatchAsk(sess, notice, ev);
+}
+function _liveWatchDispatch(sess, notice, ev) {
+  _queueNotice(sess, notice.text, { source: "live_watch", kind: "watch", task: notice.task, status: notice.status, display: notice.display });
+  _drainFollowups(sess);
+  const rec = _liveWatchState().recent.find((r) => r.id === ev.id);
+  if (rec) rec.outcome = "auto";
+  try { _flashTitle("实时监听：发现问题，自动处理中"); } catch {}
+  _liveWatchRenderBadge();
+}
+/** 「先提示我」：输入框上方挂一条，用户点「自动修复」才开一轮；一分钟没理会就收起（记录还在）。 */
+function _liveWatchAsk(sess, notice, ev) {
+  const composer = document.getElementById("composer");
+  if (!composer) return;
+  _liveWatchDismissAsk();
+  const bar = document.createElement("div");
+  bar.className = "watch-ask";
+  bar.innerHTML = `<span class="watch-ask__dot" aria-hidden="true"></span><span class="watch-ask__t"></span>`
+    + `<button type="button" class="watch-ask__btn watch-ask__btn--fix"></button><button type="button" class="watch-ask__btn"></button>`;
+  bar.querySelector(".watch-ask__t").textContent = `${t("watch.btn")}：${describeWatchEventForUser(ev)}`;
+  const [fixBtn, ignoreBtn] = bar.querySelectorAll(".watch-ask__btn");
+  fixBtn.textContent = t("watch.ask.fix");
+  ignoreBtn.textContent = t("watch.ask.ignore");
+  fixBtn.addEventListener("click", () => { _liveWatchDismissAsk(); _liveWatchDispatch(sess, notice, ev); });
+  ignoreBtn.addEventListener("click", () => {
+    const rec = _liveWatchState().recent.find((r) => r.id === ev.id);
+    if (rec) rec.outcome = "dismissed";
+    _liveWatchDismissAsk();
+  });
+  composer.insertBefore(bar, composer.firstChild);
+  _liveWatch.askBar = bar;
+  _liveWatch.askTimer = setTimeout(() => _liveWatchDismissAsk(), 60_000);
+  try { _flashTitle("实时监听：发现问题"); } catch {}
+}
+function _liveWatchDismissAsk() {
+  if (_liveWatch.askTimer) { clearTimeout(_liveWatch.askTimer); _liveWatch.askTimer = null; }
+  if (_liveWatch.askBar) { try { _liveWatch.askBar.remove(); } catch {} _liveWatch.askBar = null; }
+}
+
+// 源头 1：预览页面的控制台（调试桥送来的 preview-log）。
+function _liveWatchPreviewLog(d) {
+  if (!_liveWatchWants("preview")) return;
+  const level = String(d?.level || "");
+  const msg = String(d?.msg == null ? "" : d.msg);
+  if (!detectPreviewError(level, msg)) return;
+  const src = String(d?.src || "");
+  _liveWatchEvent(makeWatchEvent({
+    source: "preview", kind: "preview_error",
+    text: src ? `${msg}\n（${src}）` : msg,
+    where: String(_preview?.url || ""),
+  }));
+}
+// 源头 2：任务终端的输出——只盯长驻服务（dev server / watcher）；一次性命令的报错是模型自己跑命令看到的。
+function _liveWatchTerminalChunk(entry, chunk, prevOut) {
+  if (!entry || entry.closed) return;
+  if (!_liveWatchWants("terminal")) return;
+  const cmd = String(entry.lastCommand || "");
+  if (!cmd || !_looksLikeServiceCommand(cmd)) return;
+  const prev = _watchStripAnsi(String(prevOut || "").slice(-1500));
+  const hit = detectTerminalError(prev + String(chunk || ""), { minIndex: Math.max(0, prev.length - 160) });
+  if (!hit.hit) return;
+  const label = _terminalDisplayLabel(entry);
+  _liveWatchEvent(
+    makeWatchEvent({ source: "terminal", kind: `terminal_${hit.pattern}`, text: hit.excerpt, where: label }),
+    { tail: _terminalPlainText(String(entry.recentOut || "")).slice(-2500), terminalLabel: `${label} · ${cmd.slice(0, 80)}` },
+  );
+}
+// 源头 3：抓包里的服务端错误。
+function _liveWatchCaptureFlow(flow) {
+  if (!_liveWatchWants("capture")) return;
+  const f = detectCaptureFailure(flow);
+  if (!f.hit) return;
+  const where = `${String(flow.method || "")} ${String(flow.host || "")}${String(flow.path || "/")}`.trim();
+  const body = String(flow.response_body || flow.responseBody || flow.body || "").slice(0, 400);
+  _liveWatchEvent(makeWatchEvent({
+    source: "capture", kind: "http_error",
+    text: `${where} → ${f.why}${body ? `\n${body}` : ""}`,
+    where,
+  }));
+}
+// 源头 4：桌面应用界面上的文字（只按用户写的 screen 规则，每 4 秒探一次，走 probe 不作废 ref）。
+async function _liveWatchScreenTick() {
+  if (!inTauri) return;
+  const cfg = _liveWatchConfig();
+  if (_liveWatchPolicy() === "off") return;
+  const rules = cfg.rules.filter((r) => r.enabled !== false && r.source === "screen" && r.app && r.pattern);
+  if (!rules.length) return;
+  const apps = [...new Set(rules.map((r) => r.app))];
+  for (const app of apps) {
+    let out = null;
+    try { out = await backend.invoke("probe_screen", { app, pid: null }); } catch { continue; }
+    const lines = Array.isArray(out?.lines) ? out.lines.map((l) => String(l)) : [];
+    if (!lines.length) continue;
+    for (const r of rules.filter((x) => x.app === app)) {
+      let re = null;
+      try { re = r.isRegex ? new RegExp(r.pattern, "i") : null; } catch { re = null; }
+      const hits = lines.filter((l) => (re ? re.test(l) : l.toLowerCase().includes(r.pattern.toLowerCase()))).slice(0, 6);
+      if (!hits.length) continue;
+      _liveWatchEvent(makeWatchEvent({ source: "screen", kind: "screen_match", text: hits.join("\n"), where: app }));
+    }
+  }
+}
+function _liveWatchSyncTimers() {
+  const cfg = _liveWatchConfig();
+  const need = inTauri && _liveWatchPolicy() !== "off" && cfg.rules.some((r) => r.enabled !== false && r.source === "screen");
+  if (need && !_liveWatch.screenTimer) _liveWatch.screenTimer = setInterval(() => { void _liveWatchScreenTick(); }, 4000);
+  if (!need && _liveWatch.screenTimer) { clearInterval(_liveWatch.screenTimer); _liveWatch.screenTimer = null; }
+}
+
+// ── UI：输入框工具条上的按钮 + 面板 ─────────────────────────────────────────
+function _liveWatchBindUI() {
+  if (_liveWatch.uiBound) return;
+  const bar = document.querySelector("#composer .composer__bar");
+  const anchor = document.getElementById("modelPicker");
+  if (!bar) return;
+  _liveWatch.uiBound = true;
+  const wrap = document.createElement("span");
+  wrap.className = "watch-picker";
+  wrap.innerHTML = `<button type="button" class="watch-btn" id="watchBtn" aria-haspopup="dialog" aria-expanded="false">`
+    + `<span class="watch-btn__dot" aria-hidden="true"></span><span class="watch-btn__label"></span><span class="watch-btn__count" hidden></span></button>`
+    + `<div class="watch-panel" id="watchPanel" role="dialog" hidden></div>`;
+  if (anchor && anchor.parentNode === bar) anchor.insertAdjacentElement("afterend", wrap); else bar.appendChild(wrap);
+  _liveWatch.btn = wrap.querySelector("#watchBtn");
+  _liveWatch.panel = wrap.querySelector("#watchPanel");
+  _liveWatch.btn.querySelector(".watch-btn__label").textContent = t("watch.btn");
+  _liveWatch.btn.title = t("watch.title");
+  _liveWatch.btn.addEventListener("click", (e) => { e.preventDefault(); _liveWatchTogglePanel(); });
+  document.addEventListener("mousedown", (e) => {
+    if (!_liveWatch.panel || _liveWatch.panel.hidden) return;
+    if (wrap.contains(e.target)) return;
+    _liveWatchTogglePanel(false);
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && _liveWatch.panel && !_liveWatch.panel.hidden) _liveWatchTogglePanel(false); });
+  _liveWatchRenderBadge();
+  _liveWatchSyncTimers();
+}
+function _liveWatchTogglePanel(force) {
+  const panel = _liveWatch.panel;
+  if (!panel) return;
+  const open = force === undefined ? panel.hidden : !!force;
+  panel.hidden = !open;
+  _liveWatch.btn?.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) {
+    _liveWatchRenderPanel();
+    // 按钮贴在输入框工具条的右侧，面板按钮下方左对齐会伸出聊天栏。改成固定定位：贴着按钮上沿，
+    // 左右都夹在视口里（聊天栏很窄时向左伸到编辑器上方也没关系，它是浮层）。
+    try {
+      const r = _liveWatch.btn.getBoundingClientRect();
+      const w = Math.min(440, window.innerWidth - 16);
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+      panel.style.width = `${w}px`;
+      panel.style.left = `${left}px`;
+      panel.style.bottom = `${Math.max(8, window.innerHeight - r.top + 8)}px`;
+      panel.style.maxHeight = `${Math.max(240, r.top - 16)}px`;
+    } catch {}
+  }
+}
+function _liveWatchRenderBadge() {
+  const btn = _liveWatch.btn;
+  if (!btn) return;
+  const policy = _liveWatchPolicy();
+  btn.dataset.policy = policy;
+  const recent = _liveWatchState().recent.filter((r) => Date.now() - r.at < 60 * 60 * 1000 && (r.outcome === "auto" || r.outcome === "ask"));
+  const c = btn.querySelector(".watch-btn__count");
+  if (c) { c.hidden = !recent.length; c.textContent = String(recent.length); }
+}
+function _liveWatchRenderPanel() {
+  const panel = _liveWatch.panel;
+  if (!panel) return;
+  const cfg = _liveWatchConfig();
+  const policy = _liveWatchPolicy();
+  let autonomyLabel = "";
+  try { autonomyLabel = _adaptiveOptionLabel("autonomy", _loadAdaptiveProfile()?.autonomy); } catch {}
+  const esc = (v) => _escHtml(String(v ?? ""));
+  const modes = [["auto", t("watch.mode.auto", { v: autonomyLabel })], ["on", t("watch.mode.on")], ["ask", t("watch.mode.ask")], ["off", t("watch.mode.off")]];
+  const srcLabel = (k) => t(`watch.source.${k}`);
+  const rules = cfg.rules;
+  const recent = _liveWatchState().recent.slice(0, 12);
+  const fmtTime = (at) => { try { return new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); } catch { return ""; } };
+  panel.innerHTML = `
+    <div class="watch-panel__head"><span class="watch-panel__title">${esc(t("watch.title"))}</span><span class="watch-panel__policy" data-policy="${esc(policy)}">${esc(t(`watch.policy.${policy}`))}</span></div>
+    <p class="watch-panel__desc">${esc(t("watch.desc"))}</p>
+    <div class="watch-panel__sec"><div class="watch-panel__label">${esc(t("watch.mode"))}</div>
+      <div class="watch-panel__modes">${modes.map(([v, l]) => `<label class="watch-panel__opt"><input type="radio" name="watchMode" value="${esc(v)}"${cfg.mode === v ? " checked" : ""}><span>${esc(l)}</span></label>`).join("")}</div></div>
+    <div class="watch-panel__sec"><div class="watch-panel__label">${esc(t("watch.sources"))}</div>
+      <div class="watch-panel__sources">${WATCH_SOURCES.map((k) => `<label class="watch-panel__opt"><input type="checkbox" data-src="${esc(k)}"${cfg.sources[k] ? " checked" : ""}><span>${esc(srcLabel(k))}</span></label>`).join("")}</div></div>
+    <div class="watch-panel__sec"><div class="watch-panel__label">${esc(t("watch.rules"))}</div>
+      <div class="watch-panel__rules">${rules.length ? rules.map((r) => `<div class="watch-rule" data-id="${esc(r.id)}"><label class="watch-rule__on"><input type="checkbox" data-rule-on="${esc(r.id)}"${r.enabled !== false ? " checked" : ""}></label><span class="watch-rule__src">${esc(r.source === "any" ? t("watch.source.any") : srcLabel(r.source))}${r.app ? ` · ${esc(r.app)}` : ""}</span><code class="watch-rule__pat">${esc(r.pattern || "*")}</code><span class="watch-rule__do">${esc(r.prompt || t("watch.rule.fix"))}</span><button type="button" class="watch-rule__del" data-rule-del="${esc(r.id)}" title="${esc(t("watch.rule.delete"))}">×</button></div>`).join("") : ""}</div>
+      <div class="watch-add">
+        <span class="watch-add__src"></span>
+        <input name="pattern" type="text" placeholder="${esc(t("watch.rule.pattern"))}" maxlength="300">
+        <input name="app" type="text" placeholder="${esc(t("watch.rule.app"))}" maxlength="120" hidden>
+        <input name="prompt" type="text" placeholder="${esc(t("watch.rule.prompt"))}" maxlength="2000">
+        <label class="watch-panel__opt watch-add__re"><input name="isRegex" type="checkbox"><span>regex</span></label>
+        <button type="button" class="watch-add__btn">${esc(t("watch.rule.add"))}</button>
+      </div></div>
+    <div class="watch-panel__sec"><div class="watch-panel__label">${esc(t("watch.recent"))}</div>
+      <div class="watch-panel__recent">${recent.length ? recent.map((r) => `<div class="watch-recent" data-outcome="${esc(r.outcome)}"><span class="watch-recent__t">${esc(fmtTime(r.at))}</span><span class="watch-recent__src">${esc(srcLabel(r.source))}</span><span class="watch-recent__msg" title="${esc(r.text)}">${esc(r.text.split("\n")[0].slice(0, 90))}</span><span class="watch-recent__out">${esc(t(`watch.outcome.${r.outcome || "recorded"}`))}</span></div>`).join("") : `<div class="watch-panel__empty">${esc(t("watch.recent.empty"))}</div>`}</div></div>`;
+  panel.querySelectorAll('input[name="watchMode"]').forEach((el) => el.addEventListener("change", () => {
+    _liveWatchSaveConfig({ ...cfg, mode: el.value }); _liveWatchRenderPanel();
+  }));
+  panel.querySelectorAll("input[data-src]").forEach((el) => el.addEventListener("change", () => {
+    _liveWatchSaveConfig({ ...cfg, sources: { ...cfg.sources, [el.dataset.src]: el.checked } });
+  }));
+  panel.querySelectorAll("input[data-rule-on]").forEach((el) => el.addEventListener("change", () => {
+    _liveWatchSaveConfig({ ...cfg, rules: cfg.rules.map((r) => (r.id === el.dataset.ruleOn ? { ...r, enabled: el.checked } : r)) });
+  }));
+  panel.querySelectorAll("button[data-rule-del]").forEach((el) => el.addEventListener("click", () => {
+    _liveWatchSaveConfig({ ...cfg, rules: cfg.rules.filter((r) => r.id !== el.dataset.ruleDel) }); _liveWatchRenderPanel();
+  }));
+  // 面板住在 #composer 那个 <form> 里：嵌套 <form> 会被解析器丢掉，所以这里是 div + 按钮，
+  // 回车在这几个输入框里也要拦住——否则会把整个输入框表单（发消息）提交出去。
+  const form = panel.querySelector(".watch-add");
+  const appInput = form.querySelector('input[name="app"]');
+  // 来源下拉用自绘的 buildSelectControl（原生 <select> 的弹出菜单由系统画，CSS 管不着）。
+  let _addSource = "any";
+  const syncApp = () => { appInput.hidden = _addSource !== "screen"; };
+  const srcOptions = ["any", ...WATCH_SOURCES].map((k) => [k, k === "any" ? t("watch.source.any") : srcLabel(k)]);
+  form.querySelector(".watch-add__src").appendChild(buildSelectControl(srcOptions, _addSource, (val) => { _addSource = String(val); syncApp(); }));
+  syncApp();
+  const addRule = () => {
+    const val = (n) => String(form.querySelector(`input[name="${n}"]`)?.value || "");
+    const rule = normalizeRule({ source: _addSource, pattern: val("pattern"), app: val("app"), prompt: val("prompt"), isRegex: !!form.querySelector('input[name="isRegex"]')?.checked });
+    if (!rule) { showToast(t("watch.rule.invalid")); return; }
+    _liveWatchSaveConfig({ ...cfg, rules: [...cfg.rules.filter((r) => r.id !== rule.id), rule] });
+    _liveWatchRenderPanel();
+  };
+  form.querySelector(".watch-add__btn").addEventListener("click", (e) => { e.preventDefault(); addRule(); });
+  form.querySelectorAll('input[type="text"]').forEach((el) => el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); addRule(); }
+  }));
+}
+try { _liveWatchBindUI(); } catch {}
+
 function _onCaptureFlow(flow) {
   if (!flow || typeof flow !== "object") return;
   _captureFlows.push(flow);
   _captureTotal++;
+  // 实时监听：服务端错误（5xx）交给它去判要不要开一轮修。
+  try { _liveWatchCaptureFlow(flow); } catch {}
   if (_captureFlows.length > _CAPTURE_CAP) _captureFlows.shift();
   if (!featureOverlay.hidden && activeFeatureTab === "capture") _renderCaptureList();
 }
@@ -79343,8 +79728,11 @@ async function createTermTab(customLabel, cwdOverride = "") {
           // what a launched persistent task printed (e.g. a dev server URL). Trim
           // only when it grows past 2x the cap (not every chunk) — re-slicing an
           // 8KB string on every PTY chunk was needless churn during output floods.
-          entry.recentOut = (entry.recentOut || "") + ev.data;
+          const _prevOut = entry.recentOut || "";
+          entry.recentOut = _prevOut + ev.data;
           if (entry.recentOut.length > 16000) entry.recentOut = entry.recentOut.slice(-8000);
+          // 实时监听：长驻服务（dev server）的输出里出现栈 / panic / 编译失败就自动开一轮去修。
+          try { _liveWatchTerminalChunk(entry, ev.data, _prevOut); } catch {}
         } else if (ev.kind === "exit") {
           entry.lastActivityAt = Date.now();
           term.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");

@@ -12858,12 +12858,13 @@ test("Agent 开局窗口 28 个：取外部资源那一族、读本机依赖真�
   const core = /agent: \["read_file"[\s\S]*?\],/.exec(SRC);
   assert.ok(core, "agent 核心表被改名或挪走了，这条断言失去落点");
   const names = [...core[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-  // 2026-09-06 +3：read_screen / ui_click / computer。生产 30 天这三个的调用量是 0、本机情景
-  // 档案 0 条——它们只在分类器标 desktopAutomation 时才进窗口，而「帮我点一下那个弹窗」这类
-  // 话分类器十有八九标不出来；不在窗口里的工具要先花一轮 search_tools，模型不会为它付这个成本。
-  assert.equal(names.length + 1, 29, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 29`);
+  // 2026-09-06 +3 又 2026-09-07 −3：read_screen / ui_click / computer 进过开局窗口，所有者随即反馈
+  // 「用户没要求也全跑」。现在它们由**档位**授予（agent/automation-need.js + _AUTOMATION_NEED_TOOLS）：
+  // 原话里有「点一下 / 打开 / 看看 / 操作」这类要求、报告了运行时问题、或裁决声明了自动化才进窗口，
+  // 纯写代码的一轮不进——不在手边就不会被顺手拿来「验收」。「帮我点一下那个弹窗」由词表认。
+  assert.equal(names.length + 1, 26, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 26`);
   for (const t of ["read_screen", "ui_click", "computer"]) {
-    assert.ok(names.includes(t), `${t} 不在开局窗口——桌面自动化要等分类器点名才够得着，实测 30 天 0 调用`);
+    assert.ok(!names.includes(t), `${t} 回到开局窗口了——它该按自动化档位授予，见 test/automation-need.test.mjs`);
   }
   /*
    * 2026-08-23 +1：background_monitor。用户原话：
