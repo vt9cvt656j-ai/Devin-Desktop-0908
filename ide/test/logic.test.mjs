@@ -7139,7 +7139,7 @@ test("一开始就已经满足 ≠ 等到了", () => {
   // 必须真的接进 _bmFinish 的回执里，而不是只导入了没用。
   const bm3 = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
   assert.match(bm3, /preexistingConditionNote\(_bmChecks, bmType\)/, "没有把命中轮次和类型传给判据");
-  assert.match(bm3, /_queueFollowup\(_bmSess, followupText \+ _pre\)/, "警告没有真的拼进给模型的回执");
+  assert.match(bm3, /_queueNotice\(_bmSess, followupText \+ _pre, /, "警告没有真的拼进给模型的回执");
   // 只对「等到了」加，超时/取消不加——那两种本来就没有假命中问题。
   assert.match(bm3, /dotClass === "done" \? preexistingConditionNote/, "对非 done 的收尾也加了这句，属于噪音");
 });
@@ -8800,7 +8800,8 @@ test("收尾那一刻插进来的消息不会被丢掉——转成下一轮，�
   // 气泡画的是 `_slashDisplay || text`：/技能 调用时显示用户敲的那行，其余时候就是 text。
   assert.match(src, /if \(!opts\.alreadyInTranscript\) addMessage\("user", _slashDisplay \|\| text, sess, attachments\)/);
   assert.match(src, /if \(!opts\.alreadyInTranscript\) sess\.memory\.push\(\{ role: "user"/);
-  assert.match(src, /sendPrompt\(next\.text, next\.attachments \|\| \[\], config, \{ alreadyInTranscript: !!next\.alreadyInTranscript \}\)/);
+  // 抽干时同时把 notice（IDE 后台通知）交下去——那种不画气泡、画系统行。
+  assert.match(src, /sendPrompt\(next\.text, next\.attachments \|\| \[\], config, \{ alreadyInTranscript: !!next\.alreadyInTranscript, notice: next\.notice \|\| null \}\)/);
 });
 
 test("real-time user steering is marked separately from agent continuation nudges", () => {
@@ -19466,7 +19467,7 @@ test("injection and corruption paths in batch one", () => {
 });
 
 test("background monitors retire with their run instead of billing a new one", () => {
-  // _bmFinish 会 _queueFollowup + _drainFollowups —— 也就是**自动开一整轮新的计费 agent
+  // _bmFinish 会 _queueNotice + _drainFollowups —— 也就是**自动开一整轮新的计费 agent
   // run**。而轮询自续、没有存活判据：Stop 杀不掉、关标签页还在跑、用户开了新一轮之后它
   // 超时照样再塞一轮进去，跨轮复活且无次数上限。
   // The session handle MUST come from `run`. This block lives in _executeToolStepInner
@@ -19489,11 +19490,11 @@ test("background monitors retire with their run instead of billing a new one", (
   const bmStopAt = bmFinish.indexOf("if (_bmIv) clearTimeout(_bmIv);");
   const bmReleaseAt = bmFinish.indexOf("_bmRelease();");
   const bmRetireAt = bmFinish.indexOf("if (_bmRetired() && !suppressFollowup) return;");
-  // 锚点用 `_queueFollowup(_bmSess,` 而不是整句：followupText 后面会挂东西
+  // 锚点用 `_queueNotice(_bmSess,` 而不是整句：followupText 后面会挂东西
   //（比如"这个条件本来就成立"那句提示），写死整句的话下次一改参数，indexOf 返回 -1，
   //  上面那串 `<` 比较会因为 -1 最小而**恒真**——这条顺序断言就悄悄变成了摆设。
   //  这是本仓库记过的「锚点失效」那一种恒真守卫。
-  const bmQueueAt = bmFinish.indexOf("_queueFollowup(_bmSess,");
+  const bmQueueAt = bmFinish.indexOf("_queueNotice(_bmSess,");
   assert.ok(bmQueueAt >= 0, "_bmFinish 里找不到排后续轮次的调用——锚点又失效了");
   assert.ok(bmStopAt >= 0 && bmStopAt < bmReleaseAt && bmReleaseAt < bmRetireAt && bmRetireAt < bmQueueAt,
     "_bmFinish 必须先停表并注销交互，再判断退场，最后才允许排新 run");
@@ -39113,4 +39114,104 @@ test("免费点数折成钱时，点价跟着服务端下发，不许硬编码",
   const models = readFileSync(new URL("../../server/src/models.rs", import.meta.url), "utf8");
   assert.match(models, /pub const CNY_CENTS_PER_POINT: i64 = 1;/,
     "1 点 = 1 人民币分（100 积分 = ¥1）这个定义变了，两边的显示和扣费都要重算");
+});
+
+test("后台通知不冒充用户：不画气泡、不进排队卡片、并进正在跑的这一轮", () => {
+  // 所有者 2026-09-07：「不要让他给我 IDE 直接用用户视角发消息……都后台了，你可以实现多线程和异步的」。
+  // 原来监视器等到之后 _queueFollowup → 一条「[background_monitor 结果] …继续执行」以**用户气泡**
+  // 出现在对话里，还进排队小卡片、进需求账本、再花一次意图裁决——整套都是把它当用户说的话。
+  const bubbles = [];
+  const queueNotice = load("_queueNotice", {
+    addMessage: (role, text, sess, atts, opts) => { bubbles.push({ role, text, opts }); },
+    saveChatHistory: () => {},
+    _ORCH_NOTE: "〔系统编排提示——这不是用户发言〕\n",
+  });
+  // ① 这一轮还在跑：并进当前这一轮（异步），不另起一轮
+  const running = { streaming: true, _runIsLoop: true, _steerQueue: null, memory: { items: [], push(m) { this.items.push(m); } } };
+  queueNotice(running, "[background_monitor 结果] 端口 3000 已被监听，继续执行。", { source: "background_monitor", display: "后台等到了：等 dev server" });
+  assert.equal(running._steerQueue.length, 1);
+  assert.ok(running._steerQueue[0].notice, "并进这一轮的那条要打 notice 标记，循环里才不会把它当用户插话处理");
+  assert.match(running._steerQueue[0].text, /不是用户发的消息/, "给模型的正文没说明这不是用户发的");
+  assert.ok(running._steerQueue[0].text.startsWith("〔系统编排提示"), "没戴编排信封");
+  assert.ok(running._steerQueue[0].body && !running._steerQueue[0].body.startsWith("〔系统编排提示"), "steer 项要另带不含信封的 body，循环里自己拼信封");
+  assert.equal(running.memory.items[0]._ideMeta.notice.source, "background_monitor");
+  assert.deepEqual(bubbles.map((b) => !!b.opts?.notice), [true], "画的必须是系统通知行，不是用户气泡");
+  assert.equal(bubbles[0].text, "后台等到了：等 dev server");
+  assert.ok(!running._pendingSends?.length, "还在跑的时候不该排到下一轮");
+  // ② 没在跑：排一轮，但不进排队小卡片
+  const idle = { streaming: false, memory: { items: [], push(m) { this.items.push(m); } } };
+  queueNotice(idle, "[background_monitor 超时] 没等到", { source: "background_monitor", display: "后台没等到：等端口" });
+  assert.equal(idle._pendingSends.length, 1);
+  assert.ok(idle._pendingSends[0].notice);
+  assert.match(idle._pendingSends[0].text, /不是用户发的消息/);
+  assert.equal(idle.memory.items.length, 0, "没在跑时由 sendPrompt 入记忆，这里不能先写一份（否则两份）");
+  assert.match(SRC, /const items = \(Array\.isArray\(sess\._pendingSends\) \? sess\._pendingSends : \[\]\)\.filter\(\(item\) => !\(item && typeof item === "object" && item\.notice\)\);/,
+    "排队小卡片没有把后台通知过滤掉");
+  // ③ 抽干时把 notice 交给 sendPrompt；sendPrompt 画通知行、入记忆打标、跳过账本/自动标题/意图裁决
+  assert.match(SRC, /alreadyInTranscript: !!next\.alreadyInTranscript, notice: next\.notice \|\| null/, "抽干时没把 notice 传下去");
+  assert.match(SRC, /if \(opts\.notice\) \{ if \(!opts\.alreadyInTranscript\) addMessage\("user", opts\.notice\.display \|\| text, sess, \[\], \{ notice: opts\.notice \}\); \}/, "sendPrompt 还在把通知画成用户气泡");
+  assert.match(SRC, /\.\.\.\(opts\.notice \? \{ _ideMeta: \{ notice: opts\.notice \} \}/, "入记忆时没打 notice 标记，重画历史又会变成用户气泡");
+  assert.match(SRC, /if \(!opts\.notice\) \{\s*\n\s*const _lt = text\.trim\(\);/, "通知还在进需求账本");
+  assert.match(SRC, /const _autoTitle = opts\.notice \? "" : _chatTitleFrom\(/, "通知还会给会话起标题");
+  assert.match(SRC, /effectiveMode === "chat" \|\| opts\.notice\s*\n\s*\? Promise\.resolve\(null\)/, "通知还在花一次意图裁决");
+  // ④ 循环里：通知只并入 messages，在进需求账本之前就被拦下
+  const loop = extractFn("_runAgenticLoop", { code: true });
+  const noticeAt = loop.indexOf('if (queued && typeof queued === "object" && queued.notice) {');
+  const ledgerAt = loop.indexOf("session._demandLedger.push(_sl.slice(0, 240));");
+  assert.ok(noticeAt > 0 && ledgerAt > noticeAt, "循环里的通知没有在进需求账本之前被拦下");
+  assert.match(loop, /messages\.push\(\{ role: "user", content: _ORCH_NOTE \+ String\(queued\.body \|\| queued\.text \|\| ""\) \}\);/, "循环里并入的通知没戴编排信封");
+  // ⑤ 持久化：notice / alreadyInTranscript 跟着排队项一起存，重启后照样不画成气泡
+  const pendingForStorage = load("_pendingSendsForStorage", { serializeMessagesForPersistence });
+  const saved = pendingForStorage([{ text: "x", attachments: [], notice: { source: "background_monitor", display: "d" }, alreadyInTranscript: true }, { text: "y", attachments: [] }]);
+  assert.deepEqual(saved[0].notice, { source: "background_monitor", display: "d" });
+  assert.equal(saved[0].alreadyInTranscript, true);
+  assert.equal("notice" in saved[1], false);
+  // ⑥ 重画历史 / addMessage 都认这个标记
+  assert.match(SRC, /const _notice = m\.role !== "assistant" && m\._ideMeta\?\.notice \? m\._ideMeta\.notice : null;/, "重画历史不认 notice 标记");
+  assert.match(SRC, /if \(options\.notice\) \{\s*\n\s*wrap\.className = "msg notice";/, "addMessage 没有通知分支");
+});
+
+test("终端命令退出即通知（Claude Code 的 run_in_background 语义），而不是让模型轮询", () => {
+  // 所有者 2026-09-07：「主要后台这一块你一定要学些 claude code」。Claude Code 里后台命令退出会
+  // re-invoke 模型；我们原来只能让模型反复 read_terminal 去问"跑完没有"（只读轮变长的第一大来源）。
+  const queued = [];
+  const notify = load("_notifyTerminalCommandEnded", {
+    _queueNotice: (sess, text, meta) => queued.push({ sess, text, meta }),
+    _drainFollowups: () => {},
+    _terminalPlainText: (v) => String(v),
+    _terminalDisplayLabel: (e) => String(e?.label || ""),
+    _detectTerminalReady: (t) => (/error:/i.test(t) ? { ready: false, failed: true, pattern: "/error:/i" } : { ready: false, pattern: "" }),
+    _looksLikeServiceCommand: (c) => /\bdev\b/.test(c),
+  });
+  const mk = (over = {}) => ({
+    agentSession: { streaming: false, _runIsLoop: false, _runGen: 3, _disposed: false },
+    agentRunGen: 3, agentLabel: "npm install", lastCommand: "npm install", recentOut: "added 12 packages\n", exitNotified: false, ...over,
+  });
+  // ① 正在跑：并进这一轮——不看代际、也不管是不是服务型
+  notify(mk({ agentSession: { streaming: true, _runIsLoop: true, _runGen: 9 }, lastCommand: "npm run dev", agentLabel: "npm run dev" }));
+  assert.equal(queued.length, 1, "正在跑的循环没收到终端退出通知");
+  assert.match(queued[0].text, /npm run dev/); assert.equal(queued[0].meta.source, "terminal");
+  // ② 闲着 + 同一代际 + 一次性命令 → 唤醒（它说过"跑完我接着做"）
+  const idle = mk(); notify(idle);
+  assert.equal(queued.length, 2); assert.match(queued[1].text, /added 12 packages/); assert.equal(queued[1].meta.status, "已退出");
+  // ③ 同一条命令只通知一次
+  notify(idle); assert.equal(queued.length, 2, "同一条命令通知了两次");
+  // ④ 闲着但用户已经开过新一轮 → 不唤醒（他转去别的事了）
+  notify(mk({ agentSession: { streaming: false, _runGen: 4 } })); assert.equal(queued.length, 2, "用户开了新一轮还被唤醒");
+  // ⑤ 闲着时 dev server 退出 → 不唤醒（多半是用户自己停的）
+  notify(mk({ lastCommand: "npm run dev", agentLabel: "npm run dev" })); assert.equal(queued.length, 2, "服务型命令退出也去唤醒一轮");
+  // ⑥ 输出里有失败特征 → 状态里说出来
+  notify(mk({ recentOut: "error: build failed\n" })); assert.equal(queued.length, 3); assert.match(queued[2].meta.status, /失败特征/);
+  // 接线：轮询处把「跑过→停了」的跃迁交给它；起命令时打上会话/代际；回执与两条律都改口不再让模型轮询
+  assert.match(SRC, /for \(const t of applyRunningPoll\(termTabs, ids, \{ graceMs: _CMD_START_GRACE_MS \}\) \|\| \[\]\) \{\s*\n\s*try \{ _notifyTerminalCommandEnded\(t\); \} catch \{\}/,
+    "轮询处没有把命令结束的跃迁交给通知");
+  assert.match(SRC, /r\.entry\.agentSession = run\.session \|\| null;\s*\n\s*r\.entry\.agentRunGen = run\.session\?\._runGen \|\| 0;/, "起命令时没记下会话/代际");
+  assert.match(RAW_SRC, /不用反复 read_terminal 问它跑完没有/, "回执没告诉模型别轮询");
+  assert.doesNotMatch(RAW_SRC, /到真需要其结果时再 read_terminal 收割/, "并行开工律还在教模型去轮询");
+  assert.doesNotMatch(RAW_SRC, /人工操作用 background_monitor/, "持续任务律还在提 manual 那一档");
+  // 通知正文按 Claude Code 的 task-notification 形状：先「任务 / 状态」两行
+  const qn = load("_queueNotice", { addMessage: () => {}, saveChatHistory: () => {}, _ORCH_NOTE: "" });
+  const s = { streaming: false, memory: { push() {} } };
+  qn(s, "正文", { source: "terminal", task: "终端「x」", status: "已退出" });
+  assert.match(s._pendingSends[0].text, /任务：终端「x」\n状态：已退出\n正文/);
 });

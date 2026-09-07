@@ -1726,7 +1726,7 @@
     "type": "function",
     "function": {
       "name": "run_in_terminal",
-      "description": "Start a command in the IDE's real terminal tab (a true PTY / TTY) and keep it running: dev servers, watchers, daemons, and interactive or full-screen programs (REPLs, TUIs, vim/top) that fail in run_cmd's pipe. You start the user's program yourself here — this IDE terminal is a real terminal, so do not hand them a command to type. The program runs in its own tab where the user watches and interacts; for an interactive program, starting and rendering its interface is the delivery. Confirm it came up with read_terminal or read_logs, or wait for readiness with background_monitor. One-shot commands that terminate use run_cmd.",
+      "description": "Start a command in the IDE's real terminal tab (a true PTY / TTY) and keep it running: dev servers, watchers, daemons, and interactive or full-screen programs (REPLs, TUIs, vim/top) that fail in run_cmd's pipe. You start the user's program yourself here — this IDE terminal is a real terminal, so do not hand them a command to type. The program runs in its own tab where the user watches and interacts; for an interactive program, starting and rendering its interface is the delivery. Confirm it came up with read_terminal or read_logs, or wait for readiness with background_monitor. When the command itself exits, the IDE notifies you (macOS/Linux), so keep working instead of polling for it. One-shot commands that terminate use run_cmd.",
       "parameters": {
         "type": "object",
         "properties": {
