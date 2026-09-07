@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { CODE } from "./helpers/source.mjs";
+import { CODE, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 const CSS = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
 const TW = readFileSync(new URL("../src/ui/tailwind.css", import.meta.url), "utf8");
@@ -97,8 +97,9 @@ test("内置命令指向的动作必须真的存在", () => {
   assert.notStrictEqual(at, -1, "_SLASH 找不到了");
   const block = CODE.slice(at, CODE.indexOf("];", at));
   const cmds = [...block.matchAll(/cmd:\s*"([^"]+)"/g)].map((m) => m[1]);
-  assert.ok(cmds.length >= 8, `内置命令只剩 ${cmds.length} 条，之前补齐的那批被删了`);
-  for (const must of ["new", "sessions", "memory", "terminal", "skills", "mcp", "shortcuts", "settings", "cost"]) {
+  assert.ok(cmds.length >= 18, `内置命令只剩 ${cmds.length} 条，之前补齐的那批被删了`);
+  for (const must of ["new", "sessions", "memory", "terminal", "skills", "mcp", "shortcuts", "settings", "cost", "model",
+                      "init", "review", "commit", "security-review", "todos", "research", "explain", "bugs", "refactor", "tests", "docs"]) {
     assert.ok(cmds.includes(must), `内置命令少了 /${must}`);
   }
   // 这几条是**刻意不收**的，别再顺手加回来：模式切换在输入条上已经有选择器（同一件事两个
@@ -110,10 +111,38 @@ test("内置命令指向的动作必须真的存在", () => {
   // action 里调到的每个函数，main.js 里都得真的定义过。**一个打不开任何东西的命令比没有
   // 这个命令更糟**：用户敲了没反应，会以为整个斜杠功能坏了。
   const called = [...new Set([...block.matchAll(/\b(_?[a-zA-Z][\w$]*)\(/g)].map((m) => m[1]))];
-  const missing = called.filter((f) => !new RegExp(`(?:async )?function ${f}\\(`).test(CODE));
+  // 「定义过」有两种：本文件里的函数，或者从别的模块 import 进来的（`t` 就是后者）。
+  // 只认前一种的话，任务类命令用的 t() 会被误报成不存在的函数。
+  const defined = (f) => new RegExp(`(?:async )?function ${f}\\(`).test(CODE)
+    || new RegExp(`^import \\{[^}]*\\b${f}\\b[^}]*\\} from`, "m").test(RAW_SRC);
+  const missing = called.filter((f) => !defined(f));
   assert.deepEqual(missing, [], `这些命令调的函数在 main.js 里不存在：${missing.join(", ")}`);
 });
 
 // 模式切换的那条守卫连同 `/agent` `/chat` `/plan` 一起撤了：命令删掉之后模式只剩**一个**
 // 入口（输入条上的选择器），当初把它抽成 _setAiMode 的理由（两个入口会漂）不再成立，
 // 抽取也一并还原了。留一段理由已经不成立的抽象，比不抽更容易误导下一个人。
+
+test("任务类命令复用已有的提示词，而不是另写一套", () => {
+  // 输入框上方那排快捷动作用的就是 assistant.prompt.*，而它们**只在对话是空的时候**出现。
+  // 任务类斜杠命令补的正是那一半入口，所以必须指向同一批 key：另写一套文案，两边迟早漂开。
+  const at = CODE.indexOf("const _SLASH = [");
+  const block = CODE.slice(at, CODE.indexOf("];", at));
+  const keys = [...block.matchAll(/t\("(assistant\.prompt\.[A-Za-z]+)"/g)].map((m) => m[1]);
+  assert.ok(keys.length >= 10, `任务类命令只剩 ${keys.length} 条`);
+  const i18n = readFileSync(new URL("../src/i18n.js", import.meta.url), "utf8");
+  for (const k of new Set(keys)) {
+    // EN 和 ZH_CN 各一条。少一边不会报错，只会在那个语种下把 key 本身当文案显示出来。
+    assert.equal((i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) || []).length, 2,
+      `${k} 在 i18n 里不是恰好两条（EN + ZH_CN 各一条）`);
+  }
+  // 跟当前文件有关的那几条（/explain /bugs /tests …）必须在**选中的那一刻**取路径。
+  assert.match(block, /_slashPromptTarget\(\)/, "文件相关的命令没有动态取当前文件");
+  const pickAt = CODE.indexOf("function _pickSlash");
+  assert.match(CODE.slice(pickAt, pickAt + 900), /typeof s\.prompt === "function" \? s\.prompt\(\)/,
+    "_pickSlash 不认函数形式的 prompt —— 那几条会把一个 function 对象塞进输入框");
+  // 取的必须和那排快捷动作是同一个值，否则界面上看不出来、只有模型读到才发现指错了文件。
+  const target = CODE.slice(CODE.indexOf("function _slashPromptTarget"), CODE.indexOf("function _updateSlashMenu"));
+  assert.match(target, /_realFilePath\(activePath\)/, "取的不是当前打开的文件");
+  assert.match(target, /_pathToRel\(/, "没转成相对路径 —— 绝对路径进提示词会带上用户的home目录");
+});

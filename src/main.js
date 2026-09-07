@@ -76365,6 +76365,23 @@ const _SLASH = [
   { cmd: "new", desc: "Start a new conversation", action: () => { _newChatSession(); } },
   { cmd: "sessions", desc: "Browse and switch conversations", action: () => { void _openSessionPicker(); } },
   { cmd: "memory", desc: "Manage project memory", action: () => openMemoryPanel() },
+  // -- 任务类：把一段写好的提示词填进输入框（不直接发，用户还能再补一句）--
+  //
+  // 复用输入框上方那排快捷动作的 `assistant.prompt.*`，不另写一套。那排动作**只在对话是
+  // 空的时候**出现，一旦聊起来就没了入口 —— 这批命令补的正是那一半。
+  { cmd: "init", desc: "Read the project and save what matters to project memory", prompt: () => t("assistant.prompt.initMemory") },
+  { cmd: "review", desc: "Review all uncommitted changes", prompt: () => t("assistant.prompt.reviewAllChanges") },
+  { cmd: "commit", desc: "Write a commit message for the current changes", prompt: () => t("assistant.prompt.commitMessage") },
+  { cmd: "security-review", desc: "Security review of this project's own code", prompt: () => t("assistant.prompt.securityReview") },
+  { cmd: "todos", desc: "Find TODO / FIXME markers and rank them", prompt: () => t("assistant.prompt.listTodos") },
+  { cmd: "research", desc: "Deep-explore this project and map it out", prompt: () => t("assistant.prompt.projectResearch") },
+  { cmd: "explain", desc: "Explain the file open in the editor", prompt: () => t("assistant.prompt.explainFile", { path: _slashPromptTarget() }) },
+  { cmd: "bugs", desc: "Hunt for bugs in the open file", prompt: () => t("assistant.prompt.findBugs", { path: _slashPromptTarget() }) },
+  { cmd: "refactor", desc: "Refactor the open file", prompt: () => t("assistant.prompt.refactor", { path: _slashPromptTarget() }) },
+  { cmd: "tests", desc: "Write unit tests for the open file", prompt: () => t("assistant.prompt.writeTests", { path: _slashPromptTarget() }) },
+  { cmd: "docs", desc: "Add doc comments to the open file", prompt: () => t("assistant.prompt.docComments", { path: _slashPromptTarget() }) },
+  // -- 动作类：打开某个面板 --
+  { cmd: "model", desc: "Switch the model", action: () => openModelMenu() },
   { cmd: "terminal", desc: "Open the built-in terminal", action: () => { void openTerminal(); } },
   { cmd: "skills", desc: "Install and manage skills", action: () => openFeaturePanel("skills") },
   { cmd: "mcp", desc: "Manage MCP servers", action: () => openFeaturePanel("mcp") },
@@ -76778,6 +76795,17 @@ function _renderSlashActive() {
     onHover: (i) => { _slashActive = i; _renderSlashActive(); },
   });
 }
+/**
+ * 任务类斜杠命令里 `{path}` 的目标：当前打开的文件（相对路径），没开文件时回落到「当前文件」。
+ *
+ * 和输入框上方那排快捷动作（`_dynamicChatChips` 里的 `target`）取的是**同一个值**：
+ * 两处指到不同的文件，是那种界面上看不出来、只有模型读到才发现的错。
+ */
+function _slashPromptTarget() {
+  const p = _realFilePath(activePath);
+  return (p ? _pathToRel(p) : "") || t("assistant.currentFile");
+}
+
 function _updateSlashMenu() {
   // `\w*` 认不出 MCP 那些命令：服务名里有 `-`（sequential-thinking），`服务:模板` 里还有 `:`。
   const m = /^\/([\w:.\-]*)$/.exec(promptEl.value);
@@ -76835,7 +76863,9 @@ function _pickSlash(i) {
   if (typeof s.action === "function") { promptEl.value = ""; promptEl.style.height = "auto"; try { s.action(); } catch (e) { console.warn("[slash]", e); } return; }
   // MCP 模板要先取回来（可能还要先问参数），异步，所以清空输入框之后再走。
   if (s.mcp) { promptEl.value = ""; void _runMcpSlashPrompt(s); return; }
-  promptEl.value = s.prompt;
+  // prompt 可以是函数：`/explain` `/bugs` 这类要用**当前打开的文件**，写死在表里的话
+  // 永远是加载 main.js 那一刻的文件（多半还没开文件）。选中的这一刻再去取。
+  promptEl.value = typeof s.prompt === "function" ? s.prompt() : s.prompt;
   promptEl.style.height = "auto";
   promptEl.style.height = Math.min(promptEl.scrollHeight, 160) + "px";
   promptEl.focus();
