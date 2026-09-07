@@ -21,7 +21,7 @@
 2. **"线路"的语义是"一个 base_url + 一把 key"**（`models` 一行 = 站点+key+模型集；
    多 key 组号池 = 建多行 models）。文档要"线路 = 号池/上游存储地"，一个 base_url 下面挂多把
    key 组成号池，key 可以重复出现在不同分组。→ 需要把 base_url 与 api_key 从 `models` 行拆开，
-   或新增"号池成员"表。**这是全部改动里唯一需要拍板的语义分叉（见 §9-A）。**
+   或新增"号池成员"表。**这是全部改动里最大的语义分叉——二读后已锁定 A1（彻底拆号池，见 §9-A）。**
 3. **用量日志缺了溯源需要的所有维度**。`model_usage` 是纯计费流水（只在成功扣费时插入），
    没有：失败调用、延迟、错误原因、用的哪把 API key、按出口/模型/用户聚合之外的检索能力。
    文档的"用户使用日志"（多维度筛选 + 报错维度 + 三种视图 + 搜索弹窗）现有数据根本撑不起来。
@@ -74,21 +74,21 @@ CREATE TABLE IF NOT EXISTS model_groups (
 品牌枚举（对齐 `route_endpoints.rs:vendor_of` 与 `PROVIDERS` 常量，前端 `VendorMark` 已有图标）：
 `claude / gpt / deepseek / gemini / minimax / glm / grok / qwen / kimi / other`。
 删除护栏**放后端事务里**：`DELETE FROM model_groups WHERE id=$1` 前先
-`SELECT count(*) FROM models WHERE group_id=$1`（或路由表），>0 返回 400
-"请先删除该分组下的所有路由"（文档原文文案）。
+`SELECT count(*) FROM route_endpoints WHERE group_id=$1`（分组下路由=出口，见 §9-B 挂载层结论），
+>0 返回 400 "请先删除该分组下的所有路由"（文档原文文案）。
 
-### M2 `20260907_models_group.sql` — 线路/模型挂分组
+### M2 `20260907_route_endpoints_group.sql` — 出口挂分组（二读修订：替代原"线路挂分组"）
 
 ```sql
-ALTER TABLE models ADD COLUMN IF NOT EXISTS group_id UUID REFERENCES model_groups(id) ON DELETE SET NULL;
-CREATE INDEX ... ON models (group_id);
+ALTER TABLE route_endpoints ADD COLUMN IF NOT EXISTS group_id UUID REFERENCES model_groups(id) ON DELETE SET NULL;
+CREATE INDEX ... ON route_endpoints (group_id);
 ```
 
-**取舍说明**：文档里"分组"下属物是"路由"，但本项目线路（models 行）与出口（route_endpoints）
-是两层的。**推荐把分组挂在 models（线路）上**：`route_endpoints` 通过 `route_id → models.group_id`
-继承分组；理由——现有 `admin_list`/候选池/`expand`（route_endpoints.rs:496）全部按 route 聚合，
-线路挂组改动面最小，且 20260851 注释里"价格与用量归属留在线路"的设计可以延续。
-（备选方案"出口直接挂 group_id"见 §9-B。）
+**取舍说明（§9-B 修订后）**：分组的下属物是"路由"（文档原话：删除分组护栏查"该分组下是否有路由"、
+多路由界面按分组分段、每段小标题右侧建出口），路由=route_endpoints 出口，故 group_id 挂在**出口**上；
+models（线路）不挂分组、不挂价格，保持纯号池存储地（§10.1）。"同组多 key 同 base_url" = 组内多个
+出口；"同 key 跨分组" = 不同分组各建一个出口引用同一把 key（A1 后 key 进 route_credentials，无唯一
+索引冲突）。原稿"挂 models 经 route_id 继承"改动面小，但与文档证据冲突，撤销。
 
 ### M3 `20260907_endpoint_pricing.sql` — 出口 × 模型 价格/计费（新）
 
@@ -185,29 +185,44 @@ ALTER TABLE channel_rates
 配套"数据动态同步 bug"：不开新功能的排查任务（§5-4），涉及 `relay_rates` 三处读取点
 （load 105 / admin_list 214 / 548 等）与 `ratio-sync` 的预览/写入。
 
-### M6（若 §9-A 走"拆号池"方案）`20260907_route_credentials.sql` — 号池成员表
+### M6 `20260907_route_credentials.sql` — 号池成员表（A1 已锁，必做）
 
 文档"线路 = 号池"：一条线路（站点）下面多把 key，每把 key 一个备注（=路由名），
 同一 base_url 的不同备注禁止重复、同 key 可进不同分组。→ 新表 `route_credentials`
 （route_id, api_key_enc, api_key_fp, label, active）或改挂 `route_endpoints`。
-**该迁移依赖 §9-A 拍板结果，见 §9。**
+**§9-A 已锁 A1，本迁移必做（不再"视拍板"）**；现有 models 行的 api_key 如何搬迁、
+`models` 行如何折叠为线路，落 Phase 1 时按 §9-A1 详细设计。
 
 ---
 
 ## 3. 后端改动清单（按模块）
 
 ### 3.1 `src/models.rs`（线路/模型侧，最大的既有文件）
-- **分组归属**：`admin_list` / `admin_create` / `admin_update` 增 `group_id` 读写；
-  读列表时 JOIN `model_groups` 返回 `group_seq`（排序用）。
+- **分组归属（§9-B 修订）**：分组挂在 route_endpoints（出口）上（见 M2），**models 行不存 group_id**；
+  线路列表要展示的分组/组序来自引用它的出口 JOIN model_groups。原"models 增 group_id 读写"方案撤销，
+  实施时凡涉分组归属一律落到出口层。
 - **线路界面新列**：上次使用时间（从 `model_usage`/`usage_log` 取 `max(created_at)`，从未使用=NULL）、
   使用中模型数量（`enabled_models` 与 endpoint_model_prices.enabled 口径二选一，见 §9-D）、
   计费方式下拉展示（按 token/混合/按次——按"当前线路计费模式"聚合显示）。
 - **停用护栏**：`UpdateReq` 已有 `active`（Routing.tsx 注释证实）。新增在 active true→false 时统计
   "将影响 X 个路由中的 Y 个出口"并随响应返回，前端提示（文档原话）。
 - **删除护栏**：DELETE 前数被引用路由/出口，>0 返回影响明细（分组名+路由名前 5 条，超出折叠）——
-  返回结构 `{ affected: [{ group, route_label }], total }`，前端弹窗。
-- **`admin_sort` / models.sort 语义**：若走 §9-A 不做号池拆分，models.sort 保留作"分组内排序"；
-  RouteOrder 屏删除后其入口并入分组屏（一键排序按钮）。
+  返回结构 `{ affected: [{ group, route_label }], total }`，前端弹窗；用户确认后**同一事务内同步删除
+  引用该线路的全部 route_endpoints**（文档："删除该线路的同时，被引用的路由被同步删除"）。实现点：
+  确认 route_endpoints→models 外键（无则迁移加 ON DELETE CASCADE，或服务端先删出口再删线路）。
+- **创建/编辑线路弹窗（原稿漏列，二读补全）**：base url；连接协议下拉（Anthropic 原生
+  /v1/messages、OpenAI 兼容/chat/completions、xAI Responses/v1/responses —— grok 思考摘要只在这条
+  协议给）；**多把 API key（➕逐个添加）+ 每把 key 一个备注 + "测试连接"按钮**（备注=多路由列表的
+  "路由名称"，手填或默认取 base_url host，同一 base_url 的不同备注禁止重复）；勾选：Claude强力版
+  线路（新布尔，语义见拍板 1）、投入轮转（=active）、关闭缓存计费（关 models 缓存计费开关，
+  对应 0014/0021 迁移）。→ 新增 `POST /api/admin/models/test-connection`：用线路协议发最小探测
+  （复用 model_probe/prefix_probe 探测逻辑），返回延迟/状态。
+- **线路行可展开模型级明细（文档示例复核）**：一行线路下能展开模型行（上游模型名/计费方式/
+  上次使用时间）——列表"使用中模型数量 / 计费方式(按token|混合|按次) / 上次使用时间"是聚合展示，
+  展开行是模型级口径；后端列表响应带模型明细（enabled 模型 + billing_mode + max(created_at)），
+  前端展开渲染。
+- **`admin_sort` / models.sort 语义（A1 已锁）**：号池化后"线路间排序"被分组/出口结构取代，
+  排序语义需重定义，详细设计落 Phase 1；UI 层面 RouteOrder 屏删除，一键排序入口并入分组屏（按 seq）。
 - **官方原价适配数据**：新增 `admin_official_prices`（全量 models 的当前官方价 + model_catalog 快照 +
   对比状态），供新页"拉取模型原价"按钮调用 `model_catalog` 刷新（已有 official_price()/catalog 加载路径）。
 
@@ -233,6 +248,11 @@ ALTER TABLE channel_rates
   保持并补测试。
 - **排序规则保持**（现状 303-446 `endpoint_score`/可靠性/降级判定已经是一套成熟规则，
   文档"序号由原系统规则判断" = 继续沿用，UI 序号只读）。
+- **列表"汇率"列**：展示该出口 host 对应 `channel_rates.usd_per_cny`（￥/$ 格式，如 ￥1/$1、
+  ￥1.56/$1），与汇率页同源、写入后即时生效，纯展示列、不需要新字段。
+- **备注查重落点修正**："同一 base_url 的不同备注禁止重复"（文档原话，出现在**线路弹窗**）——
+  A1 号池下备注属于 key（credential），查重在号池写入处做（见 M6），不在出口层；出口的
+  "路由名称"只是把所引 key 的备注带上来显示。
 
 ### 3.4 `src/route_health.rs` + 健康查询
 - 七天健康度 = `route_attempt`(20260866) 聚合：`(ok)/(ok+fail)` 近 7 天；
@@ -314,9 +334,9 @@ ALTER TABLE channel_rates
 
 ## 5. 执行顺序与验证（每个 Phase 的验收标准）
 
-- **Phase 0 拍板（先做，不写码）**：§9 的 A（号池拆不拆）/ C（出口价格进不进账单）/ D（模型数量口径）。
-  三个都影响迁移与接口形状，拍完再动 Phase 1。
-- **Phase 1 迁移**：M1–M5（+M6 视 A）。跑 `cargo test`（sqlx 迁移测试若钉了旧表会立刻红，先改测试预期）。
+- **Phase 0 拍板（先做，不写码）**：A（号池）二读已锁 **A1**；剩余拍板见 §10 拍板 1–4（Claude强力版
+  语义 / 出口能否属多组 / 出口价格进不进账单 / 行级倍率口径）。拍完再动 Phase 1。
+- **Phase 1 迁移**：M1–M6（M6 随 A1 必做）。跑 `cargo test`（sqlx 迁移测试若钉了旧表会立刻红，先改测试预期）。
 - **Phase 2 后端采集与实体**：usage_log 埋点 + model_groups 模块 + models/route_endpoints 归属与护栏。
   验证：`cargo check` + `cargo test`（本项目测试很重，注释风格看，改 models.rs 必跑全量）；护栏手动
   （建组→加路由→删组应 400）。
@@ -350,9 +370,9 @@ ALTER TABLE channel_rates
 
 | 块 | 后端 | admin-ui | 独立可交付 |
 |---|---|---|---|
-| M1–M5 迁移 + 测试修正 | 1 | 0 | ✅ 可先合 |
+| M1–M6 迁移 + 测试修正 | 1.5 | 0 | ✅ 可先合 |
 | 分组实体与护栏 | 0.5–1 天 | 0.5 天 | ✅ |
-| 线路号池/停删护栏（含 §9-A） | 1–2 天 | 1 天 | 视拍板 |
+| 线路号池/停删护栏（§9-A 已锁 A1） | 1–2 天 | 1 天 | ✅ |
 | 出口 per-model 价格 + 拉模型 | 1 天 | 1 天 | ✅ |
 | usage_log 埋点 | 0.5–1 天 | 0 | ✅ 先于 UI |
 | usage-log 三视图/搜索 API | 1–1.5 天 | 1.5–2 天 | ✅ |
@@ -392,19 +412,27 @@ ALTER TABLE channel_rates
 
 ## 9. 语义决策点（Phase 0 拍板）
 
-### A. "线路"到底拆不拆号池（影响最大，先拍）
+### A. "线路"拆不拆号池 —— 文档已锁 A1，按 A1 执行（原"请拍板"撤销）
 - **现状**：`models` 行 = base_url + api_key + 模型集（一个站点配多 key = 多行）。
 - **文档**：线路界面示例里一个站点名只占一行、下面折叠模型；创建线路弹窗支持一个 base_url 配
-  多个 key（➕号）组号池，多路由里"同一分组多个 key 同 base_url"、"不同分组同 key 同 base_url"。
-- 方案 A1（推荐）：新增"号池成员"概念——`models` 行退化为"线路(站点+连接协议+备注)"，
-  密钥/备注挪到新表（每 key 一行、可进多个分组）。改动大但贴合文档，一次到位。
-- 方案 A2（务实）：保持一行一 key，多 key = 多行同 base_url 的 models，"号池"只是 UI 折叠展示。
-  改动小，但与"不同分组可有同样的 API key 和 base_url"（文档原话）冲突——唯一索引会拦。
-- **请拍板**：A1（彻底拆）还是 A2（UI 层折叠 + 放开唯一索引约束）？
+  多个 key（➕逐个添加、每把 key 一个备注）组号池；多路由"同一分组多个 key 同 base_url"、
+  "不同分组同 key 同 base_url"。
+- 方案 A1（采纳）：线路(站点+连接协议) 与 密钥/备注 拆开——每把 key 一行进号池表
+  （备注随 key，同 base_url 不同备注禁止重复）；线路是纯存储地：不挂分组、不挂价格，
+  被 route_endpoints 引用。
+- 方案 A2（否决）：一行一 key、"号池"只做 UI 折叠——唯一索引会拦"不同分组同 key 同 base_url"
+  （文档原话），创建线路弹窗"多 key + 多备注"也表达不了，只能放开唯一索引硬凑，埋数据脏。
+- **结论**：A1。二读 docx 后从"请拍板"改为直接执行。
 
-### B. 分组挂在哪一层
-推荐挂 models（线路），出口经 route_id 继承。备选出口直接挂 group_id（更贴文档"路由在分组下"，
-但要改候选池/expand/计费归属一整条链）。默认 A 方案按推荐走，除非你反对。
+### B. 分组挂在哪一层 —— 复核修正为「出口直接挂 group_id」（原"挂 models"推荐撤销）
+文档证据指向**出口（route_endpoints）直接挂分组**，不是挂在 models（线路）：
+- 删除分组护栏 = 查"该分组下是否有**路由**"（文档原话，路由=出口配置）；
+- 多路由界面**按分组分段**、每段小标题右侧是"添加新路由"按钮 → 出口在选定分组下创建；
+- 线路界面全程不出现分组（线路只是号池存储地，被出口引用）。
+A1 号池化后：出口 = 引用「线路 + 该线路某把 key(备注)」+ 所属分组 + per-model 配置。
+"同组多 key 同 base_url" = 组内多个出口；"同 key 跨分组" = 两个分组各建一个出口引用同一把 key。
+- 原"分组挂 models、出口经 route_id 继承"改动面小，但与上面四条文档证据冲突，撤销。
+- **待拍板（拍板 2）**：一个出口能否同时归属多个分组？默认**一对一**。
 
 ### C. 出口级倍率/中转价进不进用户账单
 默认**不进**（只做排序/展示/对账），保持 20260851"换出口换不动账单"。若要做"不同出口对同一模型
@@ -416,5 +444,48 @@ endpoint_model_prices.enabled 数。默认：**行内=线路 enabled_models 长�
 
 ---
 
-*本文档落地：`server/docs/2026-09-07-routing-rework-plan.md`。拍板 §9 后按 Phase 实施，
+---
+
+## 10. docx 二读复核（2026-09-07）—— 修订点与待拍板
+
+二读 docx 全文后，对 §9 做了三处修订：A 锁 A1（号池）、B 改为出口直接挂分组、M1 删除护栏改查出口。
+另补以下确认：
+
+1. **线路=纯号池存储地**：线路行不出现分组、不直接持价格——"使用中模型数量 / 计费方式 /
+   上次使用时间"都是从引用它的出口/模型**聚合**而来（示例行下还能展开模型级明细行），见 §3.1。
+2. **多路由"报错信息"列**要能呈现文档示例全部文案：`停用`（所属线路停用→出口被动不可用，
+   配置保留）、`上游报错 400`、`余额不足（402）`、`超过20秒没有回应`、健康列 `无真实流量`
+   （有健康度但当日 0 调用的 UI 展示态，不落库）——展示映射来自 usage_log.err_class（M4）。
+3. **健康页顶部按钮补 "测试告警邮件"**：Phase 3 加 `POST /api/admin/health/test-alert`
+   （复用 email.rs 发一封测试告警邮件），原稿漏列。
+4. **用户日志视图一**：`备注`列=所引 key 的备注（即多路由"路由名称"），站点名+base url 作副行
+   （示例两行式）；"其他"列=前端展开（请求详情），后端不建字段。
+5. **多路由"汇率"列**=host 的 usd_per_cny 展示，见 §3.3 补条。
+6. **统计区块项数按页不同（示例复核）**：多路由页=5 项（上游数量/总出口数量/正在活动数量/异常数量/
+   未测试数量）；线路页、健康页=4 项（无"未测试"）。上游数量=不重复 base_url 数；总出口数量=各分组
+   出口总和（文档示例"五个上游×五种模型=25 个连接"即视图二的 25 行）。
+
+### 拍板 1：Claude强力版线路 勾选语义
+
+文档只在线路弹窗出现、未说明作用。默认按**布尔标记**落字段（列表/详情展示），不改路由与计费行为；
+若实际影响协议选择或计费，请说明，否则实施时只做标记字段。
+
+### 拍板 2：出口能否同时归属多个分组（承 §9-B）
+
+默认**一对一**：同 key 同 base_url 要进另一组 = 再建一个出口引用同一把 key（A1 下 key 已独立，
+天然支持）。不做多对多，否则删除分组护栏（"该分组下是否有路由"）语义要重定义。
+
+### 拍板 3：出口级倍率/每次收费 进不进用户账单（重申 §9-C）
+
+文档没说"不同出口不同卖价进用户账单"；出口弹窗的价格只参与排序/健康/对账/拉模型预填，
+用户实际扣费仍走 models 计费链（线路行的"计费方式(按token|混合|按次)"才是账单口径）。维持默认，
+理解有误请指出。
+
+### 拍板 4：多路由列表"行级倍率"显示口径
+
+出口下每个模型各有倍率（1.0x/8.0x/5$/次…），列表行只显示一个"倍率"。默认：**显示该出口的
+渠道级倍率**（保留 route_endpoints.cost_ratio 作"跟随渠道"基准与列表展示；模型级
+endpoint_model_prices.rate 在"按照token"时覆盖它）。若你想显示主模型/首个启用模型的倍率，请说明。
+
+*本文档落地：`server/docs/2026-09-07-routing-rework-plan.md`。拍板 1-4 后按 Phase 实施，
 每个 Phase 一个 gao-dev 提交 + PR。*
