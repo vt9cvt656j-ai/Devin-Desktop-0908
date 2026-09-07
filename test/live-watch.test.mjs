@@ -1,11 +1,11 @@
-// 实时监听的纯逻辑（agent/live-watch.js）：判错、去重、限流、规则、拼通知。真跑。
+// 实时监听的纯逻辑（agent/live-watch.js）：判错、去重、限流、规则、拼通知。真跑。没有界面：规则来自工作区的 .mrdayone/live-watch.json。
 import test from "node:test";
 import assert from "node:assert/strict";
 import { SRC, CODE } from "./helpers/source.mjs";
 import {
-  normalizeLiveWatchConfig, normalizeRule, resolveWatchPolicy, detectTerminalError, detectPreviewError,
+  normalizeLiveWatchConfig, normalizeRule, detectTerminalError, detectPreviewError,
   detectCaptureFailure, eventSignature, makeWatchEvent, newWatchState, matchRules, decideFire, composeWatchNotice,
-  describeWatchEventForUser, DEFAULT_LIVE_WATCH,
+  DEFAULT_LIVE_WATCH, LIVE_WATCH_CONFIG_FILE,
 } from "../src/agent/live-watch.js";
 
 test("配置归一：默认全开、mode=auto；坏值回默认；规则去掉不成形的", () => {
@@ -21,13 +21,8 @@ test("配置归一：默认全开、mode=auto；坏值回默认；规则去掉�
   assert.equal(d.maxPer10Min, 20);
 });
 
-test("策略：auto 跟随执行节奏（自动推进→自动修 / 关键处确认→先提示 / 稳一点→关）；on/ask/off 硬指定", () => {
-  assert.equal(resolveWatchPolicy({ mode: "auto" }, "proactive"), "auto");
-  assert.equal(resolveWatchPolicy({ mode: "auto" }, "confirm"), "ask");
-  assert.equal(resolveWatchPolicy({ mode: "auto" }, "safe"), "off");
-  assert.equal(resolveWatchPolicy({ mode: "on" }, "safe"), "auto");
-  assert.equal(resolveWatchPolicy({ mode: "ask" }, "proactive"), "ask");
-  assert.equal(resolveWatchPolicy({ mode: "off" }, "proactive"), "off");
+test("规则文件住在工作区的 .mrdayone 下——没有界面，智能体按用户的话写它", () => {
+  assert.equal(LIVE_WATCH_CONFIG_FILE, ".mrdayone/live-watch.json");
 });
 
 test("终端判错只认强形状：栈 / traceback / panic / 编译失败 / 端口占用；警告和 ready 行不算", () => {
@@ -117,7 +112,6 @@ test("规则：来源 + 文字（或正则）+ 应用名；命中的规则带 pr
   assert.match(m.text, /终端「dev · npm run dev」/);
   assert.match(m.text, /定位根因并修好/);
   assert.match(m.text, /line2/);
-  assert.match(describeWatchEventForUser(ev), /预览页面/);
 });
 
 // ── main.js 接线：源头挂上了、通知走后台监控那条路 ─────────────────────────────

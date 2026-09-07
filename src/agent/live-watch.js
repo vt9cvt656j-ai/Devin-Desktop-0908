@@ -8,13 +8,20 @@
 // 四个源头和 _queueNotice / _drainFollowups（后台监控等到条件时走的同一条路——那条路本来就能在
 // 没有用户消息的情况下开一轮）。能在 Node 里跑的都在这里，测试做真往返。
 
-export const LIVE_WATCH_STORE_KEY = "michael-ide.live-watch";
+/**
+ * 规则文件：工作区里的 .mrdayone/live-watch.json。**没有界面**——所有者定调「这个选项不需要出现，是 AI 把控的」：
+ * 监听一直开着；用户说「出现 xxx 就 yyy」时，智能体把规则写进这个文件，IDE 每 15 秒重读。
+ * 形状：{ "sources": { "preview": true, "terminal": true, "capture": true, "screen": true },
+ *        "rules": [{ "source": "preview|terminal|capture|screen|any", "pattern": "…", "isRegex": false, "app": "（screen 用）", "prompt": "要做什么" }],
+ *        "cooldownSec": 600, "maxPer10Min": 3 }
+ */
+export const LIVE_WATCH_CONFIG_FILE = ".mrdayone/live-watch.json";
 
 /** 事件来源。 */
 export const WATCH_SOURCES = Object.freeze(["preview", "terminal", "capture", "screen"]);
 
 export const DEFAULT_LIVE_WATCH = Object.freeze({
-  // auto = 跟随「执行节奏」设置（自动推进→自动修，关键处确认→先提示，稳一点→只记录）；on / ask / off 是硬指定。
+  // mode 只剩历史兼容：产品里恒为自动（AI 把控，没有开关）。
   mode: "auto",
   sources: Object.freeze({ preview: true, terminal: true, capture: true, screen: true }),
   rules: Object.freeze([]),
@@ -54,18 +61,6 @@ export function normalizeRule(raw) {
     app,
     prompt,
   };
-}
-
-/** mode 落到实际策略。autonomy 是自适应画像里的「执行节奏」。 */
-export function resolveWatchPolicy(cfg, autonomy) {
-  const mode = cfg && cfg.mode;
-  if (mode === "on") return "auto";
-  if (mode === "ask") return "ask";
-  if (mode === "off") return "off";
-  const a = String(autonomy || "proactive");
-  if (a === "proactive") return "auto";
-  if (a === "confirm") return "ask";
-  return "off";
 }
 
 // ── 判错 ─────────────────────────────────────────────────────────────────────
@@ -264,8 +259,3 @@ export function composeWatchNotice(ev, { rule = null, tail = "", previewUrl = ""
   };
 }
 
-/** 「先提示」模式下给用户看的那句话。 */
-export function describeWatchEventForUser(ev) {
-  const src = SOURCE_LABEL[ev.source] || ev.source;
-  return `${src}${ev.where ? `（${ev.where.slice(0, 60)}）` : ""}：${ev.text.split("\n")[0].slice(0, 120)}`;
-}
