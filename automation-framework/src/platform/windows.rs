@@ -41,35 +41,32 @@ impl WindowControl for WindowsControl {
         Ok(windows.into_iter().find(|w| w.title.contains(title)))
     }
     
+    /// 按窗口标题或应用名激活。名字怎么认见 windows_tree::resolve_app（可执行名 / 窗口标题一次全认）；
+    /// 按标题命中的还会把那扇窗口本身提到最前。抢前台的四级升级和回读在 windows_tree::activate。
     fn activate_window(&self, title: &str) -> Result<()> {
-        let hwnd = find_hwnd_by_title(title)?;
-        
-        unsafe {
-            // 如果窗口最小化，先恢复
-            if IsIconic(hwnd).as_bool() {
-                let _ = ShowWindow(hwnd, SW_RESTORE);
-            }
-            
-            // 激活窗口。SetForegroundWindow 在 Windows 上会被前台锁挡下来
-            // （只有当前前台进程才有权换前台），而且它挡人的方式是**返回 false**，
-            // 不是报错——所以光看返回值不够，必须回读。
-            let _ = SetForegroundWindow(hwnd);
+        let m = crate::platform::windows_tree::resolve_app(title)
+            .map_err(|c| Error::ElementNotFound(crate::platform::windows_tree::no_such_app(title, &c)))?;
+        if m.via == "window_title" && crate::platform::windows_tree::raise_window(m.pid, title) {
+            return Ok(());
         }
-        
-        // 回读确认。RPC 那层的回执写着「到这里代表回读确认过目标真在前台了」，
-        // 而 Windows 这侧原来是发完就返回 Ok——那句话在 Windows 上是假的。
-        // 前台切换是异步的（窗口要处理 WM_ACTIVATE），所以轮询而不是读一次。
-        await_window_state(
-            hwnd,
-            |h| unsafe { GetForegroundWindow() == h },
-            2500,
-            &format!("发出了激活请求，但「{}」没有到前台。Windows 只允许当前前台进程换前台，\
-                      被别的窗口（比如某个模态框或安装程序）占着的时候这个请求会被系统丢弃。", title),
-        )
+        crate::platform::windows_tree::activate(m.pid).map_err(Error::System)
     }
-    
+
+    fn activate_pid(&self, pid: i32) -> Result<()> {
+        crate::platform::windows_tree::activate(pid).map_err(Error::System)
+    }
+
     fn minimize_window(&self, title: &str) -> Result<()> {
-        let hwnd = find_hwnd_by_title(title)?;
+        let hwnd = match find_hwnd_by_title(title) {
+            Ok(h) => h,
+            Err(e) => {
+                // 标题找不到就按应用名找（可执行名 / 窗口标题一次全认）。
+                return match crate::platform::windows_tree::resolve_app(title) {
+                    Ok(m) => crate::platform::windows_tree::set_minimized(m.pid, true).map(|_| ()).map_err(Error::System),
+                    Err(_) => Err(e),
+                };
+            }
+        };
         
         unsafe {
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
@@ -84,7 +81,15 @@ impl WindowControl for WindowsControl {
     }
     
     fn restore_window(&self, title: &str) -> Result<()> {
-        let hwnd = find_hwnd_by_title(title)?;
+        let hwnd = match find_hwnd_by_title(title) {
+            Ok(h) => h,
+            Err(e) => {
+                return match crate::platform::windows_tree::resolve_app(title) {
+                    Ok(m) => crate::platform::windows_tree::set_minimized(m.pid, false).map(|_| ()).map_err(Error::System),
+                    Err(_) => Err(e),
+                };
+            }
+        };
         
         unsafe {
             let _ = ShowWindow(hwnd, SW_RESTORE);

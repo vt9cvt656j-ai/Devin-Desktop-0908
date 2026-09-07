@@ -35619,10 +35619,13 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       // "open" 排头：它是**默认该先想到的那个**——只是要让用户看一眼页面时，交给他自己的
       // 默认浏览器，不起自动化窗口。这份名单会覆盖上面 schema 字面量里的 enum，
       // 只改那边等于没改（这次就先踩了一次）。
-      const wantedActions = ["mytabs", "open", "navigate", "observe", "viewport", "click", "dblclick", "rightclick", "longpress", "type", "clear", "append", "autofill", "fill", "hover", "drag", "slide", "swipe", "wheel", "toggle", "uncheck", "select", "focus", "blur", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "read", "find", "assert", "check", "batch", "upload", "cookies", "storage", "close", "task", "back", "forward", "reload", "tab"];
+      const wantedActions = ["mytabs", "open", "attach", "navigate", "observe", "viewport", "click", "dblclick", "rightclick", "longpress", "type", "clear", "append", "autofill", "fill", "hover", "drag", "slide", "swipe", "wheel", "toggle", "uncheck", "select", "focus", "blur", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "read", "find", "assert", "check", "batch", "upload", "cookies", "storage", "close", "task", "back", "forward", "reload", "tab"];
       browserProps.action.enum = wantedActions;
-      browserProps.action.description = "The browser action to perform. read = the page as a document (offset / max_chars / selector or node). find = locate by text / pattern / role: node hits plus text hits with context, scrolls to the first. nodes / observe = structured node list. scroll = by amount, or to a node / target text. mytabs = look at what the user already has open in their OWN browser (titles and URLs only, macOS, no automation window) — check it first when the task touches a page they may already be on. open = hand the URL to the USER'S OWN default browser for them to look at; you do not see the page. task = goal + optional url + max_steps: observe → act → note → re-observe by itself, returns a summary. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. check only performs a page health check; checkboxes and switches use toggle with checked. upload sends a file to an <input type=file>: selector picks the input, path / paths the absolute local file path. back / forward / reload move through history.";
+      browserProps.action.description = "The browser action to perform. read = the page as a document (offset / max_chars / selector or node). find = locate by text / pattern / role: node hits plus text hits with context, scrolls to the first. nodes / observe = structured node list. scroll = by amount, or to a node / target text. mytabs = look at what the user already has open in their OWN browser (titles and URLs only, macOS, no automation window) — check it first when the task touches a page they may already be on. open = hand the URL to the USER'S OWN default browser for them to look at; you do not see the page. task = goal + optional url + max_steps: observe → act → note → re-observe by itself, returns a summary. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. check only performs a page health check; checkboxes and switches use toggle with checked. upload sends a file to an <input type=file>: selector picks the input, path / paths the absolute local file path. back / forward / reload move through history. attach = take over an already-running Chromium-based app of the user's own (Electron / WebView2 / CEF started with a debugging port): port, or app / pid; the app's current window becomes the page you act on, and close only disconnects.";
     }
+    browserProps.port = { type: "integer", description: "For attach: the app's --remote-debugging-port." };
+    browserProps.app = { type: "string", description: "For attach: the app's name or window title (its debugging port is discovered); pid also works." };
+    browserProps.pid = { type: "integer", description: "For attach: the app's process id." };
     browserProps.width = { type: "integer", description: "For viewport: width, e.g. 1440 on desktop, 390 on a phone." };
     browserProps.height = { type: "integer", description: "For viewport: height, e.g. 900 on desktop, 844 on a phone." };
     browserProps.device_scale_factor = { type: "number", description: "For viewport: device scale factor, default 1." };
@@ -37197,7 +37200,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         const _ok = (name === "automation" ? _AUTOMATION_METHODS : _COMPUTER_METHODS).includes(_act);
         return _ok ? { type: "automation", via: name, method: _act, params: _p } : { type: "automation", via: name, method: "", invalidMethod: _act };
       }
-      const _sm = ({ screenshot: "screen.capture", zoom: "screen.capture", left_click: "mouse.click", right_click: "mouse.click", middle_click: "mouse.click", double_click: "mouse.double_click", triple_click: "mouse.triple_click", left_click_drag: "mouse.drag", mouse_move: "mouse.move", left_mouse_down: "mouse.down", left_mouse_up: "mouse.up", cursor_position: "mouse.position", scroll: "mouse.scroll", type: "keyboard.type", key: "keyboard.press", hold_key: "keyboard.hold", wait: "wait", paste: "keyboard.paste", screen_info: "screen.info", window_list: "window.list", window_activate: "window.activate", window_minimize: "window.minimize", window_restore: "window.restore", clipboard_get: "clipboard.get", clipboard_set: "clipboard.set", recorder_save: "recorder.save", recorder_replay: "recorder.replay", recorder_list: "recorder.list" })[_act];
+      const _sm = ({ screenshot: "screen.capture", zoom: "screen.capture", left_click: "mouse.click", right_click: "mouse.click", middle_click: "mouse.click", double_click: "mouse.double_click", triple_click: "mouse.triple_click", left_click_drag: "mouse.drag", mouse_move: "mouse.move", left_mouse_down: "mouse.down", left_mouse_up: "mouse.up", cursor_position: "mouse.position", scroll: "mouse.scroll", type: "keyboard.type", key: "keyboard.press", hold_key: "keyboard.hold", wait: "wait", paste: "keyboard.paste", screen_info: "screen.info", window_list: "window.list", window_activate: "window.activate", window_minimize: "window.minimize", window_restore: "window.restore", clipboard_get: "clipboard.get", clipboard_set: "clipboard.set", recorder_save: "recorder.save", recorder_replay: "recorder.replay", recorder_list: "recorder.list", wait_for: "screen.wait" })[_act];
       if (!_sm) return { type: "automation", via: name, method: "", invalidMethod: _act };
       return { type: "automation", via: name, method: _sm, params: _p, computer: { action: _act, args: { ...args } } };
     }
@@ -37260,6 +37263,10 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         type: "browser",
         action: args.action || "screenshot",
         url: args.url || "",
+        // attach（接管用户自己的 Chromium 内核应用）：端口 / 进程号 / 应用名三选一。
+        port: Number.isFinite(+args.port) && +args.port > 0 ? Math.floor(+args.port) : 0,
+        pid: Number.isFinite(+args.pid) && +args.pid > 0 ? Math.floor(+args.pid) : 0,
+        app: String(args.app || args.app_name || "").trim(),
         fresh: !!args.fresh || /^(?:isolated|private|incognito)$/i.test(String(args.mode || "")),
         mode: String(args.mode || "headed"),
         force: !!args.force,
@@ -44403,7 +44410,7 @@ function _toolMayProduceExternalEffect(call) {
   if (call.type === "system") return !["frontmost", "apps", "windows", "menu_items"].includes(call.op);
   // capture / position / info 也是纯观察：拍一眼屏幕、问指针在哪、问屏幕多大，都不改变
   // 任何东西。漏了它们的后果是模型"看一眼"也要过一次副作用判定。
-  if (call.type === "automation") return !/(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot|capture|position|info|wait)$/i.test(String(call.method || ""));
+  if (call.type === "automation") return !/(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot|capture|position|info|wait|ocr|resolve|probe|elements|marked|displays)$/i.test(String(call.method || ""));
   if (call.type === "uiclick") return true;
   if (call.type === "http") return !["GET", "HEAD", "OPTIONS"].includes(String(call.method || "GET").toUpperCase());
   if (["download", "download_asset", "genimage", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture"].includes(call.type)) return true;
@@ -61457,7 +61464,13 @@ async function _executeToolStepInner(step, call, root, run) {
         const _imgNote = _imgMeta ? describeScreenImage(_imgMeta, { marked: !!_img }) : "";
         const elements = Array.isArray(output?.elements) ? output.elements : [];
         const limitations = Array.isArray(output?.limitations) ? output.limitations : [];
-        const _rsPayload = { source: output?.source || "unknown", elements: elements.slice(0, 500), limitations };
+        // 读的是谁：pid / 应用名 / 可执行路径。路径落在工作区里就是用户自己正在开发的应用——
+        // 源码在手，控件没名字可以加标识再编，Chromium 内核的可以带调试端口用 browser attach 接管。
+        const _rsTarget = output?.target && typeof output.target === "object" ? output.target : null;
+        const _rsRoot = String(run?.root || "").replace(/\\/g, "/").replace(/\/+$/, "");
+        const _rsExe = String(_rsTarget?.exe || "").replace(/\\/g, "/");
+        const _rsOwnApp = !!(_rsRoot && _rsExe && _rsExe.toLowerCase().startsWith((_rsRoot + "/").toLowerCase()));
+        const _rsPayload = { source: output?.source || "unknown", ...(_rsTarget ? { target: { ..._rsTarget, own_app: _rsOwnApp } } : {}), elements: elements.slice(0, 500), limitations };
         // 给模型的这份**不缩进**。缩进在这里不是可读性，是纯损失：500 个元素 pretty-print
         // 是 101KB，紧凑只要 60KB，多出来的 68% 全部换成了被 _toolMsgForModel 挖空的元素——
         // 而挖掉的是中段，正文控件通常就在中段。面板那份照旧缩进，那是给人看的。
@@ -61467,7 +61480,8 @@ async function _executeToolStepInner(step, call, root, run) {
         res.textContent = elements.length ? `${_rsWho} · ${elements.length} 个可访问元素${_img ? " · 带标注图" : ""}` : `${_rsWho} · 未读取到元素`;
         if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structuredForView.slice(0, 24000))}</pre>`;
         if (vp) step.classList.add("is-open");
-        return { type: "readscreen", path: output?.source || "", ...(_img ? { image: _img } : {}), content: `read_screen 真实结果：\n${structured}${_imgNote ? `\n${_imgNote}` : ""}` };
+        const _rsOwnNote = _rsOwnApp ? `\n这是你正在开发的应用（可执行文件在工作区内：${_rsExe}）——源码在手：控件缺名字就在源码里加 accessibilityIdentifier / AutomationId / aria-label 再重编；Electron / WebView2 应用带 --remote-debugging-port 启动后可用 browser attach 按节点操作。` : "";
+        return { type: "readscreen", path: output?.source || "", ...(_img ? { image: _img } : {}), content: `read_screen 真实结果：\n${structured}${_imgNote ? `\n${_imgNote}` : ""}${_rsOwnNote}` };
       } catch (error) {
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "读取失败";
@@ -64730,6 +64744,13 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           if (state && _freshKeptAlive) state._freshKeptAlive = true;
           if (state && _navUrl !== (call.url || "")) state._autoUrl = _navUrl;
           if (state) state._runOwnedDevUrl = _isRunOwnedDevUrl(run, state.url || _navUrl);
+        }
+        else if (act === "attach") {
+          // 接管用户自己正在开发的 Chromium 内核应用（Electron / WebView2 / CEF，带调试端口启动的）。
+          // 之后每个 browser 动作都作用在它的窗口上；close 只断开连接，不关应用。
+          state = await backend.invoke("browser_attach", { port: call.port || null, pid: call.pid || null, app: call.app || null });
+          if (_browserOwner) _browserAgentOwner = _browserOwner;
+          try { _browserLastNavOrigin = new URL((state && state.url) || "").origin; } catch {}
         }
         else if (act === "viewport") {
           const width = Math.max(240, Math.min(3840, Math.round(call.width || 1280)));

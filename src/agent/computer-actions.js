@@ -28,7 +28,13 @@ export const EXTENDED_ACTIONS = Object.freeze([
   "screen_info", "window_list", "window_activate", "window_minimize", "window_restore",
   "clipboard_get", "clipboard_set",
   "recorder_save", "recorder_replay", "recorder_list",
+  // 等界面出现 / 消失某个元素再往下走：多步自动化最常见的失败是「动作发完立刻点下一步」，
+  // 而对话框还没弹出来、页面还没渲染完。轮询走 sidecar 的 probe，不作废手里的 ref。
+  "wait_for",
 ]);
+
+/** wait_for 最多等多少秒（sidecar 那边也钉在 30 秒）。 */
+export const WAIT_FOR_MAX_SECONDS = 30;
 
 export const COMPUTER_ACTIONS = Object.freeze([...STANDARD_ACTIONS, ...EXTENDED_ACTIONS]);
 
@@ -219,6 +225,21 @@ export function mapComputerAction(args) {
     case "paste": {
       if (a.text == null) return { error: "paste 需要 text" };
       return { method: "keyboard.paste", params: { text: String(a.text) }, coordSpace: "points" };
+    }
+    case "wait_for": {
+      // text 是必填的判据；title 指目标应用（窗口标题或应用名，省略 = 前台）；gone 等它消失；
+      // duration 是最长等待秒数（默认 8，封顶 30）。回执 ok:false 不是错误，是「没等到」。
+      const text = String(a.text || a.target || "").trim();
+      if (!text) return { error: "wait_for 需要 text：要等的那段文字（按钮 / 标题 / 提示里的字都行）；gone:true 等它消失" };
+      const sec = Number(a.duration);
+      const timeout_ms = Math.round(Math.min(Number.isFinite(sec) && sec > 0 ? sec : 8, WAIT_FOR_MAX_SECONDS) * 1000);
+      const params = { text, timeout_ms };
+      if (a.gone === true || String(a.gone).toLowerCase() === "true") params.gone = true;
+      const title = String(a.title || a.app || a.name || "").trim();
+      if (title) params.app = title;
+      const pid = Number(a.pid);
+      if (pid > 0) params.pid = Math.floor(pid);
+      return { method: "screen.wait", params, coordSpace: "points" };
     }
     case "screen_info": return { method: "screen.info", params: {}, coordSpace: "points" };
     case "window_list": return { method: "window.list", params: {}, coordSpace: "points" };

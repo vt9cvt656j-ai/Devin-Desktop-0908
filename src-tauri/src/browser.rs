@@ -1158,6 +1158,120 @@ fn try_connect_existing() -> Option<Session> {
     None
 }
 
+/// 接管用户**自己正在开发**的 Chromium 内核应用（Electron / WebView2 / CEF），它带
+/// `--remote-debugging-port` 启动。port 直接给；或给 app / pid，让 sidecar 的 app.resolve 把
+/// 这个进程（含子进程——WebView2 的端口挂在 msedgewebview2.exe 上）的调试端口认出来。
+///
+/// 接上后应用当前那扇窗口就是「当前页」，后面每个 browser 动作都作用在它上面。close 只断开
+/// 连接、不会关它：连的不是我们起的进程（headless_chrome 的 connect 不带 close_on_drop）。
+/// 之前起的自动化浏览器（如果有）会被替换掉——一次只有一个当前会话。
+#[tauri::command]
+pub async fn browser_attach(
+    port: Option<u16>,
+    pid: Option<u32>,
+    app: Option<String>,
+) -> Result<BrowserState, String> {
+    let app = app.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+    let (port, who) = match port.filter(|p| *p > 0) {
+        Some(p) => (p, format!("端口 {p}")),
+        None => {
+            let args = match (pid.filter(|p| *p > 0), app.as_deref()) {
+                (Some(p), _) => serde_json::json!({ "pid": p }),
+                (None, Some(a)) => serde_json::json!({ "name": a }),
+                (None, None) => {
+                    return Err("attach 需要 port（应用的 --remote-debugging-port），或 app / pid（让我去认它的调试端口）".into());
+                }
+            };
+            let v = tokio::time::timeout(
+                Duration::from_secs(8),
+                crate::automation::automation_call("app.resolve".into(), args),
+            )
+            .await
+            .map_err(|_| "找应用超时（自动化服务没响应）".to_string())??;
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let found_pid = v.get("pid").and_then(|x| x.as_i64()).unwrap_or(0);
+            let exe = v.get("exe").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let chromium = v.get("chromium").and_then(|x| x.as_bool()).unwrap_or(false);
+            match v.get("cdp").and_then(|c| c.get("port")).and_then(|p| p.as_u64()) {
+                Some(p) if p > 0 && p < 65536 => (p as u16, format!("「{name}」(pid {found_pid})")),
+                _ => {
+                    let ports: Vec<String> = v
+                        .get("ports")
+                        .and_then(|p| p.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.get("port").and_then(|p| p.as_u64())).map(|p| p.to_string()).collect())
+                        .unwrap_or_default();
+                    return Err(if chromium {
+                        format!(
+                            "「{name}」(pid {found_pid}, {exe}) 在跑，但没有开 Chromium 调试端口{}。重新启动它并带上调试端口：Electron 在命令行加 --remote-debugging-port=9222；WebView2 / Tauri(Windows) 设环境变量 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222；然后再 attach。",
+                            if ports.is_empty() { String::new() } else { format!("（它监听着 {}，但都不是调试接口）", ports.join(", ")) }
+                        )
+                    } else {
+                        format!(
+                            "「{name}」(pid {found_pid}, {exe}) 不是 Chromium 内核的应用，没有 CDP 可接。用 read_screen + ui_click 操作它（macOS 可访问性树 / Windows UI Automation）。"
+                        )
+                    });
+                }
+            }
+        }
+    };
+    let (ws_url, brand) = get_cdp_ws_url(port)
+        .ok_or_else(|| format!("{who} 上没有 Chromium 调试接口（/json/version 没回应）。确认应用是带 --remote-debugging-port={port} 启动的，且端口只监听本机。"))?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<BrowserState, String> {
+        let _operation = BROWSER_OPERATION
+            .lock()
+            .map_err(|_| "browser operation state poisoned")?;
+        let browser = Browser::connect_with_timeout(ws_url, Duration::from_secs(20))
+            .map_err(|e| format!("连接 {who} 的调试接口失败：{e}"))?;
+        // 页面 target 是异步冒出来的：刚连上时清单可能还是空的，等一下。
+        let mut tab: Option<Arc<Tab>> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let tabs: Vec<Arc<Tab>> = browser
+                .get_tabs()
+                .lock()
+                .map(|t| t.iter().cloned().collect())
+                .unwrap_or_default();
+            tab = tabs
+                .iter()
+                .find(|t| {
+                    let u = t.get_url();
+                    !u.starts_with("devtools://") && !u.starts_with("chrome-extension://")
+                })
+                .cloned()
+                .or_else(|| tabs.first().cloned());
+            if tab.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let tab = match tab {
+            Some(t) => t,
+            None => browser
+                .new_tab()
+                .map_err(|e| format!("{who} 没有任何页面窗口，新开一个也失败了：{e}"))?,
+        };
+        configure_new_tab(&tab)?;
+        let title = tab.get_title().unwrap_or_default();
+        let url = tab.get_url();
+        let old = {
+            let mut state = BROWSER.lock().map_err(|_| "browser state poisoned")?;
+            let old = state.invalidate();
+            state.session = Some(Session { _browser: browser, tab: tab.clone() });
+            old
+        };
+        drop(old);
+        set_session_note(format!(
+            "已接管 {who} 的窗口（{brand}，调试端口 {port}）——这是用户自己在开发的应用，后面每个 browser 动作都作用在它上面；close 只断开连接，不会关掉应用。"
+        ));
+        snapshot(
+            &tab,
+            Some(format!("[ATTACHED] 已接管 {who}（{brand}）的窗口「{title}」{url}；close 只断开，不关应用。")),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Query Chrome's `/json/version` endpoint to get the DevTools WebSocket URL.
 fn get_cdp_ws_url(port: u16) -> Option<(String, String)> {
     use std::io::{Read, Write};

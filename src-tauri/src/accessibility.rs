@@ -14,6 +14,9 @@ struct AccessibilityTarget {
     pid: i64,
     #[serde(default)]
     name: String,
+    /// 可执行文件的完整路径（sidecar 快路给）。落在工作区里 = 用户自己正在开发的应用。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    exe: String,
 }
 
 /// 前台窗口里那块网页的加载状态。路线 B（操作用户自己那个浏览器）原本没有任何
@@ -175,6 +178,10 @@ pub struct UiElement {
     pub value: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 开发者给控件起的稳定标识（accessibilityIdentifier / AutomationId / HTML id）。
+    /// 自研应用靠它：源码在自己手里时给控件加上标识，读屏就能按名字认出来，不用靠文案和坐标。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +189,9 @@ pub struct ReadScreenResponse {
     pub source: String,
     pub elements: Vec<UiElement>,
     pub limitations: Vec<String>,
+    /// 读的是谁：pid、应用名、可执行路径。JS 侧拿路径判「这是不是用户正在开发的应用」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<serde_json::Value>,
     /// 标注截图（data URL）：红框编号 = 上面元素的 ref。没图时整个字段不出现。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -328,6 +338,26 @@ async fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
 
 #[cfg(not(target_os = "macos"))]
 async fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
+    // Windows 现在有 sidecar 的 app.resolve（UI Automation 那一族）：可执行名 / 窗口标题一次全认，
+    // 找不到时把屏幕上有窗口的应用列回来。sidecar 没起来才落到下面那条老路。
+    if target.pid.filter(|p| *p > 0).is_none() {
+        if let Some(name) = target.app.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                crate::automation::automation_call("app.resolve".into(), serde_json::json!({ "name": name })),
+            )
+            .await
+            {
+                Ok(Ok(v)) => {
+                    if let Some(pid) = v.get("pid").and_then(|p| p.as_i64()).filter(|p| *p > 0) {
+                        return Ok(Some(pid));
+                    }
+                }
+                Ok(Err(e)) if e.contains("没有找到") => return Err(e),
+                _ => {}
+            }
+        }
+    }
     // **给了 app 却按名字找不到，必须硬报错，不能静默忽略。**
     // 上一版直接 `Ok(target.pid.filter(...))` —— app 参数整个被丢掉，然后底层无条件读
     // **前台窗口**（很可能就是 IDE 自己）。macOS 那一支同样的调用是硬报错，
@@ -352,7 +382,7 @@ async fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
     Ok(target.pid.filter(|p| *p > 0))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 async fn native_snapshot_via_sidecar(pid: Option<i64>, want_image: bool) -> Option<UiSnapshot> {
     let mut args = serde_json::json!({ "cap": 500 });
     if let Some(p) = pid.filter(|p| *p > 0) {
@@ -406,10 +436,15 @@ async fn native_snapshot_via_sidecar(pid: Option<i64>, want_image: bool) -> Opti
             h: e.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0),
             value: e.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             enabled: e.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+            id: e.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         });
     }
     Some(UiSnapshot {
-        target: Some(AccessibilityTarget { pid, name }),
+        target: Some(AccessibilityTarget {
+            pid,
+            name,
+            exe: out.get("exe").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        }),
         elements,
         // 前台是浏览器时 sidecar 会顺路带回 AXWebArea 的加载状态。
         // 这里原来硬写 None——于是「页面还在加载」那条提醒在快路上结构性失效，
@@ -430,8 +465,49 @@ async fn native_snapshot_via_sidecar(pid: Option<i64>, want_image: bool) -> Opti
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 async fn native_snapshot_via_sidecar(_pid: Option<i64>, _want_image: bool) -> Option<UiSnapshot> {
+    None
+}
+
+/// Windows：OCR 走 sidecar 的 screen.ocr（Windows.Media.Ocr，系统自带，按已装语言包）。
+/// 截的是目标应用的主窗口（没指定就是前台窗口）；回来的框是屏幕坐标，role 记成 OCRText，
+/// 和 macOS 的 Apple Vision 路径同一个形状，下游不用分平台。
+#[cfg(target_os = "windows")]
+async fn ocr_snapshot_via_sidecar(pid: Option<i64>) -> Option<UiSnapshot> {
+    let mut args = serde_json::json!({});
+    if let Some(p) = pid.filter(|p| *p > 0) {
+        args["pid"] = serde_json::json!(p);
+    }
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        crate::automation::automation_call("screen.ocr".into(), args),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let boxes = out.get("boxes")?.as_array()?;
+    let elements = boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| UiElement {
+            ref_: i as u32 + 1,
+            role: "OCRText".into(),
+            text: b.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            x: b.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            y: b.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            w: b.get("w").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            h: b.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            value: String::new(),
+            enabled: true,
+            id: String::new(),
+        })
+        .collect();
+    Some(UiSnapshot { target: None, elements, page: None, read_error: None, ..Default::default() })
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn ocr_snapshot_via_sidecar(_pid: Option<i64>) -> Option<UiSnapshot> {
     None
 }
 
@@ -454,7 +530,8 @@ pub async fn read_screen(
     // 和它真正问题无关的诊断（它的问题是 OCR 压根不支持指定目标）。
     // OCR 拍的是屏幕像素，压根没有"目标应用"这个概念——它只能拍最前面那个。
     // 静默忽略 app/pid 会让模型以为自己 OCR 了后台窗口，然后基于别的应用的文字往下做。
-    if use_ocr && target_explicit {
+    // Windows 的 OCR 在 sidecar 里（screen.ocr），它认 app / pid（截目标窗口），所以这条限制只对 macOS。
+    if use_ocr && target_explicit && cfg!(target_os = "macos") {
         return Err(format!(
             "ocr=true 读的是屏幕像素，只能覆盖最前面那个窗口，没法指定{}。要么去掉 app/pid 用 OCR 读前台，要么去掉 ocr 用可访问性树读指定应用。",
             target.describe()
@@ -477,11 +554,15 @@ pub async fn read_screen(
     // 快路产出的是**同一个 UiSnapshot 结构**，然后走完全相同的下游：装 ref 表、
     // 拼限制说明。绝不能在这里提前 return——ui_click 靠 install_ax_snapshot 记下的
     // pid 和元素签名来定位，跳过它等于把「按 ref 操作」整条功能弄坏。
-    let fast = if use_ocr { None } else { native_snapshot_via_sidecar(target_pid, want_image).await };
+    let fast = if use_ocr {
+        ocr_snapshot_via_sidecar(target_pid).await
+    } else {
+        native_snapshot_via_sidecar(target_pid, want_image).await
+    };
     // 走没走成快路，决定了这批 ref 的编号语义，也决定了 ui_click 该往哪条路发动作。
     // 判据必须和下面那个 match 的条件**逐字一致**：读回空清单时会落回老路，
     // 那种情况下 ref 是 JXA 的下标，按快路发就点错元素了。
-    let native_refs = fast.as_ref().is_some_and(|s| !s.elements.is_empty());
+    let native_refs = !use_ocr && fast.as_ref().is_some_and(|s| !s.elements.is_empty());
     let mut snapshot = match fast {
         Some(s) if !s.elements.is_empty() => s,
         _ => tauri::async_runtime::spawn_blocking(move || {
@@ -526,6 +607,9 @@ pub async fn read_screen(
     let image = snapshot.image.take();
     let image_meta = snapshot.image_meta.take();
     install_ax_snapshot(&mut snapshot, native_refs)?;
+    let target_json = snapshot.target.as_ref().map(|t| {
+        serde_json::json!({ "pid": t.pid, "name": t.name, "exe": if t.exe.is_empty() { serde_json::Value::Null } else { serde_json::json!(t.exe) } })
+    });
     let elements = snapshot.elements;
 
     let mut limitations = Vec::new();
@@ -573,15 +657,15 @@ pub async fn read_screen(
                     // 两处平台差异，都会让这句建议变成假话：
                     //  · 已经在 ocr 里读空的时候，再建议「用 ocr=true」等于建议它用正在用的那个；
                     //  · OCR 只有 macOS 有实现，非 macOS 上它恒返回空——把模型指过去等于送进死路。
-                    if use_ocr && !cfg!(target_os = "macos") {
-                        // 这里以前和 macOS 共用一句「OCR 也读空了，所以屏幕上没有文字」。
-                        // 在非 macOS 上 read_ocr_elements() 是个恒返回空 Vec 的实现——
-                        // 空结果跟屏幕上有没有字毫无关系。模型据此断定「这个界面没有可读的
-                        // 内容」，然后放弃整条任务，而真实原因只是这个平台没写 OCR。
+                    if use_ocr && cfg!(target_os = "windows") {
+                        // Windows 的 OCR 在 sidecar 里（Windows.Media.Ocr）。读空有两种可能，得分开说：
+                        // sidecar 没起来 / 系统没装 OCR 语言包（什么都没跑），或者真的没有文字。
+                        "Windows OCR (Windows.Media.Ocr via the automation sidecar) returned nothing — either the sidecar is not running / no OCR language pack is installed (Settings → Time & language → Language → the current language's optional features → Optical character recognition), or there really is no text in the window. Use computer's screenshot to look at the real pixels before concluding"
+                    } else if use_ocr && !cfg!(target_os = "macos") {
                         "there is NO OCR implementation on this platform — ocr=true returned empty because nothing ran, not because the screen is blank. Use computer's screen.capture to look at the real pixels instead"
                     } else if use_ocr {
                         "OCR also came back empty, so there is no text on screen to read either — this is not something a different flag fixes"
-                    } else if cfg!(target_os = "macos") {
+                    } else if cfg!(any(target_os = "macos", target_os = "windows")) {
                         "read it with ocr=true instead"
                     } else {
                         "there is no OCR fallback on this platform — use computer's screen.capture to look at the real pixels instead"
@@ -633,6 +717,7 @@ pub async fn read_screen(
         .into(),
         elements,
         limitations,
+        target: target_json,
         image,
         image_meta,
     })
@@ -1110,7 +1195,7 @@ ConvertTo-Json -Compress -Depth 4 -InputObject @{pid=$tp;app=$tn;elements=@($out
     match serde_json::from_str::<WinRead>(t) {
         Ok(r) => {
             let target = if r.pid > 0 {
-                Some(AccessibilityTarget { pid: r.pid, name: r.app })
+                Some(AccessibilityTarget { pid: r.pid, name: r.app, exe: String::new() })
             } else {
                 None
             };
@@ -1842,6 +1927,7 @@ mod tests {
             h: 20.0,
             value: String::new(),
             enabled: true,
+            id: String::new(),
         }
     }
 
@@ -1879,10 +1965,7 @@ return JSON.stringify({operated:operated,changed:changed});
     fn refs_are_invalidated_when_a_new_snapshot_is_installed() {
         clear_latest_ax_refs().expect("state should be writable");
         let mut first = UiSnapshot {
-            target: Some(AccessibilityTarget {
-                pid: 101,
-                name: "First".to_string(),
-            }),
+            target: Some(AccessibilityTarget { pid: 101, name: "First".to_string(), exe: String::new() }),
             elements: vec![element(7)],
             page: None,
             read_error: None,
@@ -1900,10 +1983,7 @@ return JSON.stringify({operated:operated,changed:changed});
         assert_eq!(target.pid, 101);
 
         let mut second = UiSnapshot {
-            target: Some(AccessibilityTarget {
-                pid: 202,
-                name: "Second".to_string(),
-            }),
+            target: Some(AccessibilityTarget { pid: 202, name: "Second".to_string(), exe: String::new() }),
             elements: vec![element(3)],
             page: None,
             read_error: None,
@@ -2088,8 +2168,10 @@ return JSON.stringify({operated:operated,changed:changed});
         let at = src
             .find("async fn native_snapshot_via_sidecar(")
             .expect("快路读屏不见了");
+        // 快路现在 mac / Windows 共用，它的兜底桩在 `not(any(macos, windows))` 下；切到那一行为止，
+        // 别把后面 OCR 那条（OCR 看像素，本来就没有 page）也切进来。
         let end = src[at..]
-            .find("\n#[cfg(not(target_os = \"macos\"))]")
+            .find("\n#[cfg(not(any(target_os = \"macos\", target_os = \"windows\")))]")
             .map(|i| at + i)
             .unwrap_or(src.len());
         let body = &src[at..end];
@@ -2397,10 +2479,7 @@ return JSON.stringify({operated:operated,changed:changed});
     #[cfg(target_os = "macos")]
     #[test]
     fn action_script_checks_full_signature_without_keyboard_fallback() {
-        let target = AccessibilityTarget {
-            pid: 4242,
-            name: "Target".to_string(),
-        };
+        let target = AccessibilityTarget { pid: 4242, name: "Target".to_string(), exe: String::new() };
         let source = element(9);
         let binding = AxRefBinding {
             raw_ref: 9,
@@ -2438,10 +2517,7 @@ return JSON.stringify({operated:operated,changed:changed});
     #[cfg(target_os = "macos")]
     #[test]
     fn action_script_supports_extended_ax_actions() {
-        let target = AccessibilityTarget {
-            pid: 7,
-            name: "App".to_string(),
-        };
+        let target = AccessibilityTarget { pid: 7, name: "App".to_string(), exe: String::new() };
         let binding = AxRefBinding {
             raw_ref: 3,
             signature: AxElementSignature::from(&element(3)),

@@ -41,6 +41,22 @@ windows = { version = "0.58", features = [
     # DwmGetWindowAttribute：判窗口是不是 cloaked（切走的虚拟桌面、挂起的 UWP）。
     # 这类窗口 IsWindowVisible 为真、矩形也正常，只有 DWM 知道它其实不在屏幕上。
     "Win32_Graphics_Dwm",
+    # 下面这批是 platform/windows_tree.rs（UI Automation 读树 / 按 ref 操作 / 按名字找应用）要的：
+    # 进程枚举（按可执行名认应用）、DPI 感知（坐标、截图、UIA 矩形统一成物理像素）、
+    # 合成输入（AttachThreadInput 抢前台、Invoke 不支持时按中心点点击、set_value 兜底逐字打）、
+    # 监听端口（自研 Electron / WebView2 应用开着调试端口就能被 browser 接管）、WinRT OCR。
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Variant",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
