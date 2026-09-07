@@ -24121,22 +24121,12 @@ test("context-window choice clamps to what is actually deliverable", () => {
   };
   // 【2026-09-01】滑轨上只剩窗口。会员档位曾经也占三格（1M/2M/5M），而那三格**拖了
   // 不算数**——发出去的 x-michael-compression 取的是会员自身的档位，不是滑块选的那格。
-  // 现在它变成卡片上一行只读事实（_ctxRetentionNote），不再是可拖的格子。
+  // 2026-09-07 起卡片上也不再显示它（所有者：那一行没用），滑轨只剩窗口。
   const opts1m = mkOpts({ michael_compression: { tier: "1m", max_input_tokens: 1_000_000 } }, true)("m");
   assert.equal(opts1m.length, 1, "会员档位不许再回到滑轨上——那几格是假的");
   assert.equal(opts1m[0].native, true);
   assert.ok(!opts1m.some((o) => o.locked), "滑轨上不许有拖不动的格子");
   assert.equal(opts1m.filter((o) => o.kind === "tier").length, 0, "滑轨上不许有留存档位");
-  // 而留存本身仍然看得见，只是换成了只读的一行。
-  const keep = load("_ctxRetentionNote", {
-    _michaelUser: { michael_compression: { tier: "1m", max_input_tokens: 1_000_000 } },
-    _gatewayHandlesCompression: () => true,
-    _compressionTier: () => "1m",
-  })();
-  assert.equal(keep.tokens, 1_000_000, "付费买到的留存必须还在卡片上，删格子不等于删功能");
-  assert.equal(load("_ctxRetentionNote", {
-    _michaelUser: null, _gatewayHandlesCompression: () => false, _compressionTier: () => null,
-  })(), null, "没会员就不该挂这一行");
 
   // 多个原生窗口要全部显示，而不是只留默认那个。Sonnet 4/4.5 真的有两个（200K 默认 +
   // 1M 走 context-1m beta），Gemini 1.5 Pro 有 1M/2M —— 只显示第一个等于把模型真实
@@ -29755,7 +29745,6 @@ test("选了哪一格就停在哪一格——不许一重画就退回去", () =>
     _escHtml: (x) => String(x),
     _escAttr: (x) => String(x),
     _micSliderHtml: (o) => o,
-    _ctxRetentionHtml: () => "",
   };
   // 分层构建：后面的函数要用到前面的，一次性用同一个 env 加载会互相看不见。
   const l1 = { ...env, _modelContextLimit: load("_modelContextLimit", env) };
