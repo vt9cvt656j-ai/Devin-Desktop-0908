@@ -7122,9 +7122,10 @@ test("一开始就已经满足 ≠ 等到了", () => {
   for (const n of [2, 3, 17]) {
     assert.equal(_preexistingConditionNote(n), "", `第 ${n} 次才命中说明是真的等到了，不该加警告`);
   }
-  // manual **根本不轮询**（它等的是用户点「已完成，继续」），_bmChecks 恒为 0——
-  // 于是"第一次检查就命中"对它恒成立。用户亲手确认完却被告知「别把它当成做完的证据」，
-  // 直接否定用户唯一的显式表态。恒真判据是这个仓库反复出现的坑，这条钉死它。
+  // manual 那一档（等用户点「已完成，继续」）2026-09-07 已从工具里撤掉——执行器在可检查性
+  // 守卫处就把它拦下了，走不到这里。这条特判留作防御：它根本不轮询，_bmChecks 恒为 0，
+  // "第一次检查就命中"对它恒成立，真走到这儿就会否定用户唯一的显式表态。恒真判据是这个
+  // 仓库反复出现的坑，这条继续钉着。
   assert.equal(_preexistingConditionNote(0, "manual"), "", "用户亲手点的确认不许被这句话否定");
   assert.equal(_preexistingConditionNote(1, "manual"), "", "manual 任何情况下都不该发这句");
   // 一次自动检查都没做过，也谈不上「本来就成立」。
@@ -36577,11 +36578,20 @@ test("background_monitor：检查不了的条件必须当场说，别用 300 秒
     assert.match(r.content, /pattern/);
   }
 
-  // capture 和 manual 有意豁免。capture 空 pattern 匹配下一条新流量，是抓包恢复路径
-  // 明说的用法（CONFIGURE_BACKGROUND_PROXY 那条回执就是这么教模型的）；manual 不轮询。
+  // capture 有意豁免：空 pattern 匹配下一条新流量，是抓包恢复路径明说的用法
+  // （CONFIGURE_BACKGROUND_PROXY 那条回执就是这么教模型的）。
   assert.equal(check(call({ message: "等流量", check_type: "capture" })), null,
     "capture 不带 pattern 被拦了 —— 抓包恢复路径正是这么教模型调的");
-  assert.equal(check(call({ message: "等用户登录" })), null, "manual 被拦了");
+  // manual 2026-09-07 撤掉（所有者：这是 AI 全自动的，不需要用户手动去点「已完成」）。
+  // 没给 check_type、或明说 manual，都要当场拦下并告诉模型改走哪条路——而不是挂一张
+  // 永远等不到点击的卡。网关那份目录更新之前模型仍可能发 manual，所以这条不能只靠枚举。
+  for (const args of [{ message: "等用户登录" }, { message: "等用户登录", check_type: "manual" }]) {
+    const r = check(call(args));
+    assert.ok(r, `${args.check_type ? "manual" : "没给 check_type"} 没被拦——会挂一张永远等不到点击的卡`);
+    assert.match(r.content, /screen/, "没告诉模型界面上的事该用 screen 盯");
+    assert.match(r.content, /结束这一轮/, "没告诉模型探测不到就直接交给用户、结束这一轮");
+    assert.equal(r.failure.attempted, false, "一次都没检查，不能报成尝试过");
+  }
   assert.equal(check(call({ message: "等端口", check_type: "port", pattern: "3000" })), null,
     "写全了还被拦");
 

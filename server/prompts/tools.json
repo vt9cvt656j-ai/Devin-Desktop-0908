@@ -3989,7 +3989,7 @@
     "type": "function",
     "function": {
       "name": "background_monitor",
-      "description": "Park in the background until a condition is met, then resume automatically — for any step that waits on the user or an external event: tell the user what to do (the link, the command, the steps), then monitor. Prefer checks that detect on their own (port / file / command / url / capture / screen); manual makes the user come back and say done. When the awaited action leaves no file, port or request behind (dismiss a dialog, finish a login, flip a switch), use screen: it watches an app's on-screen text for pattern.",
+      "description": "Park in the background until a condition is met, then resume automatically — for any step that waits on the user or an external event: tell the user what to do (the link, the command, the steps), then monitor. Every check detects on its own (port / file / command / url / capture / screen); the user never clicks anything. When the awaited action leaves no file, port or request behind (dismiss a dialog, finish a login, flip a switch), use screen: it watches an app's on-screen text for pattern. If nothing can detect it, tell the user the steps and end your turn; their next message resumes you.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -4002,13 +4002,12 @@
             "enum": [
               "capture",
               "file",
-              "manual",
               "command",
               "url",
               "port",
               "screen"
             ],
-            "description": "manual = wait for the user to click continue; file = a file appears (with file_pattern, its contents match); capture = captured traffic matches pattern; command = re-run a command until it exits 0; url = re-request a URL until it answers 2xx or 3xx (a redirect counts as reachable); port = a port is listening; screen = an app's on-screen UI text (macOS accessibility tree) contains pattern — set app; it reads without stealing focus and keeps read_screen refs valid."
+            "description": "file = a file appears (with file_pattern, its contents match); capture = captured traffic matches pattern; command = re-run a command until it exits 0; url = re-request a URL until it answers 2xx or 3xx (a redirect counts as reachable); port = a port is listening; screen = an app's on-screen UI text (macOS accessibility tree) contains pattern — set app; it reads without stealing focus and keeps read_screen refs valid."
           },
           "pattern": {
             "type": "string",

@@ -226,6 +226,8 @@ export function monitorProducerStopped({ wasExited, nowExited, recentOut } = {})
 // _bmChecks 恒为 0，于是"第一次检查就命中"对它恒成立——用户亲手确认完，模型却被告知
 // 「别把它当成那一步已完成的证据」，直接否定用户唯一的显式表态。恒真判据是这个仓库里
 // 反复出现的坑，这里当场堵掉：没做过任何自动检查（checks < 1）就没有"本来就成立"这回事。
+// manual 2026-09-07 已从工具里撤掉（所有者：AI 全自动，不让用户点按钮），执行器在可检查性
+// 守卫处就拦下了，正常走不到这里；这条特判留作防御，test/logic.test.mjs 仍钉着它。
 export function preexistingConditionNote(checks, kind = "") {
   if (kind === "manual") return "";
   if (!(Number(checks) >= 1)) return "";
