@@ -298,6 +298,35 @@ test("自己端点的 401 不许把用户从本产品登出——这条会连锁
   assert.equal(billingOpened, 1, "网关 402 必须打开充值页");
 });
 
+test("自己端点的 424 要说「你的端点」，并把网关点名的那句原样带出来", () => {
+  // 2026-09-07 实测：teamorouter 余额为零时网关回 424，客户端却说「上游供应商那边的账号出了问题…
+  // 这是服务端的配置问题…换一个模型」——三句话对自带端点全是错的：不是我们的供应商、不是服务端
+  // 配置、换模型也没用（他就想用自己的端点）。网关那句已经按 byo 分了口径（你的自定义端点余额
+  // 不足 / 连不上你的自定义端点 polly.modelbridge.cc），这里要做的只是别把它盖掉。
+  const fmt = load("_formatAgentFinalError", {
+    _stripAiRetryPrefix: (s) => String(s),
+    _aiFailureKind: () => "upstream",
+    _AI_MODEL_RETRY_LIMIT: 4,
+  });
+  const gatewayLine = "AI request failed (424 Failed Dependency): 【grok-4.6】你的自定义端点余额不足（这是你在那家中转/供应商的账户，不是本产品的余额）。上游原话：钱包余额不足（自定义端点；最后状态 400）";
+  const mine = fmt(gatewayLine, { custom: true });
+  assert.match(mine, /你自己那个端点/, "没说清是他自己的端点");
+  assert.match(mine, /你的自定义端点余额不足/, "网关点名的那句被盖掉了");
+  assert.doesNotMatch(mine, /服务端的配置问题|换一个模型/, "对自带端点说了给我们线路听的话");
+  const ours = fmt(gatewayLine, { custom: false });
+  assert.match(ours, /上游供应商/, "网关线路那句不许变");
+  // toast 那一半：自定义端点上的 424 只提示，不动账号
+  const removed = []; const toasts = []; let loginOpened = 0, billingOpened = 0;
+  const recover = load("_recoverFromAiFailure", {
+    localStorage: { removeItem: (k) => removed.push(k) }, _loggedInEmail: null, _setMichaelUserProfile: () => {},
+    _updateLoginUI: () => {}, openLoginDialog: () => { loginOpened++; }, _showBillingPanel: () => { billingOpened++; },
+    showToast: (t) => toasts.push(String(t)),
+  });
+  assert.equal(recover("upstream", { custom: true }), true, "自定义端点上的 424 也要有反馈");
+  assert.deepEqual(removed, []); assert.equal(loginOpened, 0); assert.equal(billingOpened, 0);
+  assert.ok(toasts.some((t) => t.includes("424") && t.includes("你自己那个端点")), "toast 没说清是他的端点");
+});
+
 test("调用点要把「本轮是不是自己的端点」传下去——不传的话上面那条门等于没有", () => {
   // 行为测试测的是 _recoverFromAiFailure 本身；调用点漏传 custom 它抓不到（变异实测）。
   const loop = extractFn("_runAgenticLoop", { code: true });
