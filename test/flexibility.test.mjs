@@ -107,7 +107,8 @@ test("请求已发出但上游还没开口时，界面要说明在等首字节",
   assert.ok(at > 0, "找不到 _turnStatsText");
   const fn = SRC.slice(at, RAW_SRC.indexOf("\n}\n", at));
   assert.match(fn, /live/, "实时统计要能区分 live 与收尾");
-  assert.match(fn, /等待上游首字节/, "没有任何进展时要说明在等首字节");
+  // 「等待上游首字节」那句 2026-09-07 按所有者要求撤掉；「接收中」留着。
+  assert.doesNotMatch(fn, /等待上游首字节/, "那句话所有者要求撤掉，别加回来");
   assert.match(fn, /接收中/, "已经开始收但还没画出来时要说明在接收");
   assert.ok(RAW_SRC.indexOf("live: true,") > 0, "实时统计必须以 live 模式渲染");
 });

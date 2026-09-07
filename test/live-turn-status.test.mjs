@@ -1,4 +1,6 @@
-// 实时状态条的「等待上游首字节 / 接收中」必须说的是**当前这一轮**。
+// 实时状态条的轮次/重试信息与「接收中」必须说的是**当前这一轮**。
+// 「等待上游首字节」那句 2026-09-07 按所有者要求撤掉：等首字节时只留「第 N 轮 / 重试 #N」这类
+// 有信息量的字，没有就不加——思考卡本身已经在说明还在等。
 //
 // 这两个标签原来读的是任务级首次事件（timeline.firstModelProgressAt / firstVisibleAt），
 // 而这两个字段只在第一次有值时写入。于是第一轮首显之后它们永远非空，两个分支从第二轮起
@@ -49,9 +51,11 @@ const timelineOf = (...turns) => ({
   turns,
 });
 
-test("第一轮：请求已发出、上游还没开口时说明在等首字节", () => {
+test("第一轮：请求已发出、上游还没开口时不再喊「等待上游首字节」", () => {
   const tl = timelineOf(turn());
-  assert.match(line({ elapsedMs: 8000, timeline: tl, live: true }), /等待上游首字节/);
+  const text = line({ elapsedMs: 8000, timeline: tl, live: true });
+  assert.doesNotMatch(text, /等待上游首字节|等待/, "那句话所有者要求撤掉");
+  assert.match(text, /8000ms/, "秒表照旧在");
 });
 
 test("第一轮：开始收了但还没画出来时说「接收中」", () => {
@@ -69,8 +73,9 @@ test("第二轮起同样要说话——这正是原来整条静默的地方", ()
   const tl = timelineOf(first, second);
   assert.notEqual(tl.firstModelProgressAt, null, "任务级字段确实已经有值了（旧判据据此永远沉默）");
   const text = line({ elapsedMs: 30000, timeline: tl, live: true });
-  assert.match(text, /等待上游首字节/, "第二轮卡在上游不开口，界面必须说出来");
+  assert.doesNotMatch(text, /等待上游首字节/);
   assert.match(text, /第 2 轮/, "多轮时要指明是哪一轮在等");
+  assert.doesNotMatch(text, /第 2 轮 ·\s*$|· *<\/span>/, "轮次后面不许挂一个悬空的分隔点");
 });
 
 test("第二轮开始收内容但这一轮还没出字时是「接收中」", () => {
@@ -86,7 +91,7 @@ test("物理重试要标出来：用户看到的不是一次长等待，而是�
   const first = turn({ stepIndex: 1, firstProgressAt: T0 + 800, firstVisibleAt: T0 + 900, endedAt: T0 + 1000 });
   const text = line({ elapsedMs: 60000, timeline: timelineOf(first, t), live: true });
   assert.match(text, /重试 #3/);
-  assert.match(text, /等待上游首字节/);
+  assert.doesNotMatch(text, /等待上游首字节/);
 });
 
 test("轮次都结束了（正在跑工具）就不加标签——工具卡自己在转", () => {
@@ -106,21 +111,23 @@ test("并行子体和主轮同时未结束时，说的是主轮", () => {
   const main = turn({ stepIndex: 4, kind: "main" });
   const sub = turn({ stepIndex: 5, kind: "subagent", startedAt: T0 + 100, requestStartedAt: T0 + 100, firstProgressAt: T0 + 200 });
   const text = line({ elapsedMs: 20000, timeline: timelineOf(main, sub), live: true });
-  assert.match(text, /等待上游首字节/, "主轮还在等首字节，就报主轮");
-  assert.doesNotMatch(text, /子体/);
+  assert.match(text, /第 4 轮/, "主轮还在等首字节，就报主轮");
+  assert.doesNotMatch(text, /子体|等待上游首字节/);
 });
 
 test("只有子体在跑时如实说是子体，不冒充第 N 轮", () => {
   const done = turn({ stepIndex: 1, firstProgressAt: T0 + 800, firstVisibleAt: T0 + 900, endedAt: T0 + 1000 });
   const sub = turn({ stepIndex: 2, kind: "subagent", startedAt: T0 + 3000, requestStartedAt: T0 + 3000 });
   const text = line({ elapsedMs: 20000, timeline: timelineOf(done, sub), live: true });
-  assert.match(text, /子体 · 等待上游首字节/);
+  assert.match(text, /子体/); assert.doesNotMatch(text, /等待上游首字节|子体 ·/);
 });
 
-test("还没开过任何一轮时退回任务级判据（首轮开跑前的等待照样有字）", () => {
+test("还没开过任何一轮时退回任务级判据：等首字节不加标签，开始收了才说「接收中」", () => {
   const tl = { startedAt: T0, firstModelProgressAt: null, firstVisibleAt: null, turns: [] };
-  assert.match(line({ elapsedMs: 3000, timeline: tl, live: true }), /等待上游首字节/);
-  assert.match(line({ elapsedMs: 3000, timeline: null, live: true }), /等待上游首字节/);
+  assert.doesNotMatch(line({ elapsedMs: 3000, timeline: tl, live: true }), /等待上游首字节|接收中/);
+  assert.doesNotMatch(line({ elapsedMs: 3000, timeline: null, live: true }), /等待上游首字节/);
+  const receiving = { startedAt: T0, firstModelProgressAt: T0 + 500, firstVisibleAt: null, turns: [] };
+  assert.match(line({ elapsedMs: 3000, timeline: receiving, live: true }), /接收中/);
 });
 
 // 「模型 24s / 首显 24s」从行内撤下 —— 但只是换出口，不是丢数据。
@@ -145,12 +152,12 @@ test("收尾（非 live）不加等待标签，且行内不再显示「模型 / 
   // 20302（实时）/20442（收尾）任一处的 el.title 被顺手删掉，上面三条照样全绿而两个数彻底消失。
   assert.ok((SRC.match(/el\.title = _turnStatsTitle\(/g) || []).length >= 2,
     "tooltip 没挂在渲染出口上了——行内已经撤下，这两个数就彻底看不到了");
-  // 等待期间必须照样说话：firstProgressMs / firstVisibleMs 两个 const 还是那条退路的判据，
+  // 那条退路还在：firstProgressMs / firstVisibleMs 两个 const 仍是判据（开始收了就说「接收中」），
   // 别顺手一起删干净了。startedAt 不能是 0——Number(null) === 0 会让 _timelineElapsed 返回 0
   // 而不是 null，这条退路永远进不去，断言就成了摆设。
   assert.match(line({ elapsedMs: 3000, live: true,
-    timeline: { startedAt: T0, firstModelProgressAt: null, firstVisibleAt: null, turns: [] } }),
-    /等待上游首字节/);
+    timeline: { startedAt: T0, firstModelProgressAt: T0 + 400, firstVisibleAt: null, turns: [] } }),
+    /接收中/);
 });
 
 test("判据不再是任务级首次事件", () => {
