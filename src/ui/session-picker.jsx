@@ -46,7 +46,7 @@ export function SessionPicker({ entries = [], resumableCount = 0, onPick, onClos
           />
         </div>
 
-        <div className="max-h-[52vh] overflow-y-auto px-2 pb-2">
+        <div className="max-h-[calc(var(--eh,100vh)*0.52)] overflow-y-auto px-2 pb-2">
           {rows.length === 0 ? (
             <p className="px-3 py-10 text-center text-[13px] text-muted-foreground">
               {entries.length ? "No matching sessions" : "No sessions yet"}

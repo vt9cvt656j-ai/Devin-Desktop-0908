@@ -11,7 +11,96 @@
 // 抠它跑，多一个自由标识符就 ReferenceError）、严格变更工具名单、全量注册表构造、名字→类型映射。
 // **标识符名字原样保留**：test/ 里有几十处按名字 load() 这些函数并按名字注入依赖。
 // 从 main.js 原样搬出，一行逻辑没改。
-import { TOOL_METADATA, autoEnrichToolMetadata } from "../tool-guides.js";
+import { TOOL_METADATA, CATEGORY_LABELS, autoEnrichToolMetadata } from "../tool-guides.js";
+
+/*
+ * 按**分类**查工具。
+ *
+ * 146 个工具 90 天里只有 72 个被调过，前 14 个占 93%——不是另外 74 个没用，是模型够不着：
+ * 它们不在开局窗口里，search_tools 只认精确名、模糊匹配、最后才是一次 20 秒的网络编排。
+ * 名录本来就按分类列出全部工具，缺的是「拿着分类名整组取回」这一步。
+ *
+ * 判据只认**整体**等于某个分类的 id / 展示名 / 别名（大小写、空格、连字符、「类/工具/相关」
+ * 这种后缀都容忍），不做子串匹配——"git_status" 不能因为含 git 就被当成整类请求。
+ */
+export const TOOL_CATEGORY_ALIASES = Object.freeze({
+  planning: ["规划", "起步", "计划", "脚手架", "技能", "plan", "planning", "scaffold", "skills", "setup"],
+  file_io: ["文件", "文件读写", "读写", "目录", "files", "file", "filesystem", "fs", "io"],
+  code_editing: ["编辑", "代码编辑", "改代码", "写文件", "edit", "editing", "write", "code_editing"],
+  search: ["检索", "代码检索", "符号", "查找", "搜代码", "lsp", "search", "symbols", "code_search", "find"],
+  diagnostics: ["诊断", "调试", "性能", "报错", "diagnostics", "debug", "debugging", "performance", "profiling"],
+  execution: ["终端", "命令", "执行", "运行", "部署", "shell", "terminal", "command", "commands", "execution", "run", "deploy"],
+  version_control: ["git", "版本控制", "版本", "提交", "pr", "github_pr", "vcs", "version_control", "source_control"],
+  research: ["调研", "联网调研", "联网", "搜索来源", "论文", "社区", "仓库", "research", "web", "internet", "papers", "community"],
+  networking: ["网络", "网络请求", "抓包", "http", "api", "request", "requests", "network", "networking", "capture", "remote", "远程"],
+  ui_automation: ["浏览器", "网页自动化", "浏览器自动化", "browser", "web_automation", "e2e", "playwright"],
+  desktop_automation: ["桌面", "桌面自动化", "电脑操作", "desktop", "computer", "gui", "desktop_automation"],
+  creative: ["设计", "视觉", "figma", "设计稿", "creative", "design", "visual", "ui_design", "image"],
+  game_asset_generation: ["游戏素材", "游戏", "素材", "3d", "音效", "音乐", "game", "assets", "game_assets", "audio", "music"],
+  office: ["文档", "办公", "excel", "word", "ppt", "表格", "office", "docs", "documents", "spreadsheet", "wiki"],
+  data_layer: ["数据", "数据库", "实时信息", "天气", "sql", "db", "data", "database", "data_layer", "realtime"],
+  orchestration: ["编排", "子智能体", "多智能体", "并行", "agents", "subagent", "subagents", "orchestration", "workers"],
+  interaction: ["交互", "记忆", "提问", "提醒", "interaction", "memory", "ask", "schedule", "user"],
+});
+
+const _normCategoryQuery = (query) => {
+  let q = String(query || "").toLowerCase().replace(/[\s\-]+/g, "_").replace(/[（(].*?[)）]/g, "");
+  // 「Git 相关工具」「所有文件类」这种：前缀和后缀可能叠好几层，剥到不变为止
+  for (let i = 0; i < 4; i++) {
+    const next = q
+      .replace(/(?:_?(?:类|类别|分类|相关|工具|一族|全部|所有|tools?|category|group|family))$/, "")
+      .replace(/^(?:所有|全部|列出|加载|装载|load|list|show|all)_?/, "")
+      .replace(/_+$/, "").replace(/^_+/, "");
+    if (next === q) break;
+    q = next;
+  }
+  return q.trim();
+};
+
+/** 查询整体是不是某个分类：返回分类 id，不是就 null。 */
+export function _toolCategoryFromQuery(query) {
+  const q = _normCategoryQuery(query);
+  if (!q) return null;
+  for (const [id, aliases] of Object.entries(TOOL_CATEGORY_ALIASES)) {
+    if (q === id) return id;
+    const label = String(CATEGORY_LABELS[id] || "").toLowerCase().replace(/\s+/g, "_");
+    if (label && (q === label || q === label.replace(/[（(].*?[)）]/g, ""))) return id;
+    if (aliases.some((alias) => q === String(alias).toLowerCase().replace(/[\s\-]+/g, "_"))) return id;
+  }
+  return null;
+}
+
+/** 某个分类里注册表真有的工具，按元数据 priority 高的排前面（同级按名字）。 */
+export function _toolsInCategory(categoryId, registry) {
+  const rank = { critical: 0, high: 1, medium: 2, normal: 2, low: 3 };
+  const out = [];
+  for (const [name, schema] of registry?.entries?.() || []) {
+    const meta = TOOL_METADATA[name];
+    if (!meta || meta.category !== categoryId) continue;
+    out.push({ name, schema, rank: rank[meta.priority] ?? 2 });
+  }
+  return out.sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name)).map(({ name, schema }) => ({ name, schema }));
+}
+
+/**
+ * search_tools 的分类通道：查询就是一个分类名时，一次把这一类装进窗口。
+ * 返回 null 表示「不是分类查询」，调用方照走原来的精确 / 模糊 / 编排路径。
+ */
+export function _searchToolsCategory(query, registry, loadedNames, max = 12) {
+  const id = _toolCategoryFromQuery(query);
+  if (!id) return null;
+  const all = _toolsInCategory(id, registry);
+  const loaded = new Set([...(loadedNames || [])]);
+  const fresh = all.filter((t) => !loaded.has(t.name));
+  return {
+    id,
+    label: CATEGORY_LABELS[id] || id,
+    names: all.map((t) => t.name),
+    already: all.filter((t) => loaded.has(t.name)).map((t) => t.name),
+    schemas: fresh.slice(0, Math.max(0, max)).map((t) => t.schema),
+    overflow: fresh.slice(Math.max(0, max)).map((t) => t.name),
+  };
+}
 
 let _canonicalToolName = (name) => String(name || "");
 let _STRICT_MUTATING_TOOL_NAMES = new Set();
@@ -158,8 +247,15 @@ export function _searchToolsFuzzyMatch(query, registry, loadedNames) {
     const useCases = [...(meta.use_cases || []), ...(autoMeta.use_cases || [])];
     let score = 0;
     const matchedOn = [];
+    // 分类是第六个维度：「数据库」「浏览器」「git」这类词本身就是分类名，
+    // 命中所属分类记 2 分（结构化维度，和触发条件同级）。
+    const catId = meta.category || autoMeta.category || "";
+    const catWords = catId
+      ? [catId, String(CATEGORY_LABELS[catId] || "").toLowerCase(), ...(TOOL_CATEGORY_ALIASES[catId] || []).map((x) => String(x).toLowerCase())]
+      : [];
     for (const w of tokens) {
       if (lname.includes(w)) { score += 3; matchedOn.push("name"); }
+      if (catWords.some((c) => c && c === w)) { score += 2; matchedOn.push("category"); }
       if (triggers.some((t) => String(t).toLowerCase().includes(w))) { score += 2; matchedOn.push("trigger"); }
       if (useCases.some((u) => String(u).toLowerCase().includes(w))) { score += 2; matchedOn.push("use_case"); }
       if (desc.includes(w)) { score += 1; matchedOn.push("desc"); }

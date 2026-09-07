@@ -17,6 +17,13 @@
  * 个字节，漏掉哪一个，那个平台就退回宋体。
  */
 :root {
+  /* 有效视口。界面缩放走根元素的 zoom 属性，而 vh/vw 在 Chromium（Windows 的 WebView2）里
+     **不跟着 zoom 变**——实测 1.4 倍时 100vh 的元素高 1176 物理像素，满铺的 fixed 盒子只有 840。
+     于是所有用 vh/vw 定尺寸的叠层（对话框、命令面板、菜单）一放大就出屏。
+     这两个值由 main.js 的 _syncEffectiveViewport 按 innerHeight / 缩放 实时写入，
+     两个引擎口径一致；没写入时回落到 100vh/100vw，和从前完全一样。 */
+  --eh: 100vh;
+  --ew: 100vw;
   --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
     "Helvetica Neue", Inter, "Segoe UI Variable Text", "Segoe UI", system-ui,
     "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei",
@@ -524,7 +531,7 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
   position: absolute;
   top: 100%; right: 0;
   width: 156px;
-  max-width: calc(100vw - 16px);
+  max-width: calc(var(--ew, 100vw) - 16px);
   box-sizing: border-box;
   overflow: hidden;
   /* 浮层：底下是别的界面，不是壁纸 —— 自定义皮肤不许把它调透（见皮肤那一节的三类面）。 */
@@ -595,9 +602,9 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
 .settings-dropdown__item--danger:hover { background: rgba(255, 59, 48, .08); }
 
 /* ---- billing dialog (Material light) ---- */
-.billing-dialog { border: none; border-radius: 28px; padding: 0; width: min(560px, 92vw); max-height: 82vh; background: #fff; color: #1f1f1f; box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 1px 4px rgba(0,0,0,.08); font-family: var(--font); }
+.billing-dialog { border: none; border-radius: 28px; padding: 0; width: min(560px, calc(var(--ew, 100vw) * 0.92)); max-height: calc(var(--eh, 100vh) * 0.82); background: #fff; color: #1f1f1f; box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 1px 4px rgba(0,0,0,.08); font-family: var(--font); }
 .billing-dialog::backdrop { background: rgba(0,0,0,.32); }
-.billing-dialog__inner { display: flex; flex-direction: column; max-height: 82vh; }
+.billing-dialog__inner { display: flex; flex-direction: column; max-height: calc(var(--eh, 100vh) * 0.82); }
 .billing-dialog__header { display: flex; align-items: center; justify-content: space-between; padding: 24px 24px 16px; border-bottom: 1px solid #e8eaed; }
 .billing-dialog__header h2 { margin: 0; font-size: 22px; font-weight: 400; color: #202124; letter-spacing: 0; }
 .billing-dialog__close { background: none; border: none; color: #5f6368; font-size: 20px; cursor: pointer; padding: 8px; line-height: 1; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; transition: background .15s; }
@@ -624,7 +631,31 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
   gap: 1px;
   flex: none;
   margin-left: -4px;
+  /* 紧凑模式下五个菜单面板都挂到这里（.tb-menu 改成 static），一起落在「≡」下面 */
+  position: relative;
 }
+/*
+ * 标题栏的自适应：**标题先让，菜单再收**。
+ *
+ * 这一行只有标题会缩（flex:1 + min-width:0），菜单名和右侧工具组一个都不让。窗口一窄或
+ * 界面一放大，标题先被挤成 0，然后右侧工具组整个推出屏幕——实测有效宽 640px 时 mac 上
+ * 零余量（标题只剩 24px），Windows 多三颗窗口按钮直接出去 236px。
+ *
+ * 所以在标题剩不到 72px 时就把整排菜单名收成一个「≡」（main.js 的 _syncTitlebarCompact，
+ * 挂在 .titlebar 的 ResizeObserver 上），点开列出五个菜单名，再点进原来的那份面板。
+ * 面板本身一份代码不改，只是锚点从各自的按钮换到了整条菜单栏。
+ */
+.tb-menu--compact { display: none; }
+.titlebar.is-compact .tb-menu--compact { display: block; }
+.titlebar.is-compact .tb-menu:not(.tb-menu--compact) > .tb-menu__btn { display: none; }
+.titlebar.is-compact .tb-menu { position: static; }
+.tb-menu__btn--compact {
+  min-width: 30px;
+  padding: 0 8px;
+  font-size: 16px;
+  line-height: 1;
+}
+.menu--tb .menu__item--compact-head { font-weight: 600; }
 .tb-menu {
   position: relative;
 }
@@ -680,13 +711,20 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
      而那个默认值按屏幕大小分档（见下）—— 4K 上还端 250px 会细得像条缝。 */
   width: calc(var(--sidebar-w, var(--sidebar-w-default, 250px)) / var(--ui-zoom, 1));
   min-width: calc(140px / var(--ui-zoom, 1));
-  max-width: 50vw;
+  max-width: calc(var(--ew, 100vw) * 0.5);
   flex: 0 1 auto;
 }
 .layout .assistant {
   width: calc(var(--assistant-w, var(--assistant-w-default, 440px)) / var(--ui-zoom, 1));
-  min-width: calc(240px / var(--ui-zoom, 1));
-  max-width: 50vw;
+  /* 280 不是随手定的：输入栏那一行**把能让的都让完之后**（提示收掉、两个选择器只剩图标）
+     实测下限是 268px，取 280 留一点余量。原来是 240 —— 那 40px 拖得到，但拖进去发送键
+     就被顶出可视区。仍然低于 min 档给助手栏的 290 上限，两者不打架。
+     .composer__bar 那一段有实测的逐档读数。 */
+  /* 两个下限取大：280px 是物理下限（÷缩放，栏宽不随缩放变）；268px 是**内容**下限——
+     输入栏那一行让完之后要的 CSS 像素，它不能除以缩放。只有前一个时，缩放到 1.4 倍
+     助手栏就只剩 187 CSS px，发送键又被顶出去（实测 2 倍时出框 60px）。 */
+  min-width: max(calc(280px / var(--ui-zoom, 1)), 268px);
+  max-width: calc(var(--ew, 100vw) * 0.5);
   flex: 0 1 auto;
 }
 
@@ -947,7 +985,7 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
 .ctp-overlay { position: fixed; inset: 0; z-index: 100000; background: rgba(0,0,0,.32); display: flex; align-items: center; justify-content: center; animation: ctp-fade .16s ease both; }
 @keyframes ctp-fade { from { opacity: 0; } to { opacity: 1; } }
 .ctp-card {
-  width: 468px; max-width: 92vw; max-height: 84vh; display: flex; flex-direction: column;
+  width: 468px; max-width: calc(var(--ew, 100vw) * 0.92); max-height: calc(var(--eh, 100vh) * 0.84); display: flex; flex-direction: column;
   font-family: var(--font);
   /* 浮层：不跟皮肤半透，理由见皮肤那一节。 */
   background: var(--popover-surface); color: var(--text);
@@ -1313,7 +1351,7 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
 }
 .large-transcript-page__controls button:disabled { cursor: default; opacity: .5; }
 .large-transcript-page__status { min-width: 0; color: var(--text-dim, #6b7280); font: 12px/1.35 system-ui, sans-serif; }
-.large-transcript-page__content { max-height: min(50vh, 520px); margin: 0; padding: 10px; overflow: auto; border: 1px solid var(--line-strong, rgba(128, 128, 128, .25)); border-radius: 5px; background: var(--editor-bg, rgba(128, 128, 128, .06)); white-space: pre-wrap; }
+.large-transcript-page__content { max-height: min(calc(var(--eh, 100vh) * 0.5), 520px); margin: 0; padding: 10px; overflow: auto; border: 1px solid var(--line-strong, rgba(128, 128, 128, .25)); border-radius: 5px; background: var(--editor-bg, rgba(128, 128, 128, .06)); white-space: pre-wrap; }
 /* 确保消息内所有子元素都不溢出父容器 */
 .chat-session-container * { max-width: 100%; box-sizing: border-box; }
 /* 代码块横向滚动，不撑开容器 */
@@ -1571,7 +1609,7 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
 
 .monaco-editor .suggest-widget {
   overflow: hidden !important;
-  max-width: calc(100vw - 400px) !important;
+  max-width: calc(var(--ew, 100vw) - 400px) !important;
 }
 .monaco-editor .suggest-widget .monaco-list-row {
   overflow: hidden !important;
@@ -1843,7 +1881,7 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
   flex-direction: column;
   flex: 0 0 300px;
   min-height: 150px;
-  max-height: 78vh;
+  max-height: calc(var(--eh, 100vh) * 0.78);
   background: var(--term-bg);
   /* 皮肤开着时把底图糊成色场；没有皮肤时 --skin-blur 是 none，等于没写。
      不加这一行的话，半透明的终端底会让终端文字直接压在清晰照片上。 */
@@ -1885,7 +1923,7 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
   flex-direction: column;
   flex: 0 0 320px;
   min-height: 150px;
-  max-height: 78vh;
+  max-height: calc(var(--eh, 100vh) * 0.78);
   background: var(--panel-solid, #f5f5f7);
   color: var(--text, #1c1c1e);
   border-top: 2px solid var(--accent, #0a84ff);
@@ -2572,7 +2610,7 @@ body.zen-mode .editor {
 .video-preview .image-preview__inner video {
   display: block;
   width: 100%;
-  max-height: 72vh;
+  max-height: calc(var(--eh, 100vh) * 0.72);
   border-radius: 8px;
   background: #000;
   box-shadow: 0 4px 24px rgba(0,0,0,0.2);
@@ -4991,7 +5029,7 @@ body.zen-mode .editor {
 .mpm-console__editor { display: flex; flex-direction: column; flex: 1 1 0; min-width: 0; min-height: 0; }
 .mpm-sqlhost {
   flex: none;
-  height: clamp(160px, 36vh, 520px);
+  height: clamp(160px, calc(var(--eh, 100vh) * 0.36), 520px);
   border: 0;
   border-bottom: 1px solid var(--mp-line);
   border-radius: 0;
@@ -5136,7 +5174,7 @@ body.zen-mode .editor {
 .mpm-server__subhead i { flex: 1; }
 .mpm-server__sessions { display: flex; flex-direction: column; min-height: 0; margin: 0 16px 16px; border: 1px solid var(--mp-line); border-radius: var(--mp-radius-lg); background: var(--mp-panel); overflow: hidden; }
 .mpm-server__sessions .mpm-server__subhead { padding: 10px 14px; border-bottom: 1px solid var(--mp-line); }
-.mpm-sessgrid { max-height: 60vh; }
+.mpm-sessgrid { max-height: calc(var(--eh, 100vh) * 0.6); }
 .mpm-kill { display: grid; place-items: center; width: 24px; height: 24px; border: 0; border-radius: var(--mp-radius); background: transparent; color: var(--mp-dim); cursor: pointer; }
 .mpm-kill:hover { background: color-mix(in srgb, var(--mp-danger) 10%, transparent); color: var(--mp-danger); }
 .mpm-kill svg { width: 14px; height: 14px; }
@@ -5167,8 +5205,8 @@ body.zen-mode .editor {
   from { opacity: 0; transform: scale(0.96); }
   to { opacity: 1; transform: none; }
 }
-.mpm-dialog__card--conn { width: min(680px, 92vw); }
-.mpm-dialog__card--confirm { width: min(520px, 92vw); }
+.mpm-dialog__card--conn { width: min(680px, calc(var(--ew, 100vw) * 0.92)); }
+.mpm-dialog__card--confirm { width: min(520px, calc(var(--ew, 100vw) * 0.92)); }
 .mpm-dialog__card h4 {
   display: flex;
   align-items: center;
@@ -6335,6 +6373,8 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
    用 display:none 而**不是** opacity：opacity 为 0 的元素照样接点击，那正是这排按钮
    已经踩过的坑（藏起来却点得到）。 */
 .msg__acts.is-pending { display: none; }
+/* 重启恢复出的那条消息底下的一行状态（不是正文）：只说被打断在哪，不抢眼。 */
+.msg__interrupted { margin-top: 6px; font-size: 11px; line-height: 16px; color: var(--text-dim, #8b949e); letter-spacing: .01em; }
 @keyframes msg-acts-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) {
   .msg__acts { animation: none; }
@@ -7259,6 +7299,9 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   padding: 0 4px;
 }
 .atc-result--err { color: var(--atc-danger); background: transparent; }
+/* 软件重启时还在跑的那张卡：恢复后定格成「中断」，圈不再转（见 draft-recovery.js settleLiveClone）。 */
+.atc-result--interrupted { color: var(--atc-dim); background: transparent; font-weight: 500; }
+.agent-tool-step.is-interrupted .atc-spin { display: none; }
 /* 还在跑：值轻轻呼吸一下。没有它的话，这一行是"空着 → 突然出现一个数"，
    那一跳正是"不流畅"的来源之一。 */
 .atc-result--pending { color: var(--atc-dim); background: transparent; animation: atcBreathe 1.5s ease-in-out infinite; }
@@ -7738,26 +7781,80 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   opacity: 0.8;
 }
 
-/* ── background_monitor card ── */
-@keyframes bm-pulse { 0%,100% { opacity:1 } 50% { opacity:.4 } }
-.bm-card { padding: 14px 16px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); }
-.bm-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.bm-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: bm-pulse 1.6s ease-in-out infinite; flex-shrink: 0; }
-.bm-dot.done { background: #34a853; animation: none; }
-.bm-dot.timeout { background: #f0a030; animation: none; }
-.bm-dot.cancelled { background: var(--text-dim); animation: none; }
-.bm-msg { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; line-height: 1.4; }
-.bm-meta { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; line-height: 1.6; }
-.bm-actions { display: flex; gap: 8px; margin-top: 10px; }
-.bm-btn {
-  padding: 5px 14px; border-radius: 6px; border: 1px solid var(--line);
-  background: var(--panel); color: var(--text); cursor: pointer; font-size: 12px;
-  transition: background .13s ease, border-color .13s ease;
+/* ── background_monitor card ──
+   形状对齐链接预览卡那一版定稿的样子：中性描边 + 12px 圆角 + 面板底。**没有强调色竖条、
+   没有彩色底**——那两样所有者明确否过（"蓝色线条…太丑"）。整张卡唯一的颜色是那个状态
+   指示点，它是信息不是装饰。
+
+   刻意**不放倒计时**：这张卡此前有过「Xs / Ys」和进度条，所有者要的是「还在听」而不是
+   一个滴答的表。活性全部由指示点的呼吸环表达，那一条不要再加回来。 */
+.bm-card {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--atc-bg, var(--panel));
+  border: 1px solid var(--line);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .04);
 }
-.bm-btn:hover { border-color: var(--accent); color: var(--accent); }
+.bm-head { display: flex; align-items: flex-start; gap: 10px; }
+.bm-head__body { flex: 1; min-width: 0; }
+
+/* 指示点 + 呼吸环。环是 box-shadow 撑出来的：它不占布局，所以不会把第一行顶开，
+   也不会在收尾停止动画时让整张卡跳一下。 */
+.bm-ind { position: relative; flex: none; width: 8px; height: 8px; margin-top: 5px; }
+.bm-ind__dot {
+  position: absolute; inset: 0; border-radius: 50%;
+  background: var(--accent);
+  animation: bm-pulse 1.9s cubic-bezier(.4, 0, .6, 1) infinite;
+}
+@keyframes bm-pulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent); }
+  70%  { box-shadow: 0 0 0 7px color-mix(in srgb, var(--accent) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+}
+/* 系统里关了动效就别呼吸：一个持续跳动的点在这类设置下是明确不该出现的。 */
+@media (prefers-reduced-motion: reduce) { .bm-ind__dot { animation: none; } }
+
+.bm-msg {
+  font-size: 13.5px; font-weight: 600; line-height: 1.45;
+  color: var(--atc-text, var(--text)); overflow-wrap: anywhere;
+}
+.bm-meta { display: flex; align-items: center; gap: 7px; margin-top: 5px; font-size: 11.5px; color: var(--atc-dim, var(--text-dim)); }
+/* 条件类型做成一枚很轻的胶囊：它是**分类**，和后面那句状态不是一回事，挤在一行纯文字里
+   两者会读成同一句话。 */
+.bm-tag {
+  flex: none; padding: 1px 7px; border-radius: 999px; font-weight: 500;
+  background: color-mix(in srgb, var(--atc-text, var(--text)) 8%, transparent);
+}
+.bm-state { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 空状态整个收掉：flex 的 gap 对空元素照样生效，留着就是标签后面挂一段说不清的空白。 */
+.bm-state:empty { display: none; }
+
+/* 在等什么：等宽一行。原来这张卡只说「等命令成功」，而"哪条命令"只有终端里才看得到。 */
+.bm-cond {
+  margin-top: 9px; padding: 6px 8px; border-radius: 7px;
+  background: color-mix(in srgb, var(--atc-text, var(--text)) 4%, transparent);
+  font: 11.5px/1.5 var(--mono); color: var(--atc-dim, var(--text-dim));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.bm-actions { display: flex; gap: 8px; margin-top: 11px; }
+.bm-btn {
+  padding: 5px 13px; border-radius: 7px; border: 1px solid var(--line);
+  background: transparent; color: var(--atc-text, var(--text)); cursor: pointer;
+  font-size: 12px; font-weight: 500; line-height: 1.5;
+  transition: background .13s ease, border-color .13s ease, color .13s ease;
+}
+.bm-btn:hover { border-color: var(--line-strong, var(--text-dim)); background: color-mix(in srgb, var(--atc-text, var(--text)) 5%, transparent); }
+.bm-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .bm-btn--primary { background: var(--accent); color: #fff; border-color: transparent; }
-.bm-btn--primary:hover { opacity: .88; color: #fff; }
+.bm-btn--primary:hover { background: var(--accent-hover, var(--accent)); color: #fff; border-color: transparent; }
 .bm-btn:disabled { opacity: .5; cursor: default; }
+
+/* 四种收尾状态：只换指示点的颜色并停掉呼吸。**整张卡不染色**——把卡片刷成绿的/黄的会
+   盖过正文，而正文（在等什么、等到没有）才是用户要读的东西。 */
+.bm-card[data-state="done"] .bm-ind__dot { background: #34a853; animation: none; box-shadow: none; }
+.bm-card[data-state="timeout"] .bm-ind__dot { background: #f0a030; animation: none; box-shadow: none; }
+.bm-card[data-state="cancelled"] .bm-ind__dot { background: var(--text-dim); animation: none; box-shadow: none; }
 
 /* Task plan card — 就是一份清单，不是一张卡片。
    所有者定的方向（2026-09-05）：完全照 Claude Code 桌面端那份任务计划来。它的做法是
@@ -7782,34 +7879,52 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   margin-left: auto; font-weight: 400; color: var(--text-dim); font-size: 11.5px;
   font-variant-numeric: tabular-nums;
 }
-.agent-plan__list { list-style: none; margin: 0; padding: 0; }
+/*
+ * 清单装在一张**描边卡**里——这是 Claude 桌面端的做法（它的待办清单容器类是
+ * epitaxy-card-outline + rounded-r6 + p-p7，列表 flex-col gap-g3），所有者要的就是这张框。
+ * 描边、圆角、内边距，仅此三样：不铺底色、不加阴影、不加进度条。
+ */
+.agent-plan__list {
+  list-style: none; margin: 0;
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 12px;
+  /* Claude 的 .epitaxy-card-outline 就是 box-shadow: 0 0 0 1px var(--cds-border)，
+     而 --cds-border 是文字色的淡透明（alpha-2）——不是一条实线 border。 */
+  border: 0;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--text) 10%, transparent);
+  border-radius: 10px;
+}
 .agent-plan__row {
-  display: flex; align-items: flex-start; gap: 9px;
-  padding: 3px 4px; line-height: 1.55; color: var(--text);
+  display: flex; align-items: flex-start; gap: 6px;
+  padding: 1px 2px; line-height: 1.5; color: var(--text);
   border-radius: 6px;
   transition: background .12s ease;
 }
-/* 图标槽：宽度写死，保证每一行的文字左边缘严格对齐 */
+/* 图标槽 16×16，比文字首行低 1px（Claude 那边是 size-[16px] mt-[1px]）；宽度写死保证文字左缘对齐 */
 .agent-plan__box {
-  flex: 0 0 auto; width: 15px; height: 15px; margin-top: 2px;
+  flex: 0 0 auto; width: 16px; height: 16px; margin-top: 1px;
   display: inline-flex; align-items: center; justify-content: center;
   color: var(--text-dim);
 }
-.agent-plan__box--todo { opacity: .45; }
-.agent-plan__box--cancelled { opacity: .6; }
-.agent-plan__box--active { color: var(--accent); }
-.agent-plan__box--active .atc-spin {
-  width: 12px; height: 12px; border-width: 1.7px;
-  border-color: rgba(128, 128, 128, 0.3); border-top-color: var(--accent);
+/* 记号逐字照 Claude 桌面端清单项（见 _planStepIcon 的注释）。
+   未完成：12px 空心圆，描边 = 文字色的淡透明（它的 border-alpha-3）；
+   完成：一枚细勾，正文色（它的 text-primary），没有圆底；进行中：同一只圆环换正文色。 */
+.agent-plan__glyph { display: block; }
+.agent-plan__ring {
+  display: block; width: 12px; height: 12px; border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--text) 22%, transparent);
 }
-/* 做完的：压暗 + 划掉。划线只盖住文字（见 __txt 的 flex 基数），不拉满整行。 */
+.agent-plan__box--active .agent-plan__ring { border-color: var(--text); }
+.agent-plan__box--done { color: var(--text); }
+.agent-plan__box--cancelled { color: var(--text-dim); }
+/* 做完的：压暗 + 1px 删除线。划线只盖住文字（见 __txt 的 flex 基数），不拉满整行。 */
 .agent-plan__row--done { color: var(--text-dim); }
 .agent-plan__row--done .agent-plan__txt {
   text-decoration: line-through; text-decoration-thickness: 1px;
   text-decoration-color: rgba(128, 128, 128, 0.55);
 }
-/* 正在做的：只加字重。这份清单里它已经是唯一一颗在转的，再铺底色就是第二遍强调。 */
-.agent-plan__row--active { font-weight: 600; }
+/* 正在做的：只靠那颗实心点说话，不加字重——Claude 那份行样式里没有字重变化。 */
+.agent-plan__row--active { font-weight: 500; }
 .agent-plan__row--cancelled { color: var(--text-dim); }
 .agent-plan__row--cancelled .agent-plan__txt { text-decoration: line-through; opacity: .65; }
 .agent-plan__row--actionable { cursor: pointer; }
@@ -9425,7 +9540,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   position: fixed;
   z-index: 70; /* above the menu (60) */
   width: 280px;
-  max-width: calc(100vw - 16px);
+  max-width: calc(var(--ew, 100vw) - 16px);
   padding: 12px 13px;
   background: var(--panel-2);
   border: 1px solid var(--line-strong);
@@ -9584,7 +9699,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   border-radius: 16px;
   padding: 0;
   width: 460px;
-  max-width: 92vw;
+  max-width: calc(var(--ew, 100vw) * 0.92);
   background: #fff;
   color: #202124;
   box-shadow: 0 12px 48px rgba(0,0,0,.14), 0 2px 8px rgba(0,0,0,.06);
@@ -9606,7 +9721,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 
 /* login dialog */
 /* ---- Login / registration — Google-style, always light (independent of the app theme) ---- */
-.login-sheet { width: 400px; max-width: 92vw; border: none; border-radius: 16px; padding: 0; background: transparent; }
+.login-sheet { width: 400px; max-width: calc(var(--ew, 100vw) * 0.92); border: none; border-radius: 16px; padding: 0; background: transparent; }
 .login-sheet::backdrop { background: rgba(32, 33, 36, .5); }
 .login-body {
   padding: 40px 40px 30px !important;
@@ -10613,7 +10728,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 /* 决策弹框。克制、留白、发丝描边——不要大色块和重阴影：这里问的是「要不要换掉整个项目」，
    越安静越好读。原来写死 #fff/#202124/#e8eaed，深色主题下整张卡是白的，现在全走令牌。 */
 .io-confirm-card {
-  width: min(400px, 92vw);
+  width: min(400px, calc(var(--ew, 100vw) * 0.92));
   padding: 24px 24px 18px;
   border: 1px solid var(--line-strong);
   border-radius: 14px;
@@ -10723,7 +10838,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   position: relative;
   margin: auto;
   flex: 0 0 auto;
-  width: min(420px, 92vw);
+  width: min(420px, calc(var(--ew, 100vw) * 0.92));
   border: 1px solid #f0f0f0;
   border-radius: 12px;
   background: #fff;
@@ -10865,8 +10980,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 .ide-update {
   position: relative;
-  width: min(480px, calc(100vw - 32px));
-  max-height: min(660px, calc(100vh - 40px));
+  width: min(480px, calc(var(--ew, 100vw) - 32px));
+  max-height: min(660px, calc(var(--eh, 100vh) - 40px));
   overflow: auto;
   box-sizing: border-box;
   padding: 24px;
@@ -10984,7 +11099,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .ide-update__notes { min-height: 0; margin-top: 18px; }
 .ide-update__notes h3 { margin: 0 0 8px; font-size: 13px; letter-spacing: 0; }
 .ide-update__notes p {
-  max-height: clamp(112px, 22vh, 190px);
+  max-height: clamp(112px, calc(var(--eh, 100vh) * 0.22), 190px);
   margin: 0;
   padding-right: 8px;
   overflow-x: hidden;
@@ -11117,7 +11232,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   animation: ctp-fade .16s ease both;
 }
 .remote-dialog {
-  width: min(620px, 92vw);
+  width: min(620px, calc(var(--ew, 100vw) * 0.92));
   background: #fff;
   color: #202124;
   border: 1px solid #e8eaed;
@@ -11579,8 +11694,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   animation: ctp-fade .16s ease both;
 }
 .ssh-panel {
-  width: min(960px, 94vw);
-  height: min(650px, 86vh);
+  width: min(960px, calc(var(--ew, 100vw) * 0.94));
+  height: min(650px, calc(var(--eh, 100vh) * 0.86));
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
@@ -11746,7 +11861,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   }
   .ssh-panel {
     width: 100%;
-    height: min(680px, 92vh);
+    height: min(680px, calc(var(--eh, 100vh) * 0.92));
     border-radius: 18px;
   }
   .ssh-panel__foot {
@@ -11822,7 +11937,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   display: flex;
   justify-content: center;
   align-items: flex-start;
-  padding-top: 12vh;
+  padding-top: calc(var(--eh, 100vh) * 0.12);
   background: rgba(0, 0, 0, 0.28);
   backdrop-filter: blur(2px);
   -webkit-backdrop-filter: blur(2px);
@@ -11832,8 +11947,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 .palette__panel {
   width: 600px;
-  max-width: 92vw;
-  max-height: 60vh;
+  max-width: calc(var(--ew, 100vw) * 0.92);
+  max-height: calc(var(--eh, 100vh) * 0.6);
   display: flex;
   flex-direction: column;
   /* 浮层：底下是别的界面，不是壁纸 —— 自定义皮肤不许把它调透（见皮肤那一节的三类面）。 */
@@ -11950,7 +12065,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   width: 560px;
 }
 .sheet--ext .sheet__body {
-  max-height: 78vh;
+  max-height: calc(var(--eh, 100vh) * 0.78);
   overflow: auto;
 }
 .ext-actions {
@@ -12537,7 +12652,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   display: grid;
   /* 侧栏宽度跟着窗口走。写死 236px 时，窗口窄下来或 ⌘+ 放大之后，它会把内容挤成
      一条细缝；clamp 让它在 172–236 之间收放，下限刚好放得下最长的那个页签名。 */
-  grid-template-columns: clamp(172px, 18vw, 236px) minmax(0, 1fr);
+  grid-template-columns: clamp(172px, calc(var(--ew, 100vw) * 0.18), 236px) minmax(0, 1fr);
 }
 /* 很窄的窗口：侧栏收成一列图标，标签隐去。总比把内容挤没了强。 */
 @media (max-width: 720px) {
@@ -12667,7 +12782,7 @@ body.is-win .feature-panel__tabs {
   min-width: 0;
   overflow: auto;
   /* 内边距跟着窗口走：写死 40px 时，窗口一窄内容就贴边，⌘+ 放大后又显得局促。 */
-  padding: clamp(20px, 2.6vh, 34px) clamp(16px, 3vw, 44px) 56px;
+  padding: clamp(20px, calc(var(--eh, 100vh) * 0.026), 34px) clamp(16px, calc(var(--ew, 100vw) * 0.03), 44px) 56px;
   background: var(--feature-bg);
   animation: feature-fade .14s ease both;
 }
@@ -13507,7 +13622,7 @@ body.is-win .feature-panel__tabs {
   box-shadow: 0 0 0 3px var(--feature-ring, rgba(0,0,0,.13));
 }
 .settings-input--num { width: 84px; }
-.settings-input--text { width: 260px; max-width: 40vw; }
+.settings-input--text { width: 260px; max-width: calc(var(--ew, 100vw) * 0.4); }
 textarea.settings-input {
   height: auto;
   min-height: 116px;
@@ -14259,6 +14374,31 @@ textarea.settings-input {
 
 /* ---- Mode Picker (Agent/Chat/Plan dropdown) ---- */
 .mode-picker { position: relative; flex-shrink: 0; }
+
+/*
+ * 输入栏要跟着**助手栏的实际宽度**让位，不是跟着窗口。
+ *
+ * 助手栏可以被拖窄（下限 260px），自适应档位自己还会把它压到 330（tight）/ 290（min）。
+ * 而这一行原本是纯 nowrap：.mode-picker 写着 flex-shrink:0 死不让位，.model-picker 的
+ * min-width 是 auto 也缩不下去，于是宽度不够时只能把最右边的**发送键顶出可视区**。
+ * 实测：助手栏窄于 ~384px 发送键开始出框，到 240px 时整个跑出去 130px —— 也就是说
+ * tight / min 两档本身就把输入栏推进了坏状态。
+ *
+ * 让位顺序用 flex-shrink 的倍数表达，实测逐档结果：
+ *   440/380 → 原样；340 → ⌘↵ 提示收掉；300 → 模型名截断；280 → 模式名截断；
+ *   268 → 两个选择器只剩图标，这是全部塞得下的最小宽度（助手栏下限因此定在 280）。
+ * 发送键 / 麦克风 / 计数环一步都不让（它们本来就是 flex:0 0 auto）。
+ *
+ * 两个 min-width 是「只剩图标」时的宽度（内边距 + 两个图标）。本来想让浏览器自己算
+ * ——只把标签 min-width 归零、选择器保持 auto ——但实测那样按钮的最小内容尺寸里仍然含着
+ * 完整标签，两个选择器一点都不缩。所以只能写死，改图标或内边距时要跟着量一遍。
+ */
+.composer__bar { min-width: 0; }
+.composer__hint { flex: 0 1000 auto; min-width: 0; overflow: hidden; white-space: nowrap; }
+.model-picker { flex: 0 100 auto; min-width: 46px; }
+.mode-picker { flex: 0 10 auto; min-width: 52px; }
+.mode-picker__btn, .model-picker__btn { min-width: 0; overflow: hidden; }
+.mode-picker__btn > span, .model-picker__label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .mode-picker__btn {
   display: flex; align-items: center; gap: 4px;
   padding: 4px 10px; font-size: 12px; font-weight: 500;
@@ -14457,7 +14597,7 @@ textarea.settings-input {
 }
 .mktm-overlay--visible { opacity: 1; }
 .mktm {
-  width: 92vw; max-width: 900px; height: 80vh; max-height: 660px;
+  width: calc(var(--ew, 100vw) * 0.92); max-width: 900px; height: calc(var(--eh, 100vh) * 0.8); max-height: 660px;
   background: #fff; border-radius: 16px;
   box-shadow: 0 12px 56px rgba(0,0,0,.14), 0 2px 6px rgba(0,0,0,.06);
   display: flex; flex-direction: column; overflow: hidden;
@@ -14713,8 +14853,8 @@ textarea.settings-input {
 }
 
 .new-project-dialog {
-  width: min(780px, calc(100vw - 40px));
-  max-height: min(760px, calc(100vh - 40px));
+  width: min(780px, calc(var(--ew, 100vw) - 40px));
+  max-height: min(760px, calc(var(--eh, 100vh) - 40px));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -15054,8 +15194,8 @@ textarea.settings-input {
 @media (max-width: 720px) {
   .new-project-overlay { padding: 16px; }
   .new-project-dialog {
-    width: min(520px, calc(100vw - 24px));
-    max-height: calc(100vh - 24px);
+    width: min(520px, calc(var(--ew, 100vw) - 24px));
+    max-height: calc(var(--eh, 100vh) - 24px);
     border-radius: 24px;
   }
   .new-project-head,
@@ -15086,8 +15226,8 @@ textarea.settings-input {
   -webkit-backdrop-filter: blur(6px) saturate(135%);
 }
 .memory-center {
-  width: min(980px, 95vw);
-  max-height: min(86vh, 820px);
+  width: min(980px, calc(var(--ew, 100vw) * 0.95));
+  max-height: min(calc(var(--eh, 100vh) * 0.86), 820px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -15330,7 +15470,7 @@ textarea.settings-input {
 
    滚动条挂在**行容器**上，不挂在外层：一层到底的话边框和圆角跟着一起滚，滚起来圆角被
    切掉半个。高度上限由 _updateSlashMenu 按输入条上方的真实空间算好写进 --slash-max-h，
-   这里的兜底只在它没来得及写时用。 */
+   这里的 40vh 只是它没来得及写时的兜底。 */
 .slashmenu-host .slashmenu-scroll {
   /* 兜底也走有效视口 --eh（innerHeight ÷ 界面缩放），不写裸的 vh：放大到 1.4 倍时
      vh 不跟着缩放变，面板会按未缩放的视口撑大。全文件同一条规矩，有测试守着。 */
@@ -17558,7 +17698,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 [data-theme="dark"] .monaco-editor .monaco-hover,
 .dark .monaco-editor .monaco-hover { box-shadow: 0 8px 28px rgba(0, 0, 0, .5); }
 .monaco-editor .monaco-hover .monaco-hover-content {
-  max-height: min(52vh, 520px);
+  max-height: min(calc(var(--eh, 100vh) * 0.52), 520px);
   overflow-y: auto;
 }
 .monaco-editor .monaco-hover .hover-row.markdown-hover > .hover-contents {
@@ -17581,7 +17721,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 @keyframes ctxPanelFade { from { opacity: 0; } to { opacity: 1; } }
 .ctx-panel--usage .ctx-panel__head { margin-bottom: 8px; }
 .ctx-panel {
-  position: fixed; z-index: 3000; width: 300px; max-width: calc(100vw - 16px);
+  position: fixed; z-index: 3000; width: 300px; max-width: calc(var(--ew, 100vw) - 16px);
   padding: 12px 14px 13px;
   border-radius: 14px;
   background: var(--panel-solid, var(--panel, #fff));

@@ -27,10 +27,9 @@ const RS_DIR = join(ROOT, "src-tauri/src");
 
 // 基线：2026-08-27 实测。**只许降不许升**。
 // 这 21 段全是工具结果里的散文——写给模型看的操作指导，和 tool-guides.js 的 usage_note
-// 是同一物种，只是写在 Rust 里所以 build/strip-*.mjs 全都够不着。抽查确认的四条：
+// 是同一物种，只是写在 Rust 里所以 build/strip-*.mjs 全都够不着。抽查确认的三条（qr.rs 那条随 decode_qr 工具一起删了）：
 //   accessibility.rs:555  "…等一下再 read_screen 一次，别据此断定页面上没有它。"
 //   git.rs:689            "…文件后来改过名的话，用 git_log 看重命名历史。"   ← 直接给模型指路
-//   qr.rs:77              "…建议先裁剪到二维码那块区域、放大清晰些再试。"
 //   web_scaffold.rs:152   "…【直接用这些原件，不要重造】…【不要建 tailwind.config.js…】"
 // 修法一律相同：客户端只回**结构化事实**（错误码 / 计数 / preset 名），措辞归网关。
 const BASELINE = {
@@ -45,7 +44,6 @@ const BASELINE = {
   "git.rs": 1,
   "knowledge.rs": 2,
   "protocol.rs": 1,
-  "qr.rs": 1,
   "sysctl.rs": 3,
   "ui_clone.rs": 1,
   "web_scaffold.rs": 1,

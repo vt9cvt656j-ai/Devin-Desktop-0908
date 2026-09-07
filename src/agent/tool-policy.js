@@ -167,7 +167,7 @@ export const PARALLEL_SAFE_READS = Object.freeze([
   "recall", "termread", "termlist", "logs", "search_tools", "skill", "guide", "current_time",
   "localdiscovery", "liveenvironment", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
   "semsearch", "findsymbol", "viewimage", "probeenv", "readscreen",
-  "search_game_assets", "package_source", "openapi_parser", "qr", "realtime_news_feed",
+  "search_game_assets", "package_source", "openapi_parser", "realtime_news_feed",
 ]);
 
 /** system 工具里**纯读**的那几个动作。取自 tools.json 的 action 枚举
@@ -385,7 +385,7 @@ function seed() {
    *
    * 判据其实早就写对了：`_toolMayProduceExternalEffect` 里那行
    * `if (call.type === "remote") return ["connect","disconnect"].includes(call.op);`。
-   * 只是审批门只对 gh / http / tor 三个特判去问它，remote 走兜底 needsApprovalFor()，
+   * 只是审批门只对 gh / http 两个特判去问它，remote 走兜底 needsApprovalFor()，
    * 而兜底读的正是这张表。同一个函数里紧挨着的第三条判据，那条腿从来没走到 ——
    * 补上这一条，判据仍然只有一份出处。
    *
@@ -449,11 +449,11 @@ function seed() {
   // stop_terminal → termstop：结束一个任务终端里的进程。只读模式起不了终端，也不该杀终端；
   //   不弹审批——和 browser 的 close 同类（收尾动作，不是新的副作用）。
   defineTool("termstop", { readOnlyModeBlocked: true, readOnlyBlockedVerb: "停掉任务终端里的进程" });
-  // http_request / tor_request：审批门对它们有特判（非 GET/HEAD/OPTIONS 才问），但只读门
+  // http_request：审批门对它有特判（非 GET/HEAD/OPTIONS 才问），但只读门
   //   从来没看过它们——Plan 模式里 POST / DELETE 打到任意地址畅通无阻，而隔壁 userhttp
   //   早就按方法判了。这里让声明和特判说同一句话。
   const httpWrites = (call) => !["GET", "HEAD", "OPTIONS"].includes(String(call?.method || "GET").toUpperCase());
-  for (const t of ["http", "tor"]) {
+  for (const t of ["http"]) {
     defineTool(t, {
       needsApproval: httpWrites,
       readOnlyModeBlocked: httpWrites,

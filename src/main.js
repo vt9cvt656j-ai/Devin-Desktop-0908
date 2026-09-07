@@ -155,12 +155,12 @@ import { createNudgeManager } from "./agent/nudge-manager.js";
 import { configureThinkingProfile, _THINK_LEVELS, _thinkLabels, _thinkingProfileFor, _isAnthropicWireFamily, _supportsThinking, _thinkingPrefFor, _setThinkingPref, _applyThinkingToConfig } from "./agent/thinking-profile.js";
 import { _routeInlineThinkingDelta, _flushInlineThinkingDelta, _canRenderPreAnswerReasoning } from "./agent/reasoning-stream.js";
 import { _withoutLegacyReasoningSummary, _sanitizeProviderMessages } from "./agent/provider-messages.js";
-import { recoveredDraftNotice, recoveredThinkingOpen } from "./agent/draft-recovery.js";
+import { recoveredThinkingOpen, liveMessageHtml, markRecoveredMessage } from "./agent/draft-recovery.js";
 import { groupDeltasByGen, mergeJournalIntoDrafts, drainJournal } from "./agent/stream-journal.js";
 import { _extractThinkingConclusion, _thinkLedgerPush, _thinkLedgerBlockText } from "./agent/think-ledger.js";
 import { _lexCompress, _IMPORTANT_LINE, _smartCompress, _stripAnsi, _headTailModelText, _foldAssistantText, _clipPreservingErrors } from "./agent/model-text.js";
 import { _REQUEST_MARKERS, _MODEL_REQUEST_BODY_BYTE_CAP, _enforceModelRequestBudget, _isContextOverflowAiError, _squeezeMessagesForContext } from "./agent/request-budget.js";
-import { configureToolDiscovery, _subAgentAdmitTools, _subAgentSearchToolsLabel, _unknownToolHint, _subAgentUsableToolNames, _nearestToolNames, _searchToolsExactQuery, _searchToolsLookup, _searchToolsFuzzyMatch, _confidentFuzzyResolution, _toolMetaGuideSuffix, _toolSchemaFromRegistry } from "./agent/tool-discovery.js";
+import { configureToolDiscovery, _subAgentAdmitTools, _subAgentSearchToolsLabel, _unknownToolHint, _subAgentUsableToolNames, _nearestToolNames, _searchToolsExactQuery, _searchToolsLookup, _searchToolsFuzzyMatch, _confidentFuzzyResolution, _toolMetaGuideSuffix, _toolSchemaFromRegistry, _searchToolsCategory } from "./agent/tool-discovery.js";
 import { join, tempDir } from "@tauri-apps/api/path";
 import { registerSnippetProviders, setCustomSnippets } from "./snippets.js";
 import { createLspManager } from "./lsp-client.js";
@@ -271,6 +271,7 @@ import { translateHoverMarkdown as _translateHoverMarkdown } from "./agent/hover
 import { chatTitleFrom as _chatTitleFrom, isDefaultChatName as _isDefaultChatName } from "./agent/chat-title.js";
 import { contextUsageView as _contextUsageView } from "./agent/context-usage.js";
 import { contextPartsView as _contextPartsView } from "./agent/context-parts.js";
+import { countCjk as _countCjk, sumContextParts as _sumContextParts, pendingTurnUsage as _pendingTurnUsage, costCalibration as _costCalibration } from "./agent/turn-pending.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { pointInTermSelection as _pointInTermSelection, termChipLabel as _termChipLabel, termSnippetText as _termSnippetText } from "./agent/term-drag.js";
@@ -2555,9 +2556,10 @@ setInterval(() => { void _mcpPollElicitation(); }, 1200);
 let _journalTicking = false;
 setInterval(() => {
   if (_journalTicking || !inTauri || _isSecondaryWindow) return;
-  if (!(Array.isArray(_chatSessions) && _chatSessions.some((sess) => sess && (sess._journalClearPending || (sess._journalBuf && sess._journalBuf.length))))) return;
+  if (!(Array.isArray(_chatSessions) && _chatSessions.some((sess) => sess && (sess._journalClearPending || (sess._journalBuf && sess._journalBuf.length) || (sess.streaming && sess._liveMsgEl))))) return;
   _journalTicking = true;
-  Promise.resolve(drainJournal(_chatSessions, (cmd, args) => backend.invoke(cmd, args))).finally(() => { _journalTicking = false; });
+  // 顺带每 3s 把在途消息的 DOM 快照整份落盘（draft-recovery.js）：重启后按「关闭前那一刻」原样塞回。
+  Promise.resolve(drainJournal(_chatSessions, (cmd, args) => backend.invoke(cmd, args), { snapshotHtml: (sess) => liveMessageHtml(sess._liveMsgEl) })).finally(() => { _journalTicking = false; });
 }, 400);
 
 // 内存压力自动减负：监测 WebView DOM 膨胀（历史卡死根因是 1.3GB），超过阈值时主动
@@ -8930,6 +8932,7 @@ async function _applyUiZoom(factor, { toast = true } = {}) {
   // 原生红绿灯不随缩放：把缩放系数暴露给 CSS，titlebar 用 calc(84px / var(--ui-zoom))
   // 反向补偿留位，缩小不压红绿灯、放大不留大空白。
   try { document.documentElement.style.setProperty("--ui-zoom", String(_uiZoom)); } catch {}
+  _syncEffectiveViewport();
   // 缩放后让所有按可视尺寸排版的组件重新布局（Monaco、分屏编辑器、终端、面板）
   requestAnimationFrame(() => {
     try { monacoEditor?.layout?.(); } catch {}
@@ -8951,14 +8954,45 @@ if (_uiZoom !== 1) _applyUiZoom(_uiZoom, { toast: false });
 // 布局撑不住的地步，而 `_applyUiZoom` 平时只在按快捷键时跑，没人重新算这个上限。
 window.addEventListener("resize", () => {
   if (_uiZoom > _uiZoomCeiling()) _applyUiZoom(_uiZoom, { toast: false });
+  _syncEffectiveViewport();
   _applyLayoutDensity();
+  // 标题栏收不收「≡」也在这里补一刀：它主要靠 .titlebar 上的 ResizeObserver，但缩放复位、
+  // 窗口拖回去这两条路都会走到这个监听，多算一次是幂等的，少算一次就是菜单名回不来。
+  _syncTitlebarCompact();
 });
 
-// 三栏自适应档位住在 src/agent/layout-density.js（main.js 撞行数闸时搬出去的）。
-// 量的是物理宽度，理由见那个模块的抬头。
-function _applyLayoutDensity() {
-  try { applyLayoutDensity(window.innerWidth, window.innerHeight, document.documentElement); } catch {}
+/*
+ * 有效视口 → CSS 变量 --eh / --ew。
+ *
+ * 界面缩放走 html { zoom }，而 vh/vw 在 Chromium（Windows 的 WebView2）里不跟着 zoom 变：
+ * 实测 1.4 倍时一个 100vh 的元素高 1176 物理像素，满铺的 fixed 盒子只有 840。于是所有按
+ * vh/vw 定尺寸的叠层——对话框、命令面板、菜单——一放大就出屏（命令面板 1.4 倍时底部
+ * 出视口 14px，正好等于 72vh × 1.4 − 100%）。
+ *
+ * innerWidth / innerHeight 在两个引擎里都不随 zoom 变（见 layout-density.js 抬头那张表），
+ * 除以缩放就是两边口径一致的有效视口。app.css 里 47 处 vh/vw 已换成 var(--eh/--ew, 100vh/vw)，
+ * 没写入时回落到原值。
+ */
+function _syncEffectiveViewport() {
+  const z = _uiZoom > 0 ? _uiZoom : 1;
+  const st = document.documentElement.style;
+  try {
+    st.setProperty("--eh", Math.round((window.innerHeight || 0) / z) + "px");
+    st.setProperty("--ew", Math.round((window.innerWidth || 0) / z) + "px");
+  } catch {}
 }
+
+// 三栏自适应档位住在 src/agent/layout-density.js（main.js 撞行数闸时搬出去的）。
+// 横向量的是物理宽度（三栏宽度本来就除以了缩放，理由见那个模块的抬头）；
+// 竖向量的是**有效**高度：竖直方向没有任何按物理尺寸排的东西，聊天区、输入框、空状态全是
+// CSS 像素，放大到 1.5 倍的 700px 窗口就是一个 466px 高的窗口——按 700 分档等于当它够高。
+function _applyLayoutDensity() {
+  try {
+    const z = _uiZoom > 0 ? _uiZoom : 1;
+    applyLayoutDensity(window.innerWidth, window.innerHeight / z, document.documentElement);
+  } catch {}
+}
+_syncEffectiveViewport();
 _applyLayoutDensity();
 // 缩放的键位同样登记在 DEFAULT_KEYBINDINGS 里（view.zoomIn/zoomOut/zoomReset），
 // 这里不再自己挂 keydown —— 自己挂的键在设置页里查不到也改不了。
@@ -15432,7 +15466,9 @@ function _setCreditDenominator(value) {
 function _creditUsdValue(rawCents) {
   return (Number(rawCents) || 0) / _MICHAEL_RAW_CENTS_PER_CREDIT_USD;
 }
-function _dispUsd(rawCents, digits = 2) {
+// 三位小数（2026-09-07 所有者点名「计费单位后面 2 个 0 改成 3 个 0」）：一轮几厘钱的调用按两位
+// 会印成 $0.00，用户以为没扣费。余额 / 累计花费同一个格式化器，跟着一起三位，省得两种写法并排。
+function _dispUsd(rawCents, digits = 3) {
   return "$" + _creditUsdValue(rawCents).toFixed(digits);
 }
 
@@ -17122,9 +17158,16 @@ function _streamDraftMapRead() {
 function _streamDraftMapWrite(map) {
   try {
     const ids = Object.keys(map || {});
-    if (!ids.length) localStorage.removeItem(_STREAM_DRAFT_KEY);
-    else localStorage.setItem(_STREAM_DRAFT_KEY, JSON.stringify(map));
-  } catch { /* 配额满等场景只是少个保险，不影响正常链路 */ }
+    if (!ids.length) { localStorage.removeItem(_STREAM_DRAFT_KEY); return; }
+    try { localStorage.setItem(_STREAM_DRAFT_KEY, JSON.stringify(map)); }
+    catch {
+      // 配额满：多半是退出时带的 DOM 快照（html）撑的。剥掉它再写一次——正文 / 思考 / 步骤
+      // 是主链路，不能因为一份保险写不进而整份丢掉；快照在 Rust 那边另有一份。
+      const slim = {};
+      for (const id of ids) { const { html, htmlAt, ...rest } = map[id] || {}; slim[id] = rest; }
+      localStorage.setItem(_STREAM_DRAFT_KEY, JSON.stringify(slim));
+    }
+  } catch { /* 剥掉快照还写不进：只是少个保险，不影响正常链路 */ }
 }
 // 把这一轮**已经做过的工具动作**渲染成 markdown，附进流式草稿。
 //
@@ -17219,12 +17262,17 @@ function _streamDraftFlushSync() {
     const now = Date.now();
     const written = [];
     for (const sess of live) {
+      // 关闭前那一刻的 DOM 快照也带上（同步、绕过 3s 节拍）：恢复时整块塞回。typeof 守卫是因为
+      // 本函数会被测试整函数抠出来求值，那里没有这个模块函数。
+      const _html = typeof liveMessageHtml === "function" && sess._liveMsgEl ? liveMessageHtml(sess._liveMsgEl, 1_500_000) : "";
       const draft = {
         sessionId: sess.id,
         text: String(sess._streamDraftLatest.text || "").slice(0, 400_000),
         reasoning: String(sess._streamDraftLatest.reasoning || "").slice(0, 20_000),
         // 退出这条路上也要带：这里恰恰是**最全**的一次（绕过节流、拿的是最新的 recording）。
         steps: _draftStepsMarkdown(sess).slice(0, 60_000),
+        html: _html,
+        htmlAt: _html ? now : 0,
         updatedAt: now,
       };
       map[sess.id] = draft;
@@ -17258,7 +17306,7 @@ async function _streamDraftPersistDurable(draft = null) {
 }
 function _streamDraftClear(session = null) {
   if (session) {
-    session._draftSaveAt = 0; session._draftDurableAt = 0; session._streamDraftLatest = null; session._streamRunPrefix = "";
+    session._draftSaveAt = 0; session._draftDurableAt = 0; session._streamDraftLatest = null; session._streamRunPrefix = ""; session._liveMsgEl = null;
     // 这一轮已落账、已渲染：丢掉还没刷出去的增量缓冲，并让 _journalTick 删掉 Rust 那份日志文件。
     // 标记位而非直接调后端：本函数被 load() 抠取，不能新增自由标识符（backend 就是）。
     session._journalBuf = []; session._journalClearPending = true;
@@ -17294,7 +17342,7 @@ async function _streamDraftTake() {
   const _parseDraft = (value) => {
     try {
       const draft = typeof value === "string" ? JSON.parse(value) : value;
-      if (!draft || typeof draft.sessionId !== "string" || (!String(draft.text || "").trim() && !String(draft.reasoning || "").trim())) return null;
+      if (!draft || typeof draft.sessionId !== "string" || (!String(draft.text || "").trim() && !String(draft.reasoning || "").trim() && !String(draft.steps || "").trim() && !String(draft.html || "").trim())) return null;
       // 陈年草稿（>7 天）不值得再补进历史，丢弃。
       if (Date.now() - (Number(draft.updatedAt) || 0) > 7 * 864e5) return null;
       return draft;
@@ -17863,6 +17911,25 @@ async function _renderMsgRange(session, from, to, options = {}) {
         feedback: m.role === "assistant" ? String(m.feedback || "") : "",
         settled: true,
       });
+      // 软件重启打断的那一轮：把关闭前那一刻的 DOM 快照原样塞回（思考卡、工具卡、正文段一个不少），
+      // 上面按 markdown 重画的那份只是兜底。快照挂在 session 上、按 _ideMeta.interrupted + 探针认领，
+      // 用过即删；之后整个容器的快照会把它一起存下来。typeof 守卫：本函数会被测试抠出来求值。
+      const _rec = m.role === "assistant" && m._ideMeta?.interrupted && session?._recoveredMsgHtml && typeof session._recoveredMsgHtml.html === "string"
+        && (!session._recoveredMsgHtml.probe || String(m.content || "").includes(session._recoveredMsgHtml.probe) || String(m.reasoning || "").includes(session._recoveredMsgHtml.probe))
+        ? session._recoveredMsgHtml : null;
+      if (_rec && body?.closest && typeof markRecoveredMessage === "function") {
+        const _wrap = body.closest(".msg");
+        const _tpl = document.createElement("template");
+        _tpl.innerHTML = _rec.html;
+        const _node = _tpl.content?.firstElementChild;
+        if (_wrap && _node) {
+          if (_wrap.dataset?.transcriptSequence) _node.dataset.transcriptSequence = _wrap.dataset.transcriptSequence;
+          _wrap.replaceWith(markRecoveredMessage(_node, { document }));
+          if (typeof _scrubResidue === "function") _scrubResidue(_node);
+          delete session._recoveredMsgHtml;
+          continue;
+        }
+      }
       if (body && m.role === "assistant" && m.reasoning && typeof m.reasoning === "string" && m.reasoning.trim()) {
         const card = document.createElement("div");
         card.className = "think-card";
@@ -18526,6 +18593,7 @@ function _restoreClosedChatSession(closedIndex) {
   { const _ctxRead = _ctxReadingFromStorage(sData.ctxFloor); if (_ctxRead) { session._ctxRealFloor = _ctxRead; if (_ctxRead.parts) session._ctxParts = _ctxRead.parts; } }
   if (sData.lastRun && typeof sData.lastRun === "object") session._lastRunState = sData.lastRun;
   if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
+  if (sData.recoveredMsgHtml && typeof sData.recoveredMsgHtml.html === "string") session._recoveredMsgHtml = sData.recoveredMsgHtml;
   if (sData.memory) {
     session.memory = ConversationMemory.fromJSON(sData.memory);
     session._transcriptLoaded = !(Number.isFinite(sData.memory.transcriptCheckpoint)
@@ -18786,6 +18854,8 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
   };
   if (s?.closedAt) out.closedAt = s.closedAt;
   if (includeHtml) out.html = s?.container ? _snapshotTranscript(s) : (s?.html || s?._htmlSnapshot || "");
+  // 重启恢复出的那条消息的 DOM 快照：还没被渲染（标签页没点开）时跟着存档走，别再一次重启就丢。
+  if (includeHtml && s?._recoveredMsgHtml && typeof s._recoveredMsgHtml.html === "string") out.recoveredMsgHtml = s._recoveredMsgHtml;
   return out;
 }
 
@@ -19336,6 +19406,8 @@ async function restoreChatHistory() {
         // _renderSessionHistory when this tab is first shown, restoring the full
         // visual instead of re-rendering plain text.
         if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
+        // 重启恢复出的那条消息的 DOM 快照，标签页还没点开就又重启了：跟存档一起回来，等首次渲染时塞回。
+        if (sData.recoveredMsgHtml && typeof sData.recoveredMsgHtml.html === "string") session._recoveredMsgHtml = sData.recoveredMsgHtml;
         // 读回来的 kind 过一遍白名单：存档是磁盘上的普通文件，脏值不能直接进判定链。
         if (Array.isArray(sData.plan) && sData.plan.length) session._planSteps = sData.plan.map((p) => ({
           content: String(p.content || ""),
@@ -19412,29 +19484,30 @@ async function restoreChatHistory() {
           const _already = !!_probe && _tail.some((m) =>
             (typeof m?.content === "string" && m.content.includes(_probe)) || (typeof m?.reasoning === "string" && m.reasoning.includes(_probe)));
           // 可恢复内容 = 正文/思考/步骤任一非空。以前只认正文，于是被打断在工具执行途中（满是步骤、正文还没出）的那轮整条消失。
-          const _hasContent = !!(_draftText.trim() || _draftReasoning.trim() || _steps);
+          // 关闭前那一刻的 DOM 快照（3s 节拍写进 Rust 文件 / 退出 flush 写进草稿，mergeJournalIntoDrafts 取新的）。
+          const _html = typeof _draft.html === "string" && /^\s*</.test(_draft.html) ? _draft.html : "";
+          const _hasContent = !!(_draftText.trim() || _draftReasoning.trim() || _steps) || !!_html;
           if (_draftSession && _hasContent && !_already) {
             const _hasText = !!_draftText.trim();
             const _hasReason = !!_draftReasoning.trim();
-            // 提示语按「这轮到底生成出了什么」讲实话，并把内容指到它真正所在的位置；判断在
-            // draft-recovery.js（有单测）。原来一律写「以下为已生成的部分」——可被打断在写正文
-            // 之前时正文本就是空的，那句就指着一片空白让用户以为内容丢了。
-            const _notice = recoveredDraftNotice({ hasText: _hasText, hasReason: _hasReason, hasSteps: !!_steps });
-            // 步骤清单排在叙述**前面**：被打断那轮「做了什么」比「说到哪」更要紧。
+            // 不再往正文塞「被打断」横幅——那是 harness 替模型说话。打断这件事挂成**状态**：
+            // _ideMeta.interrupted（消息底下一行状态、不进模型）+ _lastRunState.interruptedByRestart
+            // （下一轮经 run._resumeFact 喂给模型）。步骤清单仍进 content 给模型当执行事实；
+            // 用户看到的是关闭前那一刻的 DOM 快照（_recoveredMsgHtml，_renderMsgRange 塞回）。
             const _msg = {
               role: "assistant",
-              content: `${_notice}\n\n`
-                + (_steps ? `${_steps}\n\n` : "")
-                + _draftText,
+              content: (_steps ? `${_steps}\n\n` : "") + _draftText,
+              _ideMeta: { interrupted: "restart" },
             };
-            // 思考（reasoning）也存了、也被渲染过，以前只拼 steps+text 把它丢了、「✓ 思考」只剩个勾。带上它，走 assistant.reasoning 老路渲染成思考块。
+            // 思考（reasoning）也存了、也被渲染过：带上它，没有 DOM 快照时走 assistant.reasoning 老路渲染成思考块。
             if (_hasReason) {
               _msg.reasoning = _draftReasoning;
-              // 正文为空时思考是这轮唯一的实质内容 → 让它默认展开（_renderMsgRange 认这个标记），
-              // 别让用户只看到一句「被打断」提示、真正生成的东西还折在「已思考」里要去点。
+              // 正文为空时思考是这轮唯一的实质内容 → 让它默认展开（_renderMsgRange 认这个标记）。
               if (recoveredThinkingOpen({ hasText: _hasText, hasReason: _hasReason })) _msg._recoveredThinkingOpen = true;
             }
             _draftSession.memory.push(_msg);
+            if (_html) _draftSession._recoveredMsgHtml = { html: _html, probe: _probe };
+            _draftSession._lastRunState = { ...(_draftSession._lastRunState || {}), interruptedByRestart: true };
             _draftSession._htmlSnapshot = ""; // 快照里没有这条；强制从持久历史重建可见窗口
             _restored++;
           }
@@ -20097,6 +20170,12 @@ function _agentTimelineStartTurn(timeline, { requestId = "", stepIndex = null, k
     endedAt: null,
     error: "",
     retryCount: 0,
+    // 统计行「在途」那一层的记录点（见 agent/turn-pending.js）：已流出的字数（估输出 token 用）、
+    // 流结束时上游报的用量、网关结算是否已落地。三处写点：token/reasoning 处理、usage 事件、结算任务。
+    streamChars: 0,
+    streamCjk: 0,
+    usage: null,
+    settled: false,
     attempts: [],
     activeAttemptIndex: -1,
   };
@@ -20205,7 +20284,7 @@ function _agentTimelineMarkVisible(timeline, turn, kind, at = Date.now()) {
   }
 }
 
-function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, live = false } = {}) {
+function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, live = false, pending = null } = {}) {
   const _svg = (d) => `<svg class="turn-stats__icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
   const _icClock = _svg('<circle cx="8" cy="8.5" r="5.5"/><path d="M8 5.8v2.9l2 1.2M6.5 1.5h3"/>');
   const _icTokens = _svg('<path d="M5 2.5 2.5 5.5h5L5 2.5zM5 2.5v8"/><path d="M11 13.5l2.5-3h-5l2.5 3zM11 13.5v-8"/>');
@@ -20281,6 +20360,7 @@ function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, liv
   // 且信息严格多于这里（多了 kind、多了逐轮、多了物理尝试）。
   // firstProgressMs / firstVisibleMs 两个 const 不能删：上面 live 分支「一轮都还没开过」
   // 那条退路还拿它们当判据，删了首轮开跑前的等待标签会静默消失。
+  let inTok = null, outTok = null, costCents = null;
   if (settlement) {
     if (settlement.usageReported) {
       // 这一格必须和悬停面板「最近一次请求 输入」是**同一个量**：这次真正读进模型的
@@ -20301,19 +20381,40 @@ function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, liv
       const cacheReadTok = Math.max(0, Math.round(Number(settlement.cachedTokens) || 0));
       const cacheWriteTok = Math.max(0, Math.round(Number(settlement.cacheCreationTokens) || 0));
       const rawInTok = Math.max(0, Math.round(Number(settlement.promptTokens) || 0));
-      const inTok = settlement.promptIncludesCached === false ? rawInTok + cacheReadTok + cacheWriteTok : rawInTok;
-      const outTok = Math.max(0, Math.round(Number(settlement.completionTokens) || 0));
-      bits.push(`${_icTokens}${_tokenShort(inTok)}/${_tokenShort(outTok)}`);
-    } else {
-      bits.push(`${_icTokens}Usage unavailable`);
+      inTok = settlement.promptIncludesCached === false ? rawInTok + cacheReadTok + cacheWriteTok : rawInTok;
+      outTok = Math.max(0, Math.round(Number(settlement.completionTokens) || 0));
     }
-    if (Number.isInteger(settlement.costCents)) bits.push(_dispUsd(settlement.costCents));
+    if (Number.isInteger(settlement.costCents)) costCents = settlement.costCents;
+  }
+  // 「任何时刻都有数」（2026-09-07 所有者点名：第一轮还在思考时只有秒表，结算前用户看不到自己
+  // 在花钱；结算失败或按停之后干脆一个字没有）。三格永远都在：秒表 / 输入·输出 / 金额。
+  // 数从三层来——网关已结算的 + 上游已报用量但网关还没结算的 + 正在流的这一轮按本地估算的
+  //（`pending`，见 agent/turn-pending.js）；只要含估算就在数前挂 ≈，结算齐了 ≈ 自动消失。
+  // 什么都还没有时印 —，不印 0：0 读起来是「免费」，— 才是「不知道」。
+  const pendIn = Math.max(0, Math.round(Number(pending?.in) || 0));
+  const pendOut = Math.max(0, Math.round(Number(pending?.out) || 0));
+  // null = 单价未知（按次计费 / 免费模型 / 网关没下发），和 0 元是两回事：Number(null) 会变 0，所以先判空。
+  const pendCost = pending?.costCents == null ? null : Math.max(0, Number(pending.costCents) || 0);
+  const hasPending = !!pending && (pendIn > 0 || pendOut > 0 || pendCost != null);
+  if (inTok != null || hasPending) {
+    const approxTok = hasPending && pending.estimated ? "≈" : "";
+    bits.push(`${_icTokens}${approxTok}${_tokenShort((inTok || 0) + pendIn)}/${_tokenShort((outTok || 0) + pendOut)}`);
+  } else if (settlement) {
+    bits.push(`${_icTokens}Usage unavailable`);
+  } else {
+    bits.push(`${_icTokens}—/—`);
+  }
+  if (costCents != null || pendCost != null) {
+    // 在途那一份永远是估算（标价 × 本次 run 的校准系数），所以只要它在，金额就带 ≈。
+    bits.push(`${hasPending ? "≈" : ""}${_dispUsd((costCents || 0) + (pendCost || 0))}`);
+  } else {
+    bits.push("$—");
   }
   const html = bits.map((b) => `<span class="turn-stats__item">${b}</span>`).join("");
   return { html };
 }
 
-function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timeline = null } = {}) {
+function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timeline = null, pending = null } = {}) {
   const unreported = Math.max(0, Math.round(Number(settlement?.tokenUnreportedTurns) || 0));
   const cacheReadTok = Math.max(0, Math.round(Number(settlement?.cachedTokens) || 0));
   const cacheWriteTok = Math.max(0, Math.round(Number(settlement?.cacheCreationTokens) || 0));
@@ -20380,7 +20481,17 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timel
     ? `Credit cost: ${_dispUsd(settlement.costCents)} (${_MICHAEL_RAW_CENTS_PER_CREDIT_USD} raw cents = $1.00 credit; includes model, cache, and route pricing)${costBreakdown}`
     : "Cost: waiting for server settlement";
   const settledTitle = live && settlement?.settledTurns
-    ? `\nSettled: ${settlement.settledTurns} model requests; pending requests are not estimated`
+    ? `\nSettled: ${settlement.settledTurns} model requests; unsettled ones are shown as ≈ estimates`
+    : "";
+  // 在途那一层：上游已报用量但网关还没结算的（token 准、钱按标价折）+ 正在流的这一轮（本地估算）。
+  const pendIn = Math.max(0, Math.round(Number(pending?.in) || 0));
+  const pendOut = Math.max(0, Math.round(Number(pending?.out) || 0));
+  // null = 单价未知（按次计费 / 免费模型 / 网关没下发），和 0 元是两回事：Number(null) 会变 0，所以先判空。
+  const pendCost = pending?.costCents == null ? null : Math.max(0, Number(pending.costCents) || 0);
+  const pendingTitle = pending && (pendIn > 0 || pendOut > 0 || pendCost != null)
+    ? `\n在途（网关还没结算）: 输入 ${_tokenShort(pendIn)} · 输出 ${_tokenShort(pendOut)}${pendCost != null ? ` → ≈${_dispUsd(pendCost)}` : " → 单价未知，金额待结算"}`
+      + `（${pending.real ? "上游已报用量，金额按目录单价 × 本次校准折算" : "正在流：提示词按上一轮实测估、输出按已收到的字数估"}`
+      + `${pending.real && pending.estimated ? "；正在流的这一轮按本地估算" : ""}；结算落地后以网关为准，≈ 随之消失）`
     : "";
   const timelineElapsed = (target, field) => {
     const startedAt = Number(target?.startedAt);
@@ -20424,11 +20535,11 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timel
       + `\n模型轮数: ${Array.isArray(timeline.turns) ? timeline.turns.length : 0}`
       + (turnLines ? `\n${turnLines}` : "")
     : "";
-  return `${live ? "Live stats (settled requests only)" : "Reply stats"}\nTime: ${_fmtElapsed(elapsedMs)}${timelineTitle}\n${tokenTitle}\n${costTitle}${settledTitle}`;
+  return `${live ? "Live stats (settled + pending ≈)" : "Reply stats"}\nTime: ${_fmtElapsed(elapsedMs)}${timelineTitle}\n${tokenTitle}\n${costTitle}${settledTitle}${pendingTitle}`;
 }
 
-// Token 与金额只读取服务端已落库的 settlement；当前在途请求绝不估算。
-function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeline, isLive } = {}) {
+// Token 与金额以服务端已落库的 settlement 为准；在途请求只以带 ≈ 的估算出现，结算落地即被替换。
+function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeline, getPending, isLive } = {}) {
   let el = null;
   let timer = 0;
   let active = true;
@@ -20481,14 +20592,16 @@ function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeli
       }
       const settlement = typeof getSettlement === "function" ? getSettlement() : null;
       const timeline = typeof getTimeline === "function" ? getTimeline() : null;
+      const pending = typeof getPending === "function" ? getPending() : null;
       const elapsedMs = Date.now() - startedAt;
       el.innerHTML = _turnStatsText({
         elapsedMs,
         settlement,
         timeline,
         live: true,
+        pending,
       }).html;
-      el.title = _turnStatsTitle({ elapsedMs, settlement, live: true, timeline });
+      el.title = _turnStatsTitle({ elapsedMs, settlement, live: true, timeline, pending });
       pinToBottom(); // 兜底：observer 没跑起来（老 WebView / 被异常打断）时仍然归位
     } catch { /* live stats must never break a reply */ }
   };
@@ -20618,17 +20731,17 @@ function _appendRunRevertBar(body, run) {
   } catch { /* 汇总条不该影响回复本身 */ }
 }
 
-function _appendTurnStatsFooter(body, { elapsedMs = 0, settlement = null, timeline = null } = {}) {
+function _appendTurnStatsFooter(body, { elapsedMs = 0, settlement = null, timeline = null, pending = null } = {}) {
   try {
     if (!body) return;
     const live = body.querySelector(":scope > .turn-stats--live");
     if (live) live.remove();
     if (body.querySelector(":scope > .turn-stats")) return;
-    const { html } = _turnStatsText({ elapsedMs, settlement, timeline });
+    const { html } = _turnStatsText({ elapsedMs, settlement, timeline, pending });
     const el = document.createElement("div");
     el.className = "turn-stats";
     el.innerHTML = html;
-    el.title = _turnStatsTitle({ elapsedMs, settlement, timeline });
+    el.title = _turnStatsTitle({ elapsedMs, settlement, timeline, pending });
     body.appendChild(el);
     // 统计行已就位 —— 轮到操作条出场（它是 body 的兄弟，同在 .msg__main 里）。
     _revealMsgActions(body.parentElement);
@@ -20717,6 +20830,47 @@ function _liveRunSettlement(runUsage) {
 function _finalRunSettlement(runUsage) {
   if (!runUsage || !runUsage.allSettled || runUsage.settledTurns !== runUsage.turns || !runUsage.turns) return null;
   return _liveRunSettlement(runUsage);
+}
+
+// 统计行「在途」那一层的三个写/读点。记录落在时间线的轮次对象上（每个模型请求一条），
+// 智能体循环和纯对话两条路共用同一套；算数在 agent/turn-pending.js。
+function _noteTurnStreamDelta(turn, text) {
+  if (!turn || !text) return;
+  const s = String(text);
+  turn.streamChars = (Number(turn.streamChars) || 0) + s.length;
+  turn.streamCjk = (Number(turn.streamCjk) || 0) + _countCjk(s);
+}
+function _noteTurnStreamUsage(turn, ev) {
+  if (!turn || !ev) return;
+  const n = (v) => Math.max(0, Math.round(Number(v) || 0));
+  const prompt = n(ev.promptTokens ?? ev.prompt_tokens);
+  const completion = n(ev.completionTokens ?? ev.completion_tokens);
+  if (!prompt && !completion) return;
+  const read = ev.cachedTokens ?? ev.cached_tokens;
+  // 传输层已把缓存读加回 prompt（见 _recordStreamUsage 里 normalized: true），这里存的就是「含缓存」形状。
+  turn.usage = { prompt, completion, cacheRead: read == null ? 0 : n(read), cacheWrite: n(ev.cacheCreationTokens ?? ev.cache_creation_tokens) };
+}
+function _liveTurnPending({ session, timeline, prices = null, runUsage = null } = {}) {
+  try {
+    const turns = Array.isArray(timeline?.turns) ? timeline.turns : [];
+    if (!turns.length) return null;
+    // 正在流的这一轮的提示词估算：上一轮实测（含缓存的整个窗口）和本地拼装量取大者。
+    const floor = session?._ctxRealFloor || null;
+    const promptEstimate = Math.max(Number(floor?.total) || 0, _sumContextParts(session?._ctxParts));
+    // 缓存命中比例：优先本次 run 已结算的口径，其次上一轮实测；都没有就按全部未命中估（偏高，带 ≈）。
+    let cacheRatio = 0;
+    if (runUsage && (Number(runUsage.reportedTurns) || 0) > 0) {
+      const inAll = (Number(runUsage.in) || 0)
+        + (runUsage.promptIncludesCached === false ? (Number(runUsage.cacheRead) || 0) + (Number(runUsage.cacheCreation) || 0) : 0);
+      if (inAll > 0) cacheRatio = (Number(runUsage.cacheRead) || 0) / inAll;
+    } else if (floor && floor.cacheRead != null && (Number(floor.input) || 0) > 0) {
+      cacheRatio = (Number(floor.cacheRead) || 0) / Number(floor.input);
+    }
+    return _pendingTurnUsage({
+      turns, prices, rawCentsPerUsd: _MICHAEL_RAW_CENTS_PER_CREDIT_USD, promptEstimate, cacheRatio,
+      calibration: _costCalibration(runUsage, prices, _MICHAEL_RAW_CENTS_PER_CREDIT_USD),
+    });
+  } catch { return null; }
 }
 
 /*
@@ -22499,8 +22653,6 @@ function _requiresApproval(call) {
   // 上开了 PR、gh_pr_reply 用他的账号在别人 PR 下发了评论、http_request 拿同一个 URL
   // 发 DELETE 也直接就发了。更别扭的是他自己接进来的 userhttp 反倒每次都问。
   if (call.type === "gh" || call.type === "http") return _toolMayProduceExternalEffect(call);
-  // tor 无条件问：它整条链路绕开用户平时的网络出口。
-  if (call.type === "tor") return true;
   // 按**这一次调用**判定，不是按类型一刀切：browser 的 needsApproval 是个函数
   // （看页面不弹框，替用户按按钮才弹）。_APPROVE_TYPES 只回答"这个工具有可能要审批"，
   // 拿它当结论会把纯观察动作也拦下来。
@@ -22574,7 +22726,7 @@ function _approvalKey(call, run = null) {
   // （同一个 URL 上 GET 和 DELETE 不是一回事，`_requiresApproval` 本来就按方法判）。
   // 路径不进 key：REST 接口按 id 一条条问会把用户逼到关掉整道门，而越权的关键是域名和
   // 方法，不是 `/records/1` 还是 `/records/2`。URL 解析不出来就退回原文，宁可分得过细。
-  if (call.type === "http" || call.type === "tor") {
+  if (call.type === "http") {
     let origin = "";
     try { origin = new URL(String(call.url || "")).origin; } catch { origin = String(call.url || ""); }
     const method = String(call.method || "GET").trim().toUpperCase() || "GET";
@@ -22611,12 +22763,11 @@ function _approvalAlwaysLabel(call) {
     // 说清是"哪个站 + 哪个方法"，别写成一句能被读成"以后随便发"的话——key 也正是按这两个
     // 维度收的（见 `_approvalKey`）。域名解析不出来就不给这个按钮：说不清范围就别给，
     // 和 download 同一条规矩。
-    case "http": case "tor": {
+    case "http": {
       let host = "";
       try { host = new URL(String(call.url || "")).host; } catch { host = ""; }
       const method = String(call.method || "GET").trim().toUpperCase() || "GET";
-      const via = call.type === "tor" ? "经 Tor " : "";
-      return host ? `本会话总是允许${via}向 ${host} 发 ${method} 请求` : "";
+      return host ? `本会话总是允许向 ${host} 发 ${method} 请求` : "";
     }
     case "db": return `本会话总是允许 ${call.driver || "这个数据库"} 的非破坏性操作`;
     default: return "本会话总是允许";
@@ -22925,7 +23076,7 @@ const _PERM_TOOL_ALIASES = {
   read: new Set(["read", "list"]),
   write: fileMutationTypes(),
   mcp: new Set(["mcp"]),
-  webfetch: new Set(["http", "tor"]),
+  webfetch: new Set(["http"]),
   git: new Set(["git"]),
 };
 /// 规则里的 `Tool` 名是否覆盖这个调用的类型。
@@ -22945,7 +23096,7 @@ function _permRuleSubject(call) {
   // 返回空串让规则不匹配，别把「等端口 3000」也拿去撞 Bash 规则。
   if (call.type === "background_monitor") return call.checkType === "command" ? String(call.pattern || "") : "";
   if (call.type === "mcp") return `${call.server || ""}/${call.tool || call.mcpName || ""}`;
-  if (call.type === "http" || call.type === "tor") return String(call.url || "");
+  if (call.type === "http") return String(call.url || "");
   if (call.type === "git") return String(call.op || "");
   return String(call.path || call.dest || call.to || "");
 }
@@ -30143,6 +30294,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   }
 
   const body = addMessage("assistant", "", sess);
+  sess._liveMsgEl = body?.closest?.(".msg") || null; // 在途消息：重启恢复按它拍 DOM 快照（drainJournal）
   body.appendChild(thinkingCard());
   let acc = "";
   let _resumeAccSnapshot = "";
@@ -30465,8 +30617,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 已经渲染成 seg、但会被 acc 清空抹掉的正文段。收尾落盘时要把它们拼回去。
   const _segTextsThisTurn = [];
   let _toolArgBuf = {};
+  // 纯对话没有逐轮结算，统计行在流的过程中全靠「在途」那一层（估算 → 上游报的用量 → 结算）。
+  const _plainPrices = (() => { try { return _modelBillingPrices(config?.model); } catch { return null; } })();
   const _liveStats = _liveTurnStats(body, {
     startedAt: _taskStartedAt,
+    getPending: () => _liveTurnPending({ session: sess, timeline: _turnTimeline, prices: _plainPrices }),
     getTimeline: () => _turnTimeline,
     isLive: () => !!sess.streaming,   // 这一轮还在跑吗；不在就自己停
   });
@@ -30604,6 +30759,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       // Usage is read before the Stop gate: stopping does not un-spend what the model read.
       if (ev && ev.kind === "usage") {
         _recordStreamUsage(ev, { session: sess, model: config?.customModelId || config?.model || "", requestId: sess._reqId });
+        _noteTurnStreamUsage(_plainTimelineTurn, ev);
         return false;
       }
       if (!_turnLive()) return false;
@@ -30613,11 +30769,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       if (ev.kind === "reasoning") {
         // 厂商独立通道 → trusted（同 agent 路）。
         accepted = appendPlainReasoning(ev.delta || "", true);
+        _noteTurnStreamDelta(_plainTimelineTurn, ev.delta);
         if (sess) (sess._journalBuf || (sess._journalBuf = [])).push({ g: sess._runGen || 0, t: "", r: ev.delta || "" });
         _streamDraftSave(sess, acc, reasoningAll);
       }
       else if (ev.kind === "token") {
         const { th, an, accepted: routedAccepted } = _routeThink(ev.delta);
+        _noteTurnStreamDelta(_plainTimelineTurn, ev.delta);
         if (sess) (sess._journalBuf || (sess._journalBuf = [])).push({ g: sess._runGen || 0, t: an || "", r: th || "" });
         if (th) { appendPlainReasoning(th, true); _streamDraftSave(sess, acc, reasoningAll); }
         if (an) {
@@ -30717,6 +30875,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       await Promise.allSettled(_turnBillingTasks);
       await _awaitBillableAiTasks(sess._reqId);
       _plainSettlement = await _fetchGatewaySettlement(config, sess._reqId);
+      if (_plainTimelineTurn && _plainSettlement) _plainTimelineTurn.settled = true;
       if (_plainSettlement?.usageReported) {
         _recordUsage({
           prompt_tokens: _plainSettlement.promptTokens,
@@ -30819,6 +30978,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       elapsedMs: _contentDoneMs,
       settlement: _plainSettlement,
       timeline: _turnTimeline,
+      pending: _liveTurnPending({ session: sess, timeline: _turnTimeline, prices: _plainPrices }),
     });
     _chatFollow(sess);
     _drainFollowups(sess); // a message sent while this reply streamed → process it now, as its own turn
@@ -35443,7 +35603,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   let _galleryMode = false;
   try { _galleryMode = !inTauri && new URLSearchParams(location.search).get("play") === "tools"; } catch {}
   if (!inTauri && !_galleryMode) {
-    const desktopOnly = new Set(["office_write", "office_edit", "office_read", "mcp_server", "debug_control", "run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset",
+    const desktopOnly = new Set(["office_write", "office_edit", "office_read", "mcp_server", "debug_control", "run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset",
   // 这 40 个的执行器里都以 `if (!inTauri) return "[不可用] 只能在桌面 App 里用"` 开头，
   // 却一直照样把 schema 发给模型：网页版里模型手上摆着 arxiv_search、db_query、
   // gh_pr_view，选中一个就是一轮白烧，search_tools 也照样能把它们装进工具窗口、
@@ -35466,7 +35626,6 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   "visual_compare",
   "probe_env",
   "worktree",
-  "tor_request",
   "generate_image",
   "visual_explain",
   "performance_profile",
@@ -35609,7 +35768,7 @@ function _applyUserRoleEnums(tools) {
 // logic.test.mjs 里五条「模型必须看得见这条路由」的断言喂成了绿的。整段删掉，别让注释再替
 // 代码作证。两条路由钉回它们真正的落点：tool-guides 的 TOOL_METADATA，经 enrichedCatalogLine
 // 拼进语义编排器的目录行，那才是模型真读得到的地方。
-const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具（工程、终端、浏览器、数据库、Git、LSP、桌面、MCP 与外部来源都在注册表中）。自然语言请求由语义编排器依据完整目录、任务阶段和真实证据选择，不做关键词或正则路由；已知精确工具名也可直接查询。先用项目证据、记忆和 knowledge_search，只有存在明确的当前事实缺口才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。最新论文/SOTA/前沿研究加载 arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；developer_community_search 用于真实开发者社区证据；游戏价格/平台加载 steam_search。拿到社区、仓库、论坛或专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。`;
+const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具（工程、终端、浏览器、数据库、Git、LSP、桌面、MCP 与外部来源都在注册表中）。自然语言请求由语义编排器依据完整目录、任务阶段和真实证据选择，不做关键词或正则路由；已知精确工具名也可直接查询。先用项目证据、记忆和 knowledge_search，只有存在明确的当前事实缺口才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。最新论文/SOTA/前沿研究加载 arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；developer_community_search 用于真实开发者社区证据；游戏价格/平台加载 steam_search。拿到社区、仓库、论坛或专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。。也可以直接传分类名整组装载：planning（规划与起步）、file_io（文件读写）、code_editing（代码编辑）、search（代码检索与符号）、diagnostics（诊断、调试与性能）、execution（命令、终端与部署）、version_control（版本控制与 PR）、research（联网调研）、networking（网络请求、抓包与远程）、ui_automation（浏览器自动化）、desktop_automation（桌面自动化）、creative（设计与视觉）、game_asset_generation（游戏素材生成）、office（文档）、data_layer（数据与实时信息）、orchestration（多智能体编排）、interaction（与用户交互与记忆）；中文类名同样认。`;
 const _SEARCH_TOOLS_SCHEMA = { type: "function", function: { name: "search_tools", description: _SEARCH_TOOLS_DESCRIPTION, parameters: { type: "object", properties: { query: { type: "string", description: "要查找的能力或要完成的工作" } }, required: ["query"] } } };
 
 // 工具发现（精确/模糊查找、子智能体准入、就近候选）→ agent/tool-discovery.js
@@ -36034,11 +36193,11 @@ function _applyToolArgDefaults(name, args, context = "") {
       if (!a.repo) a.repo = repo.repo;
     }
   }
-  if (!a.url && (canonical === "web_fetch" || canonical === "http_request" || canonical === "tor_request" || canonical === "screenshot")) {
+  if (!a.url && (canonical === "web_fetch" || canonical === "http_request" || canonical === "screenshot")) {
     const u = firstContextUrl();
     if (u) a.url = u;
   }
-  if ((canonical === "http_request" || canonical === "tor_request") && !a.method && a.url) {
+  if (canonical === "http_request" && !a.method && a.url) {
     // The executor has always defaulted method to GET. Keep validation aligned
     // so a perfectly normal "fetch this URL" call doesn't waste a whole retry.
     a.method = "GET";
@@ -36095,8 +36254,8 @@ function _fileToolArgIssue(name, rawArgs) {
 
 const _STRICT_MUTATING_TOOL_NAMES = new Set([
   // 2026-09-04 审计补登记的四个（type 在 tool-policy.js 里新声明为有副作用）：
-  // stop_demo 写 HTML、visual_explain 落 png、http_request / tor_request 会发写请求。
-  "stop_demo", "visual_explain", "http_request", "tor_request",
+  // stop_demo 写 HTML、visual_explain 落 png、http_request 会发写请求。
+  "stop_demo", "visual_explain", "http_request",
   "write_file", "edit_file", "multi_edit", "delete_path", "move_path", "run_worker",
   "create_dir", "copy_path", "format_file", "run_cmd", "run_in_terminal",
   "deploy_site", "worktree", "git_commit", "git_branch", "git_push", "git_clone", "git_pull",
@@ -36909,14 +37068,6 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       } else { _h = null; }
       return { type: "http", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: _h, body: (args.body != null ? String(args.body) : undefined), timeout: args.timeout_secs || args.timeoutSecs || args.timeout };
     }
-    case "tor_request": {
-      let _h = args.headers || null;
-      if (typeof _h === "string") { try { _h = JSON.parse(_h); } catch { _h = null; } }
-      if (_h && typeof _h === "object") {
-        const _hh = {}; for (const k in _h) { if (_h[k] != null) _hh[k] = String(_h[k]); } _h = _hh;
-      } else { _h = null; }
-      return { type: "tor", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: _h, body: (args.body != null ? String(args.body) : undefined), timeout: args.timeout_secs || args.timeoutSecs || args.timeout };
-    }
     case "figma": return { type: "figma", action: String(args.action || "design"), url: String(args.url || args.file || args.link || ""), node: (args.node != null ? String(args.node) : (args.node_id != null ? String(args.node_id) : (args.nodeId != null ? String(args.nodeId) : ""))), depth: Number.isFinite(+args.depth) ? +args.depth : undefined, name: args.name ? String(args.name) : undefined };
     // 18 个曾经独立的检索工具已折进上面两个聚合工具（见 _RETIRED_SEARCH_ALIASES）。它们不再
     // 出现在模型看到的目录里，但**旧调用仍然照常执行**：一次会话中途换目录时，历史里已经出现
@@ -37013,7 +37164,6 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       if (_h && typeof _h === "object") { const _hh = {}; for (const k in _h) { if (_h[k] != null) _hh[k] = String(_h[k]); } _h = _hh; } else { _h = null; }
       return { type: "capture_replay", id: String(args.id || ""), url: args.url ? String(args.url) : "", method: args.method ? String(args.method) : "", headers: _h, body: (args.body != null ? String(args.body) : undefined) };
     }
-    case "decode_qr": return { type: "qr", path: args.path || args.file || args.image || args.image_path || "", dataUrl: args.data_url || args.dataUrl || args.image_data || "" };
     case "remote": return { type: "remote", op: (args.action || args.op || "status").toLowerCase(), url: args.url || args.host || args.address || "", token: args.token || args.key || "", root: args.root || args.path || args.dir || "" };
     case "generate_image": return { type: "genimage", prompt: args.prompt || "", dest: args.dest || args.path || "", width: args.width, height: args.height };
     case "office_write": return { type: "office_write", dest: args.dest || args.path || "", format: args.format || "", spec: args.spec ?? args.document ?? args.workbook ?? args.presentation ?? null, help: args.help === true || args.help === "true" }; case "office_edit": return { type: "office_edit", path: args.path || args.file || args.src || "", dest: args.dest || "", format: args.format || "", spec: args.spec ?? args.changes ?? null, ops: Array.isArray(args.ops) ? args.ops : (Array.isArray(args.replacements) ? args.replacements : null), force: args.force === true || args.force === "true", help: args.help === true || args.help === "true" }; case "office_read": return { type: "office_read", path: args.path || args.file || "", format: args.format || "", sheet: args.sheet, range: args.range, maxRows: args.maxRows ?? args.max_rows, maxCols: args.maxCols ?? args.max_cols, styles: args.styles === true, maxSlides: args.maxSlides ?? args.max_slides, maxChars: args.maxChars ?? args.max_chars };
@@ -37649,15 +37799,22 @@ const _PLAN_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="curren
 // 一列勾选框会长短不齐；而整块彩色 SVG 又把颜色写死在标记里，深浅主题各要一份。
 // 方框走 CSS 变量（尺寸、圆角、描边、颜色都跟主题走），记号只是里面那一笔。
 function _planStepIcon(st) {
-  const CHECK = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6.5"/></svg>`;
-  const CIRCLE = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/></svg>`;
-  const CROSS = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M5 5l6 6M11 5l-6 6"/></svg>`;
+  /*
+   * 逐字照 Claude 桌面端内置 UI（ion-dist）里清单项的渲染函数抄的，不是猜的：
+   *   图标格  shrink-0 size-[16px] mt-[1px] flex items-center justify-center
+   *   未完成  <span class="block size-[12px] rounded-full border border-alpha-3">   ← 12px 空心圆，描边是文字色的淡透明
+   *   完成    <Icon name="Check" size="sm" class="text-primary">                   ← 一枚细勾，正文色，**没有圆底**
+   *   行      flex items-start gap-1 decoration-1，含 [data-done] 的行 line-through + text-muted
+   * 勾的路径也是它那份：M3 8.5 L6.5 12 L13 4.5（viewBox 16，圆头圆角）。
+   * 进行中 = 同一只圆环换成正文色（参照里没有第三种记号，"轮到它了"只靠这一步深浅）。
+   * 之前三版（转圈 / 6px 小点 / 实心圆里一枚勾）都被否了：「好丑，不够高端，和 Claude 不一样」。
+   */
+  const CHECK = `<svg class="agent-plan__glyph" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5L6.5 12 13 4.5"/></svg>`;
+  const CROSS = `<svg class="agent-plan__glyph" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>`;
   if (st === "completed") return `<span class="agent-plan__box agent-plan__box--done">${CHECK}</span>`;
   if (st === "cancelled") return `<span class="agent-plan__box agent-plan__box--cancelled">${CROSS}</span>`;
-  // 进行中用这个 IDE 自己那颗转圈（工具卡在跑的时候用的就是它）——同一个界面里
-  // 「正在进行」只该有一种长相，另造一个新记号才是那种谁都没见过的小众感。
-  if (st === "in_progress") return `<span class="agent-plan__box agent-plan__box--active"><span class="atc-spin"></span></span>`;
-  return `<span class="agent-plan__box agent-plan__box--todo">${CIRCLE}</span>`;
+  if (st === "in_progress") return `<span class="agent-plan__box agent-plan__box--active"><span class="agent-plan__ring"></span></span>`;
+  return `<span class="agent-plan__box agent-plan__box--todo"><span class="agent-plan__ring"></span></span>`;
 }
 
 function _planRowHtml(s, i) {
@@ -41662,7 +41819,7 @@ function _toolResultToString(call, result) {
 // 【注入防御】一条里定义一次。
 const _EXTERNAL_DATA_TAG = "〔外部数据〕";
 const _EXTERNAL_DATA_TYPES = new Set([
-  "read", "list", "cmd", "termtask", "termread", "http", "tor", "mcp",
+  "read", "list", "cmd", "termtask", "termread", "http", "mcp",
   "search", "semsearch", "find", "findsymbol", "knowledge", "localdiscovery",
   "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
   // 下面这批原来一条都没在名单里，而其中好几条恰恰是**最直接由攻击者控制**的通道：
@@ -41692,9 +41849,8 @@ const _EXTERNAL_DATA_TYPES = new Set([
   // 又漏三条，都是**外部内容通道**，判据和上面完全一样：正文由项目之外的人写。
   //   package_source        第三方依赖的源码与文档注释。npm/PyPI 上任何人都能发包，
   //                         而"去读一下这个库怎么实现的"是最常见的用法之一。
-  //   qr                    二维码解出来的字符串——一张图片里藏一句指令，成本几乎为零。
   //   search_game_assets    远端素材目录的标题和描述，同样是别人写的。
-  "package_source", "qr", "search_game_assets",
+  "package_source", "search_game_assets",
   // 2026-09-04 审计补一批，判据不变（正文由项目之外的人/程序写）：轮询读到的文件/端口/屏幕、容器输出、
   // 调试器 evaluate 的值、页面指标、环境探针回显、随仓库 clone 来的 .mcp.json；子体的简报是它读过的
   // 外部材料的转述——标记要跟着材料走，不然一层转述就把〔外部数据〕洗掉了。
@@ -43608,7 +43764,7 @@ function _toolExecutionSucceeded(call, result) {
     : _toolFailureMatch(content);
   if (_failed) return false;
   if (/\[已合并\]|内容未变化|\(.*内容未变化\)/.test(content)) return false;
-  if (call.type === "http" || call.type === "tor") {
+  if (call.type === "http") {
     const status = Number(result.status);
     return result.ok === true && Number.isFinite(status) && status >= 200 && status < 400;
   }
@@ -44969,9 +45125,9 @@ const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "webs
   // 抽 UI、读屏，每一个都得等前一个跑完。两份手写名单漂了，这是第 N 次。
   "semsearch", "findsymbol", "viewimage", "probeenv", "uiextract", "readscreen",
   // 被 `t.endsWith("_search")` 兜不住、但同样纯读（四个执行体都核过，无写盘/建目录/删除）：
-  // package_source 读 node_modules、openapi_parser 拉 spec、qr 解码图片、news 拉新闻。
+  // package_source 读 node_modules、openapi_parser 拉 spec、news 拉新闻。
   // 漏在这里代价双份：既被当硬屏障串行跑，又被当成"写入动作"触发取证提醒。
-  "search_game_assets", "package_source", "openapi_parser", "qr", "realtime_news_feed"]);
+  "search_game_assets", "package_source", "openapi_parser", "realtime_news_feed"]);
 const _MUTATING_FILE_TOOL_TYPES = fileEditTypes();
 function _isMergedToolItem(item) {
   return item?.merged != null;
@@ -45642,6 +45798,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         // tokens the model already read, and the meter has to keep saying what is in there.
         if (ev && ev.kind === "usage") {
           _recordStreamUsage(ev, { session, aux: meterScope !== "main", model: _turnConfig?.customModelId || _turnConfig?.model || "", requestId: _turnReqId });
+          _noteTurnStreamUsage(_timelineTurn, ev);
           return false;
         }
         // 思考块的签名。排在 Stop 闸**之前**，理由和 usage 那条一样：网关只在思考块
@@ -45663,11 +45820,13 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           // appendReasoning 的注释——工具调用会置真 answerStarted，而「想→调→再想」
           // 是现代模型的常态形状。
           accepted = appendReasoning(ev.delta || "", true);
+          _noteTurnStreamDelta(_timelineTurn, ev.delta);
           if (session) (session._journalBuf || (session._journalBuf = [])).push({ g: session._runGen || 0, t: "", r: ev.delta || "" });
           if (meterScope === "main") _streamDraftSave(session, (session._streamRunPrefix ? session._streamRunPrefix + "\n\n" : "") + acc, reasoningAll);
         }
         else if (ev.kind === "token") {
           const routed = _routeInlineThinkingDelta(_inlineThinkState, ev.delta || "");
+          _noteTurnStreamDelta(_timelineTurn, ev.delta);
           if (session) (session._journalBuf || (session._journalBuf = [])).push({ g: session._runGen || 0, t: routed.answer || "", r: routed.reasoning || "" });
           // The parser only returns reasoning that occurred before its first visible
           // answer fragment, even when both appeared in one network delta.
@@ -45934,6 +46093,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         estimated: false,
       }, { aux: meterScope !== "main", session, requestId: _turnReqId });
     }
+    if (_timelineTurn && settlement) _timelineTurn.settled = true;
     try {
       if (session) {
         if (meterScope === "main" && session._lastMainUsageRequestId === _turnReqId) {
@@ -51235,10 +51395,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     && !run._loopExitedAt;
   const _scroll = () => { if (session === _currentSession()) _chatFollow(); };
   const body = addMessage("assistant", "", session);
+  session._liveMsgEl = body?.closest?.(".msg") || null; // 在途消息：重启恢复按它拍 DOM 快照（drainJournal）
   body.appendChild(thinkingCard());
   const _liveStats = _liveTurnStats(body, {
     startedAt: run._recStart,
     getSettlement: () => _liveRunSettlement(session._runUsage),
+    getPending: () => _liveTurnPending({ session, timeline: run.timeline, prices: session._runUsage?.prices || null, runUsage: session._runUsage }),
     getTimeline: () => run.timeline,
     isLive: _live,   // 这一轮还在跑吗；不在就自己停（见 _liveTurnStats 里的说明）
   });
@@ -51935,6 +52097,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     const _bwf = String(session._lastRunState.breakWriteFact).slice(0, 300);
     run._resumeFact = `上一轮在停止/中断前，${_bwf}。这些改动**已经在磁盘上了**，先读再判断，不要重做、不要整份重写。`;
     _pad.findings.push(`上一轮停止/中断前，${_bwf}。接着未完成的部分继续，别重写已落盘的文件。`);
+  }
+  // 软件重启把上一轮打断（restoreChatHistory 恢复草稿时打的标记）：横幅已经不进正文了，
+  // 这件事只能从这里作为状态喂给模型，用一次就摘掉。
+  if (isAgent && !run._resumeFact && session?._lastRunState?.interruptedByRestart) {
+    delete session._lastRunState.interruptedByRestart;
+    run._resumeFact = "上一轮回复在生成途中因软件重启被打断，历史里那条就是截断的部分。先核对哪些已经做完、落盘了什么，接着做，别整份重来。";
   }
   function _padText() {
     const includeRequirements = _shouldIncludeRequirementsInPad(run, _pad);
@@ -53290,7 +53458,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           let exact = _searchToolsExactQuery(call.query, registry);
           let fastAdds = null;
           let fastHits = [];
-          if (!exact?.schema) {
+          // 分类通道：查询整体就是一个分类（"git"、"版本控制"、"浏览器"、"数据库"…）时，
+          // 把这一类整组装进窗口，零毫秒、不等 MCP、不发编排调用。90 天里 146 个工具只有 72 个
+          // 被调过——不是没用，是不在开局窗口里又只能靠精确名或编排器碰运气。名录本来就按类列，
+          // 这条补的是「拿着类名整组取回」那一步。
+          const _cat = _searchToolsCategory(call.query, registry, loaded);
+          if (_cat) { exact = null; fastAdds = _cat.schemas; }
+          if (!_cat && !exact?.schema) {
             fastHits = _searchToolsFuzzyMatch(call.query, registry, loaded);
             const _confident = _confidentFuzzyResolution(fastHits);
             if (_confident) fastAdds = _confident.map((h) => h.schema);
@@ -53382,13 +53556,27 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               const gap = second ? `，比第二名（${second.name}）高 ${top.score - second.score} 分` : "，无并列候选";
               return `\n🧠 本地判定：${top.name} 命中${hit ? `「${hit}」` : "查询词"}${gap}——判据明确，未再调用语义编排。`;
             };
-            const _how = usedFuzzyFallback
+            const _catNote = _cat
+              ? `\n📂 分类「${_cat.label}」共 ${_cat.names.length} 个工具`
+                + (_cat.already.length ? `；已在你的工具列表里：${_cat.already.join("、")}` : "")
+                + (_cat.overflow.length ? `；其余 ${_cat.overflow.length} 个按名字直接调用即可自动装载：${_cat.overflow.join("、")}` : "")
+                + "。"
+              : "";
+            const _how = _cat ? _catNote : usedFuzzyFallback
               ? "\n（语义调度本次不可用，以上为多维度模糊匹配结果，按推荐场景自行判断适用性）"
               : usedFastPath ? _fastReason() : thoughtNote;
             content = "已加载 " + lines.length + " 个工具，现在可直接调用：\n" + lines.join("\n") + _how + rejectedNote;
             // 标签分快慢：快通道零毫秒本地判定，慢通道等过 MCP 发现并发了一次编排器调用。
             // 排查"为什么这次搜索花了半分钟"时，这一个字就够定位。
-            label = usedFastPath ? `已加载 ${lines.length}·本地` : `已加载 ${lines.length}`;
+            label = _cat ? `已加载 ${lines.length}·分类` : usedFastPath ? `已加载 ${lines.length}·本地` : `已加载 ${lines.length}`;
+          }
+          else if (_cat) {
+            // 分类命中但这一类全在手上：说清楚是「都已加载」，别掉进下面的「无匹配」——
+            // 那句会让模型以为这个分类不存在。
+            content = _cat.names.length
+              ? `分类「${_cat.label}」的 ${_cat.names.length} 个工具都已在你的工具列表里，直接调用：${_cat.names.join("、")}`
+              : `分类「${_cat.label}」当前没有可用工具（网页版会去掉桌面专用的那些）。`;
+            label = _cat.names.length ? "已在手上" : "分类为空";
           }
           else if (exact?.schema && loaded.has(exact.name)) { content = `工具已加载：\n· ${compactToolGuide(exact.schema)}`; label = "已在手上"; }
           else if (adds.length) { content = `语义调度选出 ${adds.length} 个工具，但当前 ${_TOOL_PAYLOAD_MAX_TOOLS} tools / 512 KiB 窗口无法装入，未加载。请缩小当前阶段后重试。`; label = "窗口装不下"; }
@@ -56245,10 +56433,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       await _awaitBillableAiTasks(run._reqId);
       const _scopeSettlement = await _fetchGatewaySettlement(config, run._reqId);
       if (_scopeSettlement) _addRunSettlement(_ru, _scopeSettlement);
+      // 有一轮没结算成，以前整行不出 token 和金额（「有时候扣费用户都看不到」的来路之一）：
+      // 现在退到已结算的部分，没结算的那几轮以带 ≈ 的在途估算补上。
       _appendTurnStatsFooter(body, {
         elapsedMs: _contentDoneMs,
-        settlement: _finalRunSettlement(_ru),
+        settlement: _finalRunSettlement(_ru) || _liveRunSettlement(_ru),
         timeline: run.timeline,
+        pending: _liveTurnPending({ session, timeline: run.timeline, prices: _ru?.prices || null, runUsage: _ru }),
       });
       // 「改了 N 个文件·没验证·没测试」这条事实横幅 + 「本轮改了 N 个文件·全部撤销」这条
       // 撤销条，2026-08-18 用户点名删掉——它俩是糊在回答下面的 harness footer / 文件清单，
@@ -57193,7 +57384,7 @@ function _toolStepActionLabel(call) {
     memory: "记忆", think: "思考", skill: "读取技能", guide: "加载指南", delete: "删除", move: "移动", diag: "诊断", git: "Git", gh: "GitHub",
     lsp: "LSP", findsymbol: "查找符号", semsearch: "语义搜索", knowledge: "知识检索", mkdir: "建目录",
     copy: "复制", format: "格式化", termtask: "终端任务", termread: "读终端", termlist: "终端列表",
-    termstop: "停止终端", http: "HTTP", tor: "Tor", download: "下载", mcp: "MCP", demostart: "录制中",
+    termstop: "停止终端", http: "HTTP", download: "下载", mcp: "MCP", demostart: "录制中",
     demostop: "录制完成", screenshot: "截图", browser: "浏览器", computer: "电脑", system: "系统",
     automation: "自动化", readscreen: "读取屏幕", uiclick: "操作元素", remote: "远程", askuser: "需要你确认", schedule: "定时任务", current_time: "当前时间", localdiscovery: "附近发现", liveenvironment: "环境数据", db: "数据库",
     qr: "识别二维码", genimage: "生成图片", vizcompare: "视觉对比", designboard: "设计看板", preview: "方案预览",
@@ -57378,7 +57569,7 @@ function _createToolStep(call) {
   }
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "debug" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "office_write" || call.type === "office_edit" || call.type === "office_read" || call.type === "mcp" || call.type === "mcpconfig" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "debug" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "office_write" || call.type === "office_edit" || call.type === "office_read" || call.type === "mcp" || call.type === "mcpconfig" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -58742,9 +58933,9 @@ function _previewSimulateTool(call, res, vp, root) {
     // 而映射层从不产出 type "computer"（`case "computer"` 返回的是 type "automation"）。
     case "genimage": case "vizcompare": case "explain": case "worktree": case "office_write": case "office_edit": case "office_read":
     case "system": case "automation": case "readscreen": case "uiclick": case "remote":
-    case "qr": case "capture_start": case "capture_flows": case "capture_stop": case "capture_replay":
+    case "capture_start": case "capture_flows": case "capture_stop": case "capture_replay":
     case "demostart": case "demostop": case "background_monitor": case "localdiscovery":
-    case "liveenvironment": case "tor": case "search_tools":
+    case "liveenvironment": case "search_tools":
       ok("ok");
       rows([["tool", name], ["mode", "simulated for this gallery"], ["result", "completed"]]);
       return { type: t, path: call.path || "", content: "(simulated) tool completed." };
@@ -62853,28 +63044,6 @@ ${bodyPreview}`)}</pre>`;
         return { type: "http", path: call.url, content: `[失败] http_request 出错: ${msg}${retryNote}（检查 URL / 网络 / 方法；本机内网地址会被允许，但 169.254.x.x 链路本地被禁）` };
       }
 
-    } else if (call.type === "tor") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "tor", path: call.url || "", content: "[不可用] tor_request 只能在桌面 App 里用。" }; }
-      if (!call.url) { res.className = "atc-result atc-result--err"; res.textContent = "缺 url"; return { type: "tor", path: "", content: "[ERROR] tor_request 需要 url。" }; }
-      try {
-        const r = await backend.invoke("tor_request", { method: call.method || "GET", url: call.url, headers: call.headers || null, body: (call.body == null ? null : String(call.body)), timeoutSecs: Number.isFinite(call.timeout) ? call.timeout : null });
-        const ok = !!(r && r.ok);
-        res.className = ok ? "atc-result atc-result--ok" : "atc-result atc-result--err";
-        res.textContent = r ? `🧅 ${r.status} ${r.status_text || ""}`.trim() : "无响应";
-        const hdrs = r && r.headers ? Object.entries(r.headers).slice(0, 20).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
-        const bodyPreview = (r && r.body || "").slice(0, 4000);
-        if (vp) vp.innerHTML = `<pre>${_escHtml(`🧅 Tor ${call.method} ${call.url}
-→ ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}
-${r ? (r.content_type || "") : ""}${r && r.body_encoding ? "\nencoding: " + r.body_encoding : ""}
-
-${bodyPreview}`)}</pre>`;
-        return { type: "tor", path: call.url, ok, status: Number(r?.status), content: _clip(`🧅 Tor ${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`, 8000, "响应内容") };
-      } catch (e) {
-        const msg = String(e?.message || e).slice(0, 300);
-        res.className = "atc-result atc-result--err"; res.textContent = "Tor 请求失败";
-        return { type: "tor", path: call.url, content: `[失败] tor_request 出错: ${msg}` };
-      }
-
     } else if (call.type === "figma") {
       // 桌面走 Tauri IPC，网页走 fetch（Figma 开了 CORS）——两端都能用。
       res.className = "atc-result atc-result--title"; res.textContent = `Figma ${call.action || "design"}…`;
@@ -63297,28 +63466,6 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         return { type: "remote", path: call.op, content: `[失败] remote ${call.op}: ${_m}。${_hint}` };
       }
 
-    } else if (call.type === "qr") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "qr", path: call.path || "", content: "[不可用] decode_qr 只能在桌面 App 里用。" }; }
-      if (!call.path && !call.dataUrl) { res.className = "atc-result atc-result--err"; res.textContent = "缺 path"; return { type: "qr", path: "", content: "[ERROR] decode_qr 需要 path（二维码图片的文件路径，如一张截图或项目里的图）或 data_url（base64 图片）。" }; }
-      try {
-        let p = call.path || "";
-        // Re-root a relative path under the workspace (like read_file does), so the
-        // agent can pass "debug-kuaishou.png" and it resolves to the real file.
-        if (p && !p.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(p) && !p.startsWith("data:")) {
-          const cands = _relCandidates(p); p = (cands && cands[0]) || p;
-        }
-        const out = await backend.invoke("decode_qr", { path: p || null, dataUrl: call.dataUrl || null });
-        const list = Array.isArray(out) ? out : (out ? [String(out)] : []);
-        res.className = list.length ? "atc-result atc-result--ok" : "atc-result atc-result--err";
-        res.textContent = list.length ? `${list.length} 个二维码` : "未识别";
-        if (vp) vp.innerHTML = `<pre>${_escHtml(list.map((s, i) => `[${i + 1}] ${s}`).join("\n"))}</pre>`;
-        return { type: "qr", path: call.path || "", content: list.length ? `二维码内容（识别到 ${list.length} 个）:\n${list.map((s, i) => `[${i + 1}] ${s}`).join("\n")}` : "[ERROR] 没识别到二维码" };
-      } catch (e) {
-        const msg = String(e?.message || e).slice(0, 240);
-        res.className = "atc-result atc-result--err"; res.textContent = "识别失败";
-        return { type: "qr", path: call.path || "", content: `[失败] decode_qr: ${msg}` };
-      }
-
     } else if (call.type === "download") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "download", path: call.dest || "", content: "[不可用] download_file 只能在桌面 App 里用。" }; }
       if (!call.url || !call.dest) { res.className = "atc-result atc-result--err"; res.textContent = "缺参数"; return { type: "download", path: call.dest || "", content: "[ERROR] download_file 需要 url 和 dest。" }; }
@@ -63474,8 +63621,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         if (_bmRetired() && !suppressFollowup) return;
         if (dotClass === "done") _bmNotify(statusText + " — " + bmMsg);
         if (vp) {
-          const dot = vp.querySelector(".bm-dot"); if (dot) { dot.className = "bm-dot " + dotClass; }
-          const meta = vp.querySelector(".bm-meta"); if (meta) meta.textContent = statusText;
+          const bmCard = vp.querySelector(".bm-card"); if (bmCard) bmCard.dataset.state = dotClass;
+          const st = vp.querySelector(".bm-state"); if (st) st.textContent = statusText;
           const acts = vp.querySelector(".bm-actions"); if (acts) acts.remove();
         }
         if (!suppressFollowup) {
@@ -63499,8 +63646,23 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         vp.innerHTML = "";
         const card = document.createElement("div"); card.className = "bm-card";
         card.innerHTML =
-          `<div class="bm-head"><div class="bm-dot"></div><div class="bm-msg">${_escHtml(bmMsg)}</div></div>` +
-          `<div class="bm-meta">${_escHtml(_bmTypeLabels[bmType] || bmType)}${bmType !== "manual" ? ` · 监听中` : ""}</div>` +
+          // 头一行：呼吸指示点 + 在等什么（一句话）+ 一行灰的元信息（条件类型小标签 + 当前状态）。
+          // 状态文字单独占一个 span，收尾时只换它：整行重写会把条件类型那个标签一起抹掉。
+          `<div class="bm-head">` +
+            `<span class="bm-ind" aria-hidden="true"><span class="bm-ind__dot"></span></span>` +
+            `<div class="bm-head__body">` +
+              `<div class="bm-msg">${_escHtml(bmMsg)}</div>` +
+              `<div class="bm-meta">` +
+                `<span class="bm-tag">${_escHtml(_bmTypeLabels[bmType] || bmType)}</span>` +
+                // manual 那一档的状态留空：它的标签已经是「等用户确认」，再写一遍「等你确认」是同一句话
+                // 说两遍。空的时候 CSS 把它整个收掉，不留一个 gap。收尾时这里会被填上最终状态。
+                `<span class="bm-state">${bmType === "manual" ? "" : "监听中"}</span>` +
+              `</div>` +
+            `</div>` +
+          `</div>` +
+          // **在等什么**要摆在卡片上。原来只说「等命令成功」，而"哪条命令"只有终端里才看得到——
+          // 用户看着这张卡，唯一想知道的就是它到底在等什么。太长省略，全文进 title。
+          (bmPat ? `<div class="bm-cond" title="${_escAttr(bmPat)}">${_escHtml(bmPat)}</div>` : "") +
           `<div class="bm-actions">` +
             (bmType === "manual" ? `<button class="bm-btn bm-btn--primary _bmContinue">已完成，继续</button>` : "") +
             `<button class="bm-btn _bmCancel">取消等待</button>` +
@@ -63541,7 +63703,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           const elapsed = (Date.now() - _bmStart) / 1000;
           _bmChecks++;
           // 不再显示「Xs / Ys」倒计时和进度条——用户要的是「监听中」而不是一个滴答的表。
-          // 卡片头上的 .bm-dot 一直在脉动，那就是「还在听」的活性指示；这里什么都不刷。
+          // 卡片头上的 .bm-ind__dot 一直在呼吸，那就是「还在听」的活性指示；这里什么都不刷。
           if (elapsed > bmTimeout) {
             _bmFinish("timeout", "监听结束（未捕捉到）", `[background_monitor 超时] 一直在监听「${bmMsg}」但没等到条件（检查 ${_bmChecks} 次）。${_bmCmdTimedOut
               ? `\n\n⚠️ **注意：你这条检查命令每次都被自己的超时杀掉了**（每次最多给它几十秒）。也就是说条件在结构上就不可能成立，不是"用户没做完"。换一条跑得快的判据（探端口/探 URL/看文件），或者把这条慢命令交给 run_in_terminal 起起来再监听它的产物。`
@@ -73031,7 +73193,50 @@ function buildMenubar() {
   };
 
   const MENUS = getMenus();
-  MENUS.forEach((menu, i) => {
+
+  /*
+   * 紧凑模式：一个「≡」代替整排菜单名，占 buttons/panels 的第 0 位。
+   * 标题栏一窄（或界面一放大）标题先被挤成 0、然后右侧工具组整个推出屏幕——菜单名是这一行
+   * 唯一能收的东西。收进来的只是入口：点「≡」列出五个菜单名，再点进原来那份面板
+   * （openMenu(i+1)），面板代码一行不改。什么时候收由 _syncTitlebarCompact 决定。
+   */
+  {
+    const wrap = document.createElement("div");
+    wrap.className = "tb-menu tb-menu--compact";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tb-menu__btn tb-menu__btn--compact";
+    btn.textContent = "\u2261";
+    btn.title = t("menu.compact");
+    btn.setAttribute("aria-label", t("menu.compact"));
+    btn.setAttribute("aria-haspopup", "true");
+    btn.setAttribute("aria-expanded", "false");
+    const panel = document.createElement("div");
+    panel.className = "menu menu--tb";
+    panel.setAttribute("role", "menu");
+    panel.hidden = true;
+    MENUS.forEach((menu, i) => {
+      const mi = document.createElement("div");
+      mi.className = "menu__item menu__item--compact-head";
+      mi.setAttribute("role", "menuitem");
+      mi.innerHTML = `<span class="name"></span>`;
+      mi.querySelector(".name").textContent = menu.label;
+      mi.addEventListener("click", (e) => { e.stopPropagation(); openMenu(i + 1); });
+      panel.appendChild(mi);
+    });
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (openIdx === 0) closeMenu();
+      else openMenu(0);
+    });
+    wrap.append(btn, panel);
+    bar.appendChild(wrap);
+    buttons.push(btn);
+    panels.push(panel);
+  }
+
+  MENUS.forEach((menu) => {
+    const i = buttons.length;   // 第 0 位是紧凑入口，真正的菜单从 1 起
     const wrap = document.createElement("div");
     wrap.className = "tb-menu";
     const btn = document.createElement("button");
@@ -73092,7 +73297,35 @@ function buildMenubar() {
   _menubarDocKey = (e) => { if (e.key === "Escape") closeMenu(); };
   document.addEventListener("click", _menubarDocClick);
   document.addEventListener("keydown", _menubarDocKey);
+  _syncTitlebarCompact();
 }
+
+/*
+ * 标题栏要不要收成「≡」。判据是**标题还剩多少**，不是「有没有溢出」：这一行只有标题会缩，
+ * 真溢出的时候标题早就是 0 了。每次都先摘掉 is-compact 再量，同一宽度下结果确定，不会来回翻。
+ * scrollWidth / offsetWidth 在两个引擎里都是 CSS 像素（getBoundingClientRect 在 Chromium 里
+ * 是已缩放的，不能拿来比阈值）。
+ */
+function _syncTitlebarCompact() {
+  const tb = document.querySelector(".titlebar");
+  if (!tb) return;
+  tb.classList.remove("is-compact");
+  void tb.offsetWidth;
+  const title = tb.querySelector(".titlebar__title");
+  const overflow = tb.scrollWidth - tb.clientWidth;
+  const titleW = title ? title.offsetWidth : 0;
+  if (overflow > 0 || titleW < 72) tb.classList.add("is-compact");
+}
+// 挂在 .titlebar 上：窗口拖宽拖窄、界面缩放（根 zoom 一变它的 CSS 宽就变）都会报。
+// 引用要留住——一个没人引用的 ResizeObserver 可能被回收。
+let _titlebarCompactRO = null;
+try {
+  const _tbEl = document.querySelector(".titlebar");
+  if (_tbEl && typeof ResizeObserver !== "undefined") {
+    _titlebarCompactRO = new ResizeObserver(() => _syncTitlebarCompact());
+    _titlebarCompactRO.observe(_tbEl);
+  }
+} catch {}
 
 // ---- wiring ----
 async function chooseFolder() {

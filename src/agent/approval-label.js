@@ -124,7 +124,6 @@ export function approvalLabel(call, deps = {}) {
       title: "操作系统 / 其它应用？",
       detail: `${call.action || call.op || "?"} ${String(call.app || call.target || call.item || "")}`.trim().slice(0, 300),
     };
-    case "tor": return { title: "经 Tor 网络发送请求？", detail: String(call.url || "").slice(0, 300) };
     // 关键信息是「改不改系统代理」，不是工具名：改了的话整台机器的流量都会走本地
     // mitmproxy，接着还要用户 sudo 装一张根证书。这必须写进 detail。
     case "capture_start": return {

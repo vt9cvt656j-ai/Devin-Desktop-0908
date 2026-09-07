@@ -36,32 +36,59 @@ export function mergeJournalIntoDrafts(snapshots, journal) {
   for (const j of Array.isArray(journal) ? journal : []) {
     if (!j || typeof j.sessionId !== "string") continue;
     const cur = out.get(j.sessionId);
-    if (!cur) { out.set(j.sessionId, { sessionId: j.sessionId, text: j.text || "", reasoning: j.reasoning || "", steps: "" }); continue; }
+    if (!cur) {
+      const fresh = { sessionId: j.sessionId, text: j.text || "", reasoning: j.reasoning || "", steps: "" };
+      if (typeof j.html === "string" && j.html) { fresh.html = j.html; fresh.htmlAt = Number(j.htmlAt) || 0; }
+      out.set(j.sessionId, fresh); continue;
+    }
     const jt = String(j.text || ""), jr = String(j.reasoning || "");
     if (jt.length > String(cur.text || "").length) cur.text = jt;
     if (jr.length > String(cur.reasoning || "").length) cur.reasoning = jr;
+    // 关闭前那一刻的 DOM 快照：两边都可能有（退出 flush 写进快照、3s 节拍写进日志），按拍摄时间取新的。
+    if (typeof j.html === "string" && j.html && (Number(j.htmlAt) || 0) >= (Number(cur.htmlAt) || 0)) {
+      cur.html = j.html; cur.htmlAt = Number(j.htmlAt) || 0;
+    }
   }
   return [...out.values()];
 }
 
+/** 在途消息 DOM 快照的落盘节拍（毫秒）：比 400ms 的 delta 节拍慢，因为一次是整条消息的克隆 + 序列化。 */
+export const HTML_SNAPSHOT_INTERVAL_MS = 3000;
+
 /**
  * 一拍：把每个会话缓冲的 delta 增量刷进 Rust 真文件；收尾会话删其日志文件。
  * 逻辑放模块里（main.js 有尺寸闸），main.js 只留一个 setInterval 薄壳注入 invoke。
+ * 另外每 HTML_SNAPSHOT_INTERVAL_MS 把在途消息的 DOM 快照（`opts.snapshotHtml(session)`，由 main.js 注入
+ * draft-recovery.js 的 liveMessageHtml）整份写进 Rust 文件——恢复时按「关闭前那一刻」原样塞回。
+ * 只在内容变了才写；没变的快照写了也是白写。
  * @param {Array} sessions  _chatSessions
  * @param {(cmd:string,args:object)=>Promise} invoke  backend.invoke
+ * @param {{snapshotHtml?:(s:object)=>string, now?:()=>number}} [opts]
  */
-export async function drainJournal(sessions, invoke) {
+export async function drainJournal(sessions, invoke, opts = {}) {
+  const snapshotHtml = typeof opts?.snapshotHtml === "function" ? opts.snapshotHtml : null;
+  const now = typeof opts?.now === "function" ? opts.now() : Date.now();
   for (const s of Array.isArray(sessions) ? sessions : []) {
     if (!s?.id) continue;
     if (s._journalClearPending) {
       s._journalClearPending = false;
+      s._draftHtmlLast = "";
       try { await invoke("stream_draft_clear", { sessionId: s.id }); } catch {}
       continue;
     }
     const buf = s._journalBuf;
-    if (!buf || !buf.length) continue;
-    for (const rec of groupDeltasByGen(buf.splice(0, buf.length))) {
-      try { await invoke("stream_draft_append", { sessionId: s.id, gen: rec.gen, text: rec.text, reasoning: rec.reasoning }); } catch {}
+    if (buf && buf.length) {
+      for (const rec of groupDeltasByGen(buf.splice(0, buf.length))) {
+        try { await invoke("stream_draft_append", { sessionId: s.id, gen: rec.gen, text: rec.text, reasoning: rec.reasoning }); } catch {}
+      }
     }
+    if (!snapshotHtml || !s.streaming || !s._liveMsgEl) continue;
+    if (now - (Number(s._draftHtmlAt) || 0) < HTML_SNAPSHOT_INTERVAL_MS) continue;
+    s._draftHtmlAt = now;
+    let html = "";
+    try { html = String(snapshotHtml(s) || ""); } catch { html = ""; }
+    if (!html || html === s._draftHtmlLast) continue;
+    s._draftHtmlLast = html;
+    try { await invoke("stream_draft_snapshot", { sessionId: s.id, gen: Number(s._runGen) || 0, at: now, html }); } catch {}
   }
 }

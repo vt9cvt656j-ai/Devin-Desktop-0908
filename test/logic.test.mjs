@@ -1988,7 +1988,8 @@ test("account dropdown keeps logged-in text contained and puts logout at the bot
   assert.ok(logoutAt > logoutDividerAt, "logout button should be the final bottom account action");
   assert.match(settingsBlock, /class="settings-dropdown__account"/,
     "account text should have its own flex child so long emails can shrink");
-  assert.match(APP_CSS, /\.settings-dropdown\s*\{[^}]*width:\s*156px;[\s\S]*max-width:\s*calc\(100vw - 16px\);[\s\S]*overflow:\s*hidden;/,
+  // 100vw 在 CSS zoom 下不跟着缩（Chromium 实测），所以这里也接受 var(--ew, 100vw) 那个有效视口变量。
+  assert.match(APP_CSS, /\.settings-dropdown\s*\{[^}]*width:\s*156px;[\s\S]*max-width:\s*calc\((?:var\(--ew, 100vw\)|100vw) - 16px\);[\s\S]*overflow:\s*hidden;/,
     "dropdown surface should keep its original compact width while clipping to the viewport");
   assert.match(APP_CSS, /\.settings-dropdown__account\s*\{[^}]*min-width:\s*0;[\s\S]*overflow:\s*hidden;/,
     "flex account wrapper must be allowed to shrink instead of overflowing");
@@ -2442,7 +2443,8 @@ test("advanced tools panel exposes Settings Growth Adaptive and Shortcuts", () =
   // 侧栏宽度从写死 236px 改成 clamp(172px, 18vw, 236px)：写死时窗口一窄、或者 ⌘+ 放大
   // 之后，它会把右边内容挤成一条细缝。断言改成"有一条独立的左侧导航栏且宽度是收放的"，
   // 而不是钉某个像素值——钉像素值正是上一版拦住这次改进的原因。
-  assert.match(APP_CSS, /\.feature-panel__main\s*\{[^}]*grid-template-columns:\s*clamp\([^)]*\) minmax\(0,\s*1fr\);/,
+  // clamp 的中间项现在是 calc(var(--ew, 100vw) * 0.18)（vw 在 CSS zoom 下不缩），calc 里还套着 var，要允许两层括号嵌套。
+  assert.match(APP_CSS, /\.feature-panel__main\s*\{[^}]*grid-template-columns:\s*clamp\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\) minmax\(0,\s*1fr\);/,
     "左侧导航栏没了，或者宽度又被写死成一个像素值");
   // 内容列必须居中：全屏之后内容区能有两千像素宽，左对齐会空掉右边一大片。
   assert.match(APP_CSS, /\.feature-panel__body > \*\s*\{[^}]*margin-left:\s*auto;[\s\S]{0,60}margin-right:\s*auto;/,
@@ -4863,8 +4865,6 @@ test("runtime tool schemas reject missing required parameters for native and tex
   assert.equal(unknownRejected[0].name, "made_up_tool");
   assert.match(SRC, /name: "http_request"[\s\S]{0,1600}required: \["url"\]/,
     "http_request schema should match the executor's GET default");
-  assert.match(SRC, /name: "tor_request"[\s\S]{0,1200}required: \["url"\]/,
-    "tor_request schema should match the executor's GET default");
 });
 
 test("tool cards always have a label and skipped paths settle their spinner", () => {
@@ -9192,8 +9192,16 @@ test("total tool payload keeps a bounded core and swaps requested MCP schemas fr
   // 但慢路径上它必须还在——不等完就发编排器调用，那次调用看到的目录是不全的。
   assert.match(SRC, /if \(!exact\?\.schema && !fastAdds\) \{\n\s*await _waitForRunMcpDiscovery\(run\);/,
     "慢路径必须仍然等 MCP 发现，否则编排器拿到的是不全的目录");
-  assert.match(SRC, /if \(call && call\.type === "search_tools"\) \{[\s\S]{0,1400}await _waitForRunMcpDiscovery\(run\)/,
-    "等待仍然属于 search_tools 这一支，没被挪到别处");
+  // 判据不写成「分支起点后 N 字符内」：分支一变长就假红（2026-09-07 加分类通道那次就超了 1400）。
+  // 切到等待点为止，要求中间没有别的 call.type 分支头——也就是等待没被挪到别的工具那一支去。
+  {
+    const waitAt = SRC.indexOf("await _waitForRunMcpDiscovery(run)");
+    const heads = [...SRC.matchAll(/if \(call && call\.type === "search_tools"\) \{/g)].map((m) => m.index).filter((i) => i < waitAt);
+    assert.ok(waitAt > 0 && heads.length > 0, "主循环的 search_tools 分支或 MCP 等待点找不到了");
+    const between = SRC.slice(heads[heads.length - 1], waitAt);
+    assert.ok(between.length > 200, `分支只切出 ${between.length} 字符，切法坏了`);
+    assert.doesNotMatch(between, /call\.type === "(?!search_tools")/, "等待仍然属于 search_tools 这一支，没被挪到别处");
+  }
   // 快通道：本地命中够硬时既不等 MCP，也不发那次编排器网络调用。
   assert.match(SRC, /const _confident = _confidentFuzzyResolution\(fastHits\);/);
   const confident = extractFn("_confidentFuzzyResolution");
@@ -17992,8 +18000,9 @@ test("reply stats footer uses exact server settlements on both chat paths", () =
   const creditValue = load("_creditUsdValue", { _MICHAEL_RAW_CENTS_PER_CREDIT_USD: 663 });
   const usd = load("_dispUsd", { _creditUsdValue: creditValue });
   assert.equal(creditValue(663), 1, "$6.63 of raw billing is exactly $1.00 of user credit");
-  assert.equal(usd(663), "$1.00");
-  assert.equal(usd(23), "$0.03", "the screenshot's 23 raw cents uses the 6.63:1 denomination");
+  // 2026-09-07 起三位小数：几厘钱的一轮按两位会印成 $0.00，用户以为没扣费。
+  assert.equal(usd(663), "$1.000");
+  assert.equal(usd(23), "$0.035", "the screenshot's 23 raw cents uses the 6.63:1 denomination");
   const addSettlement = load("_addRunSettlement");
   const liveSettlement = load("_liveRunSettlement");
   const finalSettlement = load("_finalRunSettlement", { _liveRunSettlement: liveSettlement });
@@ -18042,17 +18051,22 @@ test("reply stats footer uses exact server settlements on both chat paths", () =
     (n) => n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n),
     usd,
   );
-  assert.doesNotMatch(statsText({ elapsedMs: 1200 }).html, /token|\$/i);
+  // 2026-09-07 所有者点名「任何时刻都要有 token 和金额那两格」：什么都还没有时印 —，不藏格。
+  const bare = statsText({ elapsedMs: 1200 }).html;
+  assert.equal((bare.match(/turn-stats__item/g) || []).length, 3, "秒表 / 输入·输出 / 金额三格必须一直都在");
+  assert.match(bare, /—\/—/); assert.match(bare, /\$—/);
+  assert.doesNotMatch(bare, /≈/, "没有在途估算就不该挂 ≈");
   const liveHtml = statsText({ elapsedMs: 1200, settlement: partial }).html;
   const liveText = liveHtml.replace(/<[^>]+>/g, "");
   assert.match(liveHtml, /1\.2k\/56/);
   assert.doesNotMatch(liveText, /In|Out|Cache|read|write|unreported/i);
-  assert.match(liveHtml, /\$0\.02/);
+  assert.match(liveHtml, /\$0\.015/);
+  assert.doesNotMatch(liveHtml, /≈/, "全部已结算就不该挂 ≈");
   assert.doesNotMatch(liveHtml, /估算/);
   const statsSource = SRC.slice(RAW_SRC.indexOf("function _turnStatsText"), RAW_SRC.indexOf("function _liveTurnStats"));
   assert.match(statsSource, /settlement\.usageReported/);
   assert.match(statsSource, /Usage unavailable/);
-  assert.match(statsSource, /_dispUsd\(settlement\.costCents\)/);
+  assert.match(statsSource, /_dispUsd\(\(costCents \|\| 0\) \+ \(pendCost \|\| 0\)\)/, "金额 = 已结算 + 在途估算");
   // 这里原来钉的是模块级注释里那句 "663 raw cents ($6.63) = $1.00 of visible quota/credits"。
   // 注释不是代码：把常量改掉、注释留着，断言照样绿。契约（663:1 这个分母写死在源码里可查证）
   // 由下面那条常量断言完整承担，注释这条去掉。
@@ -20581,20 +20595,33 @@ test("流式草稿恢复：双通道取较新者，两侧都消费后清槽", as
   const both = await take3();
   assert.deepEqual(both.map((d) => d.sessionId).sort(), ["a", "b"], "并发流式时另一个标签的整轮输出被丢掉了");
 
-  // 恢复渲染完整性：草稿全文进 memory（push 不截断），并强制从持久历史重建可见窗口
-  assert.ok(SRC.includes("for (const _draft of await _streamDraftTake())"),
-    "恢复路径必须遍历所有会话的草稿，只取一份会丢掉并发标签页的整轮输出");
+  // 恢复渲染完整性：草稿全文进 memory（push 不截断），并强制从持久历史重建可见窗口。
+  // 两条通道（2s 快照 + Rust 增量日志）按会话合并后逐个遍历——只取一份会丢掉并发标签页的整轮输出。
+  assert.ok(SRC.includes("for (const _draft of mergeJournalIntoDrafts(await _streamDraftTake(), _journalDrafts))"),
+    "恢复路径必须遍历所有会话的草稿（两条通道合并后），只取一份会丢掉并发标签页的整轮输出");
   // 进历史的必须是**全文**，不许在这里 slice。正文捕成 _draftText = String(_draft.text||"")
-  // （全量），横幅+步骤之后接上它。步骤清单插在中间是刻意的（见恢复处注释）。
-  assert.ok(/以下为已生成的部分）[\s\S]{0,400}\+ _draftText/.test(SRC),
-    "中断恢复必须把草稿全文补进历史（横幅之后要接上 _draftText 全文）");
+  // （全量），步骤清单之后接上它。步骤清单插在前面是刻意的（给模型的执行事实，见恢复处注释）。
+  assert.match(SRC, /content: \(_steps \? `\$\{_steps\}\\n\\n` : ""\) \+ _draftText,/,
+    "中断恢复必须把草稿全文补进历史（步骤之后要接上 _draftText 全文）");
+  // 2026-09-06 用户原话「不要提示……关闭前啥样，他就要啥样」：横幅一句都不许再进正文，
+  // 「被打断」是状态（_ideMeta.interrupted → 消息底下一行状态 + 下一轮的 run._resumeFact）。
+  assert.doesNotMatch(SRC, /因软件重启被打断，下面是已经写出的部分|因软件重启被打断了——模型还没开始写回答/,
+    "恢复消息又带横幅了——那是 harness 替模型说话");
+  assert.match(SRC, /_ideMeta: \{ interrupted: "restart" \}/, "打断这件事要挂成状态，不是正文");
+  assert.match(SRC, /_lastRunState = \{ \.\.\.\(_draftSession\._lastRunState \|\| \{\}\), interruptedByRestart: true \}/,
+    "横幅不进正文之后，模型只能从状态里知道上一轮被打断——这条通道不能断");
+  assert.match(SRC, /session\?\._lastRunState\?\.interruptedByRestart\)/, "run 起点没有消费 interruptedByRestart，状态写了没人读");
+  // 关闭前那一刻的 DOM 快照：恢复时挂到 session，_renderMsgRange 按 _ideMeta.interrupted + 探针认领后整块塞回。
+  assert.match(SRC, /_recoveredMsgHtml = \{ html: _html, probe: _probe \}/, "DOM 快照没挂到会话上，工具卡照样塌成文字");
+  assert.match(extractFn("_renderMsgRange"), /_wrap\.replaceWith\(markRecoveredMessage\(_node, \{ document \}\)\)/,
+    "渲染历史时没有把 DOM 快照塞回去");
   assert.match(SRC, /const _draftText = String\(_draft\.text \|\| ""\);/,
     "恢复处必须先把草稿正文原样捕成全量变量，不许 slice");
   assert.doesNotMatch(SRC, /_draft(?:\.text|Text)\.slice\(/,
     "草稿正文在恢复处被截断了——那正是「显示一点点」的另一种写法");
   // 思考（reasoning）也存了、也是被渲染过的内容，恢复时不能丢：以前只拼 steps+text，
   // 「✓ 思考」只剩一个勾。现在带上，走 assistant.reasoning 那条渲染老路。
-  assert.match(SRC, /if \(_draftReasoning\.trim\(\)\) _msg\.reasoning = _draftReasoning;/,
+  assert.match(SRC, /if \(_hasReason\) \{\s*_msg\.reasoning = _draftReasoning;/,
     "中断恢复丢了草稿里的思考内容——reasoning 存了却没补进恢复的消息");
   // 被打断在工具执行途中（满是步骤、正文还没落）的那一轮不能整条消失：
   // 可恢复内容 = 正文/思考/步骤三者任一非空，探针也退到思考而不是只认正文。
@@ -23629,7 +23656,7 @@ test("#95: 在册工具的 catch 块返回内容可被失败记忆框架检测",
   // 桌面自动化 (4 个)
   const desktopTools = ["readscreen", "uiclick", "system", "automation"];
   // 其他 (3 个)
-  const otherTools = ["tor", "realtime_news_feed"];
+  const otherTools = ["realtime_news_feed"];
   const allTools = [...locationTools, ...designTools, ...desktopTools, ...otherTools];
   // design_research 走子智能体路径(type:"subagent")，不在 _executeToolStepInner 中直接处理
   const directTools = allTools.filter(t => t !== "designresearch");
@@ -23647,13 +23674,13 @@ test("#95: 在册工具的 catch 块返回内容可被失败记忆框架检测",
   // system 工具返回 [系统控制失败] —— 这是本次修复新增的模式
   assert.match(SRC, /call\.type === "system"[\s\S]{0,3000}\[系统控制失败\]/,
     "system catch 块返回 [系统控制失败]");
-  // readscreen / uiclick / automation / tor 返回 [失败]
+  // readscreen / uiclick / automation 返回 [失败]
   //
   // 判据不能写成「分支起点后 3000 字符内出现 [失败]」：分支一变长（automation 那条这次
   // 就因为补了方法校验和更细的报错文案而超了），断言会以「catch 块不返回 [失败]」的
   // 形式**假红**——而它其实好好的。反过来更糟：窗口内恰好扫到隔壁分支的 [失败] 会假绿。
   // 改成切到**下一个 else if (call.type ===** 为止，也就是这条分支自己的范围。
-  for (const tool of ["readscreen", "uiclick", "automation", "tor"]) {
+  for (const tool of ["readscreen", "uiclick", "automation"]) {
     const at = SRC.indexOf(`call.type === "${tool}"`);
     assert.ok(at > 0, `工具 ${tool} 的执行分支找不到了`);
     const next = SRC.indexOf('} else if (call.type === "', at + 10);
@@ -27695,8 +27722,6 @@ test("批一次 POST 不等于批下所有出站请求——按域名和方法�
   // 域名和方法，不是 /records/1 还是 /records/2。
   assert.equal(http("POST", "https://httpbin.org/post"), http("post", "https://httpbin.org/post?x=1#f"),
     "同源同方法的另一条路径不该再问一遍");
-  // tor 和 http 各记各的：一个走用户平时的出口，一个整条链路绕开它。
-  assert.notEqual(http("GET", "https://x.test/a"), key({ type: "tor", method: "GET", url: "https://x.test/a" }, run));
   // 谁都不该再落回那条粗粒度兜底。
   assert.doesNotMatch(http("POST", "https://httpbin.org/post"), /\btype:http\b/);
 });
@@ -27705,7 +27730,6 @@ test("出站请求的「总是允许」按钮要写明是哪个站、哪个方�
   const label = load("_approvalAlwaysLabel");
   assert.match(label({ type: "http", method: "POST", url: "https://httpbin.org/post" }), /httpbin\.org/);
   assert.match(label({ type: "http", method: "POST", url: "https://httpbin.org/post" }), /POST/);
-  assert.match(label({ type: "tor", method: "GET", url: "https://x.test/a" }), /Tor/);
   // 说不清范围就别给这个按钮——和 download 同一条规矩。
   assert.equal(label({ type: "http", method: "POST", url: "" }), "");
 });
@@ -31873,7 +31897,7 @@ test("被打断的 run 恢复出来要带上这一轮执行过的步骤", () => 
     "恢复时没有从草稿里取出步骤");
   // 只钉「取了值」是假断言：把下面那行拼接删掉、只留取值，它照样绿（变异实测漏网）。
   // 必须钉住 content 里**真的把 _steps 接了进去**。
-  assert.match(src, /\+ \(_steps \? `\$\{_steps\}\\n\\n` : ""\)/,
+  assert.match(src, /content: \(_steps \? `\$\{_steps\}\\n\\n` : ""\) \+ _draftText,/,
     "步骤取出来了却没拼进那条消息——恢复出来还是只有叙述");
 
   // recording 必须够得着：run 创建时挂上 session._activeRun，收尾时解引用。
@@ -32302,7 +32326,6 @@ test("对外发东西的工具也要走审批，不能只有 git 会问", async 
   // 同一个 URL，内建 http 发 DELETE 直接就发，而用户自己接的 userhttp 每次都问
   assert.equal(req({ type: "http", method: "DELETE", url: "https://x/1" }), true);
   assert.equal(req({ type: "http", method: "GET", url: "https://x/1" }), false);
-  assert.equal(req({ type: "tor", url: "http://x.onion" }), true, "Tor 绕开常规网络出口，无条件问");
   // 建目录 + 顶掉当前工作区、改系统代理，两条以前都没有声明
   assert.equal(req({ type: "createproject", name: "x" }), true);
   assert.equal(req({ type: "capture_start", systemProxy: true }), true);
@@ -32376,7 +32399,7 @@ test("网页版不提供跑不了的工具", () => {
   const at = RAW_SRC.indexOf("const desktopOnly = new Set([");
   const block = SRC.slice(at, RAW_SRC.indexOf("])", at));
   // 执行器里以 !inTauri 开头硬返回「[不可用]」的那些类型，对应的工具名都得在名单里
-  for (const name of ["arxiv_search", "db_query", "gh_pr_view", "worktree", "tor_request",
+  for (const name of ["arxiv_search", "db_query", "gh_pr_view", "worktree",
                       "ui_extract", "package_search", "visual_compare", "probe_env"]) {
     assert.ok(block.includes(`"${name}"`), `${name} 在网页版里必然报「只能在桌面 App 里用」，却照样把 schema 发给模型`);
   }
@@ -38450,7 +38473,8 @@ test("两侧栏允许收缩，窄宽度下不被裁到屏幕外", () => {
     );
     // 下限现在按**物理像素**写：calc(140px / var(--ui-zoom))。裸 140px 在放大时会跟着
     // 变大，等于下限自己吃掉更多屏幕 —— 所以这里认 calc 形式，不再认裸像素。
-    assert.match(r, /min-width:\s*calc\(\d+px \/ var\(--ui-zoom/, `${sel} 没有最小宽度，会被压成 0`);
+    // 助手栏是 max(calc(物理 / 缩放), 内容下限)：放大时物理下限会低于输入栏那一行的内容下限，见 app.css。
+    assert.match(r, /min-width:\s*(?:max\()?calc\(\d+px \/ var\(--ui-zoom/, `${sel} 没有最小宽度，会被压成 0`);
   }
   // 编辑器守住自己的下限，收缩的是两侧。
   assert.match(rule(".layout .editorwrap"), /min-width:\s*calc\(200px \/ var\(--ui-zoom/);
@@ -38661,7 +38685,8 @@ test("浮层定位一律按 CSS 视口夹取，不许混进物理像素", () => 
   let rest = RAW_SRC;
   // 该用物理口径的，各自问的都是「这块屏幕有多大」，与布局坐标系无关；
   // viewportW/H 自己的兜底也在里面（量不到 CSS 视口时退回 innerWidth，总比返回 0 强）。
-  for (const name of ["_uiZoomCeiling", "_applyLayoutDensity", "viewportW", "viewportH"]) {
+  // _syncEffectiveViewport 算的就是「物理 ÷ 缩放」写进 --eh/--ew，它必须读物理值。
+  for (const name of ["_uiZoomCeiling", "_applyLayoutDensity", "_syncEffectiveViewport", "viewportW", "viewportH"]) {
     const src = extractFn(name);
     assert.ok(rest.includes(src), `${name} 不见了 —— 白名单失效，这条断言会变成恒真`);
     rest = rest.replace(src, "");

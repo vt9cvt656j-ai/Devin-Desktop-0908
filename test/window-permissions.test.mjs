@@ -254,10 +254,10 @@ test("三栏布局的硬底仍然存在，只是从 890px 降到了 640px（这�
   for (const sel of [".layout .explorer", ".layout .assistant"]) {
     // 下限现在按**物理像素**写：calc(140px / var(--ui-zoom))。裸 140px 在放大时会跟着
     // 变大，等于下限自己多吃屏幕 —— 所以认 calc 形式，不再认裸像素。
-    assert.match(rule(sel), /min-width:\s*calc\(\d+px \/ var\(--ui-zoom/, sel + " 没有最小宽度，会被一路压成 0");
+    assert.match(rule(sel), /min-width:\s*(?:max\()?calc\(\d+px \/ var\(--ui-zoom/, sel + " 没有最小宽度，会被一路压成 0");
     assert.ok(!/flex:\s*none/.test(rule(sel)), sel + " 又变回不可收缩了 —— 890px 以下就会裁");
   }
-  assert.match(rule(".layout .editorwrap"), /min-width:\s*calc\(200px \/ var\(--ui-zoom/, "编辑器丢了自己的下限");
+  assert.match(rule(".layout .editorwrap"), /min-width:\s*(?:max\()?calc\(200px \/ var\(--ui-zoom/, "编辑器丢了自己的下限");
   assert.match(css, /\.layout\s*\{[\s\S]{0,200}overflow: hidden;/,
     "布局不再裁切了——那样窗口过窄只会出横向滚动条，不再是「控件够不着」");
 });

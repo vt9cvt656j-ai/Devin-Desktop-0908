@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 146,
+  "count": 144,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -579,11 +579,6 @@
       "desktopOnly": true
     },
     {
-      "name": "tor_request",
-      "group": "Web & browser",
-      "desktopOnly": true
-    },
-    {
       "name": "package_source",
       "group": "Knowledge",
       "desktopOnly": false
@@ -625,11 +620,6 @@
     },
     {
       "name": "capture_replay",
-      "group": "Web & browser",
-      "desktopOnly": true
-    },
-    {
-      "name": "decode_qr",
       "group": "Web & browser",
       "desktopOnly": true
     },

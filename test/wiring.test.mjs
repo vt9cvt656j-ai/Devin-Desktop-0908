@@ -2960,3 +2960,46 @@ test("Windows 的高级设置面板退回实色，且退回用的令牌真的不
   assert.match(baseDecl, /(?<!-)backdrop-filter:\s*blur\(/,
     "侧栏的基础毛玻璃被删了——mac 上那层材质是设计的一部分，Windows 的回退不该波及它");
 });
+
+/**
+ * 输入栏必须跟着助手栏的宽度让位，而且那几条覆盖规则必须**排在原规则后面**才算数。
+ *
+ * 2026-09-06 实测：助手栏窄于 ~384px，最右边的发送键就被顶出可视区；面板当时的下限是
+ * 240px，而自适应档位自己还会把它压到 330（tight）/ 290（min）—— 两档都在阈值以下，
+ * 等于档位主动把输入栏推进坏状态。修法是让 ⌘↵ 提示先收、模型名再截断、模式名最后截断。
+ *
+ * 这条断言的重点是**顺序**，不是「规则在不在」：.mode-picker 原本写着 flex-shrink:0，
+ * 覆盖它的那条同为单类选择器、特异性一样，只能靠源码顺序赢。落地时我把整块插到了原规则
+ * 前面，四条规则全部失效而测试照样绿——所以这里必须比位置。
+ */
+test("输入栏的让位规则排在原规则之后，且助手栏下限容得下让完之后的宽度", () => {
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+
+  const shrinkZero = css.indexOf(".mode-picker { position: relative; flex-shrink: 0; }");
+  const override = css.indexOf(".mode-picker { flex: 0 10 auto;");
+  assert.ok(shrinkZero > 0, "找不到 .mode-picker 那条 flex-shrink:0——下面的顺序比较会恒真");
+  assert.ok(override > 0, "输入栏的让位覆盖没了：助手栏一窄，发送键会被顶出可视区");
+  assert.ok(override > shrinkZero,
+    "让位覆盖排在了 flex-shrink:0 前面。两条都是单类选择器、特异性相同，只能靠顺序决胜——"
+    + "排前面就是一条死规则，而测试不会因此变红");
+
+  // 会挤压的那三项都要能缩到 0 或缩到只剩图标，否则挤压量不够、发送键照样出框。
+  assert.match(css, /\.composer__bar \{ min-width: 0; \}/, "输入栏自己不许有最小宽度下限");
+  // `[1-9]\d*` 而不是 `\d+`：\d+ 连 `flex: 0 0 auto`（＝根本不让位）都放过去，
+  // 那正是这条断言要拦的东西。变异测试第一次就是这么假绿的。
+  assert.match(css, /\.composer__hint \{ flex: 0 [1-9]\d* auto; min-width: 0;[^}]*overflow: hidden/,
+    "⌘↵ 提示要第一个让位（收到 0 宽），它是这一行里唯一可以整个消失的东西");
+  for (const sel of ["model-picker", "mode-picker"]) {
+    const m = css.match(new RegExp(`\\.${sel} \\{ flex: 0 [1-9]\\d* auto; min-width: (\\d+)px; \\}`));
+    assert.ok(m, `.${sel} 没有「只剩图标」的宽度下限——它会被压成 0 宽，整个选择器从界面上消失`);
+    assert.ok(Number(m[1]) >= 40, `.${sel} 的下限 ${m[1]}px 连两个图标都装不下`);
+  }
+
+  // 面板下限必须 ≥ 让完之后需要的宽度，否则那一段是「拖得到但一定坏」。
+  const floor = css.match(/min-width: calc\((\d+)px \/ var\(--ui-zoom, 1\)\);/g) || [];
+  const asst = css.match(/\.layout \.assistant \{[\s\S]*?min-width: (?:max\()?calc\((\d+)px/);
+  assert.ok(asst, "找不到助手栏的最小宽度");
+  assert.ok(Number(asst[1]) >= 268,
+    `助手栏下限 ${asst[1]}px 小于输入栏让完之后的实测下限 268px——这一段拖得到，但拖进去发送键就出框`);
+  assert.ok(floor.length > 0);
+});
