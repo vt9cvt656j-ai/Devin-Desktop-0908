@@ -20,6 +20,7 @@ use headless_chrome::protocol::cdp::{
 use crate::human_input;
 use headless_chrome::browser::tab::point::Point;
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
+use headless_chrome::protocol::cdp::types::Event as CdpEvent;
 use serde::{Deserialize, Serialize};
 
 /// 上一次鼠标落点（页面坐标）。人类化点击从这里起手画一条轨迹到目标，而不是瞬移。
@@ -63,6 +64,35 @@ static BROWSER_OPERATION: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()))
 /// and consumed by the first `snapshot` after it. `Option` rather than a plain
 /// String so it is delivered exactly once instead of on every action.
 static SESSION_NOTE: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+/// 页面弹了 JS 对话框（alert / confirm / prompt / beforeunload）：说了什么、按没按掉。
+/// 只是事实，给模型的话在 JS 侧（browser-delta.js）拼。
+#[derive(Serialize, Clone)]
+pub struct DialogNote {
+    kind: String,
+    message: String,
+    accepted: bool,
+}
+/// 动作打开了新标签页并已跟过去：第几个、标题、地址。
+#[derive(Serialize, Clone)]
+pub struct TabNote {
+    index: usize,
+    title: String,
+    url: String,
+}
+/// 视口在页面里的位置：滚了多少、页面多高、视口多高。
+#[derive(Serialize, Clone)]
+pub struct ScrollInfo {
+    y: i64,
+    height: i64,
+    viewport: i64,
+}
+/// 三个「下一次快照带走一次」的槽位，和 SESSION_NOTE 同一个模式（take 不是 clone）。
+static LAST_DIALOG: LazyLock<Mutex<Option<DialogNote>>> = LazyLock::new(|| Mutex::new(None));
+static OPENED_TAB: LazyLock<Mutex<Option<TabNote>>> = LazyLock::new(|| Mutex::new(None));
+static OVERLAY_DISMISSED: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+/// 这一步期间页面有没有要开新窗口（Page.windowOpen）：有才值得多等新标签页冒出来。
+static WINDOW_OPENED: AtomicBool = AtomicBool::new(false);
 
 fn set_session_note(note: String) {
     if let Ok(mut slot) = SESSION_NOTE.lock() {
@@ -188,7 +218,7 @@ const PAGE_OBSERVER_SCRIPT: &str = r#"(() => {
   } catch (_) {}
 })();"#;
 
-fn configure_new_tab(tab: &Tab) -> Result<(), String> {
+fn configure_new_tab(tab: &Arc<Tab>) -> Result<(), String> {
     tab.set_default_timeout(Duration::from_secs(30));
     tab.call_method(AddScriptToEvaluateOnNewDocument {
         source: PAGE_OBSERVER_SCRIPT.to_string(),
@@ -197,6 +227,29 @@ fn configure_new_tab(tab: &Tab) -> Result<(), String> {
         run_immediately: Some(true),
     })
     .map_err(|e| format!("安装页面错误观测器失败: {e}"))?;
+    // JS 对话框会把整个页面挂起：之后每一条 CDP 调用都超时，看起来像「点了没反应、截图拿不到」，
+    // 模型只能反复重试。这里自动按确定（prompt 用它的默认值），把它说了什么记进 LAST_DIALOG，
+    // 下一次快照带给模型。用 Weak 不用 Arc：监听器存在 tab 自己身上，拿 Arc 会成环、tab 永远释放不掉。
+    let weak = Arc::downgrade(tab);
+    tab.add_event_listener(Arc::new(move |event: &CdpEvent| {
+        // 页面要开新窗口（target=_blank / window.open）：记一笔，with_tab 据此多等一会儿新标签页出现。
+        if let CdpEvent::PageWindowOpen(_) = event {
+            WINDOW_OPENED.store(true, Ordering::SeqCst);
+        }
+        if let CdpEvent::PageJavascriptDialogOpening(ev) = event {
+            let kind = format!("{:?}", ev.params.Type).to_ascii_lowercase();
+            let message: String = ev.params.message.chars().take(300).collect();
+            let prompt = ev.params.default_prompt.clone();
+            let accepted = weak
+                .upgrade()
+                .map(|t| t.get_dialog().accept(prompt).is_ok())
+                .unwrap_or(false);
+            if let Ok(mut slot) = LAST_DIALOG.lock() {
+                *slot = Some(DialogNote { kind, message, accepted });
+            }
+        }
+    }))
+    .map_err(|e| format!("安装对话框处理器失败: {e}"))?;
     Ok(())
 }
 
@@ -212,6 +265,15 @@ pub struct BrowserElement {
     type_: String,
     #[serde(default)]
     text: String,
+    /// 角色（link / button / textbox / checkbox / …），和 nodes 那份同一套判法。
+    #[serde(default)]
+    role: String,
+    /// 状态："disabled,checked,expanded=false,value=abc" 这种逗号串；没有就空。
+    #[serde(default)]
+    state: String,
+    /// 在视口外（清单里仍然列出，截图上没有红数字；直接操作会先滚过去）。
+    #[serde(default)]
+    off: bool,
 }
 
 /// What every browser action returns: the page state AFTER the action, so the
@@ -253,6 +315,27 @@ pub struct BrowserState {
     /// 页面的 meta description / og:description，截到 300 字，预览卡下面那行灰字。
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// 视口在页面里的位置——模型据此知道「下面还有没有」，不用一屏一屏试。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scroll: Option<ScrollInfo>,
+    /// 焦点落在谁身上（tag[node=n] "文字"）；按键之前看一眼它，就知道 Enter 会落到哪。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus: Option<String>,
+    /// 页面可见文字总字数（text 只是前 3000 字）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text_total: Option<u64>,
+    /// 这只浏览器现在有几个标签页。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tab_count: Option<usize>,
+    /// 这一步期间弹过的 JS 对话框（已自动按掉）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dialog: Option<DialogNote>,
+    /// 这一步打开了新标签页并已跟过去。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opened_tab: Option<TabNote>,
+    /// 目标被弹层盖住、已自动点了哪个按钮把它关掉。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overlay_dismissed: Option<String>,
 }
 
 /// 在页面里求值一个返回字符串的表达式；拿不到（页面还没就绪、跨域 frame、脚本被拦）就当没有。
@@ -1133,81 +1216,72 @@ fn brand_from_version(raw: Option<&str>) -> String {
     }
 }
 
-/// Enumerate the visible, in-viewport interactive elements: tag each with a
-/// `data-mref` ref (so click/type can target `[data-mref="N"]`), draw a numbered
-/// Set-of-Mark badge on each (so the screenshot shows which is which), and return
-/// the compact list. This is what lets the agent act precisely by number instead
-/// of guessing selectors — far more reliable and ~20-50x cheaper than pixels.
-fn enumerate_elements(tab: &Tab) -> Vec<BrowserElement> {
-    // `__DRAW__` is replaced with 1/0 — controls only the VISIBLE badge; refs are
-    // always tagged so click-by-index works even with marks off (demo recording).
-    let raw = r##"(() => { try {
-  document.querySelectorAll('[data-mref]').forEach(e => e.removeAttribute('data-mref'));
-  document.querySelectorAll('.__mcp_som').forEach(e => e.remove());
-  const DRAW = __DRAW__;
-  const sel = 'a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[onclick],[contenteditable=""],[contenteditable=true]';
-  const els = Array.from(document.querySelectorAll(sel));
-  const out = []; let i = 0;
-  for (const el of els) {
-    if (i >= 60) break;
-    const r = el.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) continue;
-    if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
-    const cs = getComputedStyle(el);
-    if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;
-    el.setAttribute('data-mref', i);
-    const tag = el.tagName.toLowerCase();
-    const type = (el.getAttribute('type') || '').slice(0, 20);
-    let text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || '').trim().replace(/\s+/g, ' ').slice(0, 60);
-    out.push({ ref: i, tag: tag, type: type, text: text });
-    if (DRAW) {
-      const b = document.createElement('div');
+/// 节点编号器：和 src/agent/browser-read-scripts.js 的 NODE_TAG_SNIPPET **逐字相同**
+/// （test/browser-read-scripts.test.mjs 拿两边比，漂了就红）。
+/// 四处共用同一份（这里的每次快照、nodes / observe、read、find），同一页面状态下编号相同：
+/// 截图上的红数字 = node 号 = read 正文里的 [n]。模型只需要认一套编号。
+const NODE_TAG_JS: &str = r##"var __mtag=(function(){
+var clean=function(s){s=String(s||'');var out='',sp=false;for(var k=0;k<s.length;k++){var ch=s[k];if(ch===' '||ch==='\n'||ch==='\t'||ch==='\r'){if(!sp){out+=' ';sp=true;}}else{out+=ch;sp=false;}}return out.trim();};
+var rootList=function(){var out=[],seen=[],iframeCount=0,shadowCount=0,blocked=[];var push=function(root,depth){if(!root||seen.indexOf(root)>=0||depth>5)return;seen.push(root);out.push(root);var all=[];try{all=Array.prototype.slice.call(root.querySelectorAll('*'),0,2200);}catch(e){}for(var i=0;i<all.length;i++){var el=all[i];try{if(el.shadowRoot){shadowCount++;push(el.shadowRoot,depth+1);}}catch(e1){}try{if(el.tagName==='IFRAME'){if(el.contentDocument){iframeCount++;push(el.contentDocument,depth+1);}else{var _r=el.getBoundingClientRect();blocked.push({src:String(el.src||'').slice(0,120),w:Math.round(_r.width),h:Math.round(_r.height)});}}}catch(e2){try{var _r2=el.getBoundingClientRect();blocked.push({src:String(el.src||'').slice(0,120),w:Math.round(_r2.width),h:Math.round(_r2.height)});}catch(e3){}}}};push(document,0);out.iframeCount=iframeCount;out.shadowCount=shadowCount;out.blockedFrames=blocked;return out;};
+var qsa=function(sel,roots){var out=[],rs=roots||rootList();for(var d=0;d<rs.length;d++){try{out=out.concat(Array.prototype.slice.call(rs[d].querySelectorAll(sel)));}catch(e){}}return out.filter(function(el,i){return el&&out.indexOf(el)===i;});};
+var rootOf=function(el){try{return el&&el.getRootNode?el.getRootNode():document;}catch(e){return document;}};
+var parentDeep=function(el){try{return el&&(el.parentElement||(rootOf(el).host||null));}catch(e){return null;}};
+var closestDeep=function(el,sel){var cur=el,guard=0;while(cur&&cur.nodeType===1&&guard++<80){try{if(cur.matches&&cur.matches(sel))return cur;}catch(e){}cur=parentDeep(cur);}return null;};
+var SEL='a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=tab],[role=menu],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=option],[role=checkbox],[role=switch],[role=radio],[role=combobox],[role=slider],[role=spinbutton],[role=textbox],[role=searchbox],[role=treeitem],[onclick],[draggable=true],[data-radix-collection-item],[data-state],[data-value],[cmdk-item],[contenteditable=""],[contenteditable=true],[tabindex]:not([tabindex="-1"]),summary,label';
+var nameOf=function(el){var t=el.getAttribute('aria-label')||el.getAttribute('placeholder')||el.getAttribute('title')||el.getAttribute('alt')||(el.tagName==='INPUT'||el.tagName==='SELECT'||el.tagName==='TEXTAREA'?'':(el.innerText||el.textContent||''))||el.getAttribute('name')||'';try{var lab=closestDeep(el,'label');if(lab&&!t)t=lab.innerText||lab.textContent||'';}catch(e){}try{if(!t&&el.id){var lb=(el.ownerDocument||document).querySelector('label[for="'+el.id+'"]');if(lb)t=lb.innerText||lb.textContent||'';}}catch(e4){}try{var host=rootOf(el).host;if(host&&!t)t=host.getAttribute('aria-label')||host.getAttribute('title')||host.getAttribute('data-testid')||host.getAttribute('id')||'';}catch(e2){}return clean(t).slice(0,52);};
+var isH=function(tag){return tag.length===2&&tag.charAt(0)==='h'&&tag.charAt(1)>='1'&&tag.charAt(1)<='6';};
+var roleOf=function(el){var r=el.getAttribute('role');if(r)return r;var tag=el.tagName.toLowerCase();if(tag==='a')return'link';if(tag==='button')return'button';if(tag==='input'){var ty=(el.getAttribute('type')||'text').toLowerCase();if(ty==='checkbox')return'checkbox';if(ty==='radio')return'radio';if(ty==='submit'||ty==='button'||ty==='reset'||ty==='image')return'button';if(ty==='range')return'slider';if(ty==='file')return'file';return'textbox';}if(tag==='select')return'combobox';if(tag==='textarea')return'textbox';if(isH(tag))return'heading';if(tag==='summary')return'summary';if(tag==='label')return'label';return tag;};
+var stateOf=function(el){var s={};if(el.disabled||el.getAttribute('aria-disabled')==='true')s.disabled=true;if(el.checked||el.getAttribute('aria-checked')==='true')s.checked=true;var exp=el.getAttribute('aria-expanded');if(exp!=null)s.expanded=(exp==='true');if(el.getAttribute('aria-selected')==='true')s.selected=true;if((el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.tagName==='SELECT')&&el.value)s.value=(el.getAttribute('type')||'').toLowerCase()==='password'?'••••':String(el.value).slice(0,32);if(el.tagName==='A'&&el.getAttribute('href'))s.href=el.getAttribute('href').slice(0,70);return s;};
+var visible=function(el){try{var r=el.getBoundingClientRect();var w=(el.ownerDocument&&el.ownerDocument.defaultView)||window;var cs=w.getComputedStyle(el);return !(r.width<1||r.height<1||cs.visibility==='hidden'||cs.display==='none'||cs.opacity==='0');}catch(e){return false;}};
+return function(cap){cap=cap||120;var roots=rootList();qsa('[data-mnode],[data-mref]',roots).forEach(function(e){e.removeAttribute('data-mnode');e.removeAttribute('data-mref');});var nodes=[],id=0;var els=qsa(SEL,roots).slice(0,1500);for(var i=0;i<els.length;i++){if(id>=cap)break;var el=els[i],r;try{r=el.getBoundingClientRect();}catch(e){continue;}if(!visible(el))continue;el.setAttribute('data-mnode',String(id));el.setAttribute('data-mref',String(id));var inView=!(r.bottom<=0||r.right<=0||r.top>=innerHeight||r.left>=innerWidth);var node={i:id,r:roleOf(el),n:nameOf(el)};var st=stateOf(el);for(var kk in st){node.s=st;break;}if(!inView)node.off=1;node.el=el;node.rect=r;nodes.push(node);id++;}return {nodes:nodes,roots:roots,total:id,clean:clean,qsa:qsa,nameOf:nameOf,roleOf:roleOf,stateOf:stateOf,closestDeep:closestDeep,visible:visible,SEL:SEL};};
+})();"##;
+/// 一次最多编多少个节点（和 JS 那边的 NODE_TAG_CAP 一致）。
+const NODE_TAG_CAP: usize = 200;
+/// 视口内最多画多少个红数字：再多就糊成一片，清单里仍然全列。
+const MARK_DRAW_CAP: usize = 80;
+
+/// 每次快照跑一遍：给整页可交互元素编号（视口外的也编，标 off），视口内的画红数字。
+/// 同源 iframe 里的元素红数字要加上 iframe 自己的偏移；shadow root 里的坐标本来就是顶层的。
+const ENUMERATE_JS: &str = r##"(() => { try {
+__SNIPPET__
+  var DRAW = __DRAW__;
+  try { document.querySelectorAll('.__mcp_som').forEach(function(e){ e.remove(); }); } catch (e0) {}
+  var T = __mtag(__CAP__);
+  var out = [], drawn = 0;
+  for (var i = 0; i < T.nodes.length; i++) {
+    var n = T.nodes[i], el = n.el, st = '';
+    if (n.s) { var ks = []; for (var k in n.s) { if (k === 'href') continue; ks.push(n.s[k] === true ? k : k + '=' + n.s[k]); } st = ks.join(','); }
+    out.push({ ref: n.i, tag: el.tagName.toLowerCase(), type: (el.getAttribute('type') || '').slice(0, 20), text: n.n, role: n.r, state: st, off: !!n.off });
+    if (DRAW && !n.off && drawn < __MARKS__) {
+      var r = n.rect, ox = 0, oy = 0;
+      try { var fe = el.ownerDocument !== document ? el.ownerDocument.defaultView.frameElement : null; if (fe) { var fr = fe.getBoundingClientRect(); ox = fr.left; oy = fr.top; } } catch (e1) {}
+      var b = document.createElement('div');
       b.className = '__mcp_som';
-      b.textContent = String(i);
+      b.textContent = String(n.i);
       b.style.cssText = 'position:absolute;z-index:2147483647;background:#d93025;color:#fff;font:bold 11px monospace;padding:0 3px;border-radius:3px;pointer-events:none;line-height:15px;box-shadow:0 0 0 1px #fff;';
-      b.style.left = (r.left + window.scrollX) + 'px';
-      b.style.top = (r.top + window.scrollY) + 'px';
+      b.style.left = (r.left + ox + window.scrollX) + 'px';
+      b.style.top = (r.top + oy + window.scrollY) + 'px';
       document.body.appendChild(b);
+      drawn++;
     }
-    i++;
   }
-  try { var ifs=document.querySelectorAll('iframe');
-    for(var fi=0;fi<ifs.length&&i<60;fi++){try{
-      var idoc=ifs[fi].contentDocument; if(!idoc) continue;
-      idoc.querySelectorAll('[data-mref]').forEach(function(e){e.removeAttribute('data-mref')});
-      var ifr=ifs[fi].getBoundingClientRect();
-      var iels=Array.from(idoc.querySelectorAll(sel));
-      for(var ie=0;ie<iels.length&&i<60;ie++){
-        var iel=iels[ie]; var ir=iel.getBoundingClientRect();
-        if(ir.width<1||ir.height<1) continue;
-        var at=ifr.top+ir.top,al=ifr.left+ir.left;
-        if(at+ir.height<0||al+ir.width<0||at>innerHeight||al>innerWidth) continue;
-        try{var ics=idoc.defaultView.getComputedStyle(iel);
-          if(ics.visibility==='hidden'||ics.display==='none'||ics.opacity==='0') continue;
-        }catch(_){}
-        iel.setAttribute('data-mref',i);
-        var itag=iel.tagName.toLowerCase();
-        var itype=(iel.getAttribute('type')||'').slice(0,20);
-        var itext=(iel.innerText||iel.value||iel.getAttribute('aria-label')||iel.getAttribute('placeholder')||iel.getAttribute('title')||iel.getAttribute('name')||'').trim().replace(/\s+/g,' ').slice(0,60);
-        out.push({ref:i,tag:itag,type:itype,text:itext});
-        if(DRAW){var ib=document.createElement('div');ib.className='__mcp_som';ib.textContent=String(i);
-          ib.style.cssText='position:absolute;z-index:2147483647;background:#d93025;color:#fff;font:bold 11px monospace;padding:0 3px;border-radius:3px;pointer-events:none;line-height:15px;box-shadow:0 0 0 1px #fff;';
-          ib.style.left=(al+window.scrollX)+'px';ib.style.top=(at+window.scrollY)+'px';
-          document.body.appendChild(ib);}
-        i++;
-      }
-    }catch(e2){}}
-  }catch(e3){}
   return JSON.stringify(out);
 } catch (e) { return '[]'; } })()"##;
-    let js = raw.replace(
-        "__DRAW__",
-        if DRAW_MARKS.load(Ordering::Relaxed) {
-            "1"
-        } else {
-            "0"
-        },
-    );
+
+fn enumerate_elements(tab: &Tab) -> Vec<BrowserElement> {
+    // `__DRAW__` 只控制红数字画不画；编号总是打上，关着标记（录演示）时 node=n 照样能点。
+    let js = ENUMERATE_JS
+        .replace("__SNIPPET__", NODE_TAG_JS)
+        .replace("__CAP__", &NODE_TAG_CAP.to_string())
+        .replace("__MARKS__", &MARK_DRAW_CAP.to_string())
+        .replace(
+            "__DRAW__",
+            if DRAW_MARKS.load(Ordering::Relaxed) {
+                "1"
+            } else {
+                "0"
+            },
+        );
     match tab.evaluate(&js, false) {
         Ok(ro) => {
             let s = ro
@@ -1217,6 +1291,155 @@ fn enumerate_elements(tab: &Tab) -> Vec<BrowserElement> {
             serde_json::from_str::<Vec<BrowserElement>>(&s).unwrap_or_default()
         }
         Err(_) => Vec::new(),
+    }
+}
+
+/// 视口位置、焦点、正文总字数——快照的三个数字，一次求值拿齐。
+const PAGE_METRICS_JS: &str = r#"(()=>{try{var d=document.scrollingElement||document.documentElement;var a=document.activeElement;var f='';if(a&&a!==document.body&&a.tagName!=='HTML'){var t=String(a.value||a.innerText||a.textContent||a.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim().slice(0,40);var mn=a.getAttribute('data-mnode');f=a.tagName.toLowerCase()+(mn!=null?'[node='+mn+']':'')+(t?' "'+t+'"':'');}var tt=0;try{tt=document.body?document.body.innerText.length:0;}catch(e){}return JSON.stringify({y:Math.round(window.scrollY||(d?d.scrollTop:0)||0),h:Math.round(Math.max(d?d.scrollHeight:0,document.body?document.body.scrollHeight:0)),v:Math.round(window.innerHeight||0),tt:tt,f:f});}catch(e){return '{}';}})()"#;
+
+fn page_metrics(tab: &Tab) -> (Option<ScrollInfo>, Option<String>, Option<u64>) {
+    let raw = eval_string(tab, PAGE_METRICS_JS).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let num = |k: &str| v.get(k).and_then(|x| x.as_i64());
+    let scroll = match (num("y"), num("h"), num("v")) {
+        (Some(y), Some(height), Some(viewport)) if height > 0 && viewport > 0 => {
+            Some(ScrollInfo { y, height, viewport })
+        }
+        _ => None,
+    };
+    let focus = v
+        .get("f")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let text_total = v.get("tt").and_then(|x| x.as_u64()).filter(|n| *n > 0);
+    (scroll, focus, text_total)
+}
+
+/// 这只浏览器现在的标签页（页面类 target）。会话没了就是空。
+fn tab_list() -> Vec<Arc<Tab>> {
+    let Ok(state) = BROWSER.lock() else {
+        return Vec::new();
+    };
+    let Some(session) = state.session.as_ref() else {
+        return Vec::new();
+    };
+    session
+        ._browser
+        .get_tabs()
+        .lock()
+        .map(|t| t.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// 动作期间页面自己开了新标签页（target=_blank / window.open）就把它交出来。
+/// 页面明确说过要开窗口（Page.windowOpen）才多等：新 target 是异步冒出来的，点击的回包常常先到；
+/// 没这个信号就只看一眼——不能让每一次点击都白等。还停在空白页的不算（弹窗被拦、页面自用的工作 tab）。
+fn newly_opened_tab(before: usize, current: &Arc<Tab>, window_opened: bool) -> Option<Arc<Tab>> {
+    let mut tabs = tab_list();
+    if window_opened {
+        for _ in 0..25 {
+            if tabs.len() > before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            tabs = tab_list();
+        }
+    }
+    if tabs.len() <= before {
+        return None;
+    }
+    let last = tabs.last()?.clone();
+    if last.get_target_id() == current.get_target_id() {
+        return None;
+    }
+    for _ in 0..15 {
+        let url = last.get_url();
+        if !url.is_empty() && url != "about:blank" {
+            return Some(last);
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    None
+}
+
+/// 弹层上「关掉」类按钮的词表：只有这些才会被自动点。故意不含 ok / 确定 / continue / 继续 /
+/// 提交——那些在确认框里是「执行」，替模型点了等于替用户做了决定。
+const OVERLAY_DISMISS_WORDS: &[&str] = &[
+    "close", "dismiss", "no thanks", "no, thanks", "not now", "maybe later", "later", "skip",
+    "got it", "i got it", "understood", "i understand", "×", "✕", "x", "关闭", "稍后", "跳过",
+    "以后再说", "不用了", "知道了", "我知道了", "暂不", "取消",
+];
+/// Cookie / 隐私同意条上才允许点「接受 / 同意」；判据是那一层里有 cookie / consent / 隐私 这些字。
+const CONSENT_ACCEPT_WORDS: &[&str] = &[
+    "accept", "accept all", "accept all cookies", "accept cookies", "allow all", "allow",
+    "agree", "i agree", "agree and continue", "同意", "接受", "全部接受", "接受全部", "允许全部",
+    "同意并继续",
+];
+/// 在固定定位 / dialog / aria-modal 的那一层里找一个词表上的按钮点掉。回它的名字，没找到回空串。
+const OVERLAY_DISMISS_JS: &str = r##"(() => { try {
+  var WORDS = __WORDS__, CONSENT = __CONSENT__;
+  var clean = function(s){ return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase(); };
+  var nameOf = function(el){ return clean(el.getAttribute('aria-label') || el.innerText || el.textContent || el.getAttribute('title') || el.value || ''); };
+  var hit = function(t, list){ if (!t || t.length > 32) return false; for (var i = 0; i < list.length; i++) { if (t === list[i]) return true; } return false; };
+  var overlayOf = function(el){ var a = el, g = 0; while (a && a.nodeType === 1 && g++ < 40) { try { var cs = getComputedStyle(a); var role = a.getAttribute('role') || ''; if (cs.position === 'fixed' || cs.position === 'sticky' || role === 'dialog' || role === 'alertdialog' || a.getAttribute('aria-modal') === 'true' || a.tagName === 'DIALOG') return a; } catch (e) {} a = a.parentElement; } return null; };
+  var isConsent = function(box){ try { var s = (box.id + ' ' + box.className + ' ' + (box.innerText || '').slice(0, 400)).toLowerCase(); return /cookie|consent|gdpr|privacy|隐私|同意/.test(s); } catch (e) { return false; } };
+  var pool = Array.prototype.slice.call(document.querySelectorAll('button,a[href],[role="button"],[aria-label],[class*="close"],[class*="Close"],[class*="dismiss"],[data-dismiss]'));
+  var best = null, bestScore = 0;
+  for (var i = 0; i < pool.length; i++) {
+    var el = pool[i], r; try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+    if (r.width < 1 || r.height < 1 || r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
+    try { var cs = getComputedStyle(el); if (cs.visibility === 'hidden' || cs.display === 'none') continue; } catch (e) {}
+    var box = overlayOf(el); if (!box) continue;
+    var n = nameOf(el), al = clean(el.getAttribute('aria-label')), cls = clean(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className);
+    var score = 0;
+    if (hit(n, WORDS)) score = 4;
+    else if (isConsent(box) && hit(n, CONSENT)) score = 3;
+    else if (/(^|\s|-|_)(close|dismiss|关闭)(\s|-|_|$)/.test(al)) score = 2;
+    else if (/(^|\s|-|_)(close|dismiss)(\s|-|_|$)/.test(cls) && n.length <= 3) score = 1;
+    if (score > bestScore) { best = el; bestScore = score; }
+  }
+  if (!best) return '';
+  var label = nameOf(best) || clean(best.getAttribute('aria-label')) || '×';
+  try { best.click(); } catch (e) { return ''; }
+  return label.slice(0, 40);
+} catch (e) { return ''; } })()"##;
+
+fn dismiss_overlay(tab: &Tab) -> Option<String> {
+    let js = OVERLAY_DISMISS_JS
+        .replace("__WORDS__", &serde_json::to_string(OVERLAY_DISMISS_WORDS).unwrap_or_else(|_| "[]".into()))
+        .replace("__CONSENT__", &serde_json::to_string(CONSENT_ACCEPT_WORDS).unwrap_or_else(|_| "[]".into()));
+    eval_string(tab, &js)
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    /// 自动关弹层只许点「关掉」类的词。ok / 确定 / 继续 / 提交在确认框里是执行，替模型点了等于替用户做了决定。
+    #[test]
+    fn dismiss_words_never_include_commit_verbs() {
+        for w in ["ok", "okay", "确定", "continue", "继续", "submit", "提交", "confirm", "确认", "delete", "删除", "yes", "是"] {
+            assert!(!OVERLAY_DISMISS_WORDS.contains(&w), "{w}");
+            assert!(!CONSENT_ACCEPT_WORDS.contains(&w), "{w}");
+        }
+        for w in ["close", "关闭", "no thanks", "知道了", "取消"] {
+            assert!(OVERLAY_DISMISS_WORDS.contains(&w), "{w}");
+        }
+        let js = OVERLAY_DISMISS_JS.replace("__WORDS__", "[]").replace("__CONSENT__", "[]");
+        assert!(!js.contains("__WORDS__"));
+        assert!(js.contains("isConsent(box) && hit(n, CONSENT)"), "同意类词只在 cookie / 隐私条上生效");
+        assert!(js.contains("var box = overlayOf(el); if (!box) continue;"), "只在弹层那一层里找");
+    }
+
+    #[test]
+    fn enumerate_script_uses_the_shared_tagger() {
+        assert!(NODE_TAG_JS.starts_with("var __mtag=(function(){"));
+        assert!(ENUMERATE_JS.contains("__SNIPPET__") && ENUMERATE_JS.contains("__mtag(__CAP__)"));
+        assert_eq!(NODE_TAG_CAP, 200);
+        assert!(MARK_DRAW_CAP <= NODE_TAG_CAP);
+        let js = ENUMERATE_JS.replace("__SNIPPET__", NODE_TAG_JS);
+        assert!(js.contains("data-mnode") && js.contains("data-mref"), "两种选择器都要能点到");
     }
 }
 
@@ -1337,6 +1560,11 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
     let session_note = SESSION_NOTE.lock().ok().and_then(|mut slot| slot.take());
     let favicon = page_favicon(tab, &url);
     let description = page_description(tab);
+    let (scroll, focus, text_total) = page_metrics(tab);
+    let tab_count = Some(tab_list().len()).filter(|n| *n > 0);
+    let dialog = LAST_DIALOG.lock().ok().and_then(|mut slot| slot.take());
+    let opened_tab = OPENED_TAB.lock().ok().and_then(|mut slot| slot.take());
+    let overlay_dismissed = OVERLAY_DISMISSED.lock().ok().and_then(|mut slot| slot.take());
     Ok(BrowserState {
         title,
         url,
@@ -1348,6 +1576,13 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
         session_note,
         favicon,
         description,
+        scroll,
+        focus,
+        text_total,
+        tab_count,
+        dialog,
+        opened_tab,
+        overlay_dismissed,
     })
 }
 
@@ -1426,10 +1661,36 @@ where
         let mut last_err = String::new();
         for attempt in 0..2 {
             let tab = current_or_launch_tab()?;
+            let tabs_before = tab_list().len();
+            WINDOW_OPENED.store(false, Ordering::SeqCst);
             // CDP calls, the performance-sampling sleep, and screenshots run
             // without BROWSER locked. The operation lock above still serializes
             // mutations of the persistent tab.
-            let outcome = f(&tab).and_then(|result| snapshot(&tab, result));
+            let outcome = f(&tab).and_then(|result| {
+                // 动作打开了新标签页（target=_blank / window.open）时当前 tab 还是老的，模型看到的
+                // 是一张没变的页面，只会以为「点了没反应」。跟过去：新标签页设为当前、装上观测器
+                // 和对话框处理，快照它，并把这件事记进 opened_tab；要回去用 tab op:"switch"。
+                let window_opened = WINDOW_OPENED.swap(false, Ordering::SeqCst);
+                if let Some(new_tab) = newly_opened_tab(tabs_before, &tab, window_opened) {
+                    let _ = configure_new_tab(&new_tab);
+                    let _ = new_tab.wait_until_navigated();
+                    if set_current_tab(new_tab.clone()).is_ok() {
+                        let index = tab_list()
+                            .iter()
+                            .position(|t| t.get_target_id() == new_tab.get_target_id())
+                            .unwrap_or(0);
+                        if let Ok(mut slot) = OPENED_TAB.lock() {
+                            *slot = Some(TabNote {
+                                index,
+                                title: new_tab.get_title().unwrap_or_default(),
+                                url: new_tab.get_url(),
+                            });
+                        }
+                        return snapshot(&new_tab, result);
+                    }
+                }
+                snapshot(&tab, result)
+            });
             match outcome {
                 Ok(state) => return Ok(state),
                 Err(e) => {
@@ -1742,6 +2003,23 @@ pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
                 }
             }
             Err(reason) => {
+                // 目标被弹层（cookie 条、公告、模态）盖住：先把那层关掉再点一次。只点词表里
+                // 「关掉」类的按钮（dismiss_overlay），关不掉就把原诊断交回模型。
+                if reason.starts_with("covered by") {
+                    if let Some(label) = dismiss_overlay(tab) {
+                        std::thread::sleep(Duration::from_millis(350));
+                        if let Ok((x, y)) = resolve_click_point(tab, &selector) {
+                            if let Ok(mut slot) = OVERLAY_DISMISSED.lock() {
+                                *slot = Some(label);
+                            }
+                            if human_click(tab, x, y).is_ok() {
+                                std::thread::sleep(Duration::from_millis(140));
+                                let _ = tab.wait_until_navigated();
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
                 if let Some(msg) = unactionable_reason(&selector, &reason) {
                     return Err(msg);
                 }
@@ -2245,10 +2523,10 @@ pub async fn browser_eval(script: String) -> Result<BrowserState, String> {
         // nodes[] 是全集；中等复杂度的页面上 JSON 早就超过 8000，后半截连同结构一起没了，
         // 而它无从察觉。截断本身可以接受，**不说**不行。
         let total = val.chars().count();
-        if total > 8000 {
-            let head: String = val.chars().take(8000).collect();
+        if total > 20000 {
+            let head: String = val.chars().take(20000).collect();
             return Ok(Some(format!(
-                "{head}\n\n[已截断] 本次页面求值结果共 {total} 字符，只返回了前 8000——**上面的 JSON 很可能是半截的，不要当成完整结构**。缩小选择器范围或分批取。"
+                "{head}\n\n[已截断] 本次页面求值结果共 {total} 字符，只返回了前 20000——**上面的 JSON 很可能是半截的，不要当成完整结构**。缩小选择器范围或分批取。"
             )));
         }
         Ok(Some(val))
@@ -3418,6 +3696,7 @@ mod tab_ops_real_chrome {
             .sandbox(false)
             .user_data_dir(Some(dir.clone()))
             .window_size(Some((1280, 900)))
+            .idle_browser_timeout(Duration::from_secs(60 * 30))
             .build()
             .unwrap();
         let browser = Browser::new(opts).expect("起不来无头 Chrome");
@@ -3443,3 +3722,93 @@ mod tab_ops_real_chrome {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(test)]
+mod browser_e2e_real_chrome {
+    //! `cargo test --lib -- --ignored browser_e2e_real_chrome`：起一只临时 profile 的无头 Chrome，
+    //! 用本地 file:// 夹具把 2026-09-06 加的四样真跑一遍：快照带角色/状态/视口外/视口位置/字数、
+    //! 弹层盖住目标先关掉再点、alert 自动按掉且 onclick 后半段照常跑、target=_blank 跟到新标签页。
+    //! 默认 ignored：CI 上没有 Chrome。
+    use super::*;
+    use headless_chrome::LaunchOptionsBuilder;
+
+    fn write(dir: &std::path::Path, name: &str, html: &str) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, html).unwrap();
+        format!("file://{}", p.display())
+    }
+
+    #[test]
+    #[ignore]
+    fn 快照字段_弹层_对话框_新标签页_全走一遍() {
+        let path = crate::capture::find_headless_browser().expect("本机没有 Chromium 系浏览器");
+        let dir = std::env::temp_dir().join(format!("mrday-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = LaunchOptionsBuilder::default()
+            .path(Some(std::path::PathBuf::from(&path)))
+            .headless(true)
+            .sandbox(false)
+            .user_data_dir(Some(dir.join("profile")))
+            .window_size(Some((1280, 900)))
+            .idle_browser_timeout(Duration::from_secs(60 * 30))
+            .build()
+            .unwrap();
+        let browser = Browser::new(opts).expect("起不来无头 Chrome");
+        let tab = browser.new_tab().unwrap();
+        configure_new_tab(&tab).unwrap();
+        {
+            let mut state = BROWSER.lock().unwrap();
+            state.session = Some(Session { _browser: browser, tab });
+        }
+        let second = write(&dir, "second.html", "<title>second</title><p>second page</p>");
+        let page = write(&dir, "index.html", &format!(concat!(
+            "<title>fixture</title>",
+            "<style>body{{margin:0;height:3000px}} .ov{{position:fixed;inset:0;background:rgba(0,0,0,.35)}} ",
+            ".cookie-banner{{position:fixed;bottom:0;left:0;right:0;background:#fff;padding:20px}}</style>",
+            "<h1>Fixture</h1><p>正文第一段。</p>",
+            "<input id=\"q\" placeholder=\"搜索\" value=\"abc\">",
+            "<label><input type=\"checkbox\" id=\"c\" checked> 记住我</label>",
+            "<button id=\"dlg\" onclick=\"alert('hello there');document.title='after-alert'\">Alert</button>",
+            "<a id=\"nt\" href=\"{second}\" target=\"_blank\">open second</a>",
+            "<button id=\"t\" style=\"position:absolute;top:600px\" onclick=\"document.title='clicked-target'\">Target</button>",
+            "<a id=\"far\" href=\"#\" style=\"position:absolute;top:2500px\">far link</a>",
+            "<div id=\"ov\" class=\"ov\"><div class=\"cookie-banner\">We use cookies. ",
+            "<button id=\"acc\" onclick=\"document.getElementById('ov').remove()\">Accept all</button></div></div>"
+        ), second = second));
+
+        // ① 快照字段：角色 / 状态 / 视口外 / 视口位置 / 正文字数 / 标签页数
+        let st = tauri::async_runtime::block_on(browser_navigate(page.clone())).unwrap();
+        let brief: Vec<(String, String, String, bool)> = st.elements.iter().map(|e| (e.role.clone(), e.text.clone(), e.state.clone(), e.off)).collect();
+        assert!(st.elements.iter().any(|e| e.role == "textbox" && e.text == "搜索" && e.state.contains("value=abc")), "{brief:?}");
+        assert!(st.elements.iter().any(|e| e.role == "checkbox" && e.state.contains("checked")), "{brief:?}");
+        assert!(st.elements.iter().any(|e| e.text == "far link" && e.off), "2500px 处的链接要标 off：{brief:?}");
+        let scroll = st.scroll.as_ref().expect("scroll");
+        assert!(scroll.height >= 2900 && scroll.viewport > 0 && scroll.y == 0, "{:?}", (scroll.y, scroll.height, scroll.viewport));
+        assert!(st.text_total.unwrap_or(0) > 0);
+        assert_eq!(st.tab_count, Some(2), "headless_chrome 自带一个 about:blank + 我们开的那个");
+
+        // ② 弹层盖住目标：先关掉 cookie 条再点，目标的 onclick 要真的跑到
+        let st = tauri::async_runtime::block_on(browser_click("#t".into())).unwrap();
+        assert_eq!(st.overlay_dismissed.as_deref(), Some("accept all"), "{:?}", st.overlay_dismissed);
+        assert_eq!(st.title, "clicked-target");
+
+        // ③ alert：自动按掉，onclick 后半段照常执行，快照带上对话框内容
+        let st = tauri::async_runtime::block_on(browser_click("#dlg".into())).unwrap();
+        assert_eq!(st.title, "after-alert");
+        let d = st.dialog.as_ref().expect("dialog note");
+        assert_eq!(d.message, "hello there");
+        assert!(d.accepted);
+        assert_eq!(d.kind, "alert");
+
+        // ④ target=_blank：跟到新标签页，后续动作作用于它
+        let st = tauri::async_runtime::block_on(browser_click("#nt".into())).unwrap();
+        let ot = st.opened_tab.as_ref().unwrap_or_else(|| panic!("opened_tab 没有：tabs={:?}", tab_list().iter().map(|t| t.get_url()).collect::<Vec<_>>()));
+        assert_eq!(ot.title, "second");
+        assert_eq!(st.title, "second");
+        assert_eq!(st.tab_count, Some(3));
+
+        drop(take_browser_session());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

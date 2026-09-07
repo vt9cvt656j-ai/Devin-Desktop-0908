@@ -128,6 +128,8 @@ export const BROWSER_OBSERVE_ACTIONS = new Set([
   // 问不出「用户现在开着什么页面」，而那正是这三个模式做判断的起点。
   // （`open` 不进：它在用户机器上**启动一个外部应用**，工作区没变不等于现实世界没变。）
   "mytabs",
+  // read（把页面当文档分页读）/ find（按文字 / 正则 / 角色定位）：只读 DOM，不改页面状态。
+  "read", "find",
   "navigate", "observe", "viewport", "screenshot", "design", "network", "inspect",
   "nodes", "assert", "check", "wait", "scroll", "wheel", "swipe", "hover", "focus", "blur", "close",
 ]);
