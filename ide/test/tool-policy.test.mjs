@@ -121,7 +121,7 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // 新增（2026-09-04 审计）：explain / demostop 写盘（见上面 mutating 集合）；http / tor
     // 按 method 判——非 GET/HEAD/OPTIONS 才问。审批门对 http/tor 本来就有特判走
     // _toolMayProduceExternalEffect，这里让声明和特判说同一句话（同时补上只读门那一半）。
-    "explain", "demostop", "http", "tor",
+    "explain", "demostop", "http",
     // 新增：这一族全都真的往工作区写文件（web_scaffold / game_scaffold 更是直接铺
     // 一整棵项目树），此前一个都不问——等于「改动前审批」这个开关对十种写盘方式
     // 整体失效，而用户看不出来。
@@ -269,7 +269,7 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     //   download + 十一个生成器  往工作区落文件——原来只有审批一道门，审批关掉的用户在只读模式里什么都拦不住
     //   automation  按方法逐次判：观察类放行，合成键鼠挡下
     //   db          按这一条语句逐次判：SELECT 放行，DROP 挡下（原来平铺 needsApproval:true、只读不挡）
-    "memory", "explain", "demostop", "termstop", "http", "tor", "capture_start",
+    "memory", "explain", "demostop", "termstop", "http", "capture_start",
     "download", "download_asset", "genimage", "generate_3d", "generate_sound", "generate_music",
     "generate_voice", "generate_motion", "generate_texture", "auto_rig", "game_scaffold", "web_scaffold",
     "office_write", "office_edit",
@@ -512,7 +512,7 @@ const NO_APPROVAL_TODAY = new Set([
   "list", "liveenvironment", "localdiscovery", "logs", "lsp", "mdn_search",
   "openalex_search", "openapi_parser", "package_search", "package_source",
   "performance_profile", "plan", "preview", "probeenv", "pubchem_search", "pubmed_search",
-  "qr", "read", "readscreen", "realtime_news_feed", "recall", "screenshot", "search",
+  "read", "readscreen", "realtime_news_feed", "recall", "screenshot", "search",
   "search_game_assets", "search_tools", "semsearch", "skill",
   // load_guide：客户端只回一句「已附上」，指南正文由网关按对话内容贴上；不落盘不联网。
   "guide", "smashingmag_search",
@@ -589,8 +589,8 @@ test("automation 的观察正则和 main.js 副作用判定里那条**逐字相�
   assert.equal(m[1], AUTOMATION_OBSERVE_METHODS.source, "策略表和 main.js 的 automation 观察正则漂了");
 });
 
-test("http / tor 按 method 判：GET/HEAD/OPTIONS 放行且 GET/HEAD 可并行，写方法要问且只读模式挡", () => {
-  for (const t of ["http", "tor"]) {
+test("http 按 method 判：GET/HEAD/OPTIONS 放行且 GET/HEAD 可并行，写方法要问且只读模式挡", () => {
+  for (const t of ["http"]) {
     for (const method of ["GET", "HEAD", "OPTIONS", "get"]) {
       assert.equal(blockedInReadOnlyMode(t, { type: t, method }), false, `${t} ${method} 只读模式该能用`);
       assert.equal(needsApprovalFor(t, { type: t, method }), false, `${t} ${method} 不该弹框`);

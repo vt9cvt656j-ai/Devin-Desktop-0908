@@ -103,7 +103,7 @@ export function MemoryCenter({
 
   return (
     <Dialog defaultOpen onOpenChange={(open) => { if (!open) onClose?.(); }}>
-      <DialogContent className="flex h-[78vh] sm:max-w-4xl flex-col gap-0 overflow-hidden rounded-2xl p-0 shadow-xl">
+      <DialogContent className="flex h-[calc(var(--eh,100vh)*0.78)] sm:max-w-4xl flex-col gap-0 overflow-hidden rounded-2xl p-0 shadow-xl">
         <DialogHeader className="shrink-0 space-y-1 border-b border-border px-5 pt-5 pb-4">
           <DialogTitle className="text-base">Memory</DialogTitle>
           <DialogDescription className="text-[12px]">

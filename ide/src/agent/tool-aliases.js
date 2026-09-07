@@ -49,7 +49,6 @@ export const _TOOL_ALIASES = {
   takescreenshot: "screenshot", take_screenshot: "screenshot", snapshot: "screenshot", screen_shot: "screenshot", capture_screen: "screenshot",
   httprequest: "http_request", http: "http_request", request: "http_request", api_call: "http_request", api_request: "http_request",
   figma_tokens: "figma", figma_design: "figma", figma_inspect: "figma", figma_get: "figma", figma_variables: "figma", figma_image: "figma", figma_export: "figma", figma_to_code: "figma", get_figma: "figma", figma_read: "figma", figma_layout: "figma", figma_theme: "figma", figma_colors: "figma", figjam: "figma",
-  decodeqr: "decode_qr", scan_qr: "decode_qr", scanqr: "decode_qr", read_qr: "decode_qr", qr_decode: "decode_qr", qrcode: "decode_qr", qr: "decode_qr",
   remote_connect: "remote", connect_remote: "remote", remote_dev: "remote", remotedev: "remote",
   app: "system", launch_app: "system", open_app: "system", activate_app: "system", switch_app: "system", app_control: "system", system_control: "system", click_menu: "system", app_menu: "system",
   schedule: "schedule", schedule_task: "schedule", cron: "schedule", set_timer: "schedule", remind: "schedule",

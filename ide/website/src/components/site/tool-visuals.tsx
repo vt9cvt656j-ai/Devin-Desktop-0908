@@ -318,10 +318,6 @@ const RULES: Array<[RegExp, (name: string) => Visual]> = [
     icon: ScanLine, tint: T.web, verb: "Capture", arg: n.replace("capture_", ""), result: "ok",
     payload: { kind: "note", text: "Records real traffic so a failing request can be replayed." },
   })],
-  [/^decode_qr$/, () => ({
-    icon: ScanLine, tint: T.web, verb: "Scan QR", arg: "screenshot", result: "1 code",
-    payload: { kind: "note", text: "Reads codes out of an image or the screen." },
-  })],
   [/^remote$/, () => ({
     icon: Network, tint: T.web, verb: "Remote", arg: "ssh build-box", result: "connected",
     payload: { kind: "note", text: "Work on another machine without leaving the window." },
@@ -394,10 +390,6 @@ const RULES: Array<[RegExp, (name: string) => Visual]> = [
   [/^(download_file|download_asset)$/, () => ({
     icon: Package, tint: T.web, verb: "Download", arg: "asset", result: "saved",
     payload: { kind: "note", text: "Saves into the workspace, never outside it." },
-  })],
-  [/^(tor_request)$/, () => ({
-    icon: Shield, tint: T.web, verb: "Tor", arg: "request", result: "ok",
-    payload: { kind: "note", text: "Routed request for sources that block direct access." },
   })],
   [/^(generate_|auto_rig)/, (n) => ({
     icon: Wand2, tint: T.design, verb: "Generate", arg: n.replace("generate_", "").replace(/_/g, " "), result: "ready",

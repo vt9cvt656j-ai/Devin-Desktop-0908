@@ -3,7 +3,17 @@ import { createRoot } from "react-dom/client";
 import App from "@/App";
 import { GATEWAY } from "@/lib/account";
 import { configureMse, mseEnvConfig, mseReady } from "@/lib/mse";
+import { installRegionRouting } from "@/lib/region";
 import "@/index.css";
+
+/*
+ * 地区：写 canonical；美国站上「IP 判成大陆、库里没省份、浏览器是中文」的访客换到备案镜像
+ * （硬规则在 nginx 里已经按 IP 做完，这里只补语言那一半）。不等它——绝大多数访客一行网络请求
+ * 都不会发，真要跳的那几个也不该先看一次白屏。见 lib/region.ts。
+ */
+void installRegionRouting().catch(() => {
+  /* 地区判断失败就当在美国站，不影响渲染 */
+});
 
 /*
  * Application-layer encryption, configured before anything is rendered — and so before any

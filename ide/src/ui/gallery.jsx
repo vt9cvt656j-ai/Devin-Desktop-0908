@@ -35,7 +35,7 @@ export function Gallery() {
   const [on, setOn] = useState(true);
 
   return (
-    <div className="flex max-h-[78vh] flex-col gap-6 overflow-auto p-1">
+    <div className="flex max-h-[calc(var(--eh,100vh)*0.78)] flex-col gap-6 overflow-auto p-1">
       <Row title="Button" hint="六个变体 · 四个尺寸">
         <Button>Default</Button>
         <Button variant="secondary">Secondary</Button>

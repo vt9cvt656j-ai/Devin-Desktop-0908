@@ -67,12 +67,26 @@ SCP=(retry "${SCP_BIN[@]}")
 
 cd "$(dirname "$0")/../ide/website"
 
-echo "==> building (prebuild re-extracts the tool catalogue from the IDE registry)"
-rm -rf dist
-npm run build
+# 同一台机器上两个会话同时发站点，会共用同一个 dist/：一边 rm -rf dist 重建，另一边正从 dist 打包。
+# 2026-09-07 就这样发出去一份 index.html，指着一个从没上传的 bundle——而 Cloudflare 把那个 404
+# 缓存住了，整站白屏。所以：① 整个发布过程持锁（mkdir 锁，macOS 没有 flock）；② 构建到本次
+# 专用的临时目录，不碰共享的 dist/。锁超过 30 分钟视为上一次被强杀留下的，直接接管。
+LOCK="/tmp/mrday-site-deploy.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then rmdir "$LOCK" && mkdir "$LOCK"; else
+    echo "另一个发布正在进行（$LOCK），等它结束再跑"; exit 1; fi
+fi
+OUT="$(mktemp -d /tmp/mrday-site-build.XXXXXX)"
+TGZ="$OUT.tgz"
+trap 'rmdir "$LOCK" 2>/dev/null; rm -rf "$OUT" "$TGZ" "$OUT.files"' EXIT
 
-[ -f dist/index.html ] || { echo "build produced no index.html"; exit 1; }
-TOOLS_COUNT="$(node -e 'process.stdout.write(String(require("./dist/tools.json").count))')"
+echo "==> building (re-extracting the tool catalogue from the IDE registry first)"
+node scripts/extract-tools.mjs      # npm run build 的 prebuild 钩子；这里不走 npm，所以手工调
+npx tsc -b
+npx vite build --outDir "$OUT" --emptyOutDir
+
+[ -f "$OUT/index.html" ] || { echo "build produced no index.html"; exit 1; }
+TOOLS_COUNT="$(node -e 'process.stdout.write(String(require(process.argv[1]).count))' "$OUT/tools.json")"
 echo "    catalogue in this build: ${TOOLS_COUNT} tools"
 
 echo "==> uploading everything except index.html"
@@ -94,25 +108,25 @@ echo "==> uploading everything except index.html"
 #
 # 加 `./` 前缀锚定也不行：实测 BSD tar 照样两个都排除，GNU tar 又是另一套语义。所以干脆
 # 显式列出顶层条目，唯独漏掉 `index.html`。它要留到最后单独上传，理由见文件开头第 2、4 条。
-( cd dist && ls -A | grep -vx 'index.html' ) > /tmp/mrday-site.files
-COPYFILE_DISABLE=1 tar --no-xattrs -czf /tmp/mrday-site.tgz -C dist -T /tmp/mrday-site.files
+( cd "$OUT" && ls -A | grep -vx 'index.html' ) > "$OUT.files"
+COPYFILE_DISABLE=1 tar --no-xattrs -czf "$TGZ" -C "$OUT" -T "$OUT.files"
 
 # 上面那个故障能潜伏这么久，就是因为没人检查过归档内容。检查一次，成本是两行。
-tar -tzf /tmp/mrday-site.tgz | grep -qx 'app/index.html' \
+tar -tzf "$TGZ" | grep -qx 'app/index.html' \
   || { echo "✗ 归档里没有 app/index.html —— 嵌入的 IDE 又会停在旧 bundle 上"; exit 1; }
 # 内嵌 IDE 的 index.html 指名了它自己那套 content-hash 资源。少一个就是白屏，而且是
 # **只有网页版用户看得见**的白屏——桌面端走的是另一份产物，本地怎么点都是好的。
-_APP_HTML="$(tar -xzOf /tmp/mrday-site.tgz app/index.html)"
+_APP_HTML="$(tar -xzOf "$TGZ" app/index.html)"
 for _ref in $(printf '%s' "$_APP_HTML" | grep -oE '(src|href)="/app/[^"]+"' | sed 's/.*"\/app\/\(.*\)"/\1/'); do
-  tar -tzf /tmp/mrday-site.tgz | grep -qx "app/$_ref" \
+  tar -tzf "$TGZ" | grep -qx "app/$_ref" \
     || { echo "✗ app/index.html 引的 app/$_ref 不在归档里 —— 网页版会白屏。"; \
          echo "   多半是忘了在 ide/ 跑 npm run build:web（它带 --base=/app/）。"; exit 1; }
 done
 echo "==> 内嵌 IDE 的资源引用齐全（$(printf '%s' "$_APP_HTML" | grep -coE '(src|href)="/app/[^"]+"') 个）"
-tar -tzf /tmp/mrday-site.tgz | grep -qx 'index.html' \
+tar -tzf "$TGZ" | grep -qx 'index.html' \
   && { echo "✗ 归档里含站点根 index.html —— 它必须留到 bundle 验证通过后再单独上传"; exit 1; }
-"${SCP[@]}" -q /tmp/mrday-site.tgz "$REMOTE:$STAGE_DIR/site.tgz"
-rm -f /tmp/mrday-site.tgz
+"${SCP[@]}" -q "$TGZ" "$REMOTE:$STAGE_DIR/site.tgz"
+rm -f "$TGZ"
 "${SSH[@]}" "$REMOTE" "tar -xzf $STAGE_DIR/site.tgz -C $WEB_ROOT && rm -f $STAGE_DIR/site.tgz"
 
 echo "==> handing the files to nginx (www-data)"
@@ -122,8 +136,8 @@ echo "==> handing the files to nginx (www-data)"
 # to publish it unless that exact file is on the server and readable by nginx. Without this
 # a half-finished upload becomes a white page — and every check further down still passes,
 # because "/" returns 200 whether or not its script exists.
-BUNDLE="$(sed -n 's/.*src="\(\/assets\/index-[A-Za-z0-9_-]*\.js\)".*/\1/p' dist/index.html | head -1)"
-[ -n "$BUNDLE" ] || { echo "could not find the bundle name in dist/index.html"; exit 1; }
+BUNDLE="$(sed -n 's/.*src="\(\/assets\/index-[A-Za-z0-9_-]*\.js\)".*/\1/p' "$OUT/index.html" | head -1)"
+[ -n "$BUNDLE" ] || { echo "could not find the bundle name in the built index.html"; exit 1; }
 echo "==> checking $BUNDLE landed before pointing the site at it"
 "${SSH[@]}" "$REMOTE" "sudo -u www-data test -r $WEB_ROOT$BUNDLE" || {
   echo "ABORTED: $BUNDLE is not readable on the server — the live site is untouched." >&2
@@ -132,7 +146,7 @@ echo "==> checking $BUNDLE landed before pointing the site at it"
 }
 
 echo "==> switching index.html over"
-"${SCP[@]}" -q dist/index.html "$REMOTE:$STAGE_DIR/index.html"
+"${SCP[@]}" -q "$OUT/index.html" "$REMOTE:$STAGE_DIR/index.html"
 "${SSH[@]}" "$REMOTE" "cp -a $WEB_ROOT/index.html $STAGE_DIR/index.html.live-backup 2>/dev/null || true"
 "${SSH[@]}" "$REMOTE" "install -m 0644 -o www-data -g www-data $STAGE_DIR/index.html $WEB_ROOT/index.html"
 
@@ -173,6 +187,16 @@ if [ -n "$body" ]; then
   echo "    served catalogue: ${count:-unparseable} tools"
 else
   echo "    served catalogue: could not be checked (connection dropped) — verify by hand"
+fi
+
+# 中国区镜像放在国内那台机器上时（deploy-cn-box.sh 装的），同一份构建也同步过去：两边永远一样。
+# 没设 CN_BOX_SSH 就跳过——镜像还在美国机器上的话它读的本来就是同一个目录。
+if [ -n "${CN_BOX_SSH:-}" ]; then
+  echo "==> syncing the same build to the China box ($CN_BOX_SSH)"
+  CN_WEB_ROOT="${CN_WEB_ROOT:-$WEB_ROOT}"
+  retry rsync -az --delete -e "ssh -i ${CN_BOX_KEY:?需要 CN_BOX_KEY} -o BatchMode=yes -o StrictHostKeyChecking=accept-new" "$OUT/" "$CN_BOX_SSH:$CN_WEB_ROOT/" \
+    && retry ssh -i "$CN_BOX_KEY" -o BatchMode=yes "$CN_BOX_SSH" "chown -R www-data:www-data '$CN_WEB_ROOT' && chmod -R u=rwX,go=rX '$CN_WEB_ROOT'" \
+    || echo "    WARNING: China box sync failed — mrday.one is updated, the mirror is not. Re-run with CN_BOX_SSH set." >&2
 fi
 
 echo

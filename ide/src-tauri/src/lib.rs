@@ -44,7 +44,6 @@ mod process_util;
 mod protocol;
 mod proxy;
 mod public_data;
-mod qr;
 #[macro_use]
 mod safelog;
 mod sandbox;
@@ -330,6 +329,7 @@ pub fn run() {
             conversation_store::conversation_transcript_truncate,
             stream_draft::stream_draft_append,
             stream_draft::stream_draft_read_all,
+            stream_draft::stream_draft_snapshot,
             stream_draft::stream_draft_clear,
             git::git_status,
             git::git_worktree_add,
@@ -371,7 +371,6 @@ pub fn run() {
             ai::web_fetch,
             ai::web_search,
             net::http_request,
-            net::tor_request,
             net::download_file,
             net::generate_image_chat,
             proxy::proxy_available,
@@ -380,7 +379,6 @@ pub fn run() {
             proxy::proxy_stop,
             proxy::proxy_ca_path,
             proxy::proxy_set_system_proxy,
-            qr::decode_qr,
             image_location::reverse_geocode_coordinates,
             location::request_current_location,
             db::db_query,

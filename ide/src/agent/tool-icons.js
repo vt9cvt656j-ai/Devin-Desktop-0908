@@ -37,6 +37,9 @@ export const TOOL_ICONS = {
   _ksearch: '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v10"/><path d="M4 5.5v15A2.5 2.5 0 0 1 6.5 18H12"/><circle cx="17" cy="17" r="3.2"/><path d="M21 21l-1.7-1.7"/>',
   lsp: '<path d="M8.5 4C6.5 4 6.5 8 6.5 9s0 3-2.5 3c2.5 0 2.5 2 2.5 3s0 5 2 5"/><path d="M15.5 4c2 0 2 4 2 5s0 3 2.5 3c-2.5 0-2.5 2-2.5 3s0 5-2 5"/>',
   current_time: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 1.8"/>',
+  // 后台监控：Lucide 的 `activity` 逐字搬过来（db-icons.js 里那份烤出来的同一条 path）。
+  // 它此前没有条目，一路回落成 FILE —— 一张「在等一件事」的卡和「读了个文件」长得一样。
+  background_monitor: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>',
 
   // ── 写 ───────────────────────────────────────────────────────────────
   write: FILE + '<path d="M12 12v5"/><path d="M9.5 14.5h5"/>',
@@ -136,7 +139,6 @@ export const TOOL_ICONS = {
   computer: '<rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M8.5 20.5h7"/><path d="M12 16.5v4"/>',
   remote: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01"/><path d="M7 16.5h.01"/>',
   mcp: '<path d="M9 3v5"/><path d="M15 3v5"/><path d="M6 8h12v4a6 6 0 0 1-12 0z"/><path d="M12 18v3"/>',
-  qr: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><path d="M14 14h2.5"/><path d="M20.5 14v6.5H14"/>',
   db: '<ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6"/><path d="M4.5 12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3"/>',
   git: '<circle cx="7" cy="6" r="2.5"/><circle cx="7" cy="18" r="2.5"/><circle cx="17" cy="10" r="2.5"/><path d="M7 8.5v7"/><path d="M17 12.5c0 2.5-2 3.5-4.5 3.8"/>',
 
@@ -182,7 +184,7 @@ export const TOOL_FAMILY = {
   cmd: "run", termtask: "run", termread: "run", termlist: "run", termstop: "run",
   demostart: "run", demostop: "run", debug: "run",
   web: "net", websearch: "net", http: "net", download: "net", browser: "net",
-  screenshot: "net", computer: "net", remote: "net", mcp: "net", qr: "net",
+  screenshot: "net", computer: "net", remote: "net", mcp: "net",
   db: "net", git: "net", gh: "net",
   think: "think", skill: "think", guide: "think", memory: "think", askuser: "think",
   genimage: "think", subagent: "think", plan: "think", updateplan: "think",
@@ -206,7 +208,7 @@ export const TOOL_FAMILY = {
   smashingmag_search: "net", docker_compose_up: "net", worktree: "net",
   figma: "net", automation: "net", uiextract: "net", liveenvironment: "net",
   capture_start: "net", capture_stop: "net", capture_flows: "net", mcpconfig: "net",
-  performance_profile: "run", schedule: "run", worker: "run",
+  performance_profile: "run", schedule: "run", worker: "run", background_monitor: "run",
   awaitsubagent: "think", explain: "think", vizcompare: "think", preview: "think",
   designboard: "make", learndesign: "make", createproject: "make", web_scaffold: "make",
   delete: "danger",

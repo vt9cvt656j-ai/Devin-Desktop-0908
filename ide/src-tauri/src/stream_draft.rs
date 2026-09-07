@@ -9,6 +9,7 @@
 //! 进了 OS，进程被杀但系统还在时就活得下来），恢复时把同一轮的 delta 拼回来。追加是 O(delta)，
 //! 不碰 O(n²) 的整段 flatten。每会话一个文件；每行一条 JSON：{g:轮次, t:正文delta, r:思考delta}。
 //! 换了一轮（g 变大）就在读取时丢弃旧轮的行，收尾时删文件。
+//! 另有 `<sid>.snap.json`：在途消息的 DOM 快照（整份覆盖，临时文件 + rename 保证要么旧要么新）。
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -67,8 +68,34 @@ pub fn stream_draft_append(
     Ok(())
 }
 
-/// 读回所有会话的在途草稿，各自按**最新一轮**把 delta 拼成全量。
-/// 返回 [{sessionId, gen, text, reasoning}]。给恢复流程用。
+/// 在途消息的 DOM 快照：整份覆盖。先写临时文件再 rename，进程死在写一半时磁盘上留的是上一份完整的。
+#[tauri::command]
+pub fn stream_draft_snapshot(
+    app: AppHandle,
+    session_id: String,
+    gen: u64,
+    at: u64,
+    html: String,
+) -> Result<(), String> {
+    let sid = safe_name(&session_id);
+    if sid.is_empty() || html.is_empty() {
+        return Ok(());
+    }
+    let dir = drafts_dir(&app)?;
+    let tmp = dir.join(format!("{sid}.snap.json.tmp"));
+    let path = dir.join(format!("{sid}.snap.json"));
+    let body = serde_json::json!({ "gen": gen, "at": at, "html": html }).to_string();
+    {
+        let mut f = fs::File::create(&tmp).map_err(|e| format!("建不了快照文件: {e}"))?;
+        f.write_all(body.as_bytes()).map_err(|e| format!("写快照失败: {e}"))?;
+        let _ = f.flush();
+    }
+    fs::rename(&tmp, &path).map_err(|e| format!("换入快照失败: {e}"))?;
+    Ok(())
+}
+
+/// 读回所有会话的在途草稿：delta 日志按**最新一轮**拼成全量，DOM 快照原样带上。
+/// 返回 [{sessionId, gen, text, reasoning, html, htmlAt}]。给恢复流程用。
 #[tauri::command]
 pub fn stream_draft_read_all(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
     let dir = drafts_dir(&app)?;
@@ -77,30 +104,68 @@ pub fn stream_draft_read_all(app: AppHandle) -> Result<Vec<serde_json::Value>, S
         Ok(e) => e,
         Err(_) => return Ok(out),
     };
+    let mut sids: Vec<String> = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
-            continue;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let stem = name
+            .strip_suffix(".ndjson")
+            .or_else(|| name.strip_suffix(".snap.json"))
+            .map(str::to_string);
+        if let Some(sid) = stem {
+            if !sid.is_empty() && !sids.contains(&sid) {
+                sids.push(sid);
+            }
         }
-        let sid = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let (gen, text, reasoning) = reconstruct(&content);
-        if !text.trim().is_empty() || !reasoning.trim().is_empty() {
-            out.push(serde_json::json!({
-                "sessionId": sid,
-                "gen": gen,
-                "text": text,
-                "reasoning": reasoning,
-            }));
+    }
+    for sid in sids {
+        let (gen, text, reasoning) = fs::read_to_string(dir.join(format!("{sid}.ndjson")))
+            .map(|c| reconstruct(&c))
+            .unwrap_or((0, String::new(), String::new()));
+        let snap = fs::read_to_string(dir.join(format!("{sid}.snap.json")))
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| {
+                let html = v.get("html")?.as_str()?.to_string();
+                Some((
+                    v.get("gen").and_then(|g| g.as_u64()).unwrap_or(0),
+                    v.get("at").and_then(|a| a.as_u64()).unwrap_or(0),
+                    html,
+                ))
+            });
+        if let Some(entry) = combine(&sid, gen, text, reasoning, snap) {
+            out.push(entry);
         }
     }
     Ok(out)
+}
+
+/// 同一会话的 delta 日志与 DOM 快照合成一条恢复记录。两边轮次不同时只认新的那一轮：
+/// 旧轮的快照配新轮的正文会把上一轮的工具卡塞进这一轮。三样全空就不产出。纯函数，可单测。
+fn combine(
+    sid: &str,
+    gen: u64,
+    text: String,
+    reasoning: String,
+    snap: Option<(u64, u64, String)>,
+) -> Option<serde_json::Value> {
+    let snap_gen = snap.as_ref().map(|s| s.0).unwrap_or(0);
+    let latest = gen.max(snap_gen);
+    let (text, reasoning) = if gen == latest { (text, reasoning) } else { (String::new(), String::new()) };
+    let (html, html_at) = match snap {
+        Some((g, at, html)) if g == latest && !html.is_empty() => (Some(html), Some(at)),
+        _ => (None, None),
+    };
+    if text.trim().is_empty() && reasoning.trim().is_empty() && html.is_none() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "sessionId": sid,
+        "gen": latest,
+        "text": text,
+        "reasoning": reasoning,
+        "html": html,
+        "htmlAt": html_at,
+    }))
 }
 
 /// 把一份 ndjson 日志按最新一轮拼回 (gen, text, reasoning)。纯函数，可单测。
@@ -146,14 +211,45 @@ pub fn stream_draft_clear(app: AppHandle, session_id: String) -> Result<(), Stri
     if sid.is_empty() {
         return Ok(());
     }
-    let path = drafts_dir(&app)?.join(format!("{sid}.ndjson"));
-    let _ = fs::remove_file(path);
+    let dir = drafts_dir(&app)?;
+    let _ = fs::remove_file(dir.join(format!("{sid}.ndjson")));
+    let _ = fs::remove_file(dir.join(format!("{sid}.snap.json")));
+    let _ = fs::remove_file(dir.join(format!("{sid}.snap.json.tmp")));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{reconstruct, safe_name};
+    use super::{combine, reconstruct, safe_name};
+
+    #[test]
+    fn 快照和日志同一轮_两样都带上() {
+        let v = combine("s", 3, "正文".into(), String::new(), Some((3, 99, "<div>x</div>".into()))).unwrap();
+        assert_eq!(v["text"], "正文");
+        assert_eq!(v["html"], "<div>x</div>");
+        assert_eq!(v["htmlAt"], 99);
+    }
+
+    #[test]
+    fn 旧轮的快照不配新轮的正文() {
+        let v = combine("s", 4, "新轮正文".into(), String::new(), Some((3, 1, "<div>旧</div>".into()))).unwrap();
+        assert_eq!(v["text"], "新轮正文");
+        assert!(v["html"].is_null(), "上一轮的工具卡不许塞进这一轮");
+    }
+
+    #[test]
+    fn 新轮只有快照_旧轮正文丢弃() {
+        let v = combine("s", 3, "旧".into(), String::new(), Some((4, 1, "<div>新</div>".into()))).unwrap();
+        assert_eq!(v["text"], "");
+        assert_eq!(v["gen"], 4);
+        assert_eq!(v["html"], "<div>新</div>");
+    }
+
+    #[test]
+    fn 只有快照没有正文也算有内容_全空不产出() {
+        assert!(combine("s", 0, String::new(), String::new(), Some((2, 1, "<div/>".into()))).is_some());
+        assert!(combine("s", 0, "  ".into(), String::new(), None).is_none());
+    }
 
     #[test]
     fn 按最新一轮拼回_旧轮的行被丢弃() {

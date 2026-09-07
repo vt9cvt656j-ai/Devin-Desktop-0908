@@ -77,7 +77,7 @@ const TOOL_METADATA = Object.freeze({
 
   // 调试诊断类工具
   search: {
-    category: 'diagnostics',
+    category: 'search',
     use_cases: ['错误码搜索', '日志关键词查找', '代码模式匹配'],
     triggers: ['遇到报错', '需要定位问题', '搜索错误信息'],
     example_call: "search(query='TypeError.*line 42', path='src')",
@@ -101,7 +101,7 @@ const TOOL_METADATA = Object.freeze({
     usage_note: '【何时用】不确定有哪些后台任务在跑时。【vs 替代】已知终端名直接 read_terminal。'
   },
   debug_control: {
-    category: 'execution',
+    category: 'diagnostics',
     use_cases: ['断点停住后就地读变量真值', '判断断点到底有没有被命中'],
     triggers: ['需要运行期的真实变量值', '想避免加 print 重跑一轮'],
     example_call: "debug_control(action='await_stop', timeout_ms=30000)",
@@ -261,7 +261,7 @@ const TOOL_METADATA = Object.freeze({
 
   // Web 服务与 API
   web_fetch: {
-    category: 'networking',
+    category: 'research',
     use_cases: ['网页内容读取', '在线文档抓取', 'API 响应查看'],
     triggers: ['需要读取网页正文', '查看在线文档内容', 'web_search 找到链接后需要读内容'],
     example_call: "web_fetch(url='https://vite.dev/guide/')",
@@ -396,7 +396,7 @@ const TOOL_METADATA = Object.freeze({
   codrops_search: { category: 'research', use_cases: ['Codrops UI 示例搜索'], triggers: ['前端 UI 效果', 'CSS 动画'], example_call: "codrops_search(query='parallax scroll')", priority: 'low', usage_note: '【何时用】搜索 Codrops 上的前端 UI 示例/教程。' },
   smashingmag_search: { category: 'research', use_cases: ['Smashing Magazine 文章搜索'], triggers: ['Web 设计/开发文章'], example_call: "smashingmag_search(query='responsive images')", priority: 'low', usage_note: '【何时用】搜索 Smashing Magazine 的设计/开发文章。' },
   awwwards_search: { category: 'research', use_cases: ['Awwwards 获奖网站搜索'], triggers: ['网页设计参考', '创意网站'], example_call: "awwwards_search(query='portfolio minimal')", priority: 'low', usage_note: '【何时用】搜索 Awwwards 获奖网站获取设计灵感。' },
-  realtime_news_feed: { category: 'research', use_cases: ['实时技术新闻聚合'], triggers: ['了解近期动态', '技术风向'], example_call: "realtime_news_feed(topic='AI agents', sources='all')", priority: 'high', usage_note: '【何时用】聚合多源实时技术新闻。【vs 替代】历史搜索用 web_search。' },
+  realtime_news_feed: { category: 'data_layer', use_cases: ['实时技术新闻聚合'], triggers: ['了解近期动态', '技术风向'], example_call: "realtime_news_feed(topic='AI agents', sources='all')", priority: 'high', usage_note: '【何时用】聚合多源实时技术新闻。【vs 替代】历史搜索用 web_search。' },
   probe_env: { category: 'diagnostics', use_cases: ['一次问清这台机器装了什么', '搞清项目用哪套工具链', 'command not found 之后先看环境'], triggers: ['命令找不到', '构建莫名其妙失败', '不确定项目用 npm 还是 pnpm', '准备说「没装 X」之前'], example_call: "probe_env()", priority: 'high', usage_note: '【何时用】现实和预期不一样的那一刻。一次调用抵四五轮 run_cmd 试探。'+'【vs 替代】run_cmd 一次只能试一个命令；get_diagnostics 看的是代码问题不是环境。' },
   ui_extract: { category: 'creative', use_cases: ['把网页真实的配色/字体/间距读出来', '读原生应用的界面结构', '1:1 还原前的第一步'], triggers: ['照着这个网站做一个', '1:1 还原这个界面', '把这个 app 的 UI 复刻出来'], example_call: "ui_extract(source='url', url='https://example.com')", priority: 'high', usage_note: '【何时用】还原任何现成界面之前先调它——拿到的是事实（真实色值/字号/盒模型），不是从截图猜的。'+'【vs 替代】screenshot 只给像素；visual_compare 给的是改完之后的实测差距。三者配合：先 extract，再写，再 compare。' },
   view_image: { category: 'file_io', use_cases: ['看工作区里已有的图片', '读设计稿', '读只存在于截图里的报错'], triggers: ['用户说「看这张设计稿」', '仓库里有 bug 截图', '要比对实现和视觉稿'], example_call: "view_image(path='assets/design/home.png')", priority: 'high', usage_note: '【何时用】答案取决于图里有什么的时候——别从文件名猜。'+'【vs 替代】read_file 只读文本层，对 png 直接失败；screenshot 截的是跑着的网址；visual_compare 要同时给设计稿和 URL。' },
@@ -420,15 +420,14 @@ const TOOL_METADATA = Object.freeze({
   knowledge_search: { category: 'search', use_cases: ['项目知识库检索', '设计规范查询'], triggers: ['查找项目规范', '检索已知知识'], example_call: "knowledge_search(query='dashboard color scheme', domain='michael-design')", priority: 'high', usage_note: '【何时用】从项目知识库中检索已知信息。【vs 替代】代码搜索用 search；联网搜索用 web_search。' },
   find_symbol: { category: 'search', use_cases: ['跨文件符号查找'], triggers: ['找函数/类定义', '追踪符号引用'], example_call: "find_symbol(name='createSession')", priority: 'high', usage_note: '【何时用】查找函数/类/变量的定义和引用。【vs 替代】文本搜索用 search；语义搜索用 semantic_search。' },
   http_request: { category: 'networking', use_cases: ['HTTP API 调用', '服务健康检查', '外部服务交互'], triggers: ['调用外部 API', '验证服务状态', '发 POST/PUT 请求', '需要自定义 headers/body'], example_call: "http_request(method='GET', url='https://api.example.com/health')", priority: 'high', usage_note: '【何时用】调用任意 HTTP API——这是你用各种网上工具/在线服务的关键能力。公网 API 不要凭感觉拼路径，先用官方文档/页面源码/抓包/用户给的精确 URL 取证；localhost/dev server/已取证 URL 可直接请求。【vs 替代】只读网页正文用 web_fetch（更简单）；搜索用 web_search。【何时不用】只是读网页正文不需要自定义请求时，用 web_fetch。' },
-  download_file: { category: 'networking', use_cases: ['文件下载'], triggers: ['下载资源文件', '获取远程文件'], example_call: "download_file(url='https://example.com/file.zip', dest='./downloads/file.zip')", priority: 'medium', usage_note: '【何时用】从 URL 下载文件到本地。【vs 替代】游戏资产用 download_asset。' },
-  tor_request: { category: 'networking', use_cases: ['Tor 匿名网络请求'], triggers: ['需要匿名访问', '.onion 站点'], example_call: "tor_request(method='GET', url='http://example.onion/')", priority: 'low', usage_note: '【何时用】通过 Tor 网络访问 .onion 站点或匿名请求。桌面专用。' },
+  download_file: { category: 'file_io', use_cases: ['文件下载'], triggers: ['下载资源文件', '获取远程文件'], example_call: "download_file(url='https://example.com/file.zip', dest='./downloads/file.zip')", priority: 'medium', usage_note: '【何时用】从 URL 下载文件到本地。【vs 替代】游戏资产用 download_asset。' },
   performance_profile: { category: 'diagnostics', use_cases: ['前端性能分析', '页面加载检测'], triggers: ['页面加载慢', '性能瓶颈定位'], example_call: "performance_profile(url='http://localhost:5174')", priority: 'medium', usage_note: '【何时用】分析前端页面性能（仅 localhost）。【vs 替代】后端性能用 profiler。' },
-  openapi_parser: { category: 'specification_parsing', use_cases: ['OpenAPI 规范解析', 'API 端点提取'], triggers: ['查看可用 API', '接口文档解析'], example_call: "openapi_parser(url='./openapi.json', outputFormat='list')", priority: 'medium', usage_note: '【何时用】解析 OpenAPI/Swagger 规范提取端点列表。' },
+  openapi_parser: { category: 'data_layer', use_cases: ['OpenAPI 规范解析', 'API 端点提取'], triggers: ['查看可用 API', '接口文档解析'], example_call: "openapi_parser(url='./openapi.json', outputFormat='list')", priority: 'medium', usage_note: '【何时用】解析 OpenAPI/Swagger 规范提取端点列表。' },
   docker_compose_up: { category: 'execution', use_cases: ['多服务/微服务本地环境', '拉起 Compose 服务栈'], triggers: ['项目含 docker-compose.yml', '需要本地依赖服务(数据库/缓存)'], example_call: "docker_compose_up(path='docker-compose.yml')", priority: 'medium', usage_note: '【何时用】用 docker-compose 启动多服务栈。【vs 替代】单个持续进程用 run_in_terminal；一次性命令用 run_cmd。' },
   run_worker: { category: 'orchestration', use_cases: ['大项目多模块并行实现', '独立 scope 同时开发', '把已删除的模块交给写入型 worker'], triggers: ['计划里有互不依赖的实现步骤', '多模块可按目录清晰切分 scope', '需要并行写入加速大工程'], example_call: "run_worker(description='Build API', prompt='Implement the verified API contract.', scope=['src/api'], role='backend')", priority: 'medium', usage_note: '【何时用】把互不依赖的模块交给 worker 并行实现。【vs 替代】调研用 run_subagent。' },
   run_subagent: { category: 'orchestration', use_cases: ['bug 深度取证并行', '后台调研不阻塞主线', '收集日志/复现路径/关联调用方证据', '单个聚焦文件调查不要派——主智能体直接读更快'], triggers: ['根因未明需要并行取证', '调研可后台跑不阻塞主任务', '需要独立视角审查/调研'], example_call: "run_subagent(description='Audit auth', prompt='Inspect auth and return file:line evidence.', role='research')", priority: 'medium', usage_note: '【何时用】派发后台调研/独立审查任务。【vs 替代】并行写入用 run_worker。' },
   await_subagent: { category: 'orchestration', use_cases: ['等待后台子智能体作业落定并取回报告', '下一步依赖调研结论时显式同步', '查看作业台账现状'], triggers: ['run_subagent 后台派发后需要结果', '汇合后台作业结果', '收尾前还有作业在跑', '拦截提示结果未消化'], example_call: "await_subagent(job='all')", priority: 'medium', usage_note: '【何时用】等待并取回子智能体/worker 的作业结果。' },
-  generate_image: { category: 'generation', use_cases: ['图片生成'], triggers: ['需要生成图片', 'UI 素材'], example_call: "generate_image(prompt='Clean product backdrop', dest='assets/hero.png')", priority: 'medium', usage_note: '【何时用】生成图片。桌面专用。' },
+  generate_image: { category: 'creative', use_cases: ['图片生成'], triggers: ['需要生成图片', 'UI 素材'], example_call: "generate_image(prompt='Clean product backdrop', dest='assets/hero.png')", priority: 'medium', usage_note: '【何时用】生成图片。桌面专用。' },
   office_write: { category: 'office', use_cases: ['按规格生成 Excel（公式/样式/图表/条件格式/验证/表格/迷你图）', '生成 Word 报告（标题/列表/表格/图片/页眉页脚/目录）', '生成 PPT（母版/项目符号/图表/表格/形状）'], triggers: ['用户要 Excel / 表格文件', '用户要 Word / 报告 / 合同', '用户要 PPT / 演示文稿 / 路演'], example_call: "office_write(dest='reports/Q3.xlsx', spec={sheets:[{name:'销售', columns:[…], rows:[…], charts:[…]}]})", priority: 'high', usage_note: '【何时用】用户要的是 .xlsx/.docx/.pptx 文件本身。先 office_write(format, help:true) 拿字段表再写 spec。【vs 替代】只要看内容用 office_read；改几处用 office_edit；CSV/Markdown 用 write_file。【何时不用】用户要的是网页表格或代码时。桌面专用。' },
   office_edit: { category: 'office', use_cases: ['往已有 Excel 追加/改写行与单元格、加表、加验证', 'Word / PPT 里替换文字（保留排版）', '删表/改名/插删行列'], triggers: ['用户给了已有文档要改', '要在原表上补数据'], example_call: "office_edit(path='reports/Q3.xlsx', spec={sheets:[{name:'销售', cells:{B2:42}}]})", priority: 'high', usage_note: '【何时用】改已有 .xlsx/.docx/.pptx 且要保留其余内容。【vs 替代】结构大改用 office_read + office_write 重建；有图表的 Excel 传 dest 另存。【何时不用】文件不存在时用 office_write。桌面专用。' },
   office_read: { category: 'office', use_cases: ['读 Excel 各表的单元格/公式/合并/冻结', '读 Word 标题树与正文表格', '读 PPT 每页文字与备注'], triggers: ['用户给了 Office 文件', '核对 office_write 的结果', '改之前先看内容'], example_call: "office_read(path='reports/Q3.xlsx', sheet='销售', range='A1:H50')", priority: 'high', usage_note: '【何时用】需要文件的结构（公式、合并、每页备注）而不只是文字。【vs 替代】read_file 只给扁平文字。【何时不用】文本/代码/PDF 用 read_file。桌面专用。' },
@@ -438,31 +437,30 @@ const TOOL_METADATA = Object.freeze({
   system: { category: 'desktop_automation', use_cases: ['系统信息查询', '窗口管理'], triggers: ['获取系统信息', '管理窗口'], example_call: "system(action='frontmost')", priority: 'low', usage_note: '【何时用】查询系统信息/管理窗口。桌面专用。' },
   read_screen: { category: 'desktop_automation', use_cases: ['屏幕内容读取', 'OCR'], triggers: ['需要读取屏幕信息'], example_call: "read_screen(ocr=false)", priority: 'low', usage_note: '【何时用】读取当前屏幕内容。桌面专用。' },
   ui_click: { category: 'desktop_automation', use_cases: ['UI 元素点击'], triggers: ['需要点击界面元素'], example_call: "ui_click(ref=12, action='press')", priority: 'low', usage_note: '【何时用】点击 UI 元素。桌面专用。' },
-  visual_compare: { category: 'ui_automation', use_cases: ['设计稿与实现对比'], triggers: ['视觉回归', '设计还原检查'], example_call: "visual_compare(design='assets/design.png', url='http://localhost:5174')", priority: 'medium', usage_note: '【何时用】把实现页面与目标设计稿并排对比视觉差异（布局/间距/颜色/字体）。【vs 替代】只看当前效果不需设计稿用 screenshot；需要交互操作用 browser。' },
+  visual_compare: { category: 'creative', use_cases: ['设计稿与实现对比'], triggers: ['视觉回归', '设计还原检查'], example_call: "visual_compare(design='assets/design.png', url='http://localhost:5174')", priority: 'medium', usage_note: '【何时用】把实现页面与目标设计稿并排对比视觉差异（布局/间距/颜色/字体）。【vs 替代】只看当前效果不需设计稿用 screenshot；需要交互操作用 browser。' },
   design_board: { category: 'creative', use_cases: ['多方案视觉对比板'], triggers: ['设计方案展示', 'A/B 视觉对比'], example_call: "design_board(variants=[{label:'A', path:'a.png'}])", priority: 'low', usage_note: '【何时用】创建多方案视觉对比板。' },
-  preview_choices: { category: 'interaction', use_cases: ['可视化选项展示'], triggers: ['需要用户做视觉选择'], example_call: "preview_choices(title='Choose layout', variants=[{name:'A', html:'<i>A</i>'}])", priority: 'low', usage_note: '【何时用】以可视化方式展示选项让用户选择。' },
+  preview_choices: { category: 'creative', use_cases: ['可视化选项展示'], triggers: ['需要用户做视觉选择'], example_call: "preview_choices(title='Choose layout', variants=[{name:'A', html:'<i>A</i>'}])", priority: 'low', usage_note: '【何时用】以可视化方式展示选项让用户选择。' },
   visual_explain: { category: 'creative', use_cases: ['可视化解释技术概念'], triggers: ['需要用图解释流程', '架构可视化'], example_call: "visual_explain(title='Auth flow', prompt='Login -> Token -> API')", priority: 'low', usage_note: '【何时用】用可视化方式解释技术概念/流程。' },
-  research_project: { category: 'orchestration', use_cases: ['深度代码调研'], triggers: ['需要全面了解代码流'], example_call: "research_project(focus='authentication flow')", priority: 'medium', usage_note: '【何时用】派发子智能体做深度代码调研。' },
+  research_project: { category: 'search', use_cases: ['深度代码调研'], triggers: ['需要全面了解代码流'], example_call: "research_project(focus='authentication flow')", priority: 'medium', usage_note: '【何时用】派发子智能体做深度代码调研。' },
   design_research: { category: 'creative', use_cases: ['设计体系调研'], triggers: ['了解目标设计体系'], example_call: "design_research(goal='SaaS dashboard')", priority: 'medium', usage_note: '【何时用】调研目标产品的设计体系。' },
   learn_design: { category: 'creative', use_cases: ['从 URL 提取设计体系'], triggers: ['分析现有设计'], example_call: "learn_design(url='https://example.com')", priority: 'medium', usage_note: '【何时用】从指定 URL 提取设计体系规范。' },
-  generate_wiki: { category: 'orchestration', use_cases: ['项目 Wiki 生成'], triggers: ['需要生成文档'], example_call: "generate_wiki(focus='architecture')", priority: 'medium', usage_note: '【何时用】派发子智能体生成项目 Wiki。' },
-  game_scaffold: { category: 'generation', use_cases: ['游戏项目脚手架'], triggers: ['新建游戏项目'], example_call: "game_scaffold(engine='godot', name='space-runner')", priority: 'medium', usage_note: '【何时用】快速搭建游戏项目骨架；没有网页运行约束时默认 Godot。' },
-  web_scaffold: { category: 'generation', use_cases: ['Web 项目脚手架'], triggers: ['新建 Web 项目'], example_call: "web_scaffold(name='dashboard', framework='react')", priority: 'medium', usage_note: '【何时用】快速搭建 Web 项目骨架。' },
-  deploy_site: { category: 'deployment', use_cases: ['网站部署'], triggers: ['需要部署上线'], example_call: "deploy_site(name='dashboard')", priority: 'high', usage_note: '【何时用】将项目部署到线上。有安全白名单机制。' },
+  generate_wiki: { category: 'office', use_cases: ['项目 Wiki 生成'], triggers: ['需要生成文档'], example_call: "generate_wiki(focus='architecture')", priority: 'medium', usage_note: '【何时用】派发子智能体生成项目 Wiki。' },
+  game_scaffold: { category: 'planning', use_cases: ['游戏项目脚手架'], triggers: ['新建游戏项目'], example_call: "game_scaffold(engine='godot', name='space-runner')", priority: 'medium', usage_note: '【何时用】快速搭建游戏项目骨架；没有网页运行约束时默认 Godot。' },
+  web_scaffold: { category: 'planning', use_cases: ['Web 项目脚手架'], triggers: ['新建 Web 项目'], example_call: "web_scaffold(name='dashboard', framework='react')", priority: 'medium', usage_note: '【何时用】快速搭建 Web 项目骨架。' },
+  deploy_site: { category: 'execution', use_cases: ['网站部署'], triggers: ['需要部署上线'], example_call: "deploy_site(name='dashboard')", priority: 'high', usage_note: '【何时用】将项目部署到线上。有安全白名单机制。' },
   worktree: { category: 'version_control', use_cases: ['Git worktree 管理'], triggers: ['多分支并行开发'], example_call: "worktree(action='list')", priority: 'low', usage_note: '【何时用】管理 git worktree 实现多分支并行。' },
-  local_discovery: { category: 'location', use_cases: ['本地商户发现'], triggers: ['找附近商户/服务'], example_call: "local_discovery(query='coffee', near='current')", priority: 'low', usage_note: '【何时用】发现附近的商户/服务。非技术工具。' },
-  live_environment: { category: 'location', use_cases: ['实时天气/环境查询'], triggers: ['查天气', '环境信息'], example_call: "live_environment(kind='weather')", priority: 'low', usage_note: '【何时用】查询实时天气/环境信息。' },
-  current_time: { category: 'utility', use_cases: ['获取当前时间'], triggers: ['需要时间戳'], example_call: "current_time()", priority: 'low', usage_note: '【何时用】获取当前系统时间。' },
+  local_discovery: { category: 'data_layer', use_cases: ['本地商户发现'], triggers: ['找附近商户/服务'], example_call: "local_discovery(query='coffee', near='current')", priority: 'low', usage_note: '【何时用】发现附近的商户/服务。非技术工具。' },
+  live_environment: { category: 'data_layer', use_cases: ['实时天气/环境查询'], triggers: ['查天气', '环境信息'], example_call: "live_environment(kind='weather')", priority: 'low', usage_note: '【何时用】查询实时天气/环境信息。' },
+  current_time: { category: 'data_layer', use_cases: ['获取当前时间'], triggers: ['需要时间戳'], example_call: "current_time()", priority: 'low', usage_note: '【何时用】获取当前系统时间。' },
   capture_start: { category: 'networking', use_cases: ['启动网络抓包'], triggers: ['需要捕获网络请求'], example_call: "capture_start(mode='isolated_browser')", priority: 'medium', usage_note: '【何时用】启动网络抓包捕获 HTTP 请求。需要 mitmproxy。' },
   capture_flows: { category: 'networking', use_cases: ['查看抓包流量'], triggers: ['分析捕获的请求'], example_call: "capture_flows(limit=30)", priority: 'medium', usage_note: '【何时用】查看已捕获的网络流量。' },
   capture_stop: { category: 'networking', use_cases: ['停止抓包'], triggers: ['结束抓包'], example_call: "capture_stop()", priority: 'low', usage_note: '【何时用】停止网络抓包。' },
   capture_replay: { category: 'networking', use_cases: ['重放捕获的流量'], triggers: ['回放请求'], example_call: "capture_replay(id='FLOW_ID')", priority: 'low', usage_note: '【何时用】重放之前捕获的网络请求。' },
   background_monitor: { category: 'execution', use_cases: ['后台条件监控'], triggers: ['等待特定条件满足'], example_call: "background_monitor(message='Waiting for port 3000', check_type='port', pattern='3000')", priority: 'medium', usage_note: '【何时用】后台监控端口/文件/URL 等条件是否满足。' },
   automation: { category: 'desktop_automation', use_cases: ['桌面自动化通用调用'], triggers: ['复杂桌面自动化'], example_call: "automation(method='system.init', params={})", priority: 'low', usage_note: '【何时用】通用桌面自动化调用。需要 automation-server。' },
-  decode_qr: { category: 'utility', use_cases: ['QR 码解码'], triggers: ['扫描 QR 码'], example_call: "decode_qr(path='assets/qr.png')", priority: 'low', usage_note: '【何时用】解码图片中的 QR 码内容。' },
   remote: { category: 'networking', use_cases: ['远程连接管理'], triggers: ['管理远程连接'], example_call: "remote(action='status')", priority: 'low', usage_note: '【何时用】管理远程 SSH/网关连接状态。' },
-  start_demo: { category: 'utility', use_cases: ['启动演示模式'], triggers: ['展示功能'], example_call: "start_demo()", priority: 'low', usage_note: '【何时用】启动演示模式展示功能。' },
-  stop_demo: { category: 'utility', use_cases: ['停止演示模式'], triggers: ['结束演示'], example_call: "stop_demo()", priority: 'low', usage_note: '【何时用】停止演示模式。' },
+  start_demo: { category: 'execution', use_cases: ['启动演示模式'], triggers: ['展示功能'], example_call: "start_demo()", priority: 'low', usage_note: '【何时用】启动演示模式展示功能。' },
+  stop_demo: { category: 'execution', use_cases: ['停止演示模式'], triggers: ['结束演示'], example_call: "stop_demo()", priority: 'low', usage_note: '【何时用】停止演示模式。' },
 
   // ── P2 补全：机械差分发现的 16 个「有 schema 但缺 TOOL_METADATA」的高价值工具 ──
   // 缺元数据 = 语义编排器 catalog 里没有【场景/触发器】关联认知 → 该工具被 under-select（工具漏斗/盲搜根因）。
@@ -472,7 +470,7 @@ const TOOL_METADATA = Object.freeze({
   package_source: { category: 'research', use_cases: ['查第三方库的真实签名', '确认本项目装的那个版本怎么用', '列一个包导出了什么'], triggers: ['写第三方库调用前不确定 API', '记忆里的写法可能属于别的大版本', 'search/find_files 查不到依赖里的东西'], example_call: "package_source(package='@tanstack/react-query', symbol='useQuery')  //  不给 symbol 则返回该包的导出概览" },
   package_search: { category: 'research', use_cases: ['查包版本与兼容性', 'latest/engines/peerDependencies 核实', '选依赖版本'], triggers: ['改 package.json/锁文件', '选版本或处理 peer 冲突', '引入新库前'], example_call: "package_search(query='axios', ecosystem='npm')  //  Java: ecosystem='maven'，.NET: 'nuget'，PHP: 'packagist'，Ruby: 'rubygems'，镜像: 'dockerhub'", priority: 'high', usage_note: '【何时用】改 package.json / pom.xml / build.gradle / Gemfile / composer.json / *.csproj 或任何依赖版本前，用它核实 latest、版本历史、engines、peerDependencies，别凭记忆猜版本。【覆盖哪些注册表】ecosystem 一个参数切换：npm、pypi、crates、huggingface、dart、conda、cocoapods、hex、maven(Java/Gradle)、nuget(.NET)、packagist(PHP)、rubygems、homebrew(macOS 命令行包)、dockerhub(容器镜像)、cdnjs(前端 CDN)。【vs 替代】读仓库源码用 github_repo；查打包体积用 bundlephobia_search。【何时不用】不涉及依赖版本时。' },
   get_diagnostics: { category: 'diagnostics', use_cases: ['改完代码自检', 'LSP 实时错误/警告', '定位报错行列'], triggers: ['写完/改完代码', '排查编译或类型错误', '报错但不知具体位置'], example_call: "get_diagnostics(path='src/main.ts')", priority: 'high', usage_note: '【何时用】改完代码快速自检，或排查报错时读 LSP 实时诊断（文件:行列+原因+修复方向）；这是只读证据，不运行命令。【vs 替代】运行期日志用 read_logs；跑测试/构建用 run_cmd。【何时不用】非代码文件没有诊断。' },
-  read_logs: { category: 'diagnostics', use_cases: ['读终端/日志尾部', '后端/构建失败取证', '看 .log/.out/.err'], triggers: ['后端/API/构建报错', '需要真实错误原因', '持续任务输出'], example_call: "read_logs(name='dev-server', lines=200)", priority: 'high', usage_note: '【何时用】后端/API/构建失败时，读终端最新输出或日志文件尾部（只读证据，不启动新命令）。【vs 替代】编辑器实时诊断用 get_diagnostics；看持续任务运行状态用 read_terminal。【何时不用】需要跑新命令取证时用 run_cmd。' },
+  read_logs: { category: 'file_io', use_cases: ['读终端/日志尾部', '后端/构建失败取证', '看 .log/.out/.err'], triggers: ['后端/API/构建报错', '需要真实错误原因', '持续任务输出'], example_call: "read_logs(name='dev-server', lines=200)", priority: 'high', usage_note: '【何时用】后端/API/构建失败时，读终端最新输出或日志文件尾部（只读证据，不启动新命令）。【vs 替代】编辑器实时诊断用 get_diagnostics；看持续任务运行状态用 read_terminal。【何时不用】需要跑新命令取证时用 run_cmd。' },
   run_in_terminal: { category: 'execution', use_cases: ['启动 dev server/watch', '后台守护进程/监听'], triggers: ['需要持续运行的进程', 'npm run dev / 监听服务'], example_call: "run_in_terminal(command='npm run dev', name='dev')", priority: 'high', usage_note: '【何时用】启动 dev server/watch/守护进程等持续任务；启动后用 read_logs/read_terminal 看日志与 URL，等 ready 用 background_monitor。【vs 替代】会结束的一次性命令用 run_cmd。【何时不用】一次性命令绝不用它前台硬等。' },
   find_files: { category: 'search', use_cases: ['按文件名/glob 找文件', '定位入口/配置文件'], triggers: ['知道文件名但不知路径', '需要按模式列文件'], example_call: "find_files(pattern='src/**/*.ts')", priority: 'high', usage_note: '【何时用】按文件名或 glob 模式找文件。【vs 替代】按内容找用 search；按符号定义找用 find_symbol；只能描述功能说不出关键词用 semantic_search。【何时不用】已知精确路径时直接 read_file。' },
   spawn_multiple_agents: { category: 'orchestration', use_cases: ['多视角并行调研', '大任务分角色取证'], triggers: ['大任务需要 2-5 个视角并行', '独立领域可同时调查'], example_call: "spawn_multiple_agents(task='审计架构与安全', agents=[{role:'architect', focus:'模块边界'}])", priority: 'medium', usage_note: '【何时用】大任务需要多视角并行调研（2-5 个只读角色各自取证，结果自动汇合）。【vs 替代】单个聚焦调查主智能体直接读更快；写入型并行用 run_worker；单角色调研用 run_subagent。【何时不用】单一聚焦调查不要用。' },
@@ -561,7 +559,6 @@ const TOOL_EXAMPLES = Object.freeze({
   browser: { action: "navigate", url: "http://127.0.0.1:5174", fresh: true },
   http_request: { method: "GET", url: "https://api.example.com/health" },
   download_file: { url: "https://example.com/release.zip", dest: "downloads/release.zip" },
-  decode_qr: { path: "assets/qr.png" },
   remote: { action: "status" },
   generate_image: { prompt: "Clean product screenshot backdrop", dest: "assets/hero.png" },
   office_write: { dest: "reports/q3.xlsx", format: "xlsx", help: true },
@@ -599,7 +596,6 @@ const TOOL_EXAMPLES = Object.freeze({
   worktree: { action: "list" },
   semantic_search: { query: "where login sessions are validated", top_k: 8 },
   deploy_site: { name: "product-dashboard" },
-  tor_request: { method: "GET", url: "http://example.onion/" },
   capture_start: { mode: "isolated_browser" },
   automation: { method: "system.init", params: {} },
   capture_flows: { include_body: false, limit: 30 },
@@ -756,6 +752,10 @@ export function enrichedCatalogLine(entry) {
   const meta = TOOL_METADATA[entry?.name] || autoEnrichToolMetadata(entry);
   if (!meta) return line;
 
+  // 分类放最前：编排模型按类扫一遍就能圈定候选，比逐条读描述快得多。
+  if (meta.category && CATEGORY_LABELS[meta.category]) {
+    line += `\t【分类】${CATEGORY_LABELS[meta.category]}`;
+  }
   if (Array.isArray(meta.use_cases) && meta.use_cases.length > 0) {
     line += `\t【场景】${meta.use_cases.join('、')}`;
   }
@@ -775,26 +775,21 @@ export function enrichedCatalogLine(entry) {
 const CATEGORY_LABELS = Object.freeze({
   planning: '规划与起步',
   file_io: '文件读写',
-  office: '办公文档（Excel / Word / PPT）',
   code_editing: '代码编辑',
-  search: '符号与语义检索',
-  diagnostics: '诊断与性能',
-  execution: '命令与终端',
+  search: '代码检索与符号',
+  diagnostics: '诊断、调试与性能',
+  execution: '命令、终端与部署',
   version_control: '版本控制与 PR',
   research: '联网调研',
-  networking: '网络请求与抓包',
+  networking: '网络请求、抓包与远程',
   ui_automation: '浏览器自动化',
   desktop_automation: '桌面自动化',
-  creative: '设计',
-  generation: '生成脚手架与图像',
+  creative: '设计与视觉',
   game_asset_generation: '游戏素材生成',
-  data_layer: '数据库',
-  specification_parsing: '接口规范',
-  deployment: '部署',
+  office: '文档（Excel / Word / PPT / Wiki）',
+  data_layer: '数据与实时信息',
   orchestration: '多智能体编排',
   interaction: '与用户交互与记忆',
-  location: '本地环境发现',
-  utility: '杂项',
 });
 
 // 按「可用工具集合」分桶的缓存。**不能退回单值缓存**：这段文本进 system 提示词，

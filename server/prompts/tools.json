@@ -2238,27 +2238,6 @@
   {
     "type": "function",
     "function": {
-      "name": "decode_qr",
-      "description": "Read the QR codes in an image and return the text they encode (there may be several). Supply either path (the path to an image file — a screenshot you just captured, or an image in the project; relative to the workspace root or absolute) or data_url (a base64 image). Typical uses: read the link behind a sign-in or pairing QR code, or see what a given QR code actually encodes. When the image is too blurry or small to decode, crop and enlarge the QR area first and try again. Requires the desktop app.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string",
-            "description": "Path to the QR code image, e.g. debug.png or the path of a screenshot"
-          },
-          "data_url": {
-            "type": "string",
-            "description": "Optional; a base64 image (data:image/...;base64,...), for when there is no file"
-          }
-        },
-        "required": []
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
       "name": "remote",
       "description": "**Connect to another machine (a server or computer) and write code and run commands directly on it — no SSH or scp needed.** Once you connect to a michael-remote-agent.py daemon, all of your subsequent read_file / write_file / edit_file / list_dir / search / run_cmd calls **operate on that remote machine automatically** (exactly as if it were local), with no uploading or downloading. Use it when the user asks you to work on their server or remote machine: connect first (you need the address and token they supply; root is the remote project directory), and disconnect when done to switch back to local. status reports which machine you are currently on. ⚠️ The user must start the daemon on the remote machine first (python3 michael-remote-agent.py --token … --root …). Requires the desktop app.",
       "parameters": {
@@ -3646,44 +3625,6 @@
         },
         "required": [
           "name"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "tor_request",
-      "description": "**Send an HTTP request through the Tor network — reach deep-web / dark-web .onion sites** (and optionally reach ordinary URLs anonymously). Use it to read .onion links, reach censored or hidden resources, and fetch anonymously. **Tor starts automatically** (it is brought up if not running; the first cold start takes about 10-30s, and only a machine with tor not installed at all needs brew install tor). This is how deep-web content gets read.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "method": {
-            "type": "string",
-            "description": "HTTP method, e.g. GET, POST; omit for GET"
-          },
-          "url": {
-            "type": "string",
-            "description": "The full URL; .onion addresses (e.g. http://xxx.onion/path) and ordinary http/https are both supported"
-          },
-          "headers": {
-            "type": "object",
-            "description": "Optional; request header key/value pairs",
-            "additionalProperties": {
-              "type": "string"
-            }
-          },
-          "body": {
-            "type": "string",
-            "description": "Optional; the request body"
-          },
-          "timeout_secs": {
-            "type": "integer",
-            "description": "Optional; timeout in seconds, default 60 (Tor is slow), maximum 300"
-          }
-        },
-        "required": [
-          "url"
         ]
       }
     }
