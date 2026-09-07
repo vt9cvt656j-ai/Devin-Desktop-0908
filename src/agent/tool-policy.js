@@ -162,7 +162,7 @@ export const AUTOMATION_OBSERVE_METHODS = /(?:^|\.)(?:get|read|list|status|inspe
  */
 export const PARALLEL_SAFE_READS = Object.freeze([
   "read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think",
-  "recall", "termread", "termlist", "logs", "search_tools", "skill", "current_time",
+  "recall", "termread", "termlist", "logs", "search_tools", "skill", "guide", "current_time",
   "localdiscovery", "liveenvironment", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
   "semsearch", "findsymbol", "viewimage", "probeenv", "readscreen",
   "search_game_assets", "package_source", "openapi_parser", "qr", "realtime_news_feed",

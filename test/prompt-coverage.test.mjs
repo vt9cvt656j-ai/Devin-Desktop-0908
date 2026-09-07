@@ -27,13 +27,14 @@ const RUST = readFileSync(join(HERE, "..", "..", "server", "src", "prompts.rs"),
 const GRAPH = JSON.parse(readFileSync(join(HERE, "..", "..", "server", "prompts", "prompt_graph.json"), "utf8"));
 const PROMPT_DIR = join(HERE, "..", "..", "server", "prompts");
 
-// 图里被引用的模块名（modes / agent / design 各层都算）。
-function graphModules(node, out = new Set()) {
-  if (Array.isArray(node)) {
-    for (const item of node) (typeof item === "string" ? out.add(item) : graphModules(item, out));
-  } else if (node && typeof node === "object") {
-    for (const value of Object.values(node)) graphModules(value, out);
-  }
+// 图里被引用的模块**文件**名：v3 只看 core / modes / modules[].files。
+// 不能再把 JSON 里所有字符串一锅端——v3 的模块条目里有 modes:["agent"]、旗标名、工具名、
+// 给 load_guide 看的说明文字，"agent" 这种值会被误当成挂进图里的 agent.txt。
+function graphModules(graph) {
+  const out = new Set();
+  for (const name of graph.core || []) out.add(name);
+  for (const list of Object.values(graph.modes || {})) for (const name of list) out.add(name);
+  for (const m of graph.modules || []) for (const name of m.files || []) out.add(name);
   return out;
 }
 

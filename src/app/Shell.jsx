@@ -283,9 +283,9 @@ export function Shell() {
               <div className="diff-view__body" id="diffBody"></div>
             </div>
             <div className="welcome" id="welcome">
-              {/* 正文单独一层、且只有它滚动；版权行留在外面当固定页脚。
-                  以前两者同在 .welcome 里，版权行绝对定位钉底、正文居中排版，两套机制互不知情——
-                  终端一拖高盒子被压矮，正文就压在版权行上，再溢出到终端标签栏上（图层问题的根）。 */}
+              {/* 正文（含版权行）单独一层、且只有它滚动。
+                  版权行是内容的最后一项，不是固定页脚——钉在盒子底的话它会贴着终端顶边跟着终端上下跑，
+                  看着像是终端的一部分。以前它是 position:absolute 钉底，还会被居中的正文压上去。 */}
               <div className="welcome__scroll">
                 <h1 data-i18n="welcome.title">Mr. Day One</h1>
                 <p data-i18n="welcome.desc">A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
@@ -304,8 +304,8 @@ export function Shell() {
                   <span className="kbd-tip"><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>P</kbd> <span data-i18n="menu.commandPalette">命令面板</span></span>
                   <span className="kbd-tip" data-kbd-combo="enter"><span data-i18n="welcome.tipAsk">询问助手</span></span>
                 </div>
+                <div className="welcome__copyright">© 2026 Digital Bang Intelligence LLC. All rights reserved.</div>
               </div>
-              <div className="welcome__copyright">© 2026 Digital Bang Intelligence LLC. All rights reserved.</div>
             </div>
             <div className="problems-panel" id="problemsPanel" hidden>
               <div className="problems-panel__head">

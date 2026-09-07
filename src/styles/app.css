@@ -2350,10 +2350,10 @@ body.is-win .ctp-btn { font-weight: var(--wt-500); }
 }
 /* Copyright footer, pinned to the bottom-centre of the welcome screen (subtle). */
 .welcome__copyright {
-  /* 曾经是 position:absolute + bottom:16px。改成流里的页脚：它现在是 .welcome 的第二个
-     flex 子项，正文在上面那层自己滚，结构上就压不到它了。 */
-  flex: none;
-  padding: 0 32px 16px;
+  /* 曾经是 position:absolute + bottom:16px 钉在盒子底。两个毛病：居中排版的正文会压到它身上；
+     而盒子的下边缘跟着终端走（--term-h），于是它贴着终端顶边跟着终端上下跑，看着像终端的一部分。
+     现在它就是正文的最后一项，跟着内容走，和终端没有关系。 */
+  margin-top: 18px;
   text-align: center;
   font-size: 11.5px;
   color: var(--text-dim);
