@@ -15322,7 +15322,22 @@ textarea.settings-input {
    those proportions belong to the @-file picker (icons, directory column) and were why three
    short commands rendered at the size of a dialog. */
 .slashmenu-host { position: fixed; z-index: 9999; }
-.slashmenu-host .ui-island { max-height: 280px; overflow-y: auto; }
+/* 面板限高。
+   上一版写的是 `.slashmenu-host .ui-island` —— 一个**后代**选择器，而 `ui-island` 是
+   mountIsland 加在宿主**自己**身上的（两个类在同一个元素上）。那条规则从来没有匹配过，
+   于是面板一路长到屏幕顶，把整个编辑器盖住（用户实拍：装了三十个技能之后 `/` 一按就没法
+   看代码了）。判据：宿主上的类要用复合选择器，别的元素才用后代选择器。
+
+   滚动条挂在**行容器**上，不挂在外层：一层到底的话边框和圆角跟着一起滚，滚起来圆角被
+   切掉半个。高度上限由 _updateSlashMenu 按输入条上方的真实空间算好写进 --slash-max-h，
+   这里的兜底只在它没来得及写时用。 */
+.slashmenu-host .slashmenu-scroll {
+  /* 兜底也走有效视口 --eh（innerHeight ÷ 界面缩放），不写裸的 vh：放大到 1.4 倍时
+     vh 不跟着缩放变，面板会按未缩放的视口撑大。全文件同一条规矩，有测试守着。 */
+  max-height: var(--slash-max-h, calc(var(--eh, 100vh) * 0.4));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 
 /* @file mention dropdown in the chat composer. */
 .atmenu {

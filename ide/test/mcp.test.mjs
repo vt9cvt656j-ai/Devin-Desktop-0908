@@ -496,7 +496,9 @@ function makeSlashMatcher(mcpRows) {
       closest: () => null,
       getBoundingClientRect: () => ({ left: 0, top: 0, width: 400 }),
     },
-    _slashMenu: { style: {}, hidden: true },
+    // style 要有 setProperty：面板的高度上限是个 CSS 自定义属性（--slash-max-h，
+    // 真 DOM 上只能用 setProperty 写），假元素给个空 style 会当场 TypeError。
+    _slashMenu: { style: { setProperty() {} }, hidden: true },
     // 视口高度现在走 viewportH()（CSS 视口，不是物理像素 —— 见 src/agent/layout-density.js）。
     // 这套注入清单是手工维护的：给热函数加一个辅助函数，这里不补就整组 ReferenceError。
     viewportH: () => 800,

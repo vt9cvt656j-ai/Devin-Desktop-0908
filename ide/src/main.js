@@ -23876,6 +23876,29 @@ function _paintModeLabel(el, mode) {
   if (key) el.setAttribute("data-i18n", key); else el.removeAttribute("data-i18n");
   el.textContent = key ? t(key) : mode.label;
 }
+/**
+ * 切到某个模式（agent / chat / plan）。
+ *
+ * 抽成一份是因为现在有**两个**入口：底部那个模式选择器，和 `/agent` `/chat` `/plan`
+ * 三个斜杠命令。各写一遍必然漂——漏掉 `session.mode` 就是「切了模式，下一条消息又变回去」，
+ * 漏掉 `_renderChatTabs` 就是标签栏还标着旧模式。这类漏项在本文件里已经发生过。
+ */
+function _setAiMode(id) {
+  const mode = _AI_MODES.find((m) => m.id === id);
+  if (!mode) return;
+  _currentAiMode = mode.id;
+  _updateModeUI();
+  const session = _currentSession();
+  if (session) { session.mode = mode.id; _renderChatTabs(); saveChatHistory(); }
+  // 普通切换不弹提示（用户："不需要有提示"）—— 按钮上就写着当前模式，再弹一条是重复。
+  //
+  // **但流式进行中那句留着**：它说的是「这一轮仍按原模式跑完，从下一条消息起生效」，
+  // 那是一个和界面显示不一致的事实。删掉它，用户会以为切换对正在跑的这轮生效了。
+  if (_isStreaming()) {
+    showToast(`已切换到 ${mode.label} 模式 · 当前这一轮仍按原模式跑完，从你下一条消息起生效`);
+  }
+}
+
 function _updateModeUI() {
   _currentAiMode = _normalizeAiMode(_currentAiMode);
   const mode = _AI_MODES.find(m => m.id === _currentAiMode) || _AI_MODES[0];
@@ -23924,20 +23947,7 @@ function _fillModeMenu(menu) {
     // 只画图标 + 名字。介绍那一行删掉了（2026-08-29，用户："不需要介绍给用户"）——
     // 三个模式的名字本身已经说明问题，多一行灰字只是把菜单撑高。
     item.innerHTML = `<svg class="ic" viewBox="0 0 16 16">${mode.icon}</svg><span class="mode-menu__name">${mode.label}</span>`;
-    item.addEventListener("click", () => {
-      _currentAiMode = mode.id;
-      _updateModeUI();
-      _closeModeMenu();
-      const session = _currentSession();
-      if (session) { session.mode = mode.id; _renderChatTabs(); saveChatHistory(); }
-      // 普通切换不弹提示（用户："不需要有提示"）—— 按钮上就写着当前模式，再弹一条是重复。
-      //
-      // **但流式进行中那句留着**：它说的是「这一轮仍按原模式跑完，从下一条消息起生效」，
-      // 那是一个和界面显示不一致的事实。删掉它，用户会以为切换对正在跑的这轮生效了。
-      if (_isStreaming()) {
-        showToast(`已切换到 ${mode.label} 模式 · 当前这一轮仍按原模式跑完，从你下一条消息起生效`);
-      }
-    });
+    item.addEventListener("click", () => { _setAiMode(mode.id); _closeModeMenu(); });
     menu.appendChild(item);
   }
 }
@@ -76346,9 +76356,33 @@ if (typeof window !== "undefined") {
   window.openRemoteDesktopDialog = openRemoteDesktopDialog;
 }
 
+/*
+ * 内置斜杠命令。
+ *
+ * 每一条都必须落到一个**真实存在**的动作上——一个打不开任何东西的命令比没有这个命令更糟，
+ * 用户敲了没反应会以为整个功能坏了。test/slash-menu.test.mjs 里有一条守卫，逐个检查这里
+ * 提到的函数在 main.js 里真的定义过。
+ *
+ * 描述写英文：和这个表原有的三条一致，界面上由自动本地化转成中文。命令名本身不翻译
+ * （它是要**敲进去**的字面量），那个由行内的 data-i18n-skip 管。
+ *
+ * 顺序 = 常用程度，不是字母序：敲 `/` 之后不带任何字符时，用户看到的就是这个顺序的前几行。
+ */
 const _SLASH = [
+  { cmd: "new", desc: "Start a new conversation", action: () => { _newChatSession(); } },
   { cmd: "sessions", desc: "Browse and switch conversations", action: () => { void _openSessionPicker(); } },
   { cmd: "memory", desc: "Manage project memory", action: () => openMemoryPanel() },
+  // 三个模式各给一条：模式选择器在输入条上，敲命令比伸手去点快，而且和 Claude Code 的习惯一致。
+  { cmd: "agent", desc: "Switch to Agent mode — reads and edits the workspace", action: () => _setAiMode("agent") },
+  { cmd: "chat", desc: "Switch to Chat mode — answers only, no tools", action: () => _setAiMode("chat") },
+  { cmd: "plan", desc: "Switch to Plan mode — read-only, writes a plan first", action: () => _setAiMode("plan") },
+  { cmd: "terminal", desc: "Open the built-in terminal", action: () => { void openTerminal(); } },
+  { cmd: "skills", desc: "Install and manage skills", action: () => openFeaturePanel("skills") },
+  { cmd: "mcp", desc: "Manage MCP servers", action: () => openFeaturePanel("mcp") },
+  { cmd: "shortcuts", desc: "Keyboard shortcuts", action: () => openFeaturePanel("shortcuts") },
+  { cmd: "settings", desc: "Open settings", action: () => openFeaturePanel("settings") },
+  { cmd: "appearance", desc: "Theme, font size and layout", action: () => openFeaturePanel("appearance") },
+  { cmd: "cost", desc: "Usage and balance for this account", action: () => { void _showBillingPanel(); } },
   { cmd: "remote", desc: "Connect to a remote machine", action: () => openRemoteDialog() },
 ];
 
@@ -76790,6 +76824,19 @@ function _updateSlashMenu() {
   _slashMenu.style.left = b.left + "px";
   _slashMenu.style.width = b.width + "px";
   _slashMenu.style.bottom = viewportH() - b.top + 6 + "px";
+  /*
+   * 高度上限 = 输入条上沿到窗口顶之间的真实空间（减去那 6px 缝和 12px 顶部留白），
+   * 再钳进 120–360。装了三十个技能之后这个面板会一路长到屏幕顶把编辑器整个盖住
+   * （用户实拍）；写死一个像素值又会在矮窗口上照样顶出去，所以按真实空间算。
+   * 滚动条挂在面板内部的行容器上（.slashmenu-scroll），外层的边框圆角不跟着滚。
+   *
+   * **全部内联在这里，不抽函数也不引常量**：这个函数会被 test/mcp.test.mjs 整段抠出来
+   * 单独求值，新增的标识符在那个环境里是未定义的（见 memory「被 load() 抠的函数不能
+   * 新增标识符」）。也刻意不用 `Math.min(…, 360)` —— test/slash-menu.test.mjs 拿这个
+   * 形状判「宽度又被封了上限」，用在高度上会误伤。
+   */
+  const room = Math.round(b.top) - 18;
+  _slashMenu.style.setProperty("--slash-max-h", (room > 360 ? 360 : room < 120 ? 120 : room) + "px");
   _slashMenu.hidden = false;
   _renderSlashActive();
 }
