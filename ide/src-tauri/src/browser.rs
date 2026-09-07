@@ -246,8 +246,8 @@ pub struct BrowserState {
     /// where it happens instead of being a mystery.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_note: Option<String>,
-    /// 站点图标的绝对地址（<link rel=icon>，没有就按约定的 /favicon.ico）——聊天里的链接
-    /// 预览卡拿它画站点头像；取不到就不带，卡片退回首字母头像。
+    /// 站点图标——网站真实的那一个：<link rel=icon>（没有就按约定的 /favicon.ico）指向的图片，
+    /// 在 Rust 侧取回来编成 data URL；聊天里的链接预览卡拿它画站点头像。取不到就不带，卡片退回首字母。
     #[serde(skip_serializing_if = "Option::is_none")]
     favicon: Option<String>,
     /// 页面的 meta description / og:description，截到 300 字，预览卡下面那行灰字。
@@ -262,18 +262,164 @@ fn eval_string(tab: &Tab, js: &str) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-/// 站点图标地址：优先 <link rel~=icon>（含 shortcut icon / apple-touch-icon），
-/// 没有声明就按约定的 /favicon.ico；只对 http(s) 页面找，about:blank / data: 页没有图标。
+/// 站点图标：先问页面声明了哪个（<link rel~=icon> / apple-touch-icon），没有就按约定的
+/// /favicon.ico；然后把图片**取回来编成 data URL**。为什么不把地址直接交给 webview 去拉：
+/// 打包后的 CSP 只放行 https:、不少站点按 Referer 拒绝外链、登录后的站点要 cookie——三种情况
+/// `<img src=https://…>` 都是空框，而所有者要的是「网站真实的图标」。声明的那个取不到（404、
+/// 其实是 HTML 页）就再试 /favicon.ico；都没有才返回 None，卡片退回首字母。
+/// 只对 http(s) 页面找，about:blank / data: 页没有图标。
 fn page_favicon(tab: &Tab, url: &str) -> Option<String> {
     if !url.starts_with("http") {
         return None;
     }
-    eval_string(tab, r#"(function(){
-      var l = document.querySelector('link[rel~="icon"],link[rel="shortcut icon"],link[rel="apple-touch-icon"]');
-      var h = l && l.href;
-      if (!h) { try { h = new URL('/favicon.ico', location.href).href; } catch (e) { h = ''; } }
-      return String(h || '').slice(0, 2000);
-    })()"#)
+    let declared = eval_string(tab, r#"(function(){
+      var l = document.querySelector('link[rel~="icon"],link[rel="apple-touch-icon"],link[rel="apple-touch-icon-precomposed"]');
+      return String((l && l.href) || '').slice(0, 2000);
+    })()"#);
+    // 页面把图标直接内联成 data: 的（少见但有），原样交给卡片。
+    if let Some(inline) = declared.as_deref().filter(|d| d.starts_with("data:image/")) {
+        return Some(inline.to_string());
+    }
+    let conventional = ::url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.join("/favicon.ico").ok())
+        .map(|u| u.to_string());
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(d) = declared.filter(|d| d.starts_with("http")) {
+        candidates.push(d);
+    }
+    if let Some(c) = conventional {
+        if !candidates.contains(&c) {
+            candidates.push(c);
+        }
+    }
+    candidates.iter().find_map(|c| favicon_data_url(c))
+}
+
+/// 进程内的图标缓存：同一地址只取一次（「取不到」也记住）。浏览器每一步都拍快照，不能每步都去拉图。
+static FAVICON_CACHE: LazyLock<Mutex<std::collections::HashMap<String, Option<String>>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+/// 图标最多 512KB：够 apple-touch-icon 那种 180px PNG，挡得住把整页当图标塞进来。
+const FAVICON_MAX_BYTES: usize = 512 * 1024;
+
+fn favicon_data_url(icon_url: &str) -> Option<String> {
+    if let Ok(cache) = FAVICON_CACHE.lock() {
+        if let Some(hit) = cache.get(icon_url) {
+            return hit.clone();
+        }
+    }
+    let fetched = fetch_favicon(icon_url);
+    if let Ok(mut cache) = FAVICON_CACHE.lock() {
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(icon_url.to_string(), fetched.clone());
+    }
+    fetched
+}
+
+/// 取回图标字节并编成 data URL。只认真正的图片：先按魔数认，认不出再看 Content-Type 是不是
+/// image/*；站点常把缺失的 /favicon.ico 回成 200 + HTML 页，那种直接丢掉。
+fn fetch_favicon(icon_url: &str) -> Option<String> {
+    use std::io::Read as _;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(4))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+        .build()
+        .ok()?;
+    let mut resp = client.get(icon_url).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    if resp.content_length().is_some_and(|n| n > FAVICON_MAX_BYTES as u64) {
+        return None;
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut bytes = Vec::new();
+    (&mut resp)
+        .take(FAVICON_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.is_empty() || bytes.len() > FAVICON_MAX_BYTES {
+        return None;
+    }
+    let mime = sniff_image_mime(&bytes)
+        .map(str::to_string)
+        .or_else(|| content_type.starts_with("image/").then(|| content_type.clone()))?;
+    Some(image_data_url(&mime, &bytes))
+}
+
+fn image_data_url(mime: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// 按魔数认图片格式。MIME 以字节为准，不信 Content-Type：实测有站点把 PNG 当 image/x-icon 发。
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some("image/x-icon");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+    let head = head.trim_start_matches('\u{feff}').trim_start();
+    if head.starts_with("<svg") || (head.starts_with("<?xml") && head.contains("<svg")) {
+        return Some("image/svg+xml");
+    }
+    None
+}
+
+#[cfg(test)]
+mod favicon_tests {
+    use super::*;
+
+    /// 实测有站点把 PNG 当 image/x-icon 发（xianbao.fun 的 /favicon.ico 就是），MIME 必须按字节认；
+    /// 而缺失的 /favicon.ico 常回 200 + HTML 页，那种不能被当成图标。
+    #[test]
+    fn sniff_recognizes_real_images_and_rejects_html() {
+        assert_eq!(sniff_image_mime(b"\x89PNG\r\n\x1a\n\x00\x00"), Some("image/png"));
+        assert_eq!(sniff_image_mime(&[0x00, 0x00, 0x01, 0x00, 0x01, 0x00]), Some("image/x-icon"));
+        assert_eq!(sniff_image_mime(b"GIF89a\x01\x00"), Some("image/gif"));
+        assert_eq!(sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff_image_mime(b"RIFF\x00\x00\x00\x00WEBPVP8 "), Some("image/webp"));
+        assert_eq!(
+            sniff_image_mime(b"  <?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            Some("image/svg+xml")
+        );
+        assert_eq!(sniff_image_mime(b"<!doctype html><html><body>404</body></html>"), None);
+        assert_eq!(sniff_image_mime(b""), None);
+    }
+
+    #[test]
+    fn data_url_carries_sniffed_mime() {
+        assert_eq!(image_data_url("image/png", b"\x89PNG\r\n\x1a\n"), "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    /// 真连网络的一次性核对（默认跳过，`cargo test -- --ignored` 才跑）：这个站把 PNG 当
+    /// image/x-icon 发，取回来必须按字节认成 data:image/png；不存在的地址（404 或 HTML 页）必须是 None。
+    #[test]
+    #[ignore]
+    fn fetches_real_site_icon_over_network() {
+        let got = favicon_data_url("https://new.xianbao.fun/favicon.ico").expect("icon should fetch");
+        assert!(got.starts_with("data:image/png;base64,"), "{}", &got[..got.len().min(40)]);
+        assert!(favicon_data_url("https://new.xianbao.fun/definitely-missing-icon-xyz.ico").is_none());
+    }
 }
 
 /// 页面描述：meta description / og:description，截到 300 字。

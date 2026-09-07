@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parse } from "node-html-parser";
-import { browserLinkCardHtml, hostOf, siteInitial, bindBrowserLinkCard } from "../src/agent/browser-link-card.js";
+import { browserLinkCardHtml, hostOf, siteInitial, bindBrowserLinkCard, clipText, TITLE_MAX, DESC_MAX } from "../src/agent/browser-link-card.js";
 import { CODE as SRC } from "./helpers/source.mjs";
 import { readFileSync } from "node:fs";
 
@@ -49,6 +49,21 @@ test("描述可选；标题和主机名一样时不重复画一行；文字要�
   assert.equal(hostile.querySelector(".browser-link-card__desc b"), null, "描述没转义就成了注入口");
 });
 
+test("标题、描述过长就截断补「…」：数据层先截到上限，CSS 两行 clamp 再按视觉宽度收口", () => {
+  const vp = dom(browserLinkCardHtml({ url: "https://a.b/", title: "标".repeat(TITLE_MAX + 40), description: "描".repeat(DESC_MAX + 200) + "。", screenshot: SHOT }, esc));
+  const t = vp.querySelector(".browser-link-card__title").textContent;
+  const d = vp.querySelector(".browser-link-card__desc").textContent;
+  assert.ok(t.endsWith("…") && Array.from(t).length === TITLE_MAX, "标题该截到上限并以 … 结尾");
+  assert.ok(d.endsWith("…") && Array.from(d).length === DESC_MAX, "描述该截到上限并以 … 结尾");
+  assert.equal(clipText("刚好", 2), "刚好", "不超上限一个字都不动");
+  assert.equal(clipText("到句号为止，再来", 6), "到句号为止…");
+  assert.equal(clipText("到句号为止，再来", 7), "到句号为止…", "截断点前面的标点要去掉再补 …");
+  assert.equal(clipText("", 5), "");
+  const css = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
+  const block = css.slice(css.indexOf(".browser-link-card__title {"), css.indexOf('[data-theme="dark"] .browser-link-card'));
+  assert.equal((block.match(/-webkit-line-clamp: 2/g) || []).length, 2, "标题和描述都要有两行 clamp（WebKit / Blink 在第二行末尾画 …）");
+});
+
 test("纯截图（没有 URL/标题）只画媒体块；什么都没有就返回空串", () => {
   const bare = dom(browserLinkCardHtml({ screenshot: SHOT }, esc));
   assert.ok(bare.querySelector(".browser-link-card--bare .browser-link-card__media img"));
@@ -92,4 +107,7 @@ test("main.js 的浏览器结果视口用的就是这份实现，旧的 browser-
   assert.match(rs, /favicon: Option<String>/, "BrowserState 没有 favicon 字段");
   assert.match(rs, /description: Option<String>/, "BrowserState 没有 description 字段");
   assert.match(rs, /fn page_favicon\(/, "favicon 没有在页面里求值");
+  // 站点图标要用网站真实的：Rust 侧把图标字节取回来编成 data URL，卡片不靠 webview 跨站拉图。
+  assert.match(rs, /fn favicon_data_url\(/, "站点图标没有在 Rust 侧取回编成 data URL");
+  assert.match(rs, /fn sniff_image_mime\(/, "取回的字节没按魔数认图片，HTML 404 页会被当成图标");
 });
