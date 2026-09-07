@@ -294,7 +294,7 @@ import { _AUTOMATION_METHODS, _COMPUTER_METHODS } from "./agent/automation-metho
 import { mapComputerAction, applyScreenMap, screenMapFrom, annotateReceipt, describeScreenImage, COMPUTER_ACTIONS } from "./agent/computer-actions.js";
 import { runBrowserTask, taskModelConfig, automationBrowserCall, mergedBrowserNote, browserNavAction } from "./agent/browser-task.js";
 import { runOfficeStep } from "./agent/office-tool.js";
-import { browserLinkCardHtml, bindBrowserLinkCardMedia } from "./agent/browser-link-card.js";
+import { browserLinkCardHtml, bindBrowserLinkCard } from "./agent/browser-link-card.js";
 
 // Global shared state store for sub-agent collaboration
 const _globalSharedStore = getSharedStore();
@@ -64697,9 +64697,9 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       }
       res.className = "atc-result atc-result--ok"; res.textContent = act;
       if (vp) {
-        // 链接预览卡（Telegram 形状：竖条 | 站点 / 标题 / 截图），实现和结构测试在 agent/browser-link-card.js。
+        // 链接预览卡（书签卡形状：截图通栏在上，下面站点头像 + 站点名 / 标题 / 描述），实现和结构测试在 agent/browser-link-card.js。
         vp.innerHTML = browserLinkCardHtml(state, _escHtml);
-        bindBrowserLinkCardMedia(vp);
+        bindBrowserLinkCard(vp);
       }
       // 常驻实时预览：有它在，逐轮的截图卡默认收起（要看证据/指元素再点开），
       // 只有明确的 screenshot 视觉验收才自动展开——不再一轮一张糊满对话。

@@ -7268,33 +7268,62 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
    扫一屏卡片时会直接漏掉，以为那个子体正常跑完了。用和 --ok/--err 同族的暖色。 */
 .atc-result--timeout,
 .atc-result--warn { color: var(--atc-warning); background: transparent; }
-/* 浏览器结果的链接预览卡——Telegram「大图在上」那种形状：左侧强调色竖条从截图一直贯到
-   文字，右侧依次是页面截图、站点名（强调色）、标题（粗）、描述（灰，可选）。整张卡自成一块
-   （12px 圆角、淡淡的强调色底），不再是「一张贴边截图 + 底下一条窄带」；截图默认裁到 380px
-   高、顶部对齐，点一下展开完整一张（.is-expanded）。结构在 agent/browser-link-card.js。 */
+/* 浏览器结果的链接预览卡——现代的那种（iMessage / X / Notion 书签卡）：截图通栏在上，
+   下面一块信息区：站点头像 + 站点名、标题、描述。没有竖条、没有彩色底：中性描边、12px 圆角、
+   白/深色面板底，靠字号层级和留白立住。截图默认裁到 360px 高、顶部对齐，点一下展开完整一张
+   （.is-expanded）。结构在 agent/browser-link-card.js。 */
 .browser-link-card {
-  display: flex; align-items: stretch; gap: 10px;
-  padding: 10px 12px 12px 10px; margin: 8px 10px 10px;
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--accent) 7%, var(--atc-bg, #fff));
-  border: 1px solid color-mix(in srgb, var(--accent) 16%, transparent);
-  overflow: hidden;
+  display: flex; flex-direction: column;
+  margin: 8px 10px 10px;
+  border-radius: 12px; overflow: hidden;
+  background: var(--atc-bg, #fff);
+  border: 1px solid var(--line, #e5e7eb);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .04);
 }
-.browser-link-card--bare { padding: 8px; }
-.browser-link-card--bare .browser-link-card__media { margin-bottom: 0; }
-.browser-link-card__bar {
-  width: 3px; flex-shrink: 0; align-self: stretch; min-height: 34px;
-  border-radius: 999px; background: var(--accent);
+.browser-link-card__media {
+  position: relative; overflow: hidden;
+  background: var(--atc-head, #f6f7f9);
+  border-bottom: 1px solid var(--line, #e5e7eb);
+  cursor: zoom-in;
 }
-.browser-link-card__body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.browser-link-card--bare .browser-link-card__media { border-bottom: 0; }
+.browser-link-card__media img {
+  display: block; width: 100%; max-height: 360px;
+  object-fit: cover; object-position: top;
+}
+.browser-link-card__media.is-expanded { cursor: zoom-out; }
+.browser-link-card__media.is-expanded img { max-height: none; object-fit: contain; }
+.browser-link-card__meta {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 12px 14px 13px;
+  min-width: 0;
+}
+/* 站点行：18px 圆角方块头像 + 站点名（灰）。头像底下预先写着首字母，图标加载出来就盖住它，
+   加载失败被摘掉时字母就露出来——不会出现一个空框。 */
 .browser-link-card__site {
-  font-size: 13px; font-weight: 600; line-height: 1.35; letter-spacing: .01em;
-  color: var(--accent);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: flex; align-items: center; gap: 7px; min-width: 0;
+  font-size: 12.5px; font-weight: 500; line-height: 1.3;
+  color: var(--atc-dim, var(--text-dim));
 }
-/* 标题最多两行、描述最多三行——比省略成一行更像 Telegram，也不会把卡撑成一屏。 */
+.browser-link-card__icon {
+  position: relative; flex-shrink: 0;
+  width: 18px; height: 18px; border-radius: 5px; overflow: hidden;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--atc-text, #1f2328) 8%, transparent);
+  color: var(--atc-text, #1f2328);
+  font-size: 10.5px; font-weight: 700; line-height: 1;
+}
+.browser-link-card__icon::before { content: attr(data-letter); }
+.browser-link-card__favicon {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; background: #fff;
+}
+.browser-link-card__host {
+  min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* 标题最多两行、描述最多两行——比省略成一行更像原生的链接卡，也不会把卡撑成一屏。 */
 .browser-link-card__title {
-  font-size: 14px; font-weight: 650; line-height: 1.35;
+  font-size: 15px; font-weight: 600; line-height: 1.35; letter-spacing: -.005em;
   color: var(--atc-text, var(--text));
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   overflow-wrap: anywhere;
@@ -7302,27 +7331,16 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .browser-link-card__desc {
   font-size: 13px; line-height: 1.45;
   color: var(--atc-dim, var(--text-dim));
-  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   overflow-wrap: anywhere;
 }
-.browser-link-card__media {
-  margin-bottom: 8px; border-radius: 8px; overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--accent) 14%, transparent);
-  background: var(--atc-head, transparent);
-  cursor: zoom-in;
-}
-.browser-link-card__media img {
-  display: block; width: 100%; max-height: 380px;
-  object-fit: cover; object-position: top;
-}
-.browser-link-card__media.is-expanded { cursor: zoom-out; }
-.browser-link-card__media.is-expanded img { max-height: none; object-fit: contain; }
 [data-theme="dark"] .browser-link-card, .dark .browser-link-card {
-  background: color-mix(in srgb, var(--accent) 12%, var(--atc-bg, #111));
-  border-color: color-mix(in srgb, var(--accent) 26%, transparent);
+  background: color-mix(in srgb, var(--atc-bg, #1c1f24) 92%, #fff);
+  border-color: color-mix(in srgb, var(--line, #33363b) 80%, #fff);
+  box-shadow: none;
 }
-[data-theme="dark"] .browser-link-card__media, .dark .browser-link-card__media {
-  border-color: color-mix(in srgb, var(--accent) 24%, transparent);
+[data-theme="dark"] .browser-link-card__icon, .dark .browser-link-card__icon {
+  background: color-mix(in srgb, var(--atc-text, #e6e6e6) 14%, transparent);
 }
 /* 撞上人机验证时贴在截图下面的那条：这是要**人**动手的一步，所以按警示色处理，
    不跟随普通 URL 卡片的低对比度。文案本身就是操作指引，不折行截断。 */
