@@ -14485,21 +14485,6 @@ function _ctxFactHtml(label, value) {
     + `<span class="mic-fact__v">${_escHtml(value === undefined ? label : value)}</span></div>`;
 }
 
-/**
- * 会员留存那一行的 HTML。**不占滑轨上的格子**，因为它不是这张卡片上能选的东西：
- * 它是套餐给的（网关替你留多少历史），压缩后仍送进模型自己的窗口。混进滑轨的那一版
- * 就是用户说的"假修改"——拖过去请求里一个字节都不变。
- */
-function _ctxRetentionHtml() {
-  const keep = _ctxRetentionNote();
-  if (!keep) return "";
-  // 措辞要把话说全。撤掉那三格之后，产品里**只剩这一行**告诉用户档位存在，而它此前
-  // 从没说过最要紧的那句：你买的档位对所有模型自动生效，不用选、也没得选。
-  return `<div class="mic-fact mic-fact--keep" title="${_escAttr(`michael-compression ${String(keep.tier).toUpperCase()} 档已自动生效：网关在模型自己的窗口之外，再替你留存约 ${_tokenShort(keep.tokens)} token 的历史，压缩后仍送进这个窗口。按套餐给定，无需选择。`)}">`
-    + `<span class="mic-fact__k">会员留存</span>`
-    + `<span class="mic-fact__v">+${_escHtml(_tokenShort(keep.tokens))}<em>已自动生效</em></span></div>`;
-}
-
 function _modelCatalogEntry(id = "", group = "", connId = "") {
   // **自定义模型要按真实模型名去查目录。**
   //
@@ -15143,12 +15128,6 @@ function _setCtxChoice(modelId, tokens, kind = "native") {
   } catch {}
 }
 
-/** 会员额外留存多少历史。**只读**——它由套餐决定，不是这张卡片上能选的东西。 */
-function _ctxRetentionNote() {
-  const tierMax = Number(_michaelUser?.michael_compression?.max_input_tokens) || 0;
-  if (!tierMax || !_gatewayHandlesCompression()) return null;
-  return { tier: _compressionTier() || "", tokens: tierMax };
-}
 /**
  * 这条滑轨上的每一格 = 这个模型**真实存在**的一个上下文窗口。
  *
@@ -15160,7 +15139,7 @@ function _ctxRetentionNote() {
  *
  * 现在滑轨只剩窗口这一条轴：**能拖的每一格都会随 `x-ide-context-window` 发给网关**，
  * 压缩按它切（server/src/models.rs 的 client_context_window）。会员档位不是用户在这里
- * 选的东西，改成卡片上的一行只读事实（`_ctxRetentionNote`）。
+ * 选的东西，卡片上也不再显示它（2026-09-07 所有者：那一行没用，撤了）。
  */
 function _ctxChoiceOptions(modelId) {
   const native = _modelContextLimit(modelId);
@@ -16396,7 +16375,7 @@ function showModelInfoCard(m, anchorEl) {
     // 披露搬过两次家（见下方注释），CSS 规则也被删过一次；这个元素当时漏加了。
     `<div class="mic-note"></div>` +
     `<div class="mic-desc"></div>` +
-    `<div class="mic-ctx">${_modelContextRows(m)}${_ctxRetentionHtml()}</div>` +
+    `<div class="mic-ctx">${_modelContextRows(m)}</div>` +
     `<div class="mic-think"></div>` +
     // 价格放最后：上下文和思考深度是**能动的**，价格是只读事实。可操作的控件排在
     // 上面，一眼就能拖；只读信息垫底。

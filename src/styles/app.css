@@ -16582,7 +16582,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
    颜色一律走这套 UI 自己的 token（--text / --text-dim / --line / --accent）。
    第一版写的是 --fg / --muted-fg / --border —— 这三个变量在本文件里根本不存在，
    于是每一条都落到兜底的浅灰上，在白底卡片上糊成一片。 */
-/* 上下文这一块：滑杆（或只读事实行）+ 紧跟其后的会员留存行。间距归它管，
+/* 上下文这一块：滑杆（或只读事实行）。间距归它管，
    否则节奏散落在 .mic-sl 和 .mic-fact 各自的 margin 里，谁也说不清块和块隔多远。 */
 .model-info-card .mic-ctx { margin-top: 11px; }
 .model-info-card .mic-sl { margin: 2px 0 4px; }
@@ -16641,11 +16641,9 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .model-info-card .mic-sl__input:focus-visible::-webkit-slider-thumb {
   box-shadow: 0 0 0 3px var(--sel);
 }
-/* 只读的一行事实：上下文只有一个窗口时的读数、以及会员留存。
+/* 只读的一行事实：上下文只有一个窗口时的读数。
    **刻意长得不像控件**——没有轨道、没有底色、没有 hover 态。这张卡片上
-   「有轨道的一定会改这一轮请求，没轨道的一定改不了」是唯一一条视觉承诺。
-   会员留存档位曾经是一张收据却被做成可拖的样子（外观、手感、吸附、持久化和真旋钮
-   一模一样），那正是用户说的"假修改"。 */
+   「有轨道的一定会改这一轮请求，没轨道的一定改不了」是唯一一条视觉承诺。 */
 .model-info-card .mic-fact {
   display: flex; align-items: baseline; justify-content: space-between;
   gap: 10px; margin: 2px 0 5px; min-height: 18px;
@@ -16660,17 +16658,6 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   margin-left: auto; font-family: var(--mono); font-size: 12px; font-weight: 600;
   font-variant-numeric: tabular-nums; color: var(--text-dim);
 }
-/* 留存那一行：值压成次要色，后面缀一句「已自动生效」。撤掉滑轨上那三格之后，
-   产品里只剩这一行在说档位存在，而它最该说的恰恰是"你不用选、也没得选"。 */
-.model-info-card .mic-fact--keep { margin: 7px 0 2px; }
-.model-info-card .mic-fact--keep .mic-fact__v {
-  font-size: 12px; font-weight: 600; color: var(--text-dim);
-}
-.model-info-card .mic-fact--keep em {
-  margin-left: 6px; font-style: normal; font-weight: 600; font-size: 10px;
-  letter-spacing: .02em; color: var(--accent); opacity: .85;
-}
-
 .model-info-card .mic-sl__ends {
   display: flex; justify-content: space-between; margin-top: 4px;
   font-size: 10.5px; font-variant-numeric: tabular-nums; color: var(--text-dim);
