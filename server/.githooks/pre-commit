@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# 禁止在 main 分支上直接提交。
+#
+# 为什么要有这条：main 只接受经 PR 合并的改动。一旦有人在 main 上直接 commit，
+# 代码就绕过了 PR 审查静默进了主干，没有任何环节会提醒——和 server/AGENTS.md
+# 的流程冲突。钩子拦不住历史上已发生的绕过，拦的是"下一次顺手提交"。
+set -u
+
+branch="$(git symbolic-ref --short -q HEAD 2>/dev/null || true)"
+case "$branch" in
+  main)
+    echo "✗ 拒绝提交：当前在 main 分支上（server/AGENTS.md 红线）" >&2
+    echo "  请切到开发分支后重新提交：git switch gao-dev" >&2
+    exit 1
+    ;;
+  "")
+    # detached HEAD 下无法判断目标分支，不拦，交给用户自行判断。
+    ;;
+  gao-dev)
+    ;;
+  *)
+    echo "⚠ 当前分支是 $branch（不是 gao-dev）。" >&2
+    echo "  server/AGENTS.md 要求提交落在 gao-dev；确认无误可继续。" >&2
+    ;;
+esac
+exit 0

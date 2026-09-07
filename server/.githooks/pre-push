@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# 禁止把任何分支推送到 main。
+#
+# 为什么要有这条：push 到 main 等于绕过 PR 直接"合并"主干，正是
+# server/AGENTS.md 里「禁止自动合并 main」最直接的一种形态。
+# pre-commit 只能拦本机 commit，拦不住 `git push origin HEAD:main` 这种
+# 一次成型的操作，所以这里再拦一道。
+set -u
+
+blocked=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ -z "${local_ref:-}" ]; then
+    continue
+  fi
+  case "$remote_ref" in
+    refs/heads/main)
+      echo "✗ 拒绝推送：禁止向 main 推送（server/AGENTS.md 红线）" >&2
+      echo "  正确流程：git push origin gao-dev → 向 main 发起 PR → 由用户合并" >&2
+      blocked=1
+      ;;
+  esac
+done
+exit "$blocked"
