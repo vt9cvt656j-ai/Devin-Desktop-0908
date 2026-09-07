@@ -23,7 +23,8 @@ const built = new Set(
 const queried = [...BODY.matchAll(/querySelector\("\.([a-z][a-z0-9-]*)"\)/g)].map((m) => m[1]);
 
 assert.ok(queried.length >= 5, `只扫到 ${queried.length} 个 querySelector，锚点大概失效了`);
-assert.ok(queried.includes("mic-note"), "没扫到 .mic-note —— 这条测试的核心用例丢了");
+// 当年崩的那个 .mic-note（自定义端点那段披露）2026-09-07 按所有者要求整条撤了；哨兵换成 .mic-desc，判据不变。
+assert.ok(queried.includes("mic-desc"), "没扫到 .mic-desc —— 这条测试的核心用例丢了");
 
 const missing = queried.filter((cls) => !built.has(cls));
 assert.deepEqual(

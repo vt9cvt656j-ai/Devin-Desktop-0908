@@ -9486,18 +9486,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 自定义端点那段披露（main.js showModelInfoCard 的 .mic-note）。
-   这条规则一度随「删掉披露」那轮一起删了，而披露后来被另一条线路的改动带了回来 ——
-   规则不在的话它就是一段没有底色、没有内边距的裸文字。 */
-.mic-note {
-  margin: 6px 0 2px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  background: var(--hover);
-  font-size: 11.5px;
-  line-height: 1.55;
-  color: var(--text-dim);
-}
 .model-info-card .mic-desc {
   margin-top: 8px;
   font-size: 12px;

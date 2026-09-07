@@ -16369,11 +16369,6 @@ function showModelInfoCard(m, anchorEl) {
     `<div class="mic-htxt"><div class="mic-name"></div><div class="mic-group"></div></div>` +
     _modelPowerToggleHtml(m) + `</div>` +
     `<div class="mic-id"></div>` +
-    // .mic-note 是自定义端点那段披露的落点。下面 17590 起的分支会 querySelector(".mic-note")
-    // 然后 remove()/设 textContent —— 模板里**必须**有这个元素，否则 querySelector 回 null，
-    // 三个分支每一个都是 `null.remove()` / `null.textContent=`，整张模型悬浮卡一渲染就崩。
-    // 披露搬过两次家（见下方注释），CSS 规则也被删过一次；这个元素当时漏加了。
-    `<div class="mic-note"></div>` +
     `<div class="mic-desc"></div>` +
     `<div class="mic-ctx">${_modelContextRows(m)}</div>` +
     `<div class="mic-think"></div>` +
@@ -16389,29 +16384,8 @@ function showModelInfoCard(m, anchorEl) {
   const idEl = card.querySelector(".mic-id");
   idEl.textContent = m.id;
   idEl.title = m.id;
-  /*
-   * 自定义模型要如实说清「走自己的端点会弱一些」。
-   *
-   * 这句披露搬过两次家，两次都是因为用户嫌它占地方，两次都**没有删掉**：
-   * 最早是切端点时弹的 toast（九秒横幅、切一次弹一次）→ 搬进自定义模型弹窗顶部 →
-   * 2026-09-01 用户说弹窗里那段也删掉，于是搬到这里。悬浮卡是它现在最该在的位置：
-   * 按模型、在**选用之前**就看得到，而且不占配置表单的地方。
-   * 事实本身不变：工具描述和完整系统提示词由服务端按需下发，第三方端点两头落空；
-   * 长上下文压缩也会关闭。不说清楚，放开这个开关等于交付一个坏功能。
-   */
-  const noteEl = card.querySelector(".mic-note");
-  const _cm = String(m.id || "").startsWith(_CUSTOM_MODEL_PREFIX) ? _customModelById(m.id) : null;
-  if (!_cm) {
-    noteEl.remove();
-  } else if (_byoViaGateway(_cm)) {
-    // 远程端点现在走网关代发：完整提示词和工具由服务端装配，能力和网关模型一样。
-    // 但有一件事必须说清楚 —— **请求会经过我们的服务器**，而弹窗里原来写的是
-    // 「地址与密钥仅保存在本机，不会上传」。那句话对这条路不再成立，不说就是骗人。
-    noteEl.textContent = "完整能力：提示词、工具和长上下文压缩都由服务端装配，和内置模型一样。请求经我们的服务器转发到你填的地址（用你自己的密钥计费，我们不收费）。";
-  } else {
-    // 不能写「本机端点」：网页版上远程端点也落这个分支，那时是假话。只说「直连」。
-    noteEl.textContent = "直连你填的地址，不经过我们的服务器 —— 因此工具描述和完整系统提示词拿不到，长上下文压缩也会关闭，智能体会弱一些。";
-  }
+  // 自定义模型那段披露（「直连…会弱一些」/「完整能力…经我们的服务器转发」）2026-09-07 按所有者要求
+  // 整条撤掉：它搬过三次家，每次都是他嫌占地方。要重新加，先问所有者（见 test/custom-endpoint.test.mjs 的注释）。
   const desc = (m.desc && m.desc.trim()) || officialModelDesc(m.id);
   const dEl = card.querySelector(".mic-desc");
   if (desc) dEl.textContent = desc;
