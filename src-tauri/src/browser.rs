@@ -246,6 +246,43 @@ pub struct BrowserState {
     /// where it happens instead of being a mystery.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_note: Option<String>,
+    /// 站点图标的绝对地址（<link rel=icon>，没有就按约定的 /favicon.ico）——聊天里的链接
+    /// 预览卡拿它画站点头像；取不到就不带，卡片退回首字母头像。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    favicon: Option<String>,
+    /// 页面的 meta description / og:description，截到 300 字，预览卡下面那行灰字。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+/// 在页面里求值一个返回字符串的表达式；拿不到（页面还没就绪、跨域 frame、脚本被拦）就当没有。
+fn eval_string(tab: &Tab, js: &str) -> Option<String> {
+    let value = tab.evaluate(js, false).ok()?.value?;
+    let text = value.as_str()?.trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// 站点图标地址：优先 <link rel~=icon>（含 shortcut icon / apple-touch-icon），
+/// 没有声明就按约定的 /favicon.ico；只对 http(s) 页面找，about:blank / data: 页没有图标。
+fn page_favicon(tab: &Tab, url: &str) -> Option<String> {
+    if !url.starts_with("http") {
+        return None;
+    }
+    eval_string(tab, r#"(function(){
+      var l = document.querySelector('link[rel~="icon"],link[rel="shortcut icon"],link[rel="apple-touch-icon"]');
+      var h = l && l.href;
+      if (!h) { try { h = new URL('/favicon.ico', location.href).href; } catch (e) { h = ''; } }
+      return String(h || '').slice(0, 2000);
+    })()"#)
+}
+
+/// 页面描述：meta description / og:description，截到 300 字。
+fn page_description(tab: &Tab) -> Option<String> {
+    eval_string(tab, r#"(function(){
+      var m = document.querySelector('meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]');
+      var c = m && (m.getAttribute('content') || '');
+      return String(c || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    })()"#)
 }
 
 /// 用户此刻是不是正开着这个浏览器（macOS）。
@@ -1152,6 +1189,8 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
     let screenshot = crate::capture::bytes_to_jpeg_data_url(&png, 1280, 68)?;
     let blocked = detect_wall(tab, &title, &url, &text);
     let session_note = SESSION_NOTE.lock().ok().and_then(|mut slot| slot.take());
+    let favicon = page_favicon(tab, &url);
+    let description = page_description(tab);
     Ok(BrowserState {
         title,
         url,
@@ -1161,6 +1200,8 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
         result,
         blocked,
         session_note,
+        favicon,
+        description,
     })
 }
 
