@@ -23876,29 +23876,6 @@ function _paintModeLabel(el, mode) {
   if (key) el.setAttribute("data-i18n", key); else el.removeAttribute("data-i18n");
   el.textContent = key ? t(key) : mode.label;
 }
-/**
- * 切到某个模式（agent / chat / plan）。
- *
- * 抽成一份是因为现在有**两个**入口：底部那个模式选择器，和 `/agent` `/chat` `/plan`
- * 三个斜杠命令。各写一遍必然漂——漏掉 `session.mode` 就是「切了模式，下一条消息又变回去」，
- * 漏掉 `_renderChatTabs` 就是标签栏还标着旧模式。这类漏项在本文件里已经发生过。
- */
-function _setAiMode(id) {
-  const mode = _AI_MODES.find((m) => m.id === id);
-  if (!mode) return;
-  _currentAiMode = mode.id;
-  _updateModeUI();
-  const session = _currentSession();
-  if (session) { session.mode = mode.id; _renderChatTabs(); saveChatHistory(); }
-  // 普通切换不弹提示（用户："不需要有提示"）—— 按钮上就写着当前模式，再弹一条是重复。
-  //
-  // **但流式进行中那句留着**：它说的是「这一轮仍按原模式跑完，从下一条消息起生效」，
-  // 那是一个和界面显示不一致的事实。删掉它，用户会以为切换对正在跑的这轮生效了。
-  if (_isStreaming()) {
-    showToast(`已切换到 ${mode.label} 模式 · 当前这一轮仍按原模式跑完，从你下一条消息起生效`);
-  }
-}
-
 function _updateModeUI() {
   _currentAiMode = _normalizeAiMode(_currentAiMode);
   const mode = _AI_MODES.find(m => m.id === _currentAiMode) || _AI_MODES[0];
@@ -23947,7 +23924,20 @@ function _fillModeMenu(menu) {
     // 只画图标 + 名字。介绍那一行删掉了（2026-08-29，用户："不需要介绍给用户"）——
     // 三个模式的名字本身已经说明问题，多一行灰字只是把菜单撑高。
     item.innerHTML = `<svg class="ic" viewBox="0 0 16 16">${mode.icon}</svg><span class="mode-menu__name">${mode.label}</span>`;
-    item.addEventListener("click", () => { _setAiMode(mode.id); _closeModeMenu(); });
+    item.addEventListener("click", () => {
+      _currentAiMode = mode.id;
+      _updateModeUI();
+      _closeModeMenu();
+      const session = _currentSession();
+      if (session) { session.mode = mode.id; _renderChatTabs(); saveChatHistory(); }
+      // 普通切换不弹提示（用户："不需要有提示"）—— 按钮上就写着当前模式，再弹一条是重复。
+      //
+      // **但流式进行中那句留着**：它说的是「这一轮仍按原模式跑完，从下一条消息起生效」，
+      // 那是一个和界面显示不一致的事实。删掉它，用户会以为切换对正在跑的这轮生效了。
+      if (_isStreaming()) {
+        showToast(`已切换到 ${mode.label} 模式 · 当前这一轮仍按原模式跑完，从你下一条消息起生效`);
+      }
+    });
     menu.appendChild(item);
   }
 }
@@ -76367,23 +76357,20 @@ if (typeof window !== "undefined") {
  * （它是要**敲进去**的字面量），那个由行内的 data-i18n-skip 管。
  *
  * 顺序 = 常用程度，不是字母序：敲 `/` 之后不带任何字符时，用户看到的就是这个顺序的前几行。
+ *
+ * **不收模式切换（agent / chat / plan）**：输入条上就有模式选择器，同一件事给两个入口只是
+ * 把列表撑长。同理不收 appearance 和 remote（所有者 2026-09-07：没啥用）——两者在设置里都点得到。
  */
 const _SLASH = [
   { cmd: "new", desc: "Start a new conversation", action: () => { _newChatSession(); } },
   { cmd: "sessions", desc: "Browse and switch conversations", action: () => { void _openSessionPicker(); } },
   { cmd: "memory", desc: "Manage project memory", action: () => openMemoryPanel() },
-  // 三个模式各给一条：模式选择器在输入条上，敲命令比伸手去点快，而且和 Claude Code 的习惯一致。
-  { cmd: "agent", desc: "Switch to Agent mode — reads and edits the workspace", action: () => _setAiMode("agent") },
-  { cmd: "chat", desc: "Switch to Chat mode — answers only, no tools", action: () => _setAiMode("chat") },
-  { cmd: "plan", desc: "Switch to Plan mode — read-only, writes a plan first", action: () => _setAiMode("plan") },
   { cmd: "terminal", desc: "Open the built-in terminal", action: () => { void openTerminal(); } },
   { cmd: "skills", desc: "Install and manage skills", action: () => openFeaturePanel("skills") },
   { cmd: "mcp", desc: "Manage MCP servers", action: () => openFeaturePanel("mcp") },
   { cmd: "shortcuts", desc: "Keyboard shortcuts", action: () => openFeaturePanel("shortcuts") },
   { cmd: "settings", desc: "Open settings", action: () => openFeaturePanel("settings") },
-  { cmd: "appearance", desc: "Theme, font size and layout", action: () => openFeaturePanel("appearance") },
   { cmd: "cost", desc: "Usage and balance for this account", action: () => { void _showBillingPanel(); } },
-  { cmd: "remote", desc: "Connect to a remote machine", action: () => openRemoteDialog() },
 ];
 
 // ── MCP 服务声明的提示词模板 → 斜杠命令 ────────────────────────────────────
