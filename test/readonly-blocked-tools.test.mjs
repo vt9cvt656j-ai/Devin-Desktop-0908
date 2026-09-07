@@ -1,4 +1,5 @@
-// 只读模式的注册表里有 3 把打不开门的钥匙：ui_click / create_project / save_skill 的
+// 只读模式的注册表里有一批打不开门的钥匙：ui_click / create_project / learn_design /
+// save_skill / run_worker 的
 // 策略是 readOnlyModeBlocked，执行时 100% 回 [BLOCKED]，却照样发给模型——
 // search_tools 取得回、编排器选得中，选中一次就是一轮白烧，还占掉工具窗口的配额。
 //
@@ -7,6 +8,10 @@
 //
 // 这和本仓库已经修过的「网页版别发桌面专属工具」是同一个形状（那份注释逐字写着
 // "don't even offer them there"），只是只读模式这一份漏了。
+//
+// 补记：这个文件当年**自己带着和产品同一份错映射**（工具名去下划线去查内部类型键的
+// 策略表），所以只"看见"了巧合能对上的那 3 个，整份守卫恒绿。真实映射在 _mapToolCall
+// 的 case 表里，这里从源码取，不手抄第二份。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CODE as SRC, fnSource as topLevelFn } from "./helpers/source.mjs";
@@ -19,16 +24,33 @@ function registry(includeWrite) {
   const helper = /function _readOnlyBlockedTool\([\s\S]*?\n\}/.exec(SRC);
   assert.ok(build && helper, "锚点函数抠不出来");
   const fn = new Function("inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema",
-    "_applyUserRoleEnums", "toolPolicy",
+    "_applyUserRoleEnums", "toolPolicy", "_mapToolCall",
     // 目录字面量已搬进 src/agent/tool-catalog.js —— 三个 getter 从模块注入。
     "baseTools", "readonlyExternalTools", "writeTools",
     `${dis ? dis[0] : "const _withoutDisabledTools=(t)=>t;"}\n${helper[0]}\n${build[0]}\n;return _buildAgentToolSchemas;`)
-    (true, (t) => t, () => ({ tools: [], commands: [], roles: [], disabled: [], errors: [] }), (t) => t, (t) => t, pol.toolPolicy, baseTools, readonlyExternalTools, writeTools);
+    (true, (t) => t, () => ({ tools: [], commands: [], roles: [], disabled: [], errors: [] }), (t) => t, (t) => t, pol.toolPolicy,
+      (name) => { const t = NAME_TO_TYPE.get(String(name || "")); return t ? { type: t } : null; },
+      baseTools, readonlyExternalTools, writeTools);
   return fn(includeWrite, []).map((t) => t.function?.name).filter(Boolean);
 }
 
-const blockedIn = (names) => names.filter((n) =>
-  pol.toolPolicy(String(n).replace(/_/g, "").toLowerCase())?.readOnlyModeBlocked === true);
+/** 产品自己那份 名字→类型 映射（_mapToolCall 的 case 表）。有的分支是块体，按 case 切段取。 */
+const NAME_TO_TYPE = (() => {
+  const body = topLevelFn("_mapToolCall", { code: true });
+  const m = new Map();
+  const parts = body.split(/case "([a-z_0-9]+)":/);
+  for (let i = 1; i < parts.length; i += 2) {
+    const hit = /type:\s*"([a-z_0-9]+)"/.exec(parts[i + 1] || "");
+    if (hit) m.set(parts[i], hit[1]);
+  }
+  assert.ok(m.size > 80, `只抠到 ${m.size} 条映射，取法跟不上源码了`);
+  return m;
+})();
+const typeOf = (n) => NAME_TO_TYPE.get(String(n || ""));
+const blockedIn = (names) => names.filter((n) => {
+  const t = typeOf(n);
+  return !!t && pol.toolPolicy(t)?.readOnlyModeBlocked === true;
+});
 
 test("只读注册表里一把打不开门的钥匙都没有", () => {
   const bad = blockedIn(registry(false));
@@ -51,8 +73,7 @@ test("过滤掉的恰好就是策略说必被拒的那些，不多不少", () =>
   const ro = new Set(registry(false));
   const removed = [...rw].filter((n) => !ro.has(n));
   // 只读模式本来就比可写模式少一批写工具；这里只看**本条改动**移除的那几个。
-  const shouldRemove = [...rw].filter((n) =>
-    pol.toolPolicy(String(n).replace(/_/g, "").toLowerCase())?.readOnlyModeBlocked === true);
+  const shouldRemove = blockedIn([...rw]);
   for (const n of shouldRemove) {
     assert.ok(removed.includes(n), `${n} 该被过滤却还在`);
   }
@@ -68,10 +89,20 @@ test("判据是严格布尔，不是真值判断", () => {
     "用了 readOnlyBlockedTypes()：那个集合按真值收，含函数型字段");
 });
 
-test("名字归一化和策略表的键一致", () => {
+test("键用真实的 名字→类型 映射，不是「工具名去下划线」", () => {
+  // 原来这条钉的是 `replace(/_/g,"").toLowerCase()`，理由写着「策略表的键是 createproject」。
+  // 那个理由是**巧合**：createproject 恰好等于去下划线后的名字。真正的键是**内部调用类型**，
+  // write_file→write、run_cmd→cmd、run_worker→worker，去下划线一个都对不上。
+  // 142 个工具里只有 5 个碰对了，其余全部恒为假 —— 包括 run_worker（会写盘的子体）。
   const body = topLevelFn("_readOnlyBlockedTool", { code: true });
-  assert.match(body, /replace\(\/_\/g, ""\)\.toLowerCase\(\)/,
-    "没做下划线归一——策略表的键是 createproject 不是 create_project，核不上就恒为假");
+  assert.match(body, /_mapToolCall\(n, \{\}\)\?\.type/, "没用真实映射");
+  assert.doesNotMatch(body, /replace\(\/_\/g, ""\)/, "去下划线那一招回来了");
+  // 组合关系要真跑：这几个的类型必须查得到、且策略说必被拒。
+  for (const n of ["run_worker", "write_file", "run_cmd", "delete_path"]) {
+    const t = typeOf(n);
+    assert.ok(t, `${n} 在 _mapToolCall 里查不到类型`);
+    assert.equal(pol.toolPolicy(t)?.readOnlyModeBlocked === true, true, `${n}→${t} 竟然不是只读禁用`);
+  }
 });
 
 test("查不到策略时放行，不是拦掉", () => {

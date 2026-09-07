@@ -1,0 +1,1 @@
+import{n as e,r as t,t as n}from"./typescript-DipDc_Dt.js";e();export{n as conf,t as language};

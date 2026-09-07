@@ -44,6 +44,11 @@ struct UiSnapshot {
     /// 结果，重试或先把窗口切到前台往往就成了。模型被明确告知「重试没用」，于是转去
     /// OCR 拿一堆不可操作的坐标，然后基于「这个界面没有可点的元素」做后续决定。
     read_error: Option<String>,
+    /// 快路顺路带回的标注截图（data URL）与它的几何：只有调用方要图、且 sidecar 出了图时才有。
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    image_meta: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -177,6 +182,12 @@ pub struct ReadScreenResponse {
     pub source: String,
     pub elements: Vec<UiElement>,
     pub limitations: Vec<String>,
+    /// 标注截图（data URL）：红框编号 = 上面元素的 ref。没图时整个字段不出现。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// 图的几何（image_px / points_origin / points_per_image_px / marks…），或没出图的结构化原因（occluded）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_meta: Option<serde_json::Value>,
 }
 
 /// Read the frontmost application's accessibility tree. OCR is an explicit
@@ -323,10 +334,13 @@ fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
 }
 
 #[cfg(target_os = "macos")]
-async fn native_snapshot_via_sidecar(pid: Option<i64>) -> Option<UiSnapshot> {
+async fn native_snapshot_via_sidecar(pid: Option<i64>, want_image: bool) -> Option<UiSnapshot> {
     let mut args = serde_json::json!({ "cap": 500 });
     if let Some(p) = pid.filter(|p| *p > 0) {
         args["pid"] = serde_json::json!(p);
+    }
+    if want_image {
+        args["max_side"] = serde_json::json!(1280);
     }
     // 快路也要自带上限，理由和动作那条一样：automation_call 的 HTTP 客户端给的是
     // **120 秒**（为 browser.* 等页面准备的）。读一棵树是百毫秒级的事，真等到几十秒
@@ -336,13 +350,19 @@ async fn native_snapshot_via_sidecar(pid: Option<i64>) -> Option<UiSnapshot> {
     // 超时按「快路没跑成」处理，自动落回 JXA 老路——那条路自己有 6 秒预算，
     // 而且它是独立的 osascript 子进程，不排 sidecar 这条队。
     const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
-    let out = tokio::time::timeout(
-        READ_BUDGET,
-        crate::automation::automation_call("screen.elements".into(), args),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let call = |method: &str, args: serde_json::Value| {
+        tokio::time::timeout(READ_BUDGET, crate::automation::automation_call(method.to_string(), args))
+    };
+    // 要图就走 screen.marked：同一棵树、同一批 ref，外加一张按 ref 编号的标注截图。
+    // 老 sidecar 没有这个方法，退回 screen.elements——树照样有，只是没图。
+    let out = if want_image {
+        match call("screen.marked", args.clone()).await.ok()? {
+            Ok(v) => v,
+            Err(_) => call("screen.elements", args).await.ok()?.ok()?,
+        }
+    } else {
+        call("screen.elements", args).await.ok()?.ok()?
+    };
     let arr = out.get("elements")?.as_array()?;
     let pid = out.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
     if pid <= 0 {
@@ -378,11 +398,21 @@ async fn native_snapshot_via_sidecar(pid: Option<i64>) -> Option<UiSnapshot> {
         // 于是把「还没渲染出来」当成「这页没有这个按钮」。
         page: out.get("page").and_then(|v| serde_json::from_value(v.clone()).ok()),
         read_error: None,
+        image: out.get("image").and_then(|v| v.as_str()).map(str::to_string),
+        image_meta: {
+            let mut meta = serde_json::Map::new();
+            for k in ["image_px", "points_origin", "points_per_image_px", "points_size", "coordinate_space", "marks", "marks_hidden", "occluded", "screen_locked"] {
+                if let Some(v) = out.get(k) {
+                    meta.insert(k.to_string(), v.clone());
+                }
+            }
+            if meta.is_empty() { None } else { Some(serde_json::Value::Object(meta)) }
+        },
     })
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn native_snapshot_via_sidecar(_pid: Option<i64>) -> Option<UiSnapshot> {
+async fn native_snapshot_via_sidecar(_pid: Option<i64>, _want_image: bool) -> Option<UiSnapshot> {
     None
 }
 
@@ -391,8 +421,11 @@ pub async fn read_screen(
     ocr: Option<bool>,
     app: Option<String>,
     pid: Option<i64>,
+    image: Option<bool>,
 ) -> Result<ReadScreenResponse, String> {
     let use_ocr = ocr.unwrap_or(false);
+    // 要不要顺路带一张按 ref 编号的标注截图。OCR 路径本来就是拍像素，没有这一说。
+    let want_image = image.unwrap_or(false) && !use_ocr;
     let target = AxTarget { pid, app };
     let target_explicit = target.is_explicit();
     // 名字在这里就解析成 pid，往下一律只有 pid：读和点必须用**同一条**解析规则，
@@ -425,7 +458,7 @@ pub async fn read_screen(
     // 快路产出的是**同一个 UiSnapshot 结构**，然后走完全相同的下游：装 ref 表、
     // 拼限制说明。绝不能在这里提前 return——ui_click 靠 install_ax_snapshot 记下的
     // pid 和元素签名来定位，跳过它等于把「按 ref 操作」整条功能弄坏。
-    let fast = if use_ocr { None } else { native_snapshot_via_sidecar(target_pid).await };
+    let fast = if use_ocr { None } else { native_snapshot_via_sidecar(target_pid, want_image).await };
     // 走没走成快路，决定了这批 ref 的编号语义，也决定了 ui_click 该往哪条路发动作。
     // 判据必须和下面那个 match 的条件**逐字一致**：读回空清单时会落回老路，
     // 那种情况下 ref 是 JXA 的下标，按快路发就点错元素了。
@@ -439,6 +472,7 @@ pub async fn read_screen(
                     elements: read_ocr_elements(),
                     page: None, // OCR 看的是像素，读不到网页的加载状态
                     read_error: None, // OCR 路径不经过 AX 读取，没有「读取没完成」这回事
+                    ..Default::default()
                 }
             } else {
                 read_ui_snapshot(target_pid)
@@ -470,6 +504,8 @@ pub async fn read_screen(
             None => {}
         }
     }
+    let image = snapshot.image.take();
+    let image_meta = snapshot.image_meta.take();
     install_ax_snapshot(&mut snapshot, native_refs)?;
     let elements = snapshot.elements;
 
@@ -578,6 +614,8 @@ pub async fn read_screen(
         .into(),
         elements,
         limitations,
+        image,
+        image_meta,
     })
 }
 
@@ -1086,6 +1124,7 @@ fn read_ui_snapshot(_pid: Option<i64>) -> UiSnapshot {
         elements,
         page: None,
         read_error,
+        ..Default::default()
     }
 }
 
@@ -1828,6 +1867,7 @@ return JSON.stringify({operated:operated,changed:changed});
             elements: vec![element(7)],
             page: None,
             read_error: None,
+            ..Default::default()
         };
         install_ax_snapshot(&mut first, true).expect("first snapshot should install");
         let first_ref = first.elements[0].ref_;
@@ -1848,6 +1888,7 @@ return JSON.stringify({operated:operated,changed:changed});
             elements: vec![element(3)],
             page: None,
             read_error: None,
+            ..Default::default()
         };
         install_ax_snapshot(&mut second, false).expect("second snapshot should install");
         assert_ne!(first_ref, second.elements[0].ref_);

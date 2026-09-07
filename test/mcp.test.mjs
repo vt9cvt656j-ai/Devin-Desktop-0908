@@ -487,6 +487,8 @@ function makeSlashMatcher(mcpRows) {
     _mcpSlashCommands: () => mcpRows,
     // 用户自己声明的命令：本文件测的是 MCP 模板的匹配，这里给空。
     _userSlashCommands: () => [],
+    // 装好的技能（/tdd 这种）也进这份候选，本文件不测它，给空。
+    _skillSlashCommands: () => [],
     // closest 也要有：菜单的宽度/左缘/上沿现在跟着输入条那个圆角盒子（.composer__box）算，
     // 不再按文本区。返回 null 就走 `|| promptEl` 那条兜底，位置对这几条匹配测试无所谓。
     promptEl: {

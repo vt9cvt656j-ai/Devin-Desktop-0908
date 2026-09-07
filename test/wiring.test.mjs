@@ -459,34 +459,20 @@ test("every quiet-turn re-entry is latched or counted", () => {
 //
 // 这道门不改拒绝的决定，只要求它出声：并回既有的 [tool-args-invalid] 修复机器。
 test("装配把工具调用全吃掉时，绝不能表现成模型自己收尾", () => {
-  // 直接锚在源码上：fnBody 的括号配平对这个上千行、满是模板串的函数不可靠，
-  // 会截出一段不含装配点的残体，让这条断言变成"永远绿"。
-  const at = RAW_SRC.indexOf("let toolCalls = (fatalToolArgIssue || err)");
-  const end = RAW_SRC.indexOf("const _hasNonControlToolCall", at);
-  assert.ok(at > 0 && end > at, "工具调用装配点必须还在");
-  assert.equal(count(SRC, /let toolCalls = \(fatalToolArgIssue \|\| err\)/g), 1, "装配点必须唯一，否则这条断言可能钉错地方");
-  const tail = SRC.slice(at, end);
-  // 判据必须是三个事实同时成立：声明了带 name 的调用 × 存活 0 条 × 无错误。
-  // 只看 toolCalls 空会把纯文字回答也判成矛盾——那才是真正的安静收尾，不能动。
-  assert.match(tail, /if \(!toolCalls\.length && !err\) \{[\s\S]{0,400}?byIndex\.values\(\)[\s\S]{0,200}?filter\(\(e\) => e\?\.name\)/,
-    "判据要对照『流里声明了带 name 的调用』与『存活 0 条』，不能只看 toolCalls 空");
-  // 上层只认这个前缀（_runAgenticLoop 里的 tool-args-invalid 分支），换个前缀就等于没接线
-  assert.match(tail, /err = `\[tool-args-invalid\]/,
-    "要走既有的 [tool-args-invalid] 修复路径，模型才会被要求重发调用而不是收尾");
-  assert.match(tail, /fatalRejectedToolAttempts = _declared\.map/,
-    "被吃掉的调用要交给上层做参数补全，否则只剩一条没法照做的报错");
-  // 修复路径的落点：补不出参数时推的那条提醒必须明写不许收尾，否则模型照样宣布完成
-  assert.match(SRC, /不要收尾，不要声称已完成/,
-    "参数修复提醒必须明确禁止收尾");
+  // 2026-09-05 起装配段不再"吃掉"不合规调用：它们以 _argIssue 伪调用留在 toolCalls 里，
+  // 执行段结算成 [tool-args-invalid] 工具结果。于是「声明了 N 条、存活 0 条」结构上不可能发生，
+  // 这条改守它的新形状：伪调用真的产生、真的被结算，且没有任何一支还在丢调用。
+  const assemble = fnSource("_assembleStreamToolCalls");
+  assert.match(assemble, /_argIssue: _issue,/, "装配段没有保留不合规调用");
+  assert.doesNotMatch(assemble, /\) return null;\s*\n\s*try \{\s*\n\s*parsed = JSON\.parse\(raw\);/, "装配段又开始把不合规调用丢掉了");
+  const at = RAW_SRC.indexOf("let toolCalls = err ? [] : _assembleStreamToolCalls(");
+  assert.ok(at > 0, "工具调用装配点必须还在");
+  assert.equal(count(SRC, /let toolCalls = err \? \[\] : _assembleStreamToolCalls\(/g), 1, "装配点必须唯一");
+  const tail = SRC.slice(at, RAW_SRC.indexOf("const _hasNonControlToolCall", at));
+  assert.match(tail, /_textRejected/, "文字形态的不合规调用也要保留成伪调用，不能静默吞掉");
+  assert.match(SRC, /\[tool-args-invalid\] \$\{it\.tc\._argIssue\}/, "主循环没有把 _argIssue 结算成 is_error 工具结果");
 });
 
-// 同一个病的另一条路径，而且更隐蔽：这里连一条错误都没有。
-//
-// toolMsgs 是稀疏数组（`new Array(items.length)`）。调度器 _runOrderedToolSegments 的循环条件
-// 是 `index < items.length && isLive()`，某一项抛异常也会中断整批——两种情况都留下空洞。
-// 只有 !_live() 那条分支补过空洞；活路径直接 `for (const m of toolMsgs) messages.push(m)`，
-// 把空洞当 undefined 推进消息流。于是模型的转录里，它调过的工具没有任何结果反驳它，
-// 它就默认成功并写下「已改好」——那次调用其实没跑。
 test("没跑成的工具调用必须如实回一条结果，不能在转录里留白", () => {
   const at = RAW_SRC.indexOf("const toolMsgs = new Array(items.length);");
   assert.ok(at > 0, "toolMsgs 还是稀疏数组的话，补齐就仍是必需的");
@@ -517,7 +503,35 @@ test("没跑成的工具调用必须如实回一条结果，不能在转录里�
   // `[RECOVERY:…]` 拼进正文了，那条路同样传结构化 result）。消费方少一个是删重复的结果，
   // **不是这道守卫被放松**：剩下两处正是真正的失败归因（fails 收集、errSnippet 摘录），
   // 它们照旧按 _notAttempted 排除，"没跑"仍然不会被算成"跑失败了"。
-  assert.ok(count(SRC, /\?\._notAttempted/g) >= 2, "失败归因仍要按 _notAttempted 排除未执行项");
+  // 2 → 1（2026-09-03）：两处消费方（fails 收集、errSnippet 摘录）合并成了同一个
+  // `_failKind` 判据 —— 合并的原因是它们原来**各判一次**，而其中一处先跑全文的
+  // `_toolFailureMatch` 并短路，把按工具类型分型的那套判断绕过去了（成功的 read_file
+  // 读到 `const [error, setError]` 就被记成失败）。
+  //
+  // 所以这里不再数出现次数 —— 数次数守的是「有几处重复代码」，而这道守卫真正要守的是
+  // 「没跑的不许被算成跑失败了」。改钉那件事本身：判据里有排除，且两个消费方都走它。
+  // 按 AST 取那个判据的边界，不按下标切 —— 判据一变长，固定窗口就守不住尾部了。
+  const _fk = blockFrom("const _failKind = (m, idx) =>");
+  assert.match(_fk, /items\[idx\]\?\._notAttempted\) return null;/,
+    "失败归因的判据里没有排除未执行项 —— 「没跑」会被算成「跑失败了」");
+  // **顺序**才是这次修的东西：结构化判据在前，文案只在判不了的时候兜底。
+  //
+  // `_toolExecutionSucceeded`（_hardFail 内部）已经按工具类型分型处理过文案 ——
+  // read / search / logs / termread / knowledge 的正文是别人写的内容，只认首行标记。
+  // 而全文的 `_toolFailureMatch` 一旦排在前面并短路，那套分型判断就被整个绕过去：
+  // 一次成功的 read_file 读到 `const [error, setError] = useState()` 就被记成失败，
+  // search("error") 更是每次都把自己判失败 —— 而假失败连撞三次会硬封锁这个工具。
+  const _structAt = _fk.indexOf("_hardFail(idx)");
+  const _textAt = _fk.indexOf("_toolFailureMatch(");
+  assert.ok(_structAt > 0 && _textAt > 0, "两条判据少了一条");
+  assert.ok(_structAt < _textAt,
+    "全文判据又排到结构化判据前面了 —— 按工具类型分型的那套判断会被整个绕过去");
+  assert.match(_fk, /items\[idx\]\?\.call && items\[idx\]\?\.rawResult/,
+    "结构化那支没有先确认「判得了」，判不了时会被当成成功");
+  assert.match(SRC, /const fails = toolMsgs\.map\(_failKind\)/,
+    "fails 收集没走那个判据");
+  assert.match(SRC, /errSnippet = toolMsgs\.filter\(\(m, idx\) => !!_failKind\(m, idx\)\)/,
+    "errSnippet 摘录没走那个判据 —— 两处各判一次，喂给模型的错误和 failStreak 数的会是两批");
   // UI 上不能把"未执行"显示成绿色的成功。
   // 这条原来钉的是 _settleToolStep 里那串判据正则的**字面量**。判据后来换成了结构化的
   // （failure.code / ok:false / cmd 退出码 / 正文首行的方括号标记，见 test/tool-card-verdict），
@@ -751,17 +765,18 @@ test("模型要能先看一眼用户自己开着什么，再决定要不要新�
 test("两套浏览器自动化要有一条能照做的选择判据，而且两边都写着", () => {
   const rule = "Target lives INSIDE a web page";
   // 两份描述都要有：模型先看到哪一份是不确定的
+  // 2026-09-06 起桌面那一半是 computer（automation 只是别名），判据写在 browser 和 computer 两份里。
   assert.equal(count(SRC, new RegExp(rule, "g")), 2,
-    "选择判据必须同时写在 browser 和 automation 两份描述里，只写一边等于一半场景没judgment");
+    "选择判据必须同时写在 browser 和 computer 两份描述里，只写一边等于一半场景没judgment");
   // 判据要按**目标在哪儿**分，不是按"哪个更快""哪个更强"这类没法验证的说法
   assert.match(SRC, /Target lives OUTSIDE the page/,
     "判据要给出反面那一半，否则模型只知道什么时候用 browser，不知道什么时候该换");
   assert.match(SRC, /an OS dialog, a native file picker, the menu bar, another application/,
     "要举出具体的「不在网页里」的目标，抽象说法模型对不上号");
   // 明确堵住最常见的两种误用
-  assert.match(SRC, /Do not reach for automation just because a click failed in browser/,
+  assert.match(SRC, /Do not reach for (?:automation|computer) just because a click failed in browser/,
     "点击失败就换工具是最常见的误用，要点名");
-  assert.match(SRC, /do not drive a web page through automation coordinates when browser can address it by node/,
+  assert.match(SRC, /do not drive a web page through (?:automation|computer) coordinates when browser can address it by node/,
     "拿坐标点网页是另一种误用，同样要点名");
   // 两套用同一个浏览器这件事也要说，否则模型会以为它们各开各的
   assert.match(SRC, /Both drive the same browser brand/,
@@ -1604,7 +1619,7 @@ test("设置面板的下拉必须是自绘组件：菜单在控件正下方、�
   //
   // 把那 10 处全改成自绘超出任何单次改动的范围，所以这里上棘轮：**只减不增**。
   // 新代码想加一个原生 select，这一行立刻红；老的慢慢迁移时这个数往下调。
-  const NATIVE_SELECTS = 10;
+  const NATIVE_SELECTS = 5; // 2026-09-06 又降到 5：只剩 MCP 表单 / 调试配置 / LSP 语言 / 远程桌面 / 代码片段
   const nativeCount = (SRC.match(/<select[\s>]/g) || []).length;
   assert.ok(nativeCount <= NATIVE_SELECTS,
     `main.js 里的原生 <select> 从 ${NATIVE_SELECTS} 涨到了 ${nativeCount}。`
@@ -2703,11 +2718,22 @@ test("模型分组的次序，必须原样是后台「排序」页设的那个",
     "取分组时又走了 Object.entries——那会重新引入整数键提前的问题");
 
   // 服务端那一头也得按 sort 出，否则客户端保持得再好也是保持了一个错的顺序。
+  // 2026-09-05 起 list_for_client 不再自己查库，改走 active_models_cached（进程内 10 秒 TTL
+  // 缓存），ORDER BY 跟着搬进了缓存那一支；后台改 sort 的那条 UPDATE 必须顺手作废缓存，
+  // 否则排序页保存后要等 TTL 到期才生效。三处一起钉，缺哪一处症状都是「顺序不对」。
   const rustList = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
   const at = rustList.indexOf("pub async fn list_for_client");
   assert.notEqual(at, -1, "list_for_client 改名了");
-  assert.match(rustList.slice(at, at + 900), /ORDER BY sort, created_at/,
+  assert.match(rustList.slice(at, at + 900), /active_models_cached\(&state\.db\)/,
+    "list_for_client 不再走 active_models_cached——下面那条 ORDER BY 断言就守错了地方");
+  const cacheAt = rustList.indexOf("async fn active_models_cached(");
+  assert.notEqual(cacheAt, -1, "active_models_cached 改名了");
+  assert.match(rustList.slice(cacheAt, cacheAt + 900), /ORDER BY sort, created_at/,
     "IDE 那份模型列表不再按 sort 出——后台排序就不起作用了");
+  const sortAt = rustList.indexOf("UPDATE models SET sort = $2 WHERE id = $1");
+  assert.notEqual(sortAt, -1, "后台排序那条 UPDATE 改形了");
+  assert.match(rustList.slice(sortAt, sortAt + 1500), /invalidate_active_models_cache\(\);/,
+    "排序保存后没作废缓存——用户要等 TTL 到期才看到新顺序");
 
   // 真跑一遍：拿一个含纯数字标签的输入，确认次序不被打乱。
   const groups = new Map();
@@ -2815,7 +2841,11 @@ test("干净的 JS/TS 文件不该等满诊断期限 —— 要问 worker「答�
     /const _workerReady = t\._workerDoneAt != null && now >= t\._workerDoneAt \+ _TS_PUBLISH_GRACE_MS;/,
     "worker 完成信号被架空了（定义恒假）—— 那还是等满",
   );
-  assert.match(body, /if \(has \|\| _workerReady \|\| now >= own\(t\)\) t\._diagSettled = true;/,
+  // 原来钉的是这一整行的**逐字字面量**。后来 LSP 那条腿补了同款完成信号（干净文件
+  // publishDiagnostics 送空数组，marker 恒为 0，不接的话必然等满 4 秒），退出条件里
+  // 多了一支 `_lspReady`——一次纯增量的扩充把这条打成假红。守的应该是"worker 这一支
+  // 还在退出条件里"，不是"退出条件长什么样"。
+  assert.match(body, /if \(has \|\| _workerReady \|\|[^)]*now >= own\(t\)\) t\._diagSettled = true;/,
     "退出条件里没有 worker 完成这一支 —— 那这条改动等于没接上");
   // 期限那一支必须留着：worker 可能拿不到（Monaco 版本差异 / 被裁剪的构建），
   // 也可能挂住。去掉兜底就会变成永远等不完。
@@ -2880,4 +2910,53 @@ test("说得越不清楚，画像越不该是空的 —— 预热判「有没有
   // 入账那一段必须用的是同一份，不是自己再写一遍。
   assert.match(SRC, /const _isFiller = _isFillerUtterance\(_lt\) \|\| _lt\.length < 6;/,
     "需求账本那边又自己写了一份判据 —— 两处会对同一句话给出不同答案");
+});
+
+/**
+ * Windows 上毛玻璃必须退回实色——@supports 覆盖不到「支持但不画」这一种。
+ *
+ * 2026-09-06 所有者报「高级设置在 Windows 上界面是直接透明的，mac 正常」。
+ * 顶栏和侧栏是 `--feature-glass`（56% 白）+ backdrop-filter，模糊一旦不生效，
+ * 剩下的就只是一层白纱压在活着的工作区上：顶栏透出菜单栏和工具条、侧栏透出文件树。
+ * 在浏览器里把 backdrop-filter 全局关掉截图，复现出的正是所有者描述的那一幕。
+ *
+ * 上面那条 @supports 兜底守不住这个：WebView2 **支持** backdrop-filter，@supports
+ * 判定通过，兜底永不触发，可拿不到 GPU 合成时它一个像素都不画。
+ *
+ * 关键判据是「实色」而不是「有没有这条规则」——把令牌换成一个半透明值，规则还在、
+ * 测试还绿，而 bug 原样回来。所以这里把令牌的每一处定义都解出来验不透明。
+ */
+test("Windows 的高级设置面板退回实色，且退回用的令牌真的不透明", () => {
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+
+  const rule = css.match(
+    /body\.is-win \.feature-panel__head,\s*\n\s*body\.is-win \.feature-panel__tabs \{([^}]*)\}/,
+  );
+  assert.ok(rule,
+    "Windows 的实色回退没了——顶栏和侧栏会变回 56% 白纱压在工作区上，也就是所有者报的「直接透明」");
+  const decl = rule[1];
+
+  assert.match(decl, /(?<!-)backdrop-filter:\s*none/,
+    "底不透明之后模糊采样到的全被盖住，留着只是白付一次 GPU");
+  const bg = decl.match(/(?<!-)background(?:-color)?:\s*var\((--[a-z0-9-]+)\)/);
+  assert.ok(bg, `回退底不是一个 var() 令牌（当前：${decl.trim().slice(0, 80)}）`);
+
+  // 令牌的每一处定义都必须不透明。半透明值会让这条规则形同虚设。
+  const defs = [...css.matchAll(new RegExp(`${bg[1]}:\\s*([^;]+);`, "g"))].map((m) => m[1].trim());
+  assert.ok(defs.length >= 2,
+    `${bg[1]} 只找到 ${defs.length} 处定义——明暗两套主题都得有，否则一套会落到另一套的颜色上`);
+  const translucent = defs.filter((v) =>
+    /transparent/.test(v) || /rgba?\([^)]*,\s*0?\.\d+\s*\)/.test(v) || /hsla?\([^)]*,\s*0?\.\d+\s*\)/.test(v));
+  assert.deepEqual(translucent, [],
+    `${bg[1]} 有半透明的定义 ${JSON.stringify(translucent)}——回退底必须实色，`
+    + "否则规则还在、测试还绿，而 Windows 上的透明原样回来");
+
+  // mac 那半不许被顺手改掉：基础规则仍然是玻璃。
+  // 必须先把规则体抠出来再断言——`[\s\S]*?` 会越过右花括号匹配到下一条规则里的 blur，
+  // 那样把这条规则的 backdrop-filter 删干净了测试照样绿（恒真守卫的「固定窗口」形状）。
+  const baseAt = css.indexOf("\n.feature-panel__tabs {");
+  assert.ok(baseAt > 0, "找不到侧栏的基础规则——下面的断言会恒真");
+  const baseDecl = css.slice(baseAt, css.indexOf("\n}", baseAt));
+  assert.match(baseDecl, /(?<!-)backdrop-filter:\s*blur\(/,
+    "侧栏的基础毛玻璃被删了——mac 上那层材质是设计的一部分，Windows 的回退不该波及它");
 });

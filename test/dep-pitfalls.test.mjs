@@ -349,10 +349,11 @@ test("所有点头入口都在授权检查之前，且这份名单是全的", ()
   assert.ok(approveAt > 0, "唯一授权检查点不见了，这条断言失去落点");
   const mouths = [...wrapper.matchAll(/_(\w+CandidateFill)\(run, call\)/g)].map((m) => m[1]);
   const uniq = [...new Set(mouths)];
+  // 2026-09-05：调研门的候选口（researchGateCandidateFill）随 TECH_RESEARCH 闸门瘦身一起删了——
+  // 那道门现在只回一句事实，不再替模型武装一条候选调用。
   assert.deepEqual(uniq.sort(), [
     "browserVerifyCandidateFill",
     "depDocsCandidateFill",
-    "researchGateCandidateFill",
     "verifyCandidateFill",
   ], "点头入口的数量变了——加口子要连这条一起改，否则新口子可以落在授权检查后面");
   for (const name of uniq) {

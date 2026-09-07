@@ -148,7 +148,10 @@ test("两条臂都记账，且落进情景档案", () => {
   const race = fnSource("_aiIntentProfile", { code: true });
   const src = race || "";
   // 赢的那条臂（裁决先到）和输的那条臂（超时先到）都要记——只记一边，比率就是假的。
-  assert.match(src, /_mark\(true\); return v;/, "裁决赢的那条臂没记账");
+  // 守的是"这条臂记了账"，不是"它长什么样"：钉逐字字面量会被纯增量的扩充打成假红。
+  // （原来这条臂还多记一笔"完整裁决真实用了多久"给第一轮的第二段等待用；2026-09-05 第一发
+  // 不再等裁决，那本跨会话的账连同等待一起删了。）
+  assert.match(src, /_mark\(true\);[^\n]*return v;/, "裁决赢的那条臂没记账");
   assert.match(src, /_mark\(false\); resolve\(null\);/,
     "超时赢的那条臂没记账 —— 只记一边的话胜率恒为 100%");
   assert.match(src, /typeof _intentRaceMarker === "function"/,

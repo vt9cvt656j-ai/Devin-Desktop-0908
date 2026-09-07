@@ -74,6 +74,11 @@ export function approvalLabel(call, deps = {}) {
     case "format": return { title: "格式化文件？", detail: call.path || "" };
     case "automation": return { title: "桌面自动化？", detail: (call.method || "") + (call.params ? "  " + JSON.stringify(call.params).slice(0, 120) : "") };
     case "uiclick": return { title: "操作应用界面？", detail: `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}` };
+    // 代价最大的那件事要摆在明细里：connect 之后**所有**文件读写、删除、改名、搜索和
+    // 命令都落在那台机器上，本机什么都不会变——弹框上不说清，用户点同意时以为只是"连一下"。
+    case "remote": return String(call.op) === "connect"
+      ? { title: "把读写和命令切到另一台机器？", detail: `${call.host || call.url || call.address || "(未给地址)"} —— 之后所有文件读写、删除、改名、搜索和命令都在那台机器上执行，本机不再变化；连接凭据会发给该地址` }
+      : { title: "断开远程、切回本机？", detail: "之后的文件读写和命令回到本机执行" };
     case "download": return { title: "下载文件到工作区？", detail: (call.url || "") + "  →  " + (call.dest || "") };
     case "db": return { title: `执行数据库操作（${call.driver || "db"}）？`, detail: (call.query || "").slice(0, 300) };
     case "gh": return {
@@ -133,6 +138,10 @@ export function approvalLabel(call, deps = {}) {
     // office_write 新建 xlsx / docx / pptx；office_edit 默认覆盖原文件，另存时把两个路径都摆出来。
     case "office_write": return { title: "生成 Office 文档并写入工作区？", detail: `→ ${call.dest || ""}` };
     case "office_edit": return { title: "修改工作区里的 Office 文档？", detail: `${call.path || ""}${call.dest && call.dest !== call.path ? `\n→ ${call.dest}` : "（覆盖原文件）"}` };
+    // visual_explain 和 genimage 走同一个后端，png 落在 <root>/.mrdayone-images/explain-*.png。
+    case "explain": return { title: "生成讲解图片并写入工作区？", detail: String(call.concept || call.prompt || call.question || "").slice(0, 200) };
+    // stop_demo 把录制结果写成 HTML，路径由模型给（允许绝对路径，只建不覆盖）。
+    case "demostop": return { title: "把演示录像写成文件？", detail: `→ ${call.path || "(默认路径)"}` };
     case "generate_3d": case "generate_texture": case "generate_motion": case "auto_rig":
       return { title: "生成素材并写入工作区？", detail: `${call.type} · ${(call.prompt || call.name || "").slice(0, 200)}` };
     case "generate_sound": case "generate_music": case "generate_voice":

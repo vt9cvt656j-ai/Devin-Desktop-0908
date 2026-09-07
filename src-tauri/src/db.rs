@@ -17,7 +17,6 @@ use std::time::Duration;
 const MAX_ROWS: usize = 500;
 const MAX_DB_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
 
 async fn read_db_http_response(
     mut response: reqwest::Response,
@@ -62,6 +61,107 @@ fn normalize_driver(d: &str) -> String {
     }
 }
 
+/// 剥掉字面量与注释（'…' "…" `…` -- /* */），只留代码，判断动词时不被数据里的词骗到。
+fn strip_sql_literals(q: &str) -> String {
+    let b: Vec<char> = q.chars().collect();
+    let mut out = String::with_capacity(q.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let n = b.get(i + 1).copied().unwrap_or('\0');
+        if c == '-' && n == '-' || c == '#' {
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && n == '*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+            out.push(' ');
+            continue;
+        }
+        if c == '\'' || c == '"' || c == '`' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == '\\' && c != '`' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == c {
+                    if b.get(i + 1) == Some(&c) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            out.push(' ');
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// 这条语句 / 命令会不会改库。和客户端 db-sql-tools.js 的 classifySql 同一套判据。
+fn statement_mutates(driver: &str, q: &str) -> bool {
+    let raw = q.trim();
+    match driver {
+        "redis" => {
+            let verb = raw.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+            !matches!(
+                verb.as_str(),
+                "GET" | "MGET" | "HGET" | "HGETALL" | "HMGET" | "HKEYS" | "HVALS" | "HLEN" | "HEXISTS"
+                    | "KEYS" | "SCAN" | "SSCAN" | "HSCAN" | "ZSCAN" | "EXISTS" | "TYPE" | "TTL" | "PTTL"
+                    | "LLEN" | "LRANGE" | "LINDEX" | "SMEMBERS" | "SCARD" | "SISMEMBER" | "ZRANGE"
+                    | "ZREVRANGE" | "ZCARD" | "ZSCORE" | "ZRANGEBYSCORE" | "STRLEN" | "INFO" | "PING"
+                    | "DBSIZE" | "TIME" | "ECHO" | "CLIENT" | "CONFIG" | "OBJECT" | "MEMORY" | "RANDOMKEY"
+                    | "GETRANGE" | "BITCOUNT" | "PFCOUNT" | "XRANGE" | "XLEN" | "XINFO" | "SELECT"
+            )
+        }
+        "mongodb" => {
+            let cmd = serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|v| v.as_object().and_then(|o| o.keys().next().cloned()))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            !matches!(
+                cmd.as_str(),
+                "find" | "aggregate" | "count" | "distinct" | "listcollections" | "listdatabases"
+                    | "listindexes" | "dbstats" | "collstats" | "buildinfo" | "ping" | "hello"
+                    | "ismaster" | "serverstatus" | "explain" | "getmore" | "" | "connectionstatus"
+            )
+        }
+        "elastic" => {
+            let verb = raw.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+            !(verb == "GET" || verb == "HEAD")
+        }
+        _ => {
+            let code = strip_sql_literals(raw).to_ascii_uppercase();
+            let mut words = code.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').filter(|w| !w.is_empty());
+            let first = words.next().unwrap_or("");
+            let read_head = matches!(first, "SELECT" | "SHOW" | "PRAGMA" | "EXPLAIN" | "DESCRIBE" | "DESC" | "VALUES" | "TABLE" | "WITH" | "EXISTS" | "CHECK");
+            if !read_head {
+                return true;
+            }
+            // 可写 CTE / EXPLAIN ANALYZE：整条代码里出现写动词就算改库。
+            if first == "WITH" || first == "EXPLAIN" {
+                return code.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .any(|w| matches!(w, "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "REPLACE" | "DROP" | "TRUNCATE" | "ALTER" | "CREATE"));
+            }
+            // PRAGMA 赋值（PRAGMA journal_mode = WAL）也是写。
+            first == "PRAGMA" && code.contains('=')
+        }
+    }
+}
+
 /// Run a SQL query (mysql / mariadb / postgres / sqlite / mssql / clickhouse), a Redis
 /// command line, a MongoDB database command (JSON), or an Elasticsearch REST request
 /// (`GET /_cat/indices` / `POST /idx/_search {json}`).
@@ -71,6 +171,8 @@ pub async fn db_query(
     url: String,
     query: String,
     limit: Option<usize>,
+    read_only: Option<bool>,
+    timeout_ms: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     let driver = driver.trim().to_lowercase();
     let q = query.trim().to_string();
@@ -82,13 +184,20 @@ pub async fn db_query(
     }
     let cap = limit.unwrap_or(MAX_ROWS).min(2000);
     let driver = normalize_driver(&driver);
+    // 工作台里标成「只读」的连接：改库语句在这里就拒掉，不依赖前端那一道判断。
+    // 判据和客户端 classifySql 同源（先剥字面量，再看顶层动词；可写 CTE 与 EXPLAIN ANALYZE 算改库）。
+    if read_only.unwrap_or(false) && statement_mutates(&driver, &q) {
+        return Err("这条连接是只读的：会改库的语句没有执行（改连接设置可以放开）".into());
+    }
+    // 超时可调：默认 20s，报表类长查询可以放到 10 分钟，再长也不许——挂住的连接会拖垮界面。
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(20_000).clamp(1_000, 600_000));
     match driver.as_str() {
-        "redis" => redis_cmd(url.trim(), &q).await,
-        "mysql" | "postgres" | "sqlite" => sql_query(&driver, url.trim(), &q, cap).await,
-        "mssql" => mssql_query(url.trim(), &q, cap).await,
-        "mongodb" => mongo_query(url.trim(), &q).await,
-        "clickhouse" => clickhouse_query(url.trim(), &q, cap).await,
-        "elastic" => elastic_query(url.trim(), &q).await,
+        "redis" => redis_cmd(url.trim(), &q, timeout).await,
+        "mysql" | "postgres" | "sqlite" => sql_query(&driver, url.trim(), &q, cap, timeout).await,
+        "mssql" => mssql_query(url.trim(), &q, cap, timeout).await,
+        "mongodb" => mongo_query(url.trim(), &q, timeout).await,
+        "clickhouse" => clickhouse_query(url.trim(), &q, cap, timeout).await,
+        "elastic" => elastic_query(url.trim(), &q, timeout).await,
         other => Err(format!(
             "不支持的 driver: {other}（支持 mysql / mariadb / postgres / sqlite / mssql / mongodb / redis / clickhouse / elasticsearch 及各自的协议兼容库）"
         )),
@@ -165,7 +274,7 @@ fn mssql_cell_json(data: &tiberius::ColumnData<'_>) -> serde_json::Value {
     }
 }
 
-async fn mssql_query(url: &str, q: &str, cap: usize) -> Result<serde_json::Value, String> {
+async fn mssql_query(url: &str, q: &str, cap: usize, timeout: Duration) -> Result<serde_json::Value, String> {
     use tokio_util::compat::TokioAsyncWriteCompatExt;
     let cfg = mssql_config_from_url(url)?;
     let started = std::time::Instant::now();
@@ -190,21 +299,21 @@ async fn mssql_query(url: &str, q: &str, cap: usize) -> Result<serde_json::Value
     if is_read {
         use futures_util::{StreamExt, TryStreamExt};
 
-        let stream = tokio::time::timeout(QUERY_TIMEOUT, client.simple_query(q))
+        let stream = tokio::time::timeout(timeout, client.simple_query(q))
             .await
-            .map_err(|_| "查询超时（20s）".to_string())?
+            .map_err(|_| format!("查询超时（{}s）", timeout.as_secs()))?
             .map_err(|e| format!("查询出错: {e}"))?;
         // Stop polling the wire as soon as one row beyond the display cap arrives. The
         // extra row only proves that more data exists; it is never retained or rendered.
         let rows: Vec<tiberius::Row> = tokio::time::timeout(
-            QUERY_TIMEOUT,
+            timeout,
             stream
                 .into_row_stream()
                 .take(cap.saturating_add(1))
                 .try_collect(),
         )
         .await
-        .map_err(|_| "查询超时（20s）".to_string())?
+        .map_err(|_| format!("查询超时（{}s）", timeout.as_secs()))?
         .map_err(|e| format!("查询出错: {e}"))?;
         let mut columns: Vec<String> = Vec::new();
         if let Some(r0) = rows.first() {
@@ -226,9 +335,9 @@ async fn mssql_query(url: &str, q: &str, cap: usize) -> Result<serde_json::Value
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }))
     } else {
-        let res = tokio::time::timeout(QUERY_TIMEOUT, client.execute(q, &[]))
+        let res = tokio::time::timeout(timeout, client.execute(q, &[]))
             .await
-            .map_err(|_| "执行超时（20s）".to_string())?
+            .map_err(|_| format!("执行超时（{}s）", timeout.as_secs()))?
             .map_err(|e| format!("执行出错: {e}"))?;
         let n: u64 = res.rows_affected().iter().sum();
         Ok(affected_json(
@@ -241,7 +350,7 @@ async fn mssql_query(url: &str, q: &str, cap: usize) -> Result<serde_json::Value
 
 // ---- MongoDB ----
 
-async fn mongo_query(url: &str, q: &str) -> Result<serde_json::Value, String> {
+async fn mongo_query(url: &str, q: &str, timeout: Duration) -> Result<serde_json::Value, String> {
     let started = std::time::Instant::now();
     let mut opts =
         tokio::time::timeout(CONNECT_TIMEOUT, mongodb::options::ClientOptions::parse(url))
@@ -259,7 +368,7 @@ async fn mongo_query(url: &str, q: &str) -> Result<serde_json::Value, String> {
         "mongodb 的 query 必须是 JSON 数据库命令，例如 {\"listCollections\":1} 或 {\"find\":\"users\",\"limit\":10}".to_string()
     })?;
     let doc = mongodb::bson::to_document(&val).map_err(|e| format!("命令无效: {e}"))?;
-    let out = tokio::time::timeout(QUERY_TIMEOUT, db.run_command(doc))
+    let out = tokio::time::timeout(timeout, db.run_command(doc))
         .await
         .map_err(|_| "mongodb 命令超时（20s）".to_string())?
         .map_err(|e| format!("mongodb 出错: {e}"))?;
@@ -271,7 +380,7 @@ async fn mongo_query(url: &str, q: &str) -> Result<serde_json::Value, String> {
 
 // ---- ClickHouse（HTTP 接口，无额外驱动依赖）----
 
-async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::Value, String> {
+async fn clickhouse_query(url: &str, q: &str, cap: usize, timeout: Duration) -> Result<serde_json::Value, String> {
     let started = std::time::Instant::now();
     // 接受 clickhouse://user:pass@host:8123/db 或直接 http(s)://…
     let mut u = url::Url::parse(url).map_err(|e| format!("clickhouse 连接串无效: {e}"))?;
@@ -319,7 +428,7 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
     };
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(QUERY_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
     if is_read {
@@ -424,7 +533,7 @@ fn elastic_base_and_tls(url: &str) -> (String, bool) {
     (u.as_str().trim_end_matches('/').to_string(), insecure)
 }
 
-async fn elastic_query(url: &str, q: &str) -> Result<serde_json::Value, String> {
+async fn elastic_query(url: &str, q: &str, timeout: Duration) -> Result<serde_json::Value, String> {
     let started = std::time::Instant::now();
     let (base, insecure_tls) = elastic_base_and_tls(url);
     let base = base.as_str();
@@ -465,7 +574,7 @@ async fn elastic_query(url: &str, q: &str) -> Result<serde_json::Value, String> 
     u.set_password(None).ok();
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(QUERY_TIMEOUT)
+        .timeout(timeout)
         .danger_accept_invalid_certs(insecure_tls)
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
@@ -508,6 +617,7 @@ async fn sql_query(
     url: &str,
     q: &str,
     cap: usize,
+    timeout: Duration,
 ) -> Result<serde_json::Value, String> {
     // Concrete per-backend connections (NOT sqlx `Any`): Any fails the whole fetch the
     // moment a row has a type it can't map (e.g. a SQLite BOOLEAN or a Postgres DATE),
@@ -531,12 +641,11 @@ async fn sql_query(
     let ms = |t: std::time::Instant| t.elapsed().as_millis() as u64;
     let ct = |_| "连接超时（10s）".to_string();
     let qt = |_| {
-        (if is_read {
-            "查询超时（20s）"
+        if is_read {
+            format!("查询超时（{}s）", timeout.as_secs())
         } else {
-            "执行超时（20s）"
-        })
-        .to_string()
+            format!("执行超时（{}s）", timeout.as_secs())
+        }
     };
 
     match driver {
@@ -559,7 +668,7 @@ async fn sql_query(
             .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
                 use futures_util::{StreamExt, TryStreamExt};
-                let rows = tokio::time::timeout(QUERY_TIMEOUT, async {
+                let rows = tokio::time::timeout(timeout, async {
                     sqlx::query(sql())
                         .fetch(&mut c)
                         .take(cap.saturating_add(1))
@@ -571,7 +680,7 @@ async fn sql_query(
                 .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "sqlite", cap, ms(started)))
             } else {
-                let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
+                let res = tokio::time::timeout(timeout, sqlx::query(sql()).execute(&mut c))
                     .await
                     .map_err(qt)?
                     .map_err(|e| format!("执行出错: {e}"))?;
@@ -587,7 +696,7 @@ async fn sql_query(
                 .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
                 use futures_util::{StreamExt, TryStreamExt};
-                let rows = tokio::time::timeout(QUERY_TIMEOUT, async {
+                let rows = tokio::time::timeout(timeout, async {
                     sqlx::query(sql())
                         .fetch(&mut c)
                         .take(cap.saturating_add(1))
@@ -599,7 +708,7 @@ async fn sql_query(
                 .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "mysql", cap, ms(started)))
             } else {
-                let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
+                let res = tokio::time::timeout(timeout, sqlx::query(sql()).execute(&mut c))
                     .await
                     .map_err(qt)?
                     .map_err(|e| format!("执行出错: {e}"))?;
@@ -615,7 +724,7 @@ async fn sql_query(
                 .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
                 use futures_util::{StreamExt, TryStreamExt};
-                let rows = tokio::time::timeout(QUERY_TIMEOUT, async {
+                let rows = tokio::time::timeout(timeout, async {
                     sqlx::query(sql())
                         .fetch(&mut c)
                         .take(cap.saturating_add(1))
@@ -627,7 +736,7 @@ async fn sql_query(
                 .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "postgres", cap, ms(started)))
             } else {
-                let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
+                let res = tokio::time::timeout(timeout, sqlx::query(sql()).execute(&mut c))
                     .await
                     .map_err(qt)?
                     .map_err(|e| format!("执行出错: {e}"))?;
@@ -727,7 +836,7 @@ where
     })
 }
 
-async fn redis_cmd(url: &str, line: &str) -> Result<serde_json::Value, String> {
+async fn redis_cmd(url: &str, line: &str, timeout: Duration) -> Result<serde_json::Value, String> {
     let client = redis::Client::open(url).map_err(|e| format!("redis 连接串无效: {e}"))?;
     let mut conn = tokio::time::timeout(CONNECT_TIMEOUT, client.get_multiplexed_async_connection())
         .await
@@ -741,7 +850,7 @@ async fn redis_cmd(url: &str, line: &str) -> Result<serde_json::Value, String> {
     for a in &parts[1..] {
         cmd.arg(a);
     }
-    let val: redis::Value = tokio::time::timeout(QUERY_TIMEOUT, cmd.query_async(&mut conn))
+    let val: redis::Value = tokio::time::timeout(timeout, cmd.query_async(&mut conn))
         .await
         .map_err(|_| "redis 命令超时（20s）".to_string())?
         .map_err(|e| format!("redis 出错: {e}"))?;
@@ -861,7 +970,7 @@ mod tests {
         let url = format!("sqlite://{}?mode=rwc", path.display());
 
         let ddl = "CREATE TABLE t (id INTEGER, name TEXT, score REAL, active BOOLEAN)";
-        db_query("sqlite".into(), url.clone(), ddl.into(), None)
+        db_query("sqlite".into(), url.clone(), ddl.into(), None, None, None)
             .await
             .expect("create");
 
@@ -869,7 +978,7 @@ mod tests {
             "sqlite".into(),
             url.clone(),
             "INSERT INTO t VALUES (1,'alice',9.5,1),(2,'bob',NULL,0)".into(),
-            None,
+            None, None, None,
         )
         .await
         .expect("insert");
@@ -879,7 +988,7 @@ mod tests {
             "sqlite".into(),
             url.clone(),
             "SELECT id,name,score,active FROM t ORDER BY id".into(),
-            None,
+            None, None, None,
         )
         .await
         .expect("select");
@@ -904,7 +1013,7 @@ mod tests {
             "sqlite".into(),
             url.clone(),
             "SELECT id,name FROM t ORDER BY id".into(),
-            Some(1),
+            Some(1), None, None,
         )
         .await
         .expect("capped select");
@@ -913,5 +1022,31 @@ mod tests {
         assert_eq!(capped["truncated"].as_bool(), Some(true));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_only_guard_matches_the_client_classifier() {
+        for (driver, q, mutates) in [
+            ("postgres", "SELECT * FROM t", false),
+            ("postgres", "  with x as (select 1) select * from x", false),
+            ("postgres", "WITH d AS (DELETE FROM u RETURNING id) SELECT * FROM d", true),
+            ("postgres", "EXPLAIN ANALYZE DELETE FROM t WHERE a = 1", true),
+            ("postgres", "EXPLAIN SELECT 1", false),
+            ("mysql", "INSERT INTO audit VALUES ('drop table users')", true),
+            ("mysql", "SELECT 'delete from t' AS s", false),
+            ("mysql", "show tables", false),
+            ("sqlite", "PRAGMA table_info(t)", false),
+            ("sqlite", "PRAGMA journal_mode = WAL", true),
+            ("mysql", "UPDATE t SET a = 1", true),
+            ("redis", "GET k", false),
+            ("redis", "FLUSHALL", true),
+            ("redis", "hgetall h", false),
+            ("mongodb", "{\"find\": \"t\"}", false),
+            ("mongodb", "{\"drop\": \"t\"}", true),
+            ("elastic", "GET /_cat/indices", false),
+            ("elastic", "DELETE /idx", true),
+        ] {
+            assert_eq!(statement_mutates(driver, q), mutates, "{driver}: {q}");
+        }
     }
 }

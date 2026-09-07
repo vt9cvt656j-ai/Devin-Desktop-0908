@@ -104,10 +104,27 @@ test("动态拼出来的旗标族同样要有交代——字面量正则看不�
 });
 
 test("每个提示词文件都必须运行时到得了模型，否则要写明为什么躺着", () => {
-  const files = readdirSync(PROMPT_DIR).filter((f) => f.endsWith(".txt")).map((f) => f.slice(0, -4));
-  assert.ok(files.length > 20, `只扫到 ${files.length} 个提示词文件——路径或后缀变了，这条断言等于没跑`);
+  const all = readdirSync(PROMPT_DIR).filter((f) => f.endsWith(".txt")).map((f) => f.slice(0, -4));
+  assert.ok(all.length > 20, `只扫到 ${all.length} 个提示词文件——路径或后缀变了，这条断言等于没跑`);
 
+  // 按模型家族分版本的文件：`<模块>@<家族>.txt`（2026-09-05）。到得了模型的条件是两半都成立：
+  // 家族是 prompt_family 认得的（否则永远猜不到它），模块要么在图里（read_prompt_for 按家族换版本）、
+  // 要么是网关专门按家族追加的那块（MODEL_NOTES_MODULE，没有默认版本、缺文件就不加）。
+  const familyFn = RUST.slice(RUST.indexOf("fn prompt_family("), RUST.indexOf("fn read_prompt_for("));
+  assert.ok(familyFn.length > 100, "找不到 prompt_family——按家族分版本的入口变了");
+  const notesModule = /const MODEL_NOTES_MODULE: &str = "([a-z0-9_]+)";/.exec(RUST)?.[1];
+  assert.ok(notesModule, "找不到 MODEL_NOTES_MODULE——按家族追加备注的入口变了");
+  const variants = all.filter((f) => f.includes("@"));
+  const files = all.filter((f) => !f.includes("@"));
   const routed = graphModules(GRAPH);
+  for (const v of variants) {
+    const [base, family, ...rest] = v.split("@");
+    assert.equal(rest.length, 0, `${v}.txt：文件名只能有一个 @`);
+    assert.ok(familyFn.includes(`"${family}"`),
+      `${v}.txt 的家族「${family}」prompt_family 认不出来——这份变体永远不会被读到`);
+    assert.ok(routed.has(base) || base === notesModule,
+      `${v}.txt 的模块「${base}」既不在 prompt_graph 里、也不是 ${notesModule}——这份变体运行时到不了模型`);
+  }
   const codeRead = new Set([...RUST.matchAll(/read_prompt\(\s*"([a-z0-9_]+)"/g)].map((m) => m[1]));
 
   const orphans = files.filter((f) => !routed.has(f) && !codeRead.has(f) && !(f in RETIRED));

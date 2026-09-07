@@ -70,6 +70,56 @@ fn missing_dependency_advice(stdout: &str, stderr: &str) -> Option<&'static str>
 ///
 /// 只提示、不拦截：管道、组合命令、构建脚本里 shell 才是对的。所以只在命令**整体就是
 /// 那一件事**时才出声，并且只出一句。
+/// 这条命令是不是在**用 shell 写源码/配置文件**（重定向或 tee 到一个像源码的路径）。
+///
+/// 为什么要单独一支：上面那张动词表的每一条都挂着 `!composed`，而 `composed` 的判据里
+/// 就有 `>` —— 用 shell 写文件**必然**带 `>`，于是那条提示对"该写代码却用终端"这个场景
+/// **结构上永远不可能触发**。用户抱怨的正是这一个。
+///
+/// 而且这不只是"哪个更顺手"的偏好。run_cmd 的内部类型是 EXEC，它**没有** mutatesWorkspace
+/// （刻意的：shell 的副作用 harness 核实不了），后果是 shell 写出来的文件：
+///   · 不进本轮检查点 → 「撤销本轮改动」撤不掉它；
+///   · 写入质量扫描器、重复符号检查、依赖坑检查全都看不见它；
+///   · 不进诊断基线，也不会出现在「本次运行已落盘」那一行里。
+/// write_file / edit_file 这四样全有。这是"更强"的具体所指。
+///
+/// 判据只认**看着像源码或配置**的落点：`grep -c foo bar.txt > out.txt` 这种把输出存成
+/// 中间产物的照旧交给 shell（`real_shell_work_is_left_alone` 那条测试正面钉着）。
+fn shell_writes_source_file(last: &str) -> bool {
+    const SRC_EXT: &[&str] = &[
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "swift",
+        "c", "h", "cc", "cpp", "hpp", "cs", "rb", "php", "sh", "sql", "vue", "svelte",
+        "json", "toml", "yaml", "yml", "css", "scss", "html", "md", "env", "ini", "conf",
+    ];
+    let looks_like_source = |tok: &str| {
+        let t = tok.trim_matches(|c| c == '"' || c == '\'').trim();
+        if t.is_empty() || t.starts_with('-') { return false; }
+        // /tmp 和 /dev 下的落点不算改项目
+        if t.starts_with("/tmp/") || t.starts_with("/dev/") { return false; }
+        t.rsplit('.').next()
+            .map(|e| SRC_EXT.iter().any(|s| e.eq_ignore_ascii_case(s)))
+            .unwrap_or(false)
+    };
+    // `> path` / `>> path`：取重定向符之后的第一个词
+    let mut rest = last;
+    while let Some(i) = rest.find('>') {
+        let after = &rest[i + 1..];
+        let after = after.strip_prefix('>').unwrap_or(after);
+        if let Some(tok) = after.split_whitespace().next() {
+            if looks_like_source(tok) { return true; }
+        }
+        rest = after;
+    }
+    // `tee path` / `tee -a path`
+    if let Some(i) = last.find("tee ") {
+        for tok in last[i + 4..].split_whitespace() {
+            if tok.starts_with('-') { continue; }
+            return looks_like_source(tok);
+        }
+    }
+    false
+}
+
 fn shell_shadows_tool_advice(command: &str) -> Option<&'static str> {
     let c = command.trim();
     // 取最后一段（`cd x && cat y` 里真正干活的是后半截），再取首个动词。
@@ -78,6 +128,16 @@ fn shell_shadows_tool_advice(command: &str) -> Option<&'static str> {
     let verb = verb.rsplit('/').next().unwrap_or(&verb).to_string();
     // 带管道/重定向的是真·组合活，交给 shell 没问题。
     let composed = last.contains('|') || last.contains('>') || last.contains('<');
+    // 写文件那一支必须**排在 composed 之前**判：composed 的判据里就有 `>`，
+    // 而用 shell 写文件必然带 `>` —— 挂在 `!composed` 后面等于永远不触发。
+    if shell_writes_source_file(last) {
+        return Some(
+            "改/建源码文件用 edit_file 或 write_file，别用 shell 重定向（> / >> / tee）：\
+             专用工具有改动预览、审批、检查点和一键撤销，写完还会自动过诊断和写入质量检查；\
+             而 shell 写出来的文件**不进本轮检查点**——「撤销本轮改动」撤不掉它，\
+             写入质量扫描和「本次运行已落盘」那一行也都看不见它。",
+        );
+    }
     let tip: Option<&'static str> = match verb.as_str() {
         "cat" | "head" | "tail" | "less" | "more" if !composed => Some(
             "读文件用 read_file（可带 offset/limit 精读），别用 cat/head/tail：它拿不到行号、\
@@ -335,6 +395,9 @@ pub struct TaskRunResult {
     combined: String,
     truncated: bool,
     timed_out: bool,
+    /// 用户按停把它终止了（见 `task_cancel_capture`）。和 `timed_out` 互斥；两者都假而
+    /// code 非 0 才是命令自己失败。
+    cancelled: bool,
     /// Which confinement actually applied: `seatbelt`, `bubblewrap`, or `none`. Reported so
     /// the UI states what happened instead of implying protection the command never got —
     /// an unavailable sandbox degrades to running unconfined, it never blocks the command.
@@ -369,6 +432,69 @@ fn task_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
 }
 
+/// 正在跑的 run_cmd 抓取任务，按前端给的 capture_id 索引到各自的取消标志。
+///
+/// 用户按停原来只取消**模型请求**：命令本身一直跑到退出或 600 秒超时，调度器还在等它，
+/// 而模型下一轮被告知「已中断」——两边说的不是同一件事（Stop 了，`npm test` 还在跑，
+/// 结果也照样写进转录）。现在前端按停时对每个在飞的 capture 调 `task_cancel_capture`，
+/// 轮询循环下一拍（≤40ms）看到标志就 `terminate_task_tree`，把中止前的输出如实带回去。
+type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+static CAPTURE_CANCEL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, CancelFlag>>> =
+    std::sync::OnceLock::new();
+
+fn capture_cancel_map() -> &'static std::sync::Mutex<std::collections::HashMap<u64, CancelFlag>> {
+    CAPTURE_CANCEL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 登记一个 capture 的取消标志；Drop 时注销——所有返回路径（含 `?` 早退）都会清掉，
+/// 不会留下一个再也按不到的 id。
+struct CaptureRegistration {
+    id: Option<u64>,
+    flag: CancelFlag,
+}
+
+impl CaptureRegistration {
+    fn new(id: Option<u64>) -> Self {
+        let flag: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(id) = id {
+            if let Ok(mut m) = capture_cancel_map().lock() {
+                m.insert(id, flag.clone());
+            }
+        }
+        Self { id, flag }
+    }
+    fn cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for CaptureRegistration {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            if let Ok(mut m) = capture_cancel_map().lock() {
+                m.remove(&id);
+            }
+        }
+    }
+}
+
+/// 请求中止一个正在跑的 `task_run_capture`。回 `true` = 找到了并已置位；`false` = 没有
+/// 这个 id 在跑（已经结束、或从没登记）。只置位不杀进程：杀在抓取线程自己的轮询循环里做，
+/// 那里持有 child 句柄，也只有那里能把中止前的输出收干净。
+#[tauri::command]
+pub fn task_cancel_capture(capture_id: u64) -> bool {
+    match capture_cancel_map().lock() {
+        Ok(m) => match m.get(&capture_id) {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
 /// Run a discovered task to completion and capture stdout/stderr so the
 /// frontend can feed it through a problem matcher into the Problems panel.
 /// This is the non-interactive complement to running a task in the terminal.
@@ -376,21 +502,110 @@ fn task_shell() -> String {
 /// `sandbox` confines the command to the workspace at the OS level and defaults to ON: an
 /// agent-run command is the one place a prompt injection turns into persistence. The caller
 /// passes `false` only for an explicit, user-approved escape (see `sandbox_denied`).
+/// `capture_id` 由前端生成，用来在用户按停时点名中止这一条（见 `task_cancel_capture`）；
+/// 不传就是不可中止的旧行为（IDE 内部探针、版本检查那些）。
 pub async fn task_run_capture(
+    app: tauri::AppHandle,
     cwd: String,
     command: String,
     timeout_secs: Option<u64>,
     sandbox: Option<bool>,
+    capture_id: Option<u64>,
 ) -> Result<TaskRunResult, String> {
     // Run the blocking spawn + wait loop on the blocking pool, NOT the Tauri
     // event-loop thread. A sync command here blocks that thread for the command's
     // whole duration (up to the command timeout), freezing the whole IDE — the cause
     // of "调用终端容易卡死一会". spawn_blocking keeps the UI responsive throughout.
+    // 只有带 capture_id 的调用（智能体的 run_cmd）才逐块发实时输出；IDE 内部探针不发。
+    let live = capture_id.map(|id| CaptureLive { app, id });
     tauri::async_runtime::spawn_blocking(move || {
-        task_run_capture_inner(cwd, command, timeout_secs, sandbox.unwrap_or(true))
+        task_run_capture_inner(cwd, command, timeout_secs, sandbox.unwrap_or(true), capture_id, live)
     })
     .await
     .map_err(|e| format!("task thread join failed: {e}"))?
+}
+
+/// 命令还在跑的时候把输出**逐块**推给前端（事件 `task-capture-chunk`）。
+///
+/// 此前 run_cmd 的卡片在命令结束前只有一个跳秒的计时器：一次五分钟的构建，用户看到的是
+/// 「Running 213.4s」和一片空白，模型和用户都不知道它卡在哪一步。现在每读到一块就发一次，
+/// 卡片边跑边滚。**最终结果仍以整份缓冲区为准**（截断、解码、超时注记都在那条路上），
+/// 这里只是预览通道；发不出去也不影响命令本身。
+#[derive(Clone)]
+struct CaptureLive {
+    app: tauri::AppHandle,
+    id: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureChunk<'a> {
+    capture_id: u64,
+    stream: &'static str,
+    text: &'a str,
+}
+
+impl CaptureLive {
+    fn emit(&self, stream: &'static str, text: &str) {
+        use tauri::Emitter;
+        if text.is_empty() {
+            return;
+        }
+        let _ = self.app.emit(
+            "task-capture-chunk",
+            CaptureChunk { capture_id: self.id, stream, text },
+        );
+    }
+}
+
+/// 这段字节里可以立刻发出去的长度：到最后一个**完整** UTF-8 字符为止。
+///
+/// 8KB 读块会把多字节字符从中间切开；切开的那半个留到下一块前面拼上，否则每个块边界
+/// 都会出一个 �。但尾部无效字节超过 4 个（UTF-8 一个字符最多 4 字节）就不是被切开的字符，
+/// 是真的非 UTF-8 输出（GBK 之类）：整段按有损解码放行，别让 carry 无限长。
+fn utf8_flush_boundary(bytes: &[u8]) -> usize {
+    let valid = match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    if bytes.len() - valid > 4 { bytes.len() } else { valid }
+}
+
+/// 逐块读并顺手发出去。UTF-8 的多字节字符可能被 8KB 读块从中间切开：只发到**最后一个
+/// 完整字符**为止，剩下的半个字符留到下一块前面拼上——否则每个块边界都会出一个 �。
+fn read_capped_live<R: std::io::Read>(
+    r: &mut R,
+    out: &mut Vec<u8>,
+    cap: usize,
+    live: Option<&CaptureLive>,
+    stream: &'static str,
+) {
+    let mut buf = [0u8; 8192];
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if out.len() < cap {
+                    let take = (cap - out.len()).min(n);
+                    out.extend_from_slice(&buf[..take]);
+                }
+                if let Some(live) = live {
+                    carry.extend_from_slice(&buf[..n]);
+                    let valid = utf8_flush_boundary(&carry);
+                    if valid > 0 {
+                        live.emit(stream, &String::from_utf8_lossy(&carry[..valid]));
+                        carry.drain(..valid);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(live) = live {
+        if !carry.is_empty() {
+            live.emit(stream, &String::from_utf8_lossy(&carry));
+        }
+    }
 }
 
 fn task_run_capture_inner(
@@ -398,7 +613,11 @@ fn task_run_capture_inner(
     command: String,
     timeout_secs: Option<u64>,
     sandbox: bool,
+    capture_id: Option<u64>,
+    live: Option<CaptureLive>,
 ) -> Result<TaskRunResult, String> {
+    // 先登记再做任何检查：从这一刻起用户按停就能按到，哪怕命令还没起来。
+    let registration = CaptureRegistration::new(capture_id);
     let dir = PathBuf::from(&cwd);
     if !dir.is_dir() {
         // 带上路径和**身份**。原文是一句不带任何路径的 "task working directory is not a
@@ -543,14 +762,16 @@ fn task_run_capture_inner(
     let mut err_pipe = child.stderr.take().unwrap();
     let (tx_o, rx_o) = std::sync::mpsc::channel::<Vec<u8>>();
     let (tx_e, rx_e) = std::sync::mpsc::channel::<Vec<u8>>();
+    let live_o = live.clone();
+    let live_e = live;
     std::thread::spawn(move || {
         let mut b = Vec::new();
-        read_capped(&mut out_pipe, &mut b, MAX_TASK_OUTPUT);
+        read_capped_live(&mut out_pipe, &mut b, MAX_TASK_OUTPUT, live_o.as_ref(), "stdout");
         let _ = tx_o.send(b);
     });
     std::thread::spawn(move || {
         let mut b = Vec::new();
-        read_capped(&mut err_pipe, &mut b, MAX_TASK_OUTPUT);
+        read_capped_live(&mut err_pipe, &mut b, MAX_TASK_OUTPUT, live_e.as_ref(), "stderr");
         let _ = tx_e.send(b);
     });
 
@@ -561,10 +782,17 @@ fn task_run_capture_inner(
         .clamp(1, TASK_TIMEOUT_SECS);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut timed_out = false;
+    let mut cancelled = false;
     let code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {
+                // 用户按停：和超时走同一条终止路径（杀整个进程组），只是说法不同。
+                if registration.cancelled() {
+                    terminate_task_tree(&mut child);
+                    cancelled = true;
+                    break -1;
+                }
                 if std::time::Instant::now() >= deadline {
                     terminate_task_tree(&mut child);
                     timed_out = true;
@@ -594,7 +822,7 @@ fn task_run_capture_inner(
     // run_cmd 的语义就是「一次性命令 + 真实退出码」，跑完还活着的东西按定义就是泄漏；
     // 需要常驻服务的场景有专门的 run_in_terminal（它有自己的终端页签和生命周期）。
     // 已经拿到退出码和输出之后再清理，所以不影响任何正常命令的结果。
-    if !timed_out {
+    if !timed_out && !cancelled {
         terminate_task_tree(&mut child);
     }
     // 不能用 from_utf8_lossy：Windows 的命令行工具往**管道**里写的是 ANSI 代码页
@@ -622,6 +850,9 @@ fn task_run_capture_inner(
             "\n[已超时 {timeout_secs}s，命令及其子进程已被终止。{advice}]"
         ));
     }
+    // 被用户中止时这里**不写话**：客户端只回结构化事实（`cancelled: true`），给模型看的
+    // 那句由前端 backend.taskRunCapture 渲染——面向模型的措辞不进客户端二进制
+    //（test/rust-agent-text.test.mjs 守着这条）。
     if code != 0 {
         if let Some(dep) = missing_dependency_advice(&stdout, &stderr) {
             stderr.push_str(&format!("\n[{dep}]"));
@@ -645,6 +876,7 @@ fn task_run_capture_inner(
         combined,
         truncated,
         timed_out,
+        cancelled,
         sandbox: sandbox_kind.to_string(),
         sandbox_denied,
     })
@@ -667,22 +899,6 @@ fn terminate_task_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Read a stream into `out`, but stop storing past `cap` bytes (keep draining so
-/// the child process isn't blocked on a full pipe).
-fn read_capped<R: std::io::Read>(r: &mut R, out: &mut Vec<u8>, cap: usize) {
-    let mut buf = [0u8; 8192];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if out.len() < cap {
-                    let take = (cap - out.len()).min(n);
-                    out.extend_from_slice(&buf[..take]);
-                }
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -706,6 +922,49 @@ mod tests {
             let tip = shell_shadows_tool_advice(cmd)
                 .unwrap_or_else(|| panic!("`{cmd}` 该提示用 {want}，却什么都没说"));
             assert!(tip.contains(want), "`{cmd}` 的提示没点名 {want}：{tip}");
+        }
+    }
+
+    /// 「明明能写代码，他却用终端」——用户实拍的那一条。
+    ///
+    /// 上面那张动词表的每一条都挂着 `!composed`，而 composed 的判据里就有 `>`：
+    /// 用 shell 写文件**必然**带 `>`，于是这个场景结构上永远不可能被提示到。
+    /// 而且它不是偏好问题：run_cmd 是 EXEC 类型、没有 mutatesWorkspace，shell 写出来的
+    /// 文件不进检查点（撤销撤不掉）、写入质量扫描看不见、也不进「本次运行已落盘」。
+    #[test]
+    fn shell_writing_source_files_is_advised_even_when_composed() {
+        for cmd in [
+            "cat > src/main.rs",
+            "echo \"export const x = 1\" > src/config.ts",
+            "cat <<'EOF' > app/models.py",
+            "printf '%s' \"$BODY\" >> lib/util.js",
+            "tee Cargo.toml",
+            "tee -a docker-compose.yml",
+            "cd frontend && cat > src/App.tsx",
+            "python3 gen.py > schema.sql",
+        ] {
+            let tip = shell_shadows_tool_advice(cmd)
+                .unwrap_or_else(|| panic!("`{cmd}` 在用 shell 写源码，却一个字都没提示"));
+            assert!(tip.contains("edit_file") && tip.contains("write_file"),
+                "`{cmd}` 的提示没点名专用工具：{tip}");
+            assert!(tip.contains("检查点"), "`{cmd}` 的提示没说清代价（撤销撤不掉）：{tip}");
+        }
+    }
+
+    /// 反方向：把命令输出存成中间产物、或落在 /tmp，那是正当的 shell 活，不许拦。
+    #[test]
+    fn shell_writing_non_source_targets_is_left_alone() {
+        for cmd in [
+            "grep -c foo bar.txt > out.txt",
+            "cargo test 2> errors.log",
+            "npm run build > /tmp/build.out",
+            "ls -la > /dev/null",
+            "curl -s https://x.dev/a > /tmp/a.json",
+        ] {
+            assert!(
+                shell_shadows_tool_advice(cmd).is_none_or(|t| !t.contains("edit_file")),
+                "`{cmd}` 落点不是源码，不该被当成「该用写工具」"
+            );
         }
     }
 
@@ -910,7 +1169,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             "echo michael-ide".into(),
             None,
-            true,
+            true, None, None,
         )
         .expect("task should run");
         assert_eq!(result.code, 0);
@@ -953,7 +1212,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             "ls 中文目录".into(),
             None,
-            true,
+            true, None, None,
         )
         .expect("task should run");
         assert_eq!(result.code, 0, "stderr={}", result.stderr);
@@ -975,7 +1234,7 @@ mod tests {
     fn capture_reports_nonzero_exit() {
         let root = temp_root("capture-fail");
         let result =
-            task_run_capture_inner(root.to_string_lossy().to_string(), "exit 3".into(), None, true)
+            task_run_capture_inner(root.to_string_lossy().to_string(), "exit 3".into(), None, true, None, None)
                 .expect("task should run");
         assert_eq!(result.code, 3);
         // A plain nonzero exit is not a sandbox denial; mislabelling it would send the model
@@ -990,7 +1249,7 @@ mod tests {
             "/nonexistent-michael-ide-dir-xyz".into(),
             "echo hi".into(),
             None,
-            true,
+            true, None, None,
         );
         assert!(err.is_err());
     }
@@ -1004,7 +1263,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             "sleep 10 & wait".into(),
             Some(1),
-            true,
+            true, None, None,
         )
         .expect("timed command should return a result");
         assert_eq!(result.code, -1);
@@ -1028,7 +1287,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             "echo ok > inside.txt".into(),
             None,
-            true,
+            true, None, None,
         )
         .expect("task should run");
         assert_eq!(inside.code, 0, "writes inside the workspace must still work");
@@ -1041,7 +1300,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             format!("echo pwned > {}", probe.display()),
             None,
-            true,
+            true, None, None,
         )
         .expect("task should run");
         assert_ne!(escaped.code, 0, "a write to HOME must fail");
@@ -1054,7 +1313,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             format!("echo ok > {}", probe.display()),
             None,
-            false,
+            false, None, None,
         )
         .expect("task should run");
         assert_eq!(allowed.code, 0);
@@ -1063,5 +1322,55 @@ mod tests {
 
         let _ = std::fs::remove_file(&probe);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod capture_cancel_tests {
+    use super::{task_cancel_capture, CaptureRegistration};
+
+    #[test]
+    fn cancel_hits_only_registered_ids_and_registration_cleans_up() {
+        let id = 0xC0FF_EE01;
+        assert!(!task_cancel_capture(id), "没登记的 id 不能说「已中止」");
+        let reg = CaptureRegistration::new(Some(id));
+        assert!(!reg.cancelled(), "刚登记不该是已取消");
+        assert!(task_cancel_capture(id), "登记过的 id 要能按到");
+        assert!(reg.cancelled(), "置位之后轮询循环就该看到");
+        drop(reg);
+        assert!(!task_cancel_capture(id), "Drop 之后 id 必须注销，否则下一次复用同一个数会误杀");
+    }
+
+    #[test]
+    fn unregistered_capture_never_reports_cancelled() {
+        let reg = CaptureRegistration::new(None);
+        assert!(!reg.cancelled());
+        assert!(!task_cancel_capture(0));
+    }
+}
+
+#[cfg(test)]
+mod capture_live_tests {
+    use super::utf8_flush_boundary;
+
+    #[test]
+    fn split_multibyte_char_waits_for_its_tail() {
+        // 「中」= E4 B8 AD。读块在第二个字节后被切开：只能发出前面的 "ok "，
+        // 半个字符留到下一块。
+        let chunk = b"ok \xE4\xB8";
+        assert_eq!(utf8_flush_boundary(chunk), 3);
+        // 下一块把尾巴补上之后整段都能发。
+        let joined = b"ok \xE4\xB8\xAD!";
+        assert_eq!(utf8_flush_boundary(joined), joined.len());
+    }
+
+    #[test]
+    fn real_non_utf8_output_is_not_held_forever() {
+        // 尾部 5 个无效字节：不是被切开的字符，是 GBK 之类的输出——整段放行，
+        // 否则 carry 会一直攒到命令结束，实时输出等于没有。
+        let junk = b"abc\xFF\xFE\xFD\xFC\xFB";
+        assert_eq!(utf8_flush_boundary(junk), junk.len());
+        assert_eq!(utf8_flush_boundary(b""), 0);
+        assert_eq!(utf8_flush_boundary(b"plain ascii"), 11);
     }
 }

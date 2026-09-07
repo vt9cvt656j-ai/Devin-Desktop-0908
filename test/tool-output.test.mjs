@@ -12,6 +12,7 @@ import {
   TURN_TOOL_RESULTS_MAX_CHARS,
   PER_RESULT_FLOOR,
   OVERFLOW_MIN_OMITTED_CHARS,
+  ALWAYS_PERSIST_KINDS,
 } from "../src/agent/tool-output.js";
 import { SRC } from "./helpers/source.mjs";
 
@@ -178,13 +179,14 @@ test("丢了一大块 → 落盘，并把绝对路径写进正文", () => {
   assert.match(note, /不要为了看剩下的重跑/, "没劝阻重跑");
 });
 
-test("只丢一点点不落盘——不值得为几百字写一个文件", () => {
+test("只丢一点点不落盘——不值得为几百字写一个文件（可重取的种类；命令一类另有规矩，见下）", () => {
   const wrote = [];
   const sink = makeOverflowSink({ dir: "/tmp/mrday", writeText: (p, t) => wrote.push([p, t]) });
-  assert.equal(sink("a".repeat(9_000), 8_000, "cmd"), "", "丢 1000 字也落盘了");
+  // read 可以 offset/limit 再读一次，丢 1000 字不值得写文件。
+  assert.equal(sink("a".repeat(9_000), 8_000, "read"), "", "丢 1000 字也落盘了");
   assert.equal(wrote.length, 0);
   // 边界：刚好到阈值就落。
-  assert.notEqual(sink("a".repeat(8_000 + OVERFLOW_MIN_OMITTED_CHARS), 8_000, "cmd"), "");
+  assert.notEqual(sink("a".repeat(8_000 + OVERFLOW_MIN_OMITTED_CHARS), 8_000, "read"), "");
   assert.equal(wrote.length, 1);
 });
 
@@ -210,9 +212,14 @@ test("文件名逐次递增且不含可注入路径的字符", () => {
 });
 
 test("接线：投递层真的调了它，且喂的是**原始**正文而不是裁剪后的", () => {
-  // 喂裁剪后的等于落盘一份同样缺中段的副本，那就白落了。
-  assert.match(SRC, /message \+= _overflowSink\(rawMessage, message\.length, _rt\)/,
-    "投递层没接落盘，或者喂错了参数（必须是 rawMessage，不是 message）");
+  // 喂裁剪后的等于落盘一份同样缺中段的副本，那就白落了。sink 必须拿**原始**正文，不是 message。
+  assert.match(SRC, /message \+= _overflowSink\(_sinkRaw, message\.length, _rt\)/,
+    "投递层没接落盘，或者喂错了参数（必须是原始正文 _sinkRaw，不是裁剪后的 message）");
+  // 而 cmd/termtask/termread 的 rawMessage 本身就已经被 _executionToolResultForModel 切到各
+  // 3600 了——喂它照样是缺中段的副本。这几类必须改喂**完整流**（_fullExecStreamsForSink），
+  // 否则对不可重取的命令，落盘的中段取回退路是空的。
+  assert.match(SRC, /_rt === "cmd" \|\| _rt === "termtask" \|\| _rt === "termread"[\s\S]{0,80}_fullExecStreamsForSink\(result\) \|\| rawMessage/,
+    "cmd/termtask/termread 没改喂完整流 —— 它们的 rawMessage 已被前置切到 3600，落盘的还是缺中段副本");
 });
 
 test("一轮工具太多而被额外削短时，也要给出取回完整内容的路径", () => {
@@ -306,4 +313,35 @@ test("main.js 的两处历史改写点都带上了指针", () => {
     "Tier 1 折叠没带取回指针 —— 文件还在，模型手上的路径没了");
   assert.match(SRC, /content: withOverflowPointer\(comp\.length < c\.length/,
     "Tier 2 再压缩没带取回指针");
+});
+
+// ── 命令输出：丢了字就落盘，不看 12k 那条地板 ───────────────────────────────
+//
+// 命令输出的上限是 8k、落盘地板是 12k：一条 8k–20k 的命令输出会被掐掉中间**又不落盘**，
+// 而注记里那句「用 read_file 取回剩下的」对命令来说等于重跑一遍——正是注记自己警告的事。
+test("cmd 一类：哪怕只丢了几百字也落盘，read 一类照旧看地板", () => {
+  const wrote = [];
+  const sink = makeOverflowSink({ dir: "/tmp/mrday", writeText: (p, t) => wrote.push([p, t]) });
+  const raw = "x".repeat(8_300);
+  assert.notEqual(sink(raw, 8_000, "cmd"), "", "命令丢了 300 字没落盘——模型只能重跑命令去看剩下的");
+  assert.equal(wrote.length, 1);
+  assert.equal(wrote[0][1], raw, "落盘的必须是完整原文");
+  assert.equal(sink(raw, 8_000, "read"), "", "读文件丢 300 字不值得写文件：offset/limit 再读一次就是了");
+  assert.equal(wrote.length, 1);
+  for (const k of ["cmd", "termtask", "termread"]) assert.ok(ALWAYS_PERSIST_KINDS.has(k), `${k} 应在必落盘名单里`);
+});
+
+test("一个字都没丢（delivered ≥ 原文）时任何种类都不落盘，也不承诺路径", () => {
+  const wrote = [];
+  const sink = makeOverflowSink({ dir: "/tmp/mrday", writeText: (p, t) => wrote.push([p, t]) });
+  assert.equal(sink("abc", 3, "cmd"), "");
+  assert.equal(sink("abc", 10, "cmd"), "");
+  assert.equal(wrote.length, 0);
+});
+
+test("必落盘名单可以按调用方覆盖", () => {
+  const wrote = [];
+  const sink = makeOverflowSink({ dir: "/tmp/mrday", writeText: (p, t) => wrote.push([p, t]), alwaysPersistKinds: new Set(["read"]) });
+  assert.notEqual(sink("y".repeat(1_000), 900, "read"), "");
+  assert.equal(sink("y".repeat(1_000), 900, "cmd"), "", "覆盖之后 cmd 不在名单里，丢 100 字回到看地板");
 });

@@ -12,6 +12,7 @@
 // 修法全部是：把已经算出（或一次只读查询能算出）的执行事实，经既有的写时通道
 // （_pushNudge 事实类 / 写工具返回值）交回模型；run 级 Set 去重、每处每 run 一次。
 import test from "node:test";
+import { isNewMarker } from "../src/agent/diagnostic-baseline.js";
 // 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
@@ -272,6 +273,10 @@ test("JS/TS 不受 isRunning 影响（Monaco 自带 worker），unchecked 事实
     backend: { readTextFile: async () => "const a = 1;\n" },
     _resolveExisting: async (rel) => "/w/" + rel,
     _normRel: (p) => String(p).replace(/^\/w\//, ""),
+    // 抵扣判据现在要算「这个文件的归一化键」，好把「没采过基线」和「基线是 0」分开。
+    _pathIdentity: (p) => String(p).toLowerCase(),
+    _resolveRel: (rel) => String(rel),
+    _isNewMarker: isNewMarker,   // 注真实现，不注桩：桩会和模块悄悄漂开
     _lintableLangId: (name) => (String(name).endsWith(".py") ? "python" : "javascript"),
     _LINTABLE_EXT: new Set(["py", "js"]),
     _TS_EXT: new Set(["ts", "tsx", "mts", "cts"]),

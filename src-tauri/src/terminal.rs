@@ -374,34 +374,41 @@ pub fn term_close(state: State<TerminalState>, id: u32) -> Result<(), String> {
 ///
 /// 一次返回全部，而不是一个终端一次调用：这是要按秒轮询的，N 次 IPC 没必要。
 /// Windows 上 ConPTY 没有前台进程组这个概念，portable-pty 也就不提供
-/// `process_group_leader`。这里返回空表，标签页退回到"出身"标记——比编不过强，
-/// 也比在 Windows 上乱猜一个假状态强。
+/// `process_group_leader`，所以这里**返回 None**。
+///
+/// 返回类型是 `Option<Vec<u32>>` 而不是 `Vec<u32>`，因为「拿不到这个信号」和「一条命令
+/// 都没在跑」绝不能是同一个值。前端拿这份清单判「命令结束了没有」：空表的含义是
+/// "全都结束了"，于是旧的 `Vec::new()` 让 Windows 上**每一条命令**在宽限期一过就被判
+/// 已结束——健康的 dev server 起来 1.9 秒后就被当成结束，终端复用那条随即"原地重跑"
+/// 往同一个 PTY 里再写一条命令。锁拿不到时同理，那不是"没有命令在跑"。
 #[cfg(windows)]
 #[tauri::command(async)]
-pub fn term_running_ids(_state: State<TerminalState>) -> Vec<u32> {
-    Vec::new()
+pub fn term_running_ids(_state: State<TerminalState>) -> Option<Vec<u32>> {
+    None
 }
 
 #[cfg(not(windows))]
 #[tauri::command(async)]
-pub fn term_running_ids(state: State<TerminalState>) -> Vec<u32> {
+pub fn term_running_ids(state: State<TerminalState>) -> Option<Vec<u32>> {
     let Ok(inner) = state.inner.lock() else {
-        return Vec::new();
+        return None;
     };
-    inner
-        .terms
-        .iter()
-        .filter_map(|(id, term)| {
-            let shell = term.child.process_id()?;
-            let fg = term.master.process_group_leader()?;
-            // fg <= 0 表示拿不到（PTY 已经没有前台进程组），按"没在跑"处理。
-            if fg > 0 && fg as u32 != shell {
-                Some(*id)
-            } else {
-                None
-            }
-        })
-        .collect()
+    Some(
+        inner
+            .terms
+            .iter()
+            .filter_map(|(id, term)| {
+                let shell = term.child.process_id()?;
+                let fg = term.master.process_group_leader()?;
+                // fg <= 0 表示拿不到（PTY 已经没有前台进程组），按"没在跑"处理。
+                if fg > 0 && fg as u32 != shell {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
 }
 
 /// 去掉 Windows 可执行扩展名之后的裸名（非 Windows 上恒为空）。

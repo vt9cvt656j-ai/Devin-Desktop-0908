@@ -88,11 +88,16 @@ test("自动交付不再把报告压成一行——按行做的错误行豁免�
     "又把子体报告压成一行了：_clipPreservingErrors 的错误行豁免是 split(/\\r?\\n/) 做的，压完就废");
 });
 
-test("完整报告的载体不进 nudge 注册表——三条删除路径都够不着它", () => {
-  const src = fnSource("_pushRunFact", { code: true });
-  assert.match(src, /messages\.push\(/, "它得真把消息推进历史");
-  assert.doesNotMatch(src, /_nudgeReg/,
-    "一旦注册进 _nudgeReg，同类重发 / 14 条清扫 / _clearNudges 就能把这份证据整条删掉");
+test("完整报告的载体不进 nudge 注册表——三条删除路径都够不着它", async () => {
+  // 提醒管理器搬进了 agent/nudge-manager.js：import 产品代码做真往返，不再抠源码。
+  const { createNudgeManager } = await import("../src/agent/nudge-manager.js");
+  const messages = [];
+  const n = createNudgeManager({ messages, run: {}, orchNote: "", floor: () => 0, isEnabled: () => true, exempt: new Set() });
+  const m = n.pushRunFact("完整报告");
+  assert.ok(messages.includes(m), "它得真把消息推进历史");
+  assert.equal(n.reg.size, 0, "一旦注册进登记表，同类重发 / 14 条清扫 / clear 就能把这份证据整条删掉");
+  n.sweep(); n.clear();
+  assert.ok(messages.includes(m), "三条删除路径都够不着它");
   assert.match(SRC, /run\._pushRunFact = _pushRunFact/, "得挂到 run 上，门那一侧才够得着");
 });
 
@@ -161,25 +166,25 @@ test("子体 search_tools：三种相反的结局给三种标签，不再全是�
 // ── ④ nudge 棘轮：历史只进不摆 ────────────────────────────────────────────
 const mkHistory = (n) => Array.from({ length: n }, (_, i) => ({ role: "assistant", content: `turn-${i}` }));
 
-test("陈旧提醒只注销、不从消息中段 splice——中段删一条就把它后面的整段历史踢出前缀缓存", () => {
+test("陈旧提醒只注销、不从消息中段 splice——中段删一条就把它后面的整段历史踢出前缀缓存", async () => {
+  const { createNudgeManager } = await import("../src/agent/nudge-manager.js");
   const messages = mkHistory(3);
-  const stale = { role: "user", content: "〔提醒〕旧的" };
-  messages.push(stale);
+  const n = createNudgeManager({ messages, run: {}, orchNote: "〔提醒〕", floor: () => 0, isEnabled: () => true, exempt: new Set() });
+  n.push("diag", "旧的");
+  const stale = messages[3];
   messages.push(...mkHistory(20)); // 距尾远超 14 条
-  const reg = new Map([["diag", stale]]);
-  const sweep = load("_sweepNudges", { messages, _nudgeReg: reg });
   const before = messages.length;
 
-  sweep();
-  assert.equal(reg.has("diag"), false, "陈旧提醒必须退出管理：不再占活跃名额、不再挡同类刷新");
+  n.sweep();
+  assert.equal(n.reg.has("diag"), false, "陈旧提醒必须退出管理：不再占活跃名额、不再挡同类刷新");
   assert.equal(messages.length, before, "它已经付过 token 了，从中段删掉只会让前缀缓存从那点起失效");
   assert.equal(messages.indexOf(stale), 3, "而且不许挪位置");
 
-  // 已经不在 messages 里的条目照旧从注册表清掉（_clearNudges 走过之后的残留）。
-  const orphan = { role: "user", content: "被 _clearNudges 摘掉了" };
-  reg.set("gone", orphan);
-  sweep();
-  assert.equal(reg.has("gone"), false);
+  // 已经不在 messages 里的条目照旧从注册表清掉（clear 走过之后的残留）。
+  const orphan = { role: "user", content: "被 clear 摘掉了" };
+  n.reg.set("gone", orphan);
+  n.sweep();
+  assert.equal(n.reg.has("gone"), false);
 });
 
 /**
@@ -194,18 +199,20 @@ test("陈旧提醒只注销、不从消息中段 splice——中段删一条就�
  */
 const NUDGE_DEPS = (on = true) => ({ run: {}, _NUDGE_GATE_EXEMPT: NUDGE_GATE_EXEMPT, _harnessNudgesEnabled: () => on });
 
-test("同类提醒重发：只有本轮尾部区间里的旧条才 splice，更早的留在原地", () => {
-  const _nudgeRank = () => 1; // 全按事实类，避开淘汰逻辑，这条只看同类替换
-  const _ORCH_NOTE = "〔编排〕";
+test("同类提醒重发：只有本轮尾部区间里的旧条才 splice，更早的留在原地", async () => {
+  const { createNudgeManager } = await import("../src/agent/nudge-manager.js");
+  // 单一类别、不触发淘汰，这条只看同类替换；floor 用引用传，模拟「每轮开头抬到 messages.length」。
+  const mkPush = (messages, floorRef) => createNudgeManager({
+    messages, run: {}, orchNote: "〔编排〕", floor: () => floorRef.v, isEnabled: () => true, exempt: NUDGE_GATE_EXEMPT,
+  });
 
   // A) 旧条在本轮尾部区间之内（同一轮里推了两次）→ 换掉，消息不增长。
   {
     const messages = mkHistory(5);
-    const reg = new Map();
-    const push = load("_pushNudge", { messages, _nudgeReg: reg, _nudgeRank, _ORCH_NOTE, _nudgeTurnFloor: 5, ...NUDGE_DEPS() });
-    push("diag", "第一次");
+    const n = mkPush(messages, { v: 5 });
+    n.push("diag", "第一次");
     const afterFirst = messages.length;
-    push("diag", "第二次");
+    n.push("diag", "第二次");
     assert.equal(messages.length, afterFirst, "同一轮里的旧条就在尾部，替换掉它不动历史");
     assert.match(messages[messages.length - 1].content, /第二次/);
   }
@@ -213,23 +220,22 @@ test("同类提醒重发：只有本轮尾部区间里的旧条才 splice，更�
   // B) 旧条落在更早的轮次（本轮尾部区间起点之前）→ 留在原地，新条追加。
   {
     const messages = mkHistory(5);
-    const reg = new Map();
-    const pushEarly = load("_pushNudge", { messages, _nudgeReg: reg, _nudgeRank, _ORCH_NOTE, _nudgeTurnFloor: 5, ...NUDGE_DEPS() });
-    pushEarly("toolReminder", "第 12 轮的目录刷新");
+    const floor = { v: 5 };
+    const n = mkPush(messages, floor);
+    n.push("toolReminder", "第 12 轮的目录刷新");
     const old = messages[messages.length - 1];
     messages.push(...mkHistory(6)); // 中间隔了模型轮和工具结果
-    const floor = messages.length;
-    const pushNow = load("_pushNudge", { messages, _nudgeReg: reg, _nudgeRank, _ORCH_NOTE, _nudgeTurnFloor: floor, ...NUDGE_DEPS() });
-    pushNow("toolReminder", "第 24 轮的目录刷新");
+    floor.v = messages.length;
+    n.push("toolReminder", "第 24 轮的目录刷新");
 
     assert.ok(messages.includes(old), "旧条被从中段抠走了——每 12 轮抠一次，前缀缓存每 12 轮塌一次");
     assert.equal(messages.indexOf(old), 5, "旧条不许挪位置");
     assert.match(messages[messages.length - 1].content, /第 24 轮/);
-    assert.equal(reg.get("toolReminder"), messages[messages.length - 1], "注册表要指向最新那条");
+    assert.equal(n.reg.get("toolReminder"), messages[messages.length - 1], "注册表要指向最新那条");
   }
 });
 
-test("超额淘汰在尾部照样摘掉，但不许伸进历史中段", () => {
+test("超额淘汰在尾部照样摘掉，但不许伸进历史中段", async () => {
   // 这条原来的理由是「淘汰只发生在活跃条目之间，它们都在尾部」——**不成立**。
   // _nudgeReg 跨轮存活，它里面那条是「这个类别上次触发时」推的。toolReminder 每 12 轮
   // 才推一次，所以第 13 轮去淘汰它时，那条在十几轮之前，位置在消息中段。从中段抠掉一条
@@ -238,16 +244,31 @@ test("超额淘汰在尾部照样摘掉，但不许伸进历史中段", () => {
   // 所以两件事都要：**尾部区间内照样摘**（gate-tristate 钉着「不能只从注册表删」，
   // 那条仍然成立，收敛行为一字不变），**更早的留在原地当历史**（它们隔了十几轮，
   // 早就不构成「同时挂一堆提醒逼模型逐条表态」那个问题了）。
-  // 按**内容边界**切，不用固定字符窗口：注释剥离器把注释换成等长空格，
-  // 函数上多写几行说明就会把窗口撑爆，断言静默失配（本仓库踩过好几次）。
-  const src = fnSource("_pushNudge", { code: true });
-  const at = src.indexOf("const _dropNudge");
-  assert.ok(at >= 0, "_dropNudge 被改名或挪走了");
-  const body = src.slice(at, src.indexOf("_nudgeReg.delete(victim)", at));
-  assert.ok(body, "切不到 _dropNudge 的函数体");
-  assert.match(body, /messages\.splice\(oi, 1\)/, "超额淘汰不再把条目从 messages 摘掉了");
-  assert.match(body, /oi >= _nudgeTurnFloor\) messages\.splice\(oi, 1\)/,
-    "淘汰没有被尾部区间守着——它会伸进历史中段，把整段前缀缓存作废");
+  // 真往返，不切源码：两个方向各跑一遍。
+  const { createNudgeManager } = await import("../src/agent/nudge-manager.js");
+  // 尾部区间内：淘汰真的把条目从 messages 摘掉（gate-tristate 那条「不能只从注册表删」仍成立）。
+  {
+    const messages = [];
+    const n = createNudgeManager({ messages, run: {}, orchNote: "", floor: () => 0, isEnabled: () => true, exempt: new Set() });
+    n.push("askBudget", "建议");
+    n.push("planNudge", "另一条建议");
+    assert.equal(messages.length, 1, "超额淘汰不再把尾部的条目从 messages 摘掉了");
+    assert.equal(n.reg.has("askBudget"), false);
+  }
+  // 历史中段：上次触发在十几轮之前，淘汰只从登记表摘，消息留在原地。
+  {
+    const messages = mkHistory(2);
+    const floor = { v: 0 };
+    const n = createNudgeManager({ messages, run: {}, orchNote: "", floor: () => floor.v, isEnabled: () => true, exempt: new Set() });
+    n.push("askBudget", "第 1 轮的建议");
+    const old = messages[messages.length - 1];
+    messages.push(...mkHistory(12));
+    floor.v = messages.length;
+    n.push("planNudge", "第 13 轮的建议");
+    assert.ok(messages.includes(old), "淘汰没有被尾部区间守着——它伸进了历史中段，把整段前缀缓存作废");
+    assert.equal(messages.indexOf(old), 2, "旧条不许挪位置");
+    assert.equal(n.reg.has("askBudget"), false, "但登记表里要摘掉，不再占名额");
+  }
 });
 
 // ── ⑤ 单次运行 token 预算 ─────────────────────────────────────────────────
@@ -269,49 +290,56 @@ test("run 用量读的是本 run 自己的结算账，不是挂在 session 上�
 });
 
 test("预算判定挂在结算落地那一刻，下一轮开头消费标记——不阻塞工具执行", async () => {
+  const { createNudgeManager } = await import("../src/agent/nudge-manager.js");
   const _runUsageTokens = load("_runUsageTokens");
   const session = { _runUsage: { in: 900, out: 100, cacheRead: 0, cacheCreation: 0 } };
   const run = {};
-  const _readTokenCap = load("_readTokenCap", { localStorage: { getItem: () => "1500" } });
-  assert.equal(_readTokenCap(), 1500);
-  const note = load("_noteTokenCapOnSettlement", { run, session, _readTokenCap, _runUsageTokens });
+  const n = createNudgeManager({
+    messages: [], run, orchNote: "", floor: () => 0,
+    readCap: () => 1500, usageTokens: () => _runUsageTokens(session._runUsage),
+  });
 
-  note();
+  n.noteTokenCapOnSettlement();
   assert.equal(run._tokenCapPending, undefined, "1000 < 1500，还没超");
   session._runUsage.in = 1600;
-  note();
+  n.noteTokenCapOnSettlement();
   assert.deepEqual(run._tokenCapPending, { used: 1700, cap: 1500 },
     "结算落地后要用本 run 自己的账判超限，并且只置标记（推提醒是下一轮开头的事）");
   const first = run._tokenCapPending;
   session._runUsage.in = 9999;
-  note();
+  n.noteTokenCapOnSettlement();
   assert.equal(run._tokenCapPending, first, "标记还没被消费，不重复覆盖");
   run._tokenCapPending = null;
   run._tokenCapNudged = true;
-  note();
+  n.noteTokenCapOnSettlement();
   assert.equal(run._tokenCapPending, null, "已经提醒过就不再置");
 
   // 关的是「零上限 = 不限」这道门。
-  const noCap = load("_noteTokenCapOnSettlement", {
-    run: {}, session, _runUsageTokens, _readTokenCap: load("_readTokenCap", { localStorage: { getItem: () => "0" } }),
-  });
-  noCap();
+  const run2 = {};
+  const noCap = createNudgeManager({ messages: [], run: run2, orchNote: "", floor: () => 0, readCap: () => 0, usageTokens: () => 99999 });
+  noCap.noteTokenCapOnSettlement();
+  assert.equal(run2._tokenCapPending, undefined, "零上限 = 不限");
+  // 预算从 localStorage 的 michael-ide.token-budget 读，坏值/缺省按 0——接线在主循环建管理器那一处。
+  assert.match(SRC, /readCap: \(\) => \{[^\n]*michael-ide\.token-budget/, "预算键没接进管理器");
 });
 
 test("结算任务每条只挂一次钩子，落地即判——异常也不许把主循环带下去", async () => {
-  let notes = 0;
+  const { createNudgeManager } = await import("../src/agent/nudge-manager.js");
+  let reads = 0;   // readCap 只在真判定那一刻被读：读了几次 = 判了几次
   const run = { _billingTasks: [] };
-  const hook = load("_hookSettlementTasks", {
-    run, _billingHooked: new WeakSet(), _noteTokenCapOnSettlement: () => { notes++; },
+  const n = createNudgeManager({
+    messages: [], run, orchNote: "", floor: () => 0,
+    readCap: () => { reads++; return 1; }, usageTokens: () => 100,
   });
   const settled = Promise.resolve("settlement");
   const failed = Promise.reject(new Error("gateway down"));
   run._billingTasks.push(settled, failed, "not-a-promise");
-  hook();
-  hook(); // 每轮都调；已经挂过的不许再挂一次
+  n.hookSettlementTasks();
+  n.hookSettlementTasks(); // 每轮都调；已经挂过的不许再挂一次
   await Promise.allSettled([settled, failed]);
   await Promise.resolve();
-  assert.equal(notes, 1, "结算落地判定必须每条任务只跑一次，失败的那条不判也不抛");
+  assert.equal(reads, 1, "结算落地判定必须每条任务只跑一次，失败的那条不判也不抛");
+  assert.deepEqual(run._tokenCapPending, { used: 100, cap: 1 });
 
   assert.match(SRC, /_hookSettlementTasks\(\);\s*\n\s*run\._tokens = _runUsageTokens/,
     "钩子要在主循环里每轮挂一次，否则 break/continue 路径上新压入的结算任务永远没人接");

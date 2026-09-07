@@ -577,9 +577,31 @@ const EXTRACTED_TO_AGENT = {
     "_isRateLimitedAiError", "_isRetryableAiError", "_isCompressionPrefixInvalidError",
     "_isStalledAiError", "_modelEventHasProgress", "_streamResumeMode",
   ],
+  // 2026-09-05 推理 / 工具 / 发送三条路径各自拆出来的七族（每族有同名 test/<模块>.test.mjs 真往返）。
+  // 只列 main.js 真 import 的名字：模块里还有一些只供模块内部或测试用的导出，不在这张表上。
+  "thinking-profile.js": [
+    "_thinkingProfileFor", "_applyThinkingToConfig", "_thinkingPrefFor", "_setThinkingPref",
+    "_supportsThinking", "_THINK_LEVELS", "_thinkLabels", "_isAnthropicWireFamily",
+  ],
+  "reasoning-stream.js": ["_routeInlineThinkingDelta", "_flushInlineThinkingDelta", "_canRenderPreAnswerReasoning"],
+  "provider-messages.js": ["_sanitizeProviderMessages", "_withoutLegacyReasoningSummary"],
+  "think-ledger.js": ["_extractThinkingConclusion", "_thinkLedgerPush", "_thinkLedgerBlockText"],
+  "model-text.js": [
+    "_clipPreservingErrors", "_headTailModelText", "_foldAssistantText", "_smartCompress",
+    "_lexCompress", "_stripAnsi", "_IMPORTANT_LINE",
+  ],
+  "request-budget.js": [
+    "_enforceModelRequestBudget", "_squeezeMessagesForContext", "_isContextOverflowAiError",
+    "_REQUEST_MARKERS", "_MODEL_REQUEST_BODY_BYTE_CAP",
+  ],
+  "tool-discovery.js": [
+    "_searchToolsExactQuery", "_searchToolsLookup", "_searchToolsFuzzyMatch", "_confidentFuzzyResolution",
+    "_nearestToolNames", "_unknownToolHint", "_subAgentUsableToolNames", "_subAgentAdmitTools",
+    "_subAgentSearchToolsLabel", "_toolMetaGuideSuffix", "_toolSchemaFromRegistry",
+  ],
 };
 
-test("腾出来的三族必须住在 src/agent/，不许搬回 main.js", async () => {
+test("腾出来的模块必须住在 src/agent/，不许搬回 main.js", async () => {
   const problems = [];
 
   for (const [file, names] of Object.entries(EXTRACTED_TO_AGENT)) {

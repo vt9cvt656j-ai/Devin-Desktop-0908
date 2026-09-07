@@ -50,11 +50,15 @@ function transportAccepts(header) {
     && /^[a-z0-9.:,_]*$/.test(value);
 }
 
-/** 网关的选块判据：mode == "agent" && semantic_profile 里有 "engineering"。 */
+/**
+ * 网关的选块判据：mode == "agent" && (semantic_profile 里有 "engineering" || 兜底)。
+ * 兜底（2026-09-05）= 头里有 unjudged（裁决还没落定）：agent 模式先按工程任务挂工程块，
+ * 这是模式级默认，不按请求原文分类；裁决落定说不是工程就撤下。
+ */
 function gatewayBlocksFor(mode, header) {
   const flags = new Set(String(header || "").replace(/^2\.5:/, "").split(",").filter(Boolean));
   const blocks = [...PROMPT_GRAPH.core];
-  if (mode === "agent" && flags.has("engineering")) blocks.push(...PROMPT_GRAPH.modules.find((m) => m.id === "engineering").files);
+  if (mode === "agent" && (flags.has("engineering") || flags.has("unjudged"))) blocks.push(...PROMPT_GRAPH.modules.find((m) => m.id === "engineering").files);
   return blocks;
 }
 
@@ -66,19 +70,22 @@ test("转运层与网关判据没有漂：本文件模拟的那两道门就是�
     "桌面端不再发 x-ide-semantic-profile 头了");
 
   // ② 网关的选块判据（prompts.rs）。这是「agent_engineering 到底什么时候挂」的唯一真源。
-  // v3：判据在 prompt_graph.json 的模块条目里（head.flags），装配器只跑一个通用循环。
+  // v3：工程块的判据在 prompt_graph.json（engineering.head.flags + unjudged_default），装配器只跑通用循环。
   assert.match(GATEWAY_RS, /crate::prompt_modules::head_modules\(&graph, mode, &routing_flags\)/,
     "网关不再按目录条件装头模块——客户端发的旗标名就没人消费了");
-  const engineering = PROMPT_GRAPH.modules.find((m) => m.id === "engineering");
-  assert.deepEqual(engineering.head.flags, ["engineering"], "engineering 模块的旗标判据变了——客户端发的旗标名必须跟着改");
-  assert.equal(engineering.head.unjudged_default, true, "裁决没落定时工程块要按默认挂上");
+  const engineeringModule = PROMPT_GRAPH.modules.find((m) => m.id === "engineering");
+  assert.deepEqual(engineeringModule.head.flags, ["engineering"]);
+  assert.equal(engineeringModule.head.unjudged_default, true, "裁决没落定时工程块要按默认挂上");
+  // 兜底那一半：裁决还没落定（unjudged）且请求原文像工程任务 → 挂工程块，第一发不再裸着出门。
+  assert.match(GATEWAY_RS, /let engineering_fallback = mode == "agent"\s*&& semantic\("unjudged"\)\s*&& !semantic\("engineering"\)/,
+    "工程块的兜底判据变了——客户端第一发不等裁决靠的就是它");
 
   // ③ 生产日志里那四块，就是 graph 里的 agent.base——「画像空 = 只剩基础四块」得到复核。
   // system_invariants 是**指令层级**，2026-09-02 加的，排在每个模式的第一块：
   // 它是全系统唯一一条说明"几种指令谁大谁小"的排序，客户端任何文本都不该排到它前面。
   assert.deepEqual(PROMPT_GRAPH.core,
     ["system_invariants", "agent_core", "truth_core", "answer_core"]);
-  assert.deepEqual(engineering.files, ["engineering_core"]);
+  assert.deepEqual(engineeringModule.files, ["engineering_core"]);
 });
 
 test("端到端：快通道旗标落地 → 请求头 → 网关真的挂上 agent_engineering", () => {
@@ -87,9 +94,11 @@ test("端到端：快通道旗标落地 → 请求头 → 网关真的挂上 age
   const config = {};
   // 出发时：没有任何旗标。这正是坏掉的那一版每一轮的样子。
   const atSend = stable(session, semanticProfile({ intentSource: "pending" }));
-  assert.equal(atSend, "2.5:");
-  assert.deepEqual(gatewayBlocksFor("agent", atSend), PROMPT_GRAPH.core,
-    "空画像下网关只挂基础四块——这就是生产日志里的那一行");
+  assert.equal(atSend, "2.5:unjudged", "裁决没落定的第一发只带 unjudged 这一位");
+  assert.ok(gatewayBlocksFor("agent", atSend).includes("engineering_core"),
+    "裁决没落定时网关要先按工程任务挂工程块（2026-09-05）——原来这一发只带基础四块，就是生产日志里那一行");
+  assert.deepEqual(gatewayBlocksFor("agent", "2.5:"), PROMPT_GRAPH.core,
+    "既没裁决位也没工程旗标（判过了、说不是工程）→ 只挂基础块");
 
   // 快通道在第一个模型回合期间落定（模型自己声明的旗标，不是词表猜的）。
   const run = {
@@ -122,7 +131,7 @@ test("快通道的结果必须有落地点，不能只被那一行同步表达�
   // 而 sess 的旗标是会话级单调并集。只写局部变量 _fastRouteProfile 等于没有读者。
   const head = then.slice(0, 900);
   assert.match(head, /_turnIntentState\.fastProfile = p/,
-    "快通道的结果没有交给 _turnIntentState——它就到不了循环边界，赢不了那 6 秒 race 就等于白跑");
+    "快通道的结果没有交给 _turnIntentState——它就到不了循环边界，等于白跑");
   assert.match(head, /config\.ideSemanticProfile = _sessionStableSemanticProfile\(sess, _ideSemanticProfile\(p\)\)/,
     "快通道落定时没有并进会话画像");
 
@@ -134,9 +143,10 @@ test("快通道的结果必须有落地点，不能只被那一行同步表达�
   assert.match(start, /!_sessionFlags\.length|_profileStillEmpty/,
     "启动判据应当是「会话画像还空」——空才值得再花一次 200 token 的快通道");
 
-  // 两条腿仍然并行 race（第一轮能赶上就直接带上旗标出门，这条没变）。
-  assert.match(CODE, /Promise\.race\(\[\s*_turnIntentExactPromise,\s*_fastRoute,/,
-    "两条腿必须在同一个 race 里");
+  // 2026-09-05 起第一发不等裁决：两条腿都是后台腿，不许再把它们放进一个卡住第一发的 race。
+  // 落定后由循环边界的 _applyFastRouteProfileIfLanded / _applyLateIntentIfLanded 补进请求头。
+  assert.doesNotMatch(CODE, /Promise\.race\(\[\s*_turnIntentExactPromise,\s*_fastRoute,/,
+    "第一发又在等两条腿的 race 了——每个新会话固定多付几秒静默，而生产里裁决中位 80 秒才到");
 });
 
 test("每个采纳迟到裁决的循环边界，都必须同时收快通道和执行事实", () => {

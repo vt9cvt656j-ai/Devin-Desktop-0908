@@ -23,6 +23,9 @@ import {
   needsApproval,
   needsApprovalFor,
   BROWSER_OBSERVE_ACTIONS,
+  AUTOMATION_OBSERVE_METHODS,
+  PARALLEL_SAFE_READS,
+  parallelSafeTypes,
   readOnlyBlockedTypes,
   toolPolicy,
   workerScopeField,
@@ -71,6 +74,10 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
     // 子体，main.js 有四处已经把它当改工作区的动作在记账（_toolMutatesWorkspace 周边），
     // 唯独这张判定表里从没登记过。和上面 learndesign / worktree 是同一种漏法。
     "worker",
+    // 新增（2026-09-04 审计）：visual_explain → explain 和 genimage 走同一个后端把 png 落进
+    // <root>/.mrdayone-images/；stop_demo → demostop 把录像写成 HTML（路径由模型给）。
+    // 两个都真的往工作区写文件，此前一条声明都没有。
+    "explain", "demostop",
   ])));
   // The subtle one: a shell command may change the workspace but never REPORTS it, so it is
   // not in this set. Adding it would make `mutated === false` look like proof of a no-op.
@@ -91,6 +98,11 @@ test("approval set matches the pre-refactor literal exactly", () => {
   assert.deepEqual(sorted(approvalTypes()), sorted(new Set([
     "write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format",
     "cmd", "termtask", "automation", "uiclick", "download", "db", "mcp",
+    // 新增：remote。它把 backend 的读/写/删/建目录/改名/复制/搜索/跑命令**整体重定向**
+    // 到模型指定的另一台机器（connect 还会把守护进程 token POST 过去），此前根本没进过
+    // 策略表 → 拿默认值 needsApproval:false → 「改动前审批」开着也零弹框。判据在
+    // _toolMayProduceExternalEffect 里早就写对了，只是审批门那条腿没走到它。
+    "remote",
     // 新增：用户自己声明接进来的 HTTP 能力。它能往任意 http(s) 地址发请求，而声明可能
     // 来自 clone 来的仓库，所以和 mcp 同级——一律要审批。
     "userhttp",
@@ -106,6 +118,10 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // 新增：mode='system' / system_proxy=true 会改掉**操作系统级**代理，整台机器的
     // 流量都走本地 mitmproxy，接着还要用户 sudo 装根证书。
     "capture_start",
+    // 新增（2026-09-04 审计）：explain / demostop 写盘（见上面 mutating 集合）；http / tor
+    // 按 method 判——非 GET/HEAD/OPTIONS 才问。审批门对 http/tor 本来就有特判走
+    // _toolMayProduceExternalEffect，这里让声明和特判说同一句话（同时补上只读门那一半）。
+    "explain", "demostop", "http", "tor",
     // 新增：这一族全都真的往工作区写文件（web_scaffold / game_scaffold 更是直接铺
     // 一整棵项目树），此前一个都不问——等于「改动前审批」这个开关对十种写盘方式
     // 整体失效，而用户看不出来。
@@ -197,6 +213,9 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
   assert.deepEqual(sorted(readOnlyBlockedTypes()), sorted(new Set([
     "write", "edit", "multiedit", "cmd", "delete", "move", "mkdir", "copy", "format",
     "uiclick", "mcp", "termtask",
+    // 新增：remote(connect)。把整台机器的读写和命令切走，在只读模式里显然不是"只读"。
+    // disconnect 不挡——那是**退回本机**，挡住反而把人锁在远端。
+    "remote",
     // 新增：只读模式里也能建目录并把用户当前工作区顶掉——模式标签写着「只读」。
     // 新增：定时任务。它排下的是一条**将来在没人看着时执行**的常驻指令，和 mcpconfig
     // 同级——网页正文、仓库文件、命令输出都可能诱导模型偷偷排一条。list 只读不弹框，
@@ -241,6 +260,20 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     // Plan / Explorer / Reviewer，模型照样能派子体改文件。和 subagent 是同一族的漏。
     "worker",
     "background_monitor",
+    // 新增（2026-09-04 审计）。判据一条：只读模式不许留下持久化写入、不许动进程、不许发写请求。
+    //   memory      remember 写 <root>/.mrdayone/memory.md（不弹审批：IDE 自己的目录，worktree 的先例）
+    //   explain / demostop  真的写工作区文件（见 mutating 集合）
+    //   termstop    杀掉任务终端里的进程
+    //   http / tor  按 method 逐次判：GET/HEAD/OPTIONS 照常放行（Plan 模式查接口正靠它）
+    //   capture_start  改写操作系统级代理
+    //   download + 十一个生成器  往工作区落文件——原来只有审批一道门，审批关掉的用户在只读模式里什么都拦不住
+    //   automation  按方法逐次判：观察类放行，合成键鼠挡下
+    //   db          按这一条语句逐次判：SELECT 放行，DROP 挡下（原来平铺 needsApproval:true、只读不挡）
+    "memory", "explain", "demostop", "termstop", "http", "tor", "capture_start",
+    "download", "download_asset", "genimage", "generate_3d", "generate_sound", "generate_music",
+    "generate_voice", "generate_motion", "generate_texture", "auto_rig", "game_scaffold", "web_scaffold",
+    "office_write", "office_edit",
+    "automation", "db",
   ])));
   // 逐次细则：只挡跑 shell 的那一种。写成一刀切会把「等端口起来」这类观察也挡掉，
   // 而那正是 Plan 模式最需要的能力。
@@ -329,8 +362,13 @@ test("a worker's copy is scope-checked at the destination, not the source", () =
 test("an unregistered tool gets the safe default, so read-only tools need no declaration", () => {
   // The large majority of the 126 call types are read-only lookups. Requiring a declaration
   // for each would be a list that rots; the default IS their policy.
-  for (const t of ["npm_search", "arxiv_search", "read", "list", "current_time", "think", ""]) {
+  for (const t of ["npm_search", "arxiv_search", ""]) {
     assert.deepEqual(toolPolicy(t), DEFAULT_POLICY, `${t || "(empty)"} should default`);
+  }
+  // 纯读工具唯一声明的是「能并行」（parallelSafe），三道门一个都不声明——门的部分仍然
+  // 就是默认值。这条守的是「读工具不需要为门写声明」，不是「读工具不许出现在注册表里」。
+  for (const t of ["read", "list", "current_time", "think"]) {
+    assert.deepEqual(toolPolicy(t), { ...DEFAULT_POLICY, parallelSafe: true }, `${t} 除了并行声明之外应当全是默认值`);
   }
   assert.equal(needsApproval("some_tool_invented_tomorrow"), false);
   assert.equal(blockedInReadOnlyMode("some_tool_invented_tomorrow"), false);
@@ -457,9 +495,10 @@ test("worktree 算改动工作区——它在 <root>/.mrdayone/worktrees 下面�
 // 每一种都必须被归类——要么进 REGISTRY（有策略），要么写进下面这张"确认无需审批"的
 // 明单。新加一个工具时两边都不写，这条就红。
 //
-// 明单是**棘轮，不是体检报告**：这 81 个是审计当天的既有状态，逐个复核过的只有上面
-// 点名的那四个。里面仍有值得单独判的（gh / http / tor 由 _requiresApproval 特判，
-// memory 会写盘，preview / demostart 会起服务，subagent / spawnmulti 会派出子智能体）。
+// 明单是**棘轮，不是体检报告**：这些是审计当天的既有状态。2026-09-04 又逐个打开执行分支
+// 核了一遍，从这里摘走六个登记进策略表：memory（写盘）、explain / demostop（写盘）、
+// termstop（杀进程）、http / tor（按 method 判）。仍留在这里、值得单独判的：preview /
+// demostart 会起服务，subagent / spawnmulti 会派出子智能体。
 // 它们留在这里只表示"今天不问"，不表示"已确认不该问"。
 const NO_APPROVAL_TODAY = new Set([
   // office_read 只读 Office 文件的结构，不落盘、不联网。
@@ -467,18 +506,18 @@ const NO_APPROVAL_TODAY = new Set([
   "arxiv_search", "askuser", "awaitsubagent", "awwwards_search", "background_monitor",
   "bundlephobia_search", "capture_flows", "capture_stop", "clinical_trials_search",
   "codeberg_repo", "codrops_search", "crossref_search", "current_time", "cve_search", "debate",
-  "demostart", "demostop", "designboard", "developer_community_search", "diag", "explain",
+  "demostart", "designboard", "developer_community_search", "diag",
   "figma", "find", "findsymbol", "gh", "git", "gitee_repo", "github_repo", "github_search",
-  "gitlab_repo", "hackernews_search", "http", "iconify_search", "knowledge", "learndesign",
-  "list", "liveenvironment", "localdiscovery", "logs", "lsp", "mdn_search", "memory",
+  "gitlab_repo", "hackernews_search", "iconify_search", "knowledge", "learndesign",
+  "list", "liveenvironment", "localdiscovery", "logs", "lsp", "mdn_search",
   "openalex_search", "openapi_parser", "package_search", "package_source",
   "performance_profile", "plan", "preview", "probeenv", "pubchem_search", "pubmed_search",
-  "qr", "read", "readscreen", "realtime_news_feed", "recall", "remote", "screenshot", "search",
+  "qr", "read", "readscreen", "realtime_news_feed", "recall", "screenshot", "search",
   "search_game_assets", "search_tools", "semsearch", "skill",
   // load_guide：客户端只回一句「已附上」，指南正文由网关按对话内容贴上；不落盘不联网。
   "guide", "smashingmag_search",
   "spawnmulti", "stackoverflow_search", "steam_search", "subagent", "termlist", "termread",
-  "termstop", "think", "tor", "uiextract", "viewimage", "vizcompare", "web", "websearch",
+  "think", "uiextract", "viewimage", "vizcompare", "web", "websearch",
   "wiki_search", "worker",
 ]);
 
@@ -507,6 +546,120 @@ test("每一种工具调用类型都必须被归类——没登记也算漏，�
     "这些工具类型既没登记策略、也没写进「确认无需审批」的明单，于是默认无声放行：\n  "
     + orphans.join(", ")
     + "\n把它 defineTool 进 tool-policy.js，或者写进 NO_APPROVAL_TODAY 并说明为什么不用问。");
+});
+
+// ── 2026-09-04 审计：按调用判的那几类，细则逐条钉住 ─────────────────────────
+
+test("db 按这一条语句判：SELECT 不弹框、只读模式放行、可并行；会写的三道门全关", () => {
+  // 判据不在策略表里算：main.js 的 _dbCallMayMutate 判完把结论标到 call.dbMayMutate 上
+  //（_requiresApproval 和 _executeToolStepInner 两处都标），策略表只读那一位。
+  const sel = { type: "db", dbMayMutate: false };
+  const drop = { type: "db", dbMayMutate: true };
+  assert.equal(needsApprovalFor("db", sel), false, "SELECT 不该弹审批");
+  assert.equal(blockedInReadOnlyMode("db", sel), false, "Plan 模式看一眼表结构是它最该干的事");
+  assert.equal(toolPolicy("db").parallelSafe(sel), true);
+  assert.equal(needsApprovalFor("db", drop), true);
+  assert.equal(blockedInReadOnlyMode("db", drop), true, "只读模式里 DROP TABLE 照跑——这条原来就是这样");
+  assert.equal(toolPolicy("db").parallelSafe(drop), false);
+  // 没标注（不经 _mapToolCall 构造的调用）按会写处理：宁可多问，不能替用户 DROP。
+  assert.equal(needsApprovalFor("db", { type: "db" }), true);
+  assert.equal(blockedInReadOnlyMode("db", { type: "db" }), true);
+  assert.equal(toolPolicy("db").parallelSafe({ type: "db" }), false);
+});
+
+test("automation 按方法判：观察类不弹框不挡，合成键鼠 / 写剪贴板要问且只读模式挡", () => {
+  // 名单照 main.js 那条正则来（下一条测试对账）：browser.content 这类读页面正文的动作
+  // 不在观察名单里——它跑在共享的自动化浏览器上，main.js 把它算成副作用，这里不另立判据。
+  for (const m of ["screen.capture", "screen.info", "mouse.position", "clipboard.get", "window.list", "browser.nodes", "app.status", "wait"]) {
+    assert.equal(needsApprovalFor("automation", { type: "automation", method: m }), false, `${m} 是观察`);
+    assert.equal(blockedInReadOnlyMode("automation", { type: "automation", method: m }), false, `${m} 只读模式该能用`);
+  }
+  for (const m of ["mouse.click", "keyboard.type", "keyboard.combo", "clipboard.set", "window.activate", "app.open"]) {
+    assert.equal(needsApprovalFor("automation", { type: "automation", method: m }), true, `${m} 动真格`);
+    assert.equal(blockedInReadOnlyMode("automation", { type: "automation", method: m }), true, `${m} 只读模式必须挡`);
+  }
+  // 没给 method 按动真格处理。
+  assert.equal(needsApprovalFor("automation", { type: "automation" }), true);
+});
+
+test("automation 的观察正则和 main.js 副作用判定里那条**逐字相同**", () => {
+  // 两处对同一件事说不同的话就是事故：这边放行、那边判成副作用（或反过来）。
+  const m = /if \(call\.type === "automation"\) return !\/(.+?)\/i\.test\(String\(call\.method \|\| ""\)\);/.exec(MAIN);
+  assert.ok(m, "main.js 里 automation 那条副作用判定改了形状，这条对账要跟着改");
+  assert.equal(m[1], AUTOMATION_OBSERVE_METHODS.source, "策略表和 main.js 的 automation 观察正则漂了");
+});
+
+test("http / tor 按 method 判：GET/HEAD/OPTIONS 放行且 GET/HEAD 可并行，写方法要问且只读模式挡", () => {
+  for (const t of ["http", "tor"]) {
+    for (const method of ["GET", "HEAD", "OPTIONS", "get"]) {
+      assert.equal(blockedInReadOnlyMode(t, { type: t, method }), false, `${t} ${method} 只读模式该能用`);
+      assert.equal(needsApprovalFor(t, { type: t, method }), false, `${t} ${method} 不该弹框`);
+    }
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+      assert.equal(blockedInReadOnlyMode(t, { type: t, method }), true, `${t} ${method} 只读模式必须挡`);
+      assert.equal(needsApprovalFor(t, { type: t, method }), true, `${t} ${method} 必须问`);
+    }
+    assert.equal(toolPolicy(t).parallelSafe({ type: t, method: "GET" }), true);
+    assert.equal(toolPolicy(t).parallelSafe({ type: t, method: "POST" }), false);
+    assert.equal(blockedInReadOnlyMode(t, { type: t }), false, "没给 method 按 GET（和 _mapToolCall 的默认一致）");
+  }
+});
+
+test("gh 的读 op 不弹框；git branch 不带名字是列分支，只读模式放行且可并行", () => {
+  for (const op of ["pr_view", "pr_checks", "actions_log", "pr_review_comments"]) {
+    assert.equal(needsApprovalFor("gh", { type: "gh", op }), false, `gh ${op} 是读`);
+    assert.equal(toolPolicy("gh").parallelSafe({ type: "gh", op }), true);
+  }
+  for (const op of ["pr_create", "pr_reply"]) {
+    assert.equal(needsApprovalFor("gh", { type: "gh", op }), true, `gh ${op} 不可逆，必须问`);
+    assert.equal(toolPolicy("gh").parallelSafe({ type: "gh", op }), false);
+  }
+  assert.equal(blockedInReadOnlyMode("git", { type: "git", op: "branch" }), false, "列分支是纯读");
+  assert.equal(toolPolicy("git").parallelSafe({ type: "git", op: "branch" }), true);
+  assert.equal(blockedInReadOnlyMode("git", { type: "git", op: "branch", branch: "feat" }), true, "切/建分支动工作树");
+  assert.equal(blockedInReadOnlyMode("git", { type: "git", op: "branch", create: true }), true);
+  assert.equal(toolPolicy("git").parallelSafe({ type: "git", op: "commit" }), false);
+  assert.equal(toolPolicy("git").parallelSafe({ type: "git", op: "diff" }), true);
+});
+
+test("补登记的四个：memory / termstop 只读模式挡但不弹框；explain / demostop 写盘、要问、只读挡", () => {
+  for (const t of ["memory", "termstop"]) {
+    assert.equal(blockedInReadOnlyMode(t), true, `${t} 只读模式要挡`);
+    assert.equal(needsApproval(t), false, `${t} 不该弹框（收尾 / IDE 自己的目录）`);
+    assert.equal(mutatesWorkspace(t), false, `${t} 不报 mutated，不能进 mutating 集合`);
+  }
+  for (const t of ["explain", "demostop"]) {
+    assert.equal(mutatesWorkspace(t), true);
+    assert.equal(needsApproval(t), true);
+    assert.equal(blockedInReadOnlyMode(t), true);
+  }
+  // 十一个生成器 + download：只读模式挡。原来只有审批一道门。
+  for (const t of ["genimage", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "game_scaffold", "web_scaffold", "download_asset", "download", "office_write", "office_edit"]) {
+    assert.equal(blockedInReadOnlyMode(t), true, `${t} 往工作区落文件，只读模式必须挡`);
+  }
+  assert.equal(blockedInReadOnlyMode("capture_start"), true, "改写系统代理不是只读");
+});
+
+test("并行安全性是声明出来的：main.js 那份 _READ_ONLY_TYPES 名单和 parallelSafeTypes() 逐个对账", () => {
+  // main.js 那份文本暂时留着（三处测试用 load() 抠 _isReadOnlyParallel 跑，注入表里就是它），
+  // 但它必须和声明**一致**——这条守卫让两边任何一边单独改都会红。
+  const m = /const _READ_ONLY_TYPES = new Set\(\[([\s\S]*?)\]\);/.exec(MAIN);
+  assert.ok(m, "main.js 里 _READ_ONLY_TYPES 的形状变了");
+  const inMain = new Set([...m[1].matchAll(/"([a-z_0-9]+)"/g)].map((x) => x[1]));
+  const declared = parallelSafeTypes();
+  // 已知的一处分歧，理由写在 PARALLEL_SAFE_READS 上：uiextract 会导航那一个共享的自动化浏览器，
+  // 不该并行；但它同时在子体的 _READ_TYPES 里，logic.test.mjs 有一条「两份只读名单不许漂」
+  // 的守卫要求它留在 main.js 那份里。那条守卫松绑之后把它一起摘掉。
+  const KNOWN_DIVERGENCE = new Set(["uiextract"]);
+  const onlyMain = [...inMain].filter((t) => !declared.has(t) && !KNOWN_DIVERGENCE.has(t)).sort();
+  const onlyDeclared = [...declared].filter((t) => !inMain.has(t)).sort();
+  assert.deepEqual(onlyMain, [], `main.js 认为可并行、策略表没声明：${onlyMain.join(", ")}`);
+  assert.deepEqual(onlyDeclared, [], `策略表声明可并行、main.js 名单里没有：${onlyDeclared.join(", ")}`);
+  assert.deepEqual([...declared].sort(), [...PARALLEL_SAFE_READS].sort(), "声明的集合就是 PARALLEL_SAFE_READS，别在别处再登记");
+  // 类型级声明为 true 的是布尔；没声明的默认假——「没有证据说它不动东西就不并行」。
+  assert.equal(toolPolicy("read").parallelSafe, true);
+  assert.equal(toolPolicy("write").parallelSafe, false);
+  assert.equal(toolPolicy("完全不存在").parallelSafe, false);
 });
 
 test("四个有外部副作用的工具已经在审批门内——它们曾经整整一轮都在门外", () => {
@@ -604,4 +757,23 @@ test("mcp_server：list 只读不弹框，改配置的四个动作一律要用�
   // 只读模式同理：看得，改不得。
   assert.equal(blockedInReadOnlyMode("mcpconfig", { action: "list" }), false);
   assert.equal(blockedInReadOnlyMode("mcpconfig", { action: "add" }), true);
+});
+
+test("remote 切换主机要过审批门，查询不打扰", () => {
+  // 用户实拍不到这一条，因为它**从来不弹框**：`remote(connect)` 把 backend 的读/写/删/
+  // 建目录/改名/复制/搜索/跑命令整体重定向到模型给的地址，并把守护进程 token POST 过去。
+  // 而 type "remote" 此前根本没进过策略表 → DEFAULT_POLICY → needsApproval:false。
+  // 判据在 _toolMayProduceExternalEffect 里早就写对了（connect/disconnect），
+  // 只是审批门只对 gh/http/tor 三个特判去问它，remote 走的兜底读的正是这张表。
+  const ask = (op) => needsApprovalFor("remote", { type: "remote", op });
+  assert.equal(ask("connect"), true, "切到另一台机器竟然不用问");
+  assert.equal(ask("disconnect"), true);
+  assert.equal(ask("status"), false, "查一下连没连也弹框，就是「做点事就撞门」");
+  assert.equal(ask(undefined), false, "没给 op 默认按查询算");
+
+  // 只读模式只挡 connect：disconnect 是退回本机，挡住反而把人锁在远端。
+  assert.equal(blockedInReadOnlyMode("remote", { type: "remote", op: "connect" }), true);
+  assert.equal(blockedInReadOnlyMode("remote", { type: "remote", op: "disconnect" }), false);
+  assert.equal(blockedInReadOnlyMode("remote", { type: "remote", op: "status" }), false);
+  assert.match(String(toolPolicy("remote").readOnlyBlockedVerb || ""), /另一台机器/);
 });

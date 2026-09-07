@@ -78,6 +78,17 @@ export const DEFAULT_POLICY = Object.freeze({
   /** A [BLOCKED]/[CONFLICT] result is a recoverable policy stop rather than a hard failure,
    *  so it must not count toward the three-strike tool lockout. */
   recoverableBlock: false,
+  /**
+   * 同一轮里能和别的只读调用**并行**跑。布尔，或按调用判的函数（git 只有读 op 能并行）。
+   *
+   * 这是 Claude Code 每个工具自己声明的 isConcurrencySafe 那一位。此前它在 main.js 里是一份
+   * 手写名单 `_READ_ONLY_TYPES`，和子体的 `_READ_TYPES` 各抄一份，漂过不止一次（那段注释
+   * 自己记着「两份手写名单漂了，这是第 N 次」）。声明放在这里之后，名单成了推导物；
+   * tool-policy.test.mjs 有一条断言把 main.js 那份文本和 parallelSafeTypes() 逐个对账。
+   *
+   * 默认 false：没有证据说它不动东西，就不并行——和只读模式那道门同一条纪律。
+   */
+  parallelSafe: false,
 });
 
 /** file-mutation defaults, shared by the eight structured file operations. */
@@ -92,7 +103,11 @@ const FILE_OP = {
 /** the four that write content (and therefore reach diagnostics + diff review). */
 const FILE_CONTENT_OP = { ...FILE_OP, fileEdit: true, scopeField: "path" };
 /** a generator that lands assets in the workspace: mutating, but not a file operation. */
-const GENERATOR = { mutatesWorkspace: true, needsApproval: true };
+// 只读模式也要挡：它们真的往工作区写文件（genimage 落 png、web_scaffold 铺一整棵项目树），
+// 此前 readOnlyModeBlocked 取默认 false，于是 Plan / Explorer / Reviewer 里生成一张图、
+// 铺一个脚手架都畅通无阻——而同一时刻 write_file 写一个字节都被挡。审批开着时还有审批
+// 兜着；审批关掉的用户在只读模式里什么都拦不住。
+const GENERATOR = { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "生成素材并写进工作区" };
 /** an execution tool: side effects the harness cannot verify, but no `mutated` report. */
 const EXEC = { needsApproval: true, hooked: true };
 /**
@@ -133,6 +148,25 @@ export function defineTool(type, policy = {}) {
   REGISTRY.set(name, Object.freeze({ ...DEFAULT_POLICY, ...policy }));
   return REGISTRY.get(name);
 }
+
+/**
+ * automation 里**纯观察**的方法名（按 `.` 分段的最后一段）：拍屏、问指针、读页面、读剪贴板。
+ * 和 main.js `_toolMayProduceExternalEffect` 里那条正则**必须**逐字相同——那边是外部副作用
+ * 判定，这边是审批 / 只读门，两处对同一件事说不同的话就是事故。tool-policy.test.mjs 对账。
+ */
+export const AUTOMATION_OBSERVE_METHODS = /(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot|capture|position|info|wait)$/i;
+
+/**
+ * 能和别的只读调用并行的纯读类型。四个执行体都核过：无写盘、无建目录、无删除、
+ * 不碰共享的自动化浏览器。`*_search` 一族由 main.js 按后缀放行，不逐个列。
+ */
+export const PARALLEL_SAFE_READS = Object.freeze([
+  "read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think",
+  "recall", "termread", "termlist", "logs", "search_tools", "skill", "current_time",
+  "localdiscovery", "liveenvironment", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
+  "semsearch", "findsymbol", "viewimage", "probeenv", "readscreen",
+  "search_game_assets", "package_source", "openapi_parser", "qr", "realtime_news_feed",
+]);
 
 /** system 工具里**纯读**的那几个动作。取自 tools.json 的 action 枚举
  *  （open / menu / menu_items / apps / windows / focus / frontmost），读的是
@@ -303,8 +337,16 @@ function seed() {
    * 只读 op 照常放行：只读模式的价值就在于取证能力完整。
    */
   const GIT_READ_OPS = new Set(["status", "diff", "show", "log", "blame", "stash_list", "conflicts"]);
-  const gitWrites = (call) => !GIT_READ_OPS.has(String(call?.op || "status"));
+  // `branch` 不带名字是**列分支**（纯读），带名字或 create 才是切/建分支（动工作树）。
+  // 判据和 main.js 的 _toolMutatesWorkspace / _isReadOnlyParallel 对齐——原来这里把所有
+  // branch 一律当写，于是只读模式里连「有哪些分支」都问不出来。
+  const gitWrites = (call) => {
+    const op = String(call?.op || "status");
+    if (op === "branch") return !!call?.branch || !!call?.create;
+    return !GIT_READ_OPS.has(op);
+  };
   defineTool("git", {
+    parallelSafe: (call) => !gitWrites(call),
     // **不登记 mutatesWorkspace。** 那个字段是 type 级的布尔，而 git 这个 type 底下
     // 一多半是纯读取——把整个类型标成"会改工作区"，`git_status` 也会被算成一次改动，
     // 于是 _toolMutatesWorkspace 对 `{op:"branch"}`（列分支）返回 true，
@@ -316,10 +358,15 @@ function seed() {
     readOnlyBlockedVerb: "改仓库状态（提交 / 切分支 / 暂存 / 打标签）",
   });
   const GH_READ_OPS = new Set(["pr_view", "pr_checks", "actions_log", "pr_review_comments"]);
+  const ghWrites = (call) => !GH_READ_OPS.has(String(call?.op || ""));
   defineTool("gh", {
     // 不是改工作区，是改**外部世界**（GitHub 上的 PR 和评论），而且不可逆。
-    needsApproval: true,
-    readOnlyModeBlocked: (call) => !GH_READ_OPS.has(String(call?.op || "")),
+    // 审批也按 op 判：看一个 PR、读 CI 日志是纯读，原来一刀切 true 让「看一眼」也弹框
+    //（审批门对 gh 有特判走 _toolMayProduceExternalEffect，那条早就按 op 判了；这里对齐，
+    // 让声明和特判说同一句话）。
+    needsApproval: ghWrites,
+    readOnlyModeBlocked: ghWrites,
+    parallelSafe: (call) => !ghWrites(call),
     readOnlyBlockedVerb: "改 GitHub 上的东西（建 PR / 回复评论）",
   });
   // learn_design 一直没登记，于是三道门同时哑掉，它在 Plan / Explorer / Reviewer 里
@@ -328,9 +375,53 @@ function seed() {
   // search_tools 取得回；网关那份拒绝清单里同样没有它。
   defineTool("learndesign", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "学习并落盘设计资产" });
   defineTool("uiclick", { needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "点用户屏幕上的界面" });
-  defineTool("automation", { needsApproval: true });
-  defineTool("db", { needsApproval: true });
-  defineTool("download", { mutatesWorkspace: true, needsApproval: true });
+  /*
+   * `remote` 把 backend 的读 / 写 / 删 / 建目录 / 改名 / 复制 / 搜索 / 跑命令**整体重定向**
+   * 到模型指定的另一台机器（connect 时还会把用户给的守护进程 token POST 过去）。
+   * 而它此前**根本没进过这张表** —— 于是拿 DEFAULT_POLICY，needsApproval:false，
+   * 「改动前审批」开着也零弹框。
+   *
+   * 判据其实早就写对了：`_toolMayProduceExternalEffect` 里那行
+   * `if (call.type === "remote") return ["connect","disconnect"].includes(call.op);`。
+   * 只是审批门只对 gh / http / tor 三个特判去问它，remote 走兜底 needsApprovalFor()，
+   * 而兜底读的正是这张表。同一个函数里紧挨着的第三条判据，那条腿从来没走到 ——
+   * 补上这一条，判据仍然只有一份出处。
+   *
+   * status 之类的查询免打扰；只读模式只挡 connect（disconnect 是**退回本机**，
+   * 在只读模式里挡它反而把人锁在远端）。
+   */
+  const _remoteSwitchesHost = (call) => ["connect", "disconnect"].includes(String(call?.op || "status"));
+  defineTool("remote", {
+    needsApproval: _remoteSwitchesHost,
+    readOnlyModeBlocked: (call) => String(call?.op || "status") === "connect",
+    readOnlyBlockedVerb: "把文件读写和命令整体切到另一台机器",
+  });
+  // automation：按**方法**判，不是整个工具一刀切。capture / position / info / get / read /
+  // list / status / inspect / nodes / check / screenshot 是纯观察（拍一眼、问指针在哪、读
+  // 页面正文）；其余（click / type / key / app.* / clipboard.set …）合成真实键鼠，能开终端
+  // 敲任意命令。原来 needsApproval 平铺 true 让「看一眼」也弹框，而只读模式**根本不挡**——
+  // Plan 模式里合成键鼠畅通无阻。判据和 main.js `_toolMayProduceExternalEffect` 那条正则
+  // 同一份（tool-policy.test.mjs 有断言把两处的正则文本对账，漂了会红）。
+  const automationActs = (call) => !AUTOMATION_OBSERVE_METHODS.test(String(call?.method || ""));
+  defineTool("automation", {
+    needsApproval: automationActs,
+    readOnlyModeBlocked: automationActs,
+    readOnlyBlockedVerb: "合成键鼠 / 操作应用（点击、输入、切窗口、写剪贴板）",
+  });
+  // db：按**这一条语句**判。判据不在这里算——SQL 会不会写（含 WITH 可写 CTE、PRAGMA 赋值、
+  // EXPLAIN ANALYZE、Redis 写命令）由 main.js 的 _dbCallMayMutate 判，它在执行前把结论标到
+  // call.dbMayMutate 上（和 mcp 的 mcpReadOnly、userhttp 的 userReadOnly 同一种做法）。
+  // 没标（不经 _mapToolCall 构造的调用）按会写处理：宁可多问，不能在只读模式里替用户 DROP。
+  // 原来平铺 needsApproval:true、不挡只读：SELECT 也弹框，而 Plan 模式里 DROP TABLE 照跑。
+  const dbWrites = (call) => call?.dbMayMutate !== false;
+  defineTool("db", {
+    needsApproval: dbWrites,
+    readOnlyModeBlocked: dbWrites,
+    parallelSafe: (call) => !dbWrites(call),
+    readOnlyBlockedVerb: "改数据库（写 / 删 / 建表 / 改结构）",
+  });
+  // download 落的是工作区文件，只读模式同样要挡（和 GENERATOR 同一个理由）。
+  defineTool("download", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "下载文件到工作区" });
   // create_project 一直没有声明：它会在用户主目录下真的建出 ~/MrDayOne/<name>，
   // 并把左侧文件树整个切到那个新目录——只读模式里也能干，"改动前审批"也不弹。
   // 用户原来打开的项目就这么被顶掉，而模式标签一直写着「只读」。
@@ -338,7 +429,46 @@ function seed() {
   // capture_start：mode='system' / system_proxy=true 会改掉**操作系统级**代理设置，
   // 整台机器的流量（浏览器、邮件、其他 App）一起被切到本地 mitmproxy 上，接着还要
   // 用户 sudo 装一张根证书。这不该是一句「我顺手开了抓包」就发生的事。
-  defineTool("capture_start", { needsApproval: true });
+  defineTool("capture_start", { needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "开启抓包并改写系统代理" });
+
+  // ── 2026-09-04 审计补登记：会写盘 / 杀进程 / 发写请求，却一直拿默认策略的 ──────────
+  //
+  // 判据和上面每一条一样：策略表只枚举**已登记**的类型，没登记 = 三道门全默认 =
+  // 不审批、只读不拦、mutatesWorkspace 恒 false。这批是逐个打开执行分支核出来的。
+  //
+  // remember → memory：写 <root>/.mrdayone/memory.md。落在 IDE 自己的目录里，按 worktree
+  //   的先例不弹审批（每记一条弹一次框没法用），但只读模式不许留下持久化写入（saveskill 的先例）。
+  defineTool("memory", { readOnlyModeBlocked: true, readOnlyBlockedVerb: "写项目记忆文件" });
+  // visual_explain → explain：和 genimage 走同一个 generate_image_chat 后端，把 png 落到
+  //   <root>/.mrdayone-images/。同一个动作，隔壁登记了它没登记。
+  defineTool("explain", { ...GENERATOR, readOnlyBlockedVerb: "生成讲解图片并写进工作区" });
+  // stop_demo → demostop：把录制结果写成 HTML，路径由模型给（允许绝对路径，create-only）。
+  defineTool("demostop", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "把演示录像写成文件" });
+  // stop_terminal → termstop：结束一个任务终端里的进程。只读模式起不了终端，也不该杀终端；
+  //   不弹审批——和 browser 的 close 同类（收尾动作，不是新的副作用）。
+  defineTool("termstop", { readOnlyModeBlocked: true, readOnlyBlockedVerb: "停掉任务终端里的进程" });
+  // http_request / tor_request：审批门对它们有特判（非 GET/HEAD/OPTIONS 才问），但只读门
+  //   从来没看过它们——Plan 模式里 POST / DELETE 打到任意地址畅通无阻，而隔壁 userhttp
+  //   早就按方法判了。这里让声明和特判说同一句话。
+  const httpWrites = (call) => !["GET", "HEAD", "OPTIONS"].includes(String(call?.method || "GET").toUpperCase());
+  for (const t of ["http", "tor"]) {
+    defineTool(t, {
+      needsApproval: httpWrites,
+      readOnlyModeBlocked: httpWrites,
+      parallelSafe: (call) => /^(get|head)$/i.test(String(call?.method || "GET").trim()),
+      readOnlyBlockedVerb: "发出会改变服务端状态的 HTTP 请求（POST / PUT / DELETE …）",
+    });
+  }
+  // mcp 的并行判据：服务自己声明了 readOnlyHint 的才并行（和只读门同一个信号）。
+  // 声明本身在上面 defineTool("mcp") 里，这里只补 parallelSafe 一位。
+  defineTool("mcp", { ...toolPolicy("mcp"), parallelSafe: (call) => !!call?.mcpReadOnly });
+
+  // ── 能和别的只读调用并行的纯读工具 ─────────────────────────────────────────
+  //
+  // 这份名单就是 main.js `_READ_ONLY_TYPES` 那一份（tool-policy.test.mjs 逐个对账）。
+  // 故意**不含** uiextract：它会 browser_navigate 到模型给的 URL，用的是那一个共享的
+  // 自动化浏览器——两个并发的 uiextract 互相把对方的页面导航走。原名单里有它，是漏。
+  for (const t of PARALLEL_SAFE_READS) defineTool(t, { parallelSafe: true });
 
   // ── 有真实外部副作用、却一直没登记的四个 ──────────────────────────────────
   //
@@ -425,6 +555,15 @@ export const fileEditTypes = () => typesWhere((p) => p.fileEdit);
 export const approvalTypes = () => typesWhere((p) => p.needsApproval);
 export const hookedTypes = () => typesWhere((p) => p.hooked);
 export const readOnlyBlockedTypes = () => typesWhere((p) => p.readOnlyModeBlocked);
+/**
+ * 类型级恒可并行的那些（声明为 true 的）。按调用判的（git / gh / http / db / mcp 的函数值）
+ * 不在这里——它们由 `toolPolicy(type).parallelSafe(call)` 逐次问。
+ *
+ * 主循环的 `_isReadOnlyParallel` 暂时还读 main.js 里那份手写名单（三处测试用 load() 抠它跑，
+ * 注入表里就是那份名单，多一个自由标识符就 ReferenceError）；子体的预起跑已经改读这里。
+ * tool-policy.test.mjs 有一条把两份逐个对账，任何一边单独改都会红。
+ */
+export const parallelSafeTypes = () => typesWhere((p) => p.parallelSafe === true);
 
 // ── Predicates: what call sites should actually use ─────────────────────────
 export const mutatesWorkspace = (type) => toolPolicy(type).mutatesWorkspace;

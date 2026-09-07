@@ -68,87 +68,32 @@ function numericConst(code, name) {
   return base * Number(m[2].replace(/[*\s]/g, "").replace(/_/g, ""));
 }
 
-// 「第一轮等意图裁决」那一整段的源文本。按那道 if 的判据取——它在 main.js 里唯一。
-// 锚在等待门自己的收尾上：并行的两套实现一个用 _sessionFlags、一个把空判抽成
-// _profileStillEmpty 常量——按表达式原文锚会命中 const 定义行，waitBlock 整个切错位置。
-const WAIT_ANCHOR = "&& !sess._intentWaitPaid) {";
-function waitBlock() {
-  const i = CODE.indexOf(WAIT_ANCHOR);
-  assert.ok(i > 0, `找不到第一轮等待那道 if（锚点 ${WAIT_ANCHOR}）——它是本文件全部断言的落点`);
-  const start = CODE.lastIndexOf("if (", i);
-  return CODE.slice(start, i + 1100);
+// 「快通道起跑 → 本轮请求头定稿」那一段的源文本：从 `const _fastRoute = ` 到 `const _routeSource = `。
+// 2026-09-05 起第一发**不等裁决**，这一段里不许再出现任何等待；两个锚点在 sendPrompt 里都唯一。
+function routeBlock() {
+  const start = CODE.indexOf("const _fastRoute = ");
+  const end = CODE.indexOf("const _routeSource = ");
+  assert.ok(start > 0 && end > start, "找不到快通道起跑点或请求头定稿点——它们是本文件几条断言的落点");
+  return CODE.slice(start, end);
 }
 
-test("第一轮等意图裁决的上限不许短于前台窗口——短一点这道等待就恒定失败", () => {
-  const windowMs = numericConst(CODE, "_INTENT_FOREGROUND_WAIT_MS");
-  // 这个上限**必须有界，而且不能大**。此前写的是 15000，理由是"抬高没有代价：race 的
-  // 超时臂，裁决一落定就放行"。那条推理漏了一件事：上游拥堵时裁决**必然**赶不上窗口，
-  // 于是这个数字变成每一轮实打实多付的墙钟时间。
-  //
-  // 2026-08-18 从生产网关日志量到的上游首响应头延迟（同一段时间、同一批请求）：
-  //   claude-opus-5 平均 8.3s（最慢 28.0s）／gpt-5.5 平均 10.8s／gpt-5.6-sol 平均 18.4s
-  //   而且 gpt-5.6-sol 有 45% 的请求以 502 结束，失败前平均还要耗 23.3s。
-  // 裁决走的是用户选的同一个模型，所以它和正文一样慢。窗口 15 秒 + 旧的"只有落定才算
-  // 付过"，合起来就是每条消息先干等十几秒——用户实拍："同一个 API 在 Claude Code 和
-  // Codex 里飞快，在我软件里巨慢"。
-  //
-  // 等不到不等于丢掉：裁决在后台继续跑，_applyLateIntentIfLanded 在循环边界补上，
-  // 行为闸门照样只认它。所以这里的取舍是"第一轮画像弱一点" vs "每轮多等十几秒"。
-  assert.ok(windowMs > 0 && windowMs <= 8000,
-    `前台窗口 ${windowMs}ms 不在合理区间：它只在「裁决比它慢」的轮次生效，而那正是要止损的`
-    + `场景。定得太大 = 上游一慢，用户的每条消息都先被我们自己拖住十几秒。`);
-
-  // 关键是这两个值**同源**。分成两个独立字面量，就是上一次留下 1500 的方式：
-  // 一边调了另一边没跟上，race 从此恒定由 timer 赢，而且没有任何东西会报错。
-  const m = /const\s+_FIRST_TURN_INTENT_WAIT_MS\s*=\s*([^;]+);/.exec(CODE);
-  assert.ok(m, "找不到 _FIRST_TURN_INTENT_WAIT_MS");
-  const rhs = m[1].trim();
-  assert.ok(
-    rhs.includes("_INTENT_FOREGROUND_WAIT_MS"),
-    `第一轮等待上限必须从前台窗口推导，现在是裸字面量 ${rhs}——两个数字会各自漂移，`
-    + "而漂到「等待 < 窗口」时这道等待就完全失效且无声无息",
-  );
-
-  // 真的用上了：那个 race 必须拿这个常量当 timer，不是另一个数。
-  // 锚点用那道 if 本身——`_turnIntentExactPromise` 的第一次出现是它的声明处，从那里切
-  // 600 字符根本到不了 race，断言会永远为假（写这个文件时就先踩了一次）。
-  assert.ok(
-    waitBlock().includes("_FIRST_TURN_INTENT_WAIT_MS"),
-    "第一轮那道 Promise.race 没有用 _FIRST_TURN_INTENT_WAIT_MS 当超时",
-  );
-});
-
-test("零旗标的裁决是合法的，不能让此后每一轮都重付一次等待", () => {
-  const block = waitBlock();
-  const gate = block.slice(0, block.indexOf("{") + 1);
-
-  assert.ok(
-    gate.includes("_intentWaitPaid"),
-    "这道等待只按 _semanticProfileFlags 是否为空来判。普通问答的裁决合法地返回零 flag"
-    + "（action=answer、workspaceAction=none），于是 flag 永远是空的，纯聊天会话每一轮都要"
-    + "白等一次完整窗口——被这个数字拖成逐轮卡顿。判据要落在「这个会话已经拿到过裁决」上。",
-  );
-
-  // 付款按「等过一次」算，不按「等到了」算。
-  //
-  // 旧写法是 `if (settled) paid = true`，看着更严谨，实际是复利陷阱：上游慢的时候裁决
-  // 本来就赶不上窗口（本文件上面记着实测 19.8s，而窗口只有几秒），于是 settled 永远为假
-  // → 永远记不上账 → **每一轮都再干等一个完整窗口**。它想防的是"一次网络抖动让整个会话
-  // 永久失去画像"，但那件事根本不会发生：_applyLateIntentIfLanded 在循环边界会把迟到的
-  // 裁决补上，run.engineering 和粘性画像都会更新。防的是个不存在的风险，代价是每轮实打实
-  // 多等十几秒。
-  assert.match(
-    block,
-    /sess\._intentWaitPaid\s*=\s*true/,
-    "整个会话最多为这道等待付一次；按「等到了」记账会让上游一慢就每轮重付",
-  );
-  // 光断言"出现过这一行"是不够的：`if (settled) paid = true` 同样含这一行。
-  // 明确禁掉条件式——那正是要防的那个写法。
-  assert.doesNotMatch(
-    block,
-    /if\s*\(\s*_turnIntentState\.settled\s*\)\s*sess\._intentWaitPaid/,
-    "记账又被挂回「裁决落定」上了：上游一慢裁决就永远赶不上窗口，于是每一轮都重付一次完整等待",
-  );
+test("第一发不等裁决：起跑到定稿之间没有任何等待，等待记账整条删掉", () => {
+  // Claude Code / Codex 的循环里没有「先等一次分类再发」这一步：它们的提示词是静态的。
+  // 原来这里的 Promise.race 每个新会话固定多付 4~6 秒静默，而它想等的完整裁决在生产
+  // 中位 80 秒才落地（2026-09-05 七天读数），一半的 run 根本等不到——等待几乎买不到东西。
+  // 现在：快通道和完整裁决照常后台跑，落定后由循环边界补进画像和请求头；没落定时请求头
+  // 带 unjudged 这一位，网关据此在 agent 模式先按工程任务挂工程块（模式级默认，不按原文分类）。
+  const block = routeBlock();
+  assert.doesNotMatch(block, /\bawait\b/, "起跑到定稿之间又出现了 await——第一发又在等什么了");
+  assert.doesNotMatch(block, /setTimeout\(/, "起跑到定稿之间又出现了定时器——那就是等待窗口回来了");
+  assert.doesNotMatch(CODE, /_intentWaitPaid|_FIRST_TURN_INTENT_WAIT_MS|_waitStartedAt|_verdictCanStillLand/,
+    "等待窗口的记账/常量/续等判据回来了——它们只在「第一发要等裁决」时才有意义");
+  // 没落定的那一发要把「还没判过」告诉网关，否则它只带 base 四块出门（就是「突然变弱智」那次）。
+  const stable = fnSource("_sessionStableSemanticProfile", { code: true });
+  assert.match(stable, /"unjudged"/, "请求头没有 unjudged 这一位——网关分不清「判过了没旗标」和「还没判」");
+  // 迟到的裁决仍然要有归宿：循环边界补画像，行为闸门只认它。
+  assert.match(CODE, /_applyLateIntentIfLanded\(run, config, task, session, body, _live, messages\);/,
+    "迟到裁决的补录路径没了——不等之后它是完整裁决唯一的落地点");
 });
 
 test("「服务端挂了设计层吗」必须按 design 旗标判，空画像的 2.5: 是 truthy 的", () => {
@@ -228,11 +173,12 @@ test("面向模型的判断一律跟随用户选的模型——廉价降级这�
   assert.doesNotMatch(CODE, /_pickCheapModel/,
     "廉价模型降级又长回来了。全项目的约定是：任何面向模型的判断都跟随用户选择的模型");
 
-  // 锚点用这个函数独有的局部变量——`_ASK_PREDICT_SYSTEM` 的第一次出现是它的**定义处**，
-  // 从那里切窗口根本到不了发请求那段（写这个文件时踩了两次同样的坑）。
-  const i = CODE.indexOf("_predictCfg = {");
-  assert.ok(i > 0, "找不到回复建议那次请求的配置组装");
-  const call = CODE.slice(Math.max(0, i - 600), i + 2600);
+  // 取整个 _predictNextAsk 函数体，不切固定窗口：配置组装到真正发请求之间隔着那段建议
+  // 提示词，原来 +2600 的窗口在提示词长了一截之后就够不到 `model: _predictCfg.model`
+  // 那一行——断言从此守的是提示词正文，不是发请求的那一句。fnSource 按 AST 边界取，
+  // 中间塞多少都不漂。
+  const call = fnSource("_predictNextAsk", { code: true });
+  assert.ok(call.includes("_predictCfg = {"), "找不到回复建议那次请求的配置组装");
   assert.match(call, /model: _predictCfg\.model/,
     "建议请求没有用用户当前选的模型");
 
@@ -327,8 +273,13 @@ test("完整裁决要 19.8 秒，路由必须有第二条腿——而且那条�
   // 仍然用用户选的模型（全项目唯一约定），且不继承深度思考预算。
   assert.doesNotMatch(fn, /_pickCheapModel|gpt-|claude-3|mini/,
     "快通道不许换模型：面向模型的判断一律跟随用户选择的模型");
-  assert.match(fn, /for \(const key of \["reasoningEffort", "thinkingBudget", "thinking", "thinkingConfig", "thinkingEffort"\]\) delete cfg\[key\]/,
-    "快通道必须剥掉深度思考预算，否则它会和完整裁决一样慢");
+  // 判据从「删哪几个键」改成「**结果是不是低档**」——删 reasoningEffort 留下的是
+  // 供应商默认档，对原生推理模型就是深档，比不删还糟（实测两天 64 次输出卡在 4996）。
+  // 现在是显式封顶，比原来更强，但字面量变了。
+  assert.ok(fn.includes('for (const key of ["thinkingBudget", "thinking", "thinkingConfig", "thinkingEffort"]) delete cfg[key]'),
+    "快通道不再剥掉思考预算 —— 它会和完整裁决一样慢");
+  assert.ok(fn.includes("cfg.reasoningEffort = auxEffortFor(config)"),
+    "快通道没有显式封顶档位 —— 只删键留下的是供应商默认深档，200 token 的输出会被推理吃光");
 
   // 宁缺毋滥：判不准就省略，靠单调并集让完整裁决补齐。
   assert.match(fn, /raw\[k\] === true/,
@@ -336,24 +287,14 @@ test("完整裁决要 19.8 秒，路由必须有第二条腿——而且那条�
   assert.match(fn, /return meaningful \? profile : null/,
     "一个旗标都没点亮时要返回 null，别把空画像当成「判过了」");
 
-  // 两条腿必须真的并行 race，否则快通道等于没接。
-  const wait = waitBlock();
-  assert.match(wait, /Promise\.race\(\[\s*_turnIntentExactPromise,\s*_fastRoutingFlags\(|Promise\.race\(\[\s*_turnIntentExactPromise,\s*_fastRoute,/,
-    "两条腿必须在同一个 race 里——串行等待就没有意义了");
-
-  // 快通道的**启动点**已经搬到这道等待之外，而且必须在它之外。
-  //
-  // 原来它是等待块里的一个 const：既然生在块里，就只有块里那次 race 能用它，块外那行同步的
-  // `_fastRouteProfile || _turnEngineeringResolved` 是它唯一的读者。而这条腿自己是一次完整的
-  // 模型调用（生产首响应头 8~18 秒），它结构上赢不了 6 秒的窗口——赢不了就等于结果没有读者。
-  // 生产 46/46 语义画像全空正是这个形状。启动点提到块外，结果才有机会在循环边界落地。
+  // 两条腿都是后台腿：第一发不等任何一条（本文件上面那条守着），但快通道**必须起跑**，
+  // 而且它的结果要有落点——落定时并进会话画像、交给 _turnIntentState，循环边界再补进请求头。
   const startAt = CODE.indexOf("const _fastRoute = ");
-  const waitAt = CODE.indexOf(WAIT_ANCHOR);
-  assert.ok(startAt > 0 && startAt < waitAt,
-    "快通道的启动点必须在等待块之外——生在块里，它的结果就只有那一次赢不了的 race 能读到");
-  assert.doesNotMatch(CODE.slice(startAt, startAt + 200), /_intentWaitPaid/,
-    "快通道的启动判据不许挂在 _intentWaitPaid 上：那个标志记的是「这一轮等过」，"
-    + "一置真整条会话就再也不发快通道了");
+  assert.ok(startAt > 0, "快通道的起跑点没了");
+  assert.match(CODE.slice(startAt, startAt + 200), /_profileStillEmpty/,
+    "快通道的起跑判据应当是「会话画像还空」——空才值得再花一次 200 token");
+  assert.match(routeBlock(), /_turnIntentState\.fastProfile = p/,
+    "快通道的结果没有交给 _turnIntentState——它就到不了循环边界，等于白跑");
 });
 
 test("角色计划第一轮就要到，但只当指路用——闸门仍然只认完整裁决", () => {
@@ -388,8 +329,8 @@ test("角色计划第一轮就要到，但只当指路用——闸门仍然只�
 
 
 test("第 2 轮起本轮契约必然赶不上第一发——要把上一轮的契约带上去顶着", () => {
-  // 那道等待窗口按会话只付一次（sess._intentWaitPaid，理由写在 sendPrompt 里）：
-  // 第 2 轮起，本轮裁决必然赶不上第一次模型调用，契约要等循环边界的 late-adopt 才有，
+  // 第一发不等裁决（2026-09-05 起，理由写在 sendPrompt 里）：
+  // 本轮裁决多半赶不上第一次模型调用，契约要等循环边界的 late-adopt 才有，
   // 也就是**第二个模型回合**。而一轮里最关键的判断——要不要动手、动哪儿、算不算做完——
   // 就在第一发决定完了。上一轮收敛出来的契约躺在 sess._intentState.semantic 里，
   // 零延迟零成本，不用它纯属浪费。

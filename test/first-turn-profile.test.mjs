@@ -9,8 +9,8 @@
 //
 // 两处成因都是**时序**，不是缺规则：
 //   一、打字空闲时的预热对「本进程第一条消息」永远不跑（凭证只在 sendPrompt 内部写）；
-//   二、快通道几秒就回并赢下 race，把整场等待退掉，而完整裁决（唯一产出 domain /
-//       architectureMode / researchMode 的那条腿）还有几秒**已经批过**的预算没用。
+//   二、（2026-09-05 已换掉）原来第一发要在一个 6 秒窗口里等裁决：等到的很少，每个新会话
+//       却固定多付几秒静默。现在第一发不等，预热是它带上完整画像的唯一途径。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CODE as SRC, fnSource as topLevelFn } from "./helpers/source.mjs";
@@ -56,46 +56,20 @@ test("预热不额外多发一次请求", () => {
   assert.match(PREFETCH, /if \(t === _intentPrefetchedText\) return;/, "同一句话被重复预取");
 });
 
-// ── 二、快通道赢了 race 不等于这场等待该结束 ────────────────────────────
+// ── 二、第一发不等裁决 ──────────────────────────────────────────────
 const SEND = topLevelFn("sendPrompt", { code: true });
 
-test("快通道赢下 race 之后，剩余预算继续等完整裁决", () => {
-  // domain / architectureMode / researchMode 三样只有完整裁决产得出，
-  // 而快通道只回四个枚举加一批布尔旗标。
-  const seg = SEND.slice(SEND.indexOf("_intentWaitPaid"), SEND.indexOf("_intentWaitPaid") + 4000);
-  assert.match(seg, /_turnIntentExactPromise && !_turnIntentState\.settled/,
-    "快通道一落定就把整场等待退掉了——完整裁决赶不上决定架构的那一发");
-  assert.match(seg, /_FIRST_TURN_INTENT_WAIT_MS - \(Date\.now\(\) - _waitStartedAt\)/,
-    "续等的额度不是从原窗口里扣的——那会变成真的多等一个窗口");
-});
-
-test("续等只花原来那笔预算，绝不新开一个窗口", () => {
-  const seg = SEND.slice(SEND.indexOf("_waitStartedAt"), SEND.indexOf("_waitStartedAt") + 3000);
-  // 上限必须仍是同一个常量。写成 setTimeout(..., _FIRST_TURN_INTENT_WAIT_MS) 就是
-  // 在已经等过一截之后再等一整个窗口——用户那边量到的是首轮卡两倍时间。
-  assert.doesNotMatch(seg, /_restTimer = setTimeout\(resolve, _FIRST_TURN_INTENT_WAIT_MS\)/,
-    "续等又开了一个完整窗口——首轮会卡成两倍");
-  assert.match(seg, /_left > 50/, "没有下限保护：只剩几毫秒时还去开一次定时器纯属浪费");
-});
-
-test("等不到照样往下走，迟到的旗标由循环边界补", () => {
-  // 这条守的是「不能把它写成必须等到」：上游慢的时候会把每一轮都卡死。
-  //
-  // 取窗口必须从 `_left > 50` 之后开始：从 `_waitStartedAt` 开始的话，**外层那个**
-  // Promise.race 也在窗口里，把续等改成死等照样能匹配到——那样这条就是绿着的摆设
-  // （2026-08-23 变异实测确实如此）。
-  const at = SEND.indexOf("_left > 50");
-  assert.ok(at > 0, "续等那道下限保护不见了，这条断言失去落点");
-  const rest = SEND.slice(at, at + 900);
-  assert.match(rest, /Promise\.race\(/, "续等写成了 await 完整裁决——上游慢时会把这一轮卡死");
-  assert.match(rest, /clearTimeout\(_restTimer\)/, "定时器没清，会吊住一个 handle");
-});
-
-test("续等只等完整裁决那条腿，不会把快通道再等一遍", () => {
-  const seg = SEND.slice(SEND.indexOf("_waitStartedAt"), SEND.indexOf("_waitStartedAt") + 3000);
-  const race2 = seg.slice(seg.indexOf("_left > 50"));
-  assert.doesNotMatch(race2.slice(0, 500), /_fastRoute\b/,
-    "把已经落定的快通道又放进第二场 race——它会立刻兑现，续等等于没写");
+test("第一发不等裁决：预热命中就同步采纳，没命中就带 unjudged 发车", () => {
+  // 2026-09-05 起 sendPrompt 里没有等待窗口：快通道和完整裁决都在后台跑，落定由循环边界补。
+  // 于是预热成了第一发能带上完整画像的**唯一**途径——它命中时 _engineeringProfileWithAiIntent
+  // 同步就从 _aiIntentCache 取到裁决；没命中时请求头带 unjudged，网关按工程任务默认挂块。
+  assert.doesNotMatch(SEND, /_intentWaitPaid|_FIRST_TURN_INTENT_WAIT_MS|_waitStartedAt|_restTimer/,
+    "等待窗口回来了——它每个新会话固定多付 4~6 秒静默，而生产里它想等的裁决中位 80 秒才到");
+  assert.match(SEND, /const _fastRoute = /, "快通道的起跑点没了——画像还空时它仍然要后台跑");
+  assert.match(topLevelFn("_engineeringProfileWithAiIntent", { code: true }), /_aiIntentCache\.get\(/,
+    "同步取画像那条路不读缓存了——预热命中也带不上画像，第一发又裸着出门");
+  assert.match(SRC, /_applyLateIntentIfLanded\(run, config, task, session, body, _live, messages\);/,
+    "迟到裁决的补录路径没了——不等之后它是完整裁决唯一的落地点");
 });
 
 // ── 三、行为闸门的边界不许被这次改动动到 ────────────────────────────────

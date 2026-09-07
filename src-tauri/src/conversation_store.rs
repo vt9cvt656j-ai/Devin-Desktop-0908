@@ -177,6 +177,18 @@ struct StoredEvent {
     content_chunks: Vec<String>,
 }
 
+fn seal_field(plaintext: &str, table: &str) -> String {
+    if crate::local_crypto::enabled() {
+        crate::local_crypto::seal(plaintext, table).unwrap_or_else(|_| plaintext.to_string())
+    } else {
+        plaintext.to_string()
+    }
+}
+
+fn open_field(stored: &str, table: &str) -> String {
+    crate::local_crypto::open(stored, table).unwrap_or_else(|_| stored.to_string())
+}
+
 fn stored_event(message: &Value) -> Result<StoredEvent, String> {
     let original = serde_json::to_string(message)
         .map_err(|error| format!("conversation event serialization failed: {error}"))?;
@@ -314,8 +326,9 @@ async fn ensure_event_column(pool: &SqlitePool, name: &str) -> Result<(), String
 }
 
 fn decode_snapshot(payload: String, expected_checksum: String) -> Option<Value> {
-    (checksum(&payload) == expected_checksum)
-        .then(|| serde_json::from_str(&payload).ok())
+    let plain = open_field(&payload, "state");
+    (checksum(&plain) == expected_checksum)
+        .then(|| serde_json::from_str(&plain).ok())
         .flatten()
 }
 
@@ -336,7 +349,7 @@ async fn upsert_session_tx(
         "INSERT INTO conversation_sessions (session_id, session_json, is_closed, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET session_json = excluded.session_json, is_closed = excluded.is_closed, updated_at = excluded.updated_at",
     )
     .bind(id)
-    .bind(payload)
+    .bind(seal_field(&payload, "sessions"))
     .bind(if is_closed { 1_i64 } else { 0_i64 })
     .bind(now)
     .execute(&mut **tx)
@@ -453,7 +466,7 @@ async fn insert_event_tx(
         sqlx::query(
             "UPDATE conversation_transcript_events SET payload = ?, checksum = ?, byte_len = ?, large_content = ?, content_len = ?, created_at = ? WHERE session_id = ? AND sequence = ?",
         )
-        .bind(&stored.payload)
+        .bind(seal_field(&stored.payload, "events"))
         .bind(&stored.checksum)
         .bind(stored.byte_len)
         .bind(if stored.large_content { 1_i64 } else { 0_i64 })
@@ -489,7 +502,7 @@ async fn insert_event_tx(
     .bind(session_id)
     .bind(sequence)
     .bind(segment)
-    .bind(&stored.payload)
+    .bind(seal_field(&stored.payload, "events"))
     .bind(&stored.checksum)
     .bind(stored.byte_len)
     .bind(if stored.large_content { 1_i64 } else { 0_i64 })
@@ -533,13 +546,14 @@ async fn replace_event_content_chunks_tx(
     .await
     .map_err(|error| format!("conversation content chunk cleanup failed: {error}"))?;
     for (chunk_no, content) in chunks.iter().enumerate() {
+        let sealed = seal_field(content, "chunks");
         sqlx::query(
             "INSERT INTO conversation_transcript_content_chunks (session_id, sequence, chunk_no, content, checksum, byte_len) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(session_id)
         .bind(sequence)
         .bind(checked_i64(chunk_no))
-        .bind(content)
+        .bind(&sealed)
         .bind(checksum(content))
         .bind(checked_i64(content.len()))
         .execute(&mut **tx)
@@ -722,7 +736,7 @@ async fn migrate_legacy_transcripts(pool: &SqlitePool, snapshot: &Value) -> Resu
         .map_err(|error| format!("legacy transcript event merge read failed: {error}"))?;
         let mut merged = messages;
         for row in rows {
-            let payload: String = row.get("payload");
+            let payload: String = open_field(&row.get::<String, _>("payload"), "events");
             let expected: String = row.get("checksum");
             let sequence = row.get::<i64, _>("sequence");
             let index = usize::try_from(sequence)
@@ -740,7 +754,7 @@ async fn migrate_legacy_transcripts(pool: &SqlitePool, snapshot: &Value) -> Resu
                 .map_err(|error| format!("legacy transcript content merge read failed: {error}"))?;
                 let mut content = String::new();
                 for (expected_chunk, chunk_row) in chunks.into_iter().enumerate() {
-                    let chunk: String = chunk_row.get("content");
+                    let chunk: String = open_field(&chunk_row.get::<String, _>("content"), "chunks");
                     if chunk_row.get::<i64, _>("chunk_no") != checked_i64(expected_chunk)
                         || chunk_row.get::<i64, _>("byte_len") != checked_i64(chunk.len())
                         || chunk_row.get::<String, _>("checksum") != checksum(&chunk)
@@ -812,7 +826,7 @@ async fn event_content(
                 "conversation content chunk gap in session {session_id}"
             ));
         }
-        let chunk: String = row.get("content");
+        let chunk: String = open_field(&row.get::<String, _>("content"), "chunks");
         if row.get::<i64, _>("byte_len") != checked_i64(chunk.len())
             || row.get::<String, _>("checksum") != checksum(&chunk)
         {
@@ -909,7 +923,7 @@ async fn event_content_slice(
             }
         }
         expected_chunk = Some(chunk_no);
-        let chunk: String = row.get("content");
+        let chunk: String = open_field(&row.get::<String, _>("content"), "chunks");
         if row.get::<i64, _>("byte_len") != checked_i64(chunk.len())
             || row.get::<String, _>("checksum") != checksum(&chunk)
         {
@@ -959,7 +973,7 @@ async fn event_content_slice(
         .fetch_one(pool)
         .await
         .map_err(|error| format!("conversation content progress page failed: {error}"))?;
-        let chunk: String = row.get("content");
+        let chunk: String = open_field(&row.get::<String, _>("content"), "chunks");
         let chunk_start = usize::try_from(row.get::<i64, _>("start_offset").max(0))
             .map_err(|_| "conversation content offset is invalid".to_string())?;
         let local_start = actual_start.saturating_sub(chunk_start).min(chunk.len());
@@ -976,12 +990,13 @@ async fn event_message(
     pool: &SqlitePool,
     session_id: &str,
     sequence: i64,
-    payload: String,
+    raw_payload: String,
     expected_checksum: String,
     large_content: bool,
     content_len: i64,
     preview_only: bool,
 ) -> Result<Value, String> {
+    let payload = open_field(&raw_payload, "events");
     let mut message: Value = serde_json::from_str(&payload)
         .map_err(|error| format!("conversation event decode failed: {error}"))?;
     if !large_content {
@@ -1130,7 +1145,7 @@ async fn transcript_content_slice(
     .await
     .map_err(|error| format!("conversation content slice lookup failed: {error}"))?
     .ok_or_else(|| "conversation event does not exist".to_string())?;
-    let payload: String = row.get("payload");
+    let payload: String = open_field(&row.get::<String, _>("payload"), "events");
     let large_content = row.get::<i64, _>("large_content") != 0;
     let total_bytes = if large_content {
         row.get::<i64, _>("content_len").max(0)
@@ -1244,7 +1259,7 @@ async fn hydrate_snapshot(pool: &SqlitePool, snapshot: &mut Value) -> Result<(),
         if present.contains(&id) {
             continue;
         }
-        let mut session: Value = serde_json::from_str(&row.get::<String, _>("session_json"))
+        let mut session: Value = serde_json::from_str(&open_field(&row.get::<String, _>("session_json"), "sessions"))
             .map_err(|error| format!("conversation session registry decode failed: {error}"))?;
         {
             let memory = memory_mut(&mut session)?;
@@ -1497,7 +1512,7 @@ pub async fn conversation_sessions_index(
         .into_iter()
         .map(|row| {
             let id: String = row.get("session_id");
-            let raw: String = row.get("session_json");
+            let raw: String = open_field(&row.get::<String, _>("session_json"), "sessions");
             let closed: i64 = row.get("is_closed");
             let updated: i64 = row.get("updated_at");
             index_row_from_json(id, &raw, closed != 0, updated)
@@ -1518,7 +1533,7 @@ pub async fn conversation_session_load(
         .await
         .map_err(|error| format!("conversation session load failed: {error}"))?;
     let Some(row) = row else { return Ok(None) };
-    let raw: String = row.get("session_json");
+    let raw: String = open_field(&row.get::<String, _>("session_json"), "sessions");
     let mut value: Value = serde_json::from_str(&raw)
         .map_err(|error| format!("conversation session decode failed: {error}"))?;
     // 和快照回填走同一套：把转录长度信息补上，前端才知道要不要按需拉取。
@@ -1544,10 +1559,11 @@ pub async fn conversation_snapshot_save(
         .as_object_mut()
         .ok_or_else(|| "conversation snapshot must be an object".to_string())?
         .insert("version".to_string(), Value::from(3));
-    let payload = serde_json::to_string(&snapshot)
+    let payload_plain = serde_json::to_string(&snapshot)
         .map_err(|error| format!("conversation snapshot serialization failed: {error}"))?;
-    let digest = checksum(&payload);
-    let bytes = payload.len();
+    let digest = checksum(&payload_plain);
+    let bytes = payload_plain.len();
+    let payload = seal_field(&payload_plain, "state");
     let current = sqlx::query(
         "SELECT revision, payload, checksum, byte_len FROM conversation_state WHERE scope = ?",
     )

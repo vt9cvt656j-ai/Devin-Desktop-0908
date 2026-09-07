@@ -261,3 +261,88 @@ test("三栏布局的硬底仍然存在，只是从 890px 降到了 640px（这�
   assert.match(css, /\.layout\s*\{[\s\S]{0,200}overflow: hidden;/,
     "布局不再裁切了——那样窗口过窄只会出横向滚动条，不再是「控件够不着」");
 });
+
+/**
+ * Windows 字重补偿：只准降档，不准抬高，也不准把两档压成同一个数。
+ *
+ * 2026-09-06：用户报「高级设置在 Windows 上界面都不一样」。把 `is-win` 这个 class
+ * 手动加到 body 上做 A/B（它只是个 class，mac 上就能复现 CSS 那一半差异），量出来
+ * 整个面板 155 个元素里只有 28 个变，且全在标签页上——那块补偿在这个面板里只干了
+ * 一件事，而这件事是反的：
+ *
+ *   `.feature-tab` 未选中 500 → **550**（抬高了，和「抵掉 DirectWrite 的墨」正相反）
+ *   `.feature-tab.is-active`  600 → 550（于是选中和未选中都是 550，**选中态消失**）
+ *   `.mcpfp-card__name strong` 700 → 550（strong 继承 UA 的 bold，一把摁掉 150）
+ *   `.titlebar__menu` / `.statusbar` 400 → 450（基础就是最轻档，没有下移余地，却被抬高）
+ *   `.settings-row__label` 550 → 550（纯空转）
+ *   `body.is-win .tab` 全应用匹配 0 个元素（死选择器）
+ *
+ * 根因是「按选择器钉死一个绝对值」：一个 --wt-strong: 550 同时盖到基础 700/600/550/500
+ * 四种元素上。改成按档位下移之后，下面这三条守着它不再退回去。
+ *
+ * MAC_BASE 是**在浏览器里 getComputedStyle 量出来的**，不是从源码猜的——加新选择器
+ * 必须先量再登记，这正是上一版栽跟头的地方。
+ */
+test("Windows 字重补偿只降不升，且不抹平选中态", () => {
+  const css = readFileSync(join(ROOT, "src/styles/app.css"), "utf8");
+
+  const varBlock = css.match(/body\.is-win \{([^}]*)\}/);
+  assert.ok(varBlock, "body.is-win 的档位表没了——补偿整块被删或改写了");
+  const tier = new Map();
+  for (const m of varBlock[1].matchAll(/--wt-(\d+)\s*:\s*(\d+)\s*;/g)) {
+    tier.set(Number(m[1]), Number(m[2]));
+  }
+  assert.ok(tier.size >= 3, `只解析到 ${tier.size} 个档位，解析器坏了（那会让这条恒绿）`);
+  for (const [base, win] of tier) {
+    assert.ok(win < base,
+      `--wt-${base} 被设成 ${win}——Windows 上只准比 mac 轻。抬高等于把病治反了：`
+      + "Blink 在 Windows 不实现 -webkit-font-smoothing，同一个数值本来就已经更粗。");
+  }
+
+  // selector -> 它被分到哪个档
+  const assigned = new Map();
+  const RULE = /((?:body\.is-win [^,{}]+,\s*)*body\.is-win [^,{}]+)\{\s*font-weight:\s*var\(--wt-(\d+)\)\s*;\s*\}/g;
+  for (const m of css.matchAll(RULE)) {
+    const base = Number(m[2]);
+    for (const sel of m[1].split(",")) {
+      const s = sel.trim().replace(/^body\.is-win\s+/, "");
+      if (s) assigned.set(s, base);
+    }
+  }
+  assert.ok(assigned.size >= 5, `只解析到 ${assigned.size} 条选择器，解析器坏了`);
+
+  // 浏览器实测的 mac 计算值。改这张表之前先去量，别照着 CSS 源码猜——
+  // `.mcpfp-card__name strong` 自己的规则里就没有 font-weight，700 是 UA 给 strong 的。
+  const MAC_BASE = {
+    ".mcpfp-card__name strong": 700,
+    ".titlebar__title": 600,
+    ".skill-row__name": 600,
+    ".feature-tab.is-active": 600,
+    ".settings-row__label": 550,
+    ".tbtn": 550,
+    ".feature-tab": 500,
+    ".ctp-btn": 500,
+  };
+  const unmeasured = [...assigned.keys()].filter((s) => !(s in MAC_BASE));
+  assert.deepEqual(unmeasured, [],
+    "这些选择器进了 is-win 补偿但没登记实测基础字重——先在浏览器里读一次 "
+    + "getComputedStyle(el).fontWeight 再填进 MAC_BASE，照源码猜就是上一版翻车的原因");
+  const misfiled = [...assigned].filter(([s, base]) => MAC_BASE[s] !== base)
+    .map(([s, base]) => `${s}: 实测 ${MAC_BASE[s]} 却挂在 --wt-${base} 档`);
+  assert.deepEqual(misfiled, [],
+    "档位挂错了——挂错档就等于按另一个基础值去降，降幅要么不够要么过头");
+
+  // 选中态那条必须比常态重，且类更多（否则 body.is-win .x 会靠元素选择器盖掉 .x.is-active）
+  for (const [variant, vBase] of assigned) {
+    for (const [plain, pBase] of assigned) {
+      if (variant === plain) continue;
+      if (!variant.startsWith(plain) || !/^[.:]/.test(variant.slice(plain.length))) continue;
+      assert.ok(vBase > pBase,
+        `${variant} 和 ${plain} 落在同一档——Windows 上这两个状态的字重会一模一样，`
+        + "选中/强调态在视觉上直接消失");
+      const cls = (s) => (s.match(/\./g) || []).length;
+      assert.ok(cls(variant) > cls(plain),
+        `${variant} 的类不比 ${plain} 多，优先级压不住 body.is-win ${plain}`);
+    }
+  }
+});

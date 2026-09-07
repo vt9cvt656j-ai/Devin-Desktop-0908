@@ -212,3 +212,70 @@ test("离谱的光标列数撑不爆行数组", () => {
   const back = ansiToText(`a${E}[999999Db`);
   assert.equal(back, "b");
 });
+
+// ── ansi.js 产出的 class，样式表里必须真的给得出颜色 ──────────────────────────
+//
+// 这两条守的是一种**不报错的失效**：`.ansi-fg-red { color: var(--ansi-red) }` 里的变量
+// 一旦没有定义，那条声明整条作废，文字静默退回继承色 —— 屏幕上看起来只是「这条命令
+// 没输出颜色」，没有任何一处会喊。
+//
+// 它真的发生过：这组变量原来挂在 `.agent-term-output`（那张已被删掉的终端大卡）上，
+// 卡片删掉时定义跟着走了，而消费它们的 16 条 `.ansi-fg-*` 规则留在原地，于是从那以后
+// 所有带色输出都是哑的。现在定义挂在 `.atc-term-out` 自己身上——变量和用它的元素同生共死。
+import { readFileSync } from "node:fs";
+
+const APP_CSS = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
+
+test("每个 ansi-fg-* / ansi-bg-* 用到的变量，样式表里都定义得出来", () => {
+  // 消费方：`color: var(--ansi-xxx)` 这一族。
+  const consumed = new Set(
+    [...APP_CSS.matchAll(/var\((--ansi-[a-z]+)\)/g)].map((m) => m[1]),
+  );
+  assert.ok(consumed.size >= 16, `只找到 ${consumed.size} 个消费点，选择器改名了？`);
+
+  // 定义方：`--ansi-xxx: #hex`。注释里出现的不算，所以要求后面跟着冒号和颜色值。
+  const defined = new Set(
+    [...APP_CSS.matchAll(/(--ansi-[a-z]+)\s*:\s*#[0-9a-fA-F]{3,8}/g)].map((m) => m[1]),
+  );
+
+  const missing = [...consumed].filter((v) => !defined.has(v));
+  assert.deepEqual(
+    missing,
+    [],
+    `这些变量有人用、没人定义，带色输出会静默变成继承色：${missing.join(", ")}`,
+  );
+});
+
+test("ANSI 色板明暗各一套，深色那套挂在 data-theme=\"dark\" 下", () => {
+  // 一套色板必然有一边糊在背景里：浅色底上要暗一档，深色底上要亮一档。
+  const darkBlock = APP_CSS.match(
+    /:root\[data-theme="dark"\]\s+\.atc-term-out\s*\{[^}]*\}/,
+  );
+  assert.ok(darkBlock, "深色那套 ANSI 色板不见了");
+  assert.match(darkBlock[0], /--ansi-red\s*:/, "深色块里没有重新给色");
+
+  // 浅色那套必须是**基色**（不带 data-theme 前缀）：main.js 要等 setTheme 跑完才挂属性，
+  // 在那之前没有属性，基色写成深色会让每次启动先闪一下黑块。
+  const base = APP_CSS.match(/(?<!\])\n\.atc-term-out\s*\{[^}]*--ansi-red[^}]*\}/);
+  assert.ok(base, "浅色那套 ANSI 色板不是基色（或者被挂到了某个主题选择器下面）");
+});
+
+test("命令输出的底色跟随主题，浅色下不许是深色", () => {
+  // 用户实拍否掉过一版：浅色主题下一张白卡中间嵌一块纯黑。深色留给主题，不留给内容类型。
+  const rules = [...APP_CSS.matchAll(/^[^\n{}]*\.atc-term-out[^\n{}]*\{([^}]*)\}/gm)];
+  assert.ok(rules.length >= 3, `.atc-term-out 的规则只找到 ${rules.length} 条，锚点漂了`);
+
+  for (const [whole, body] of rules) {
+    const selector = whole.slice(0, whole.indexOf("{"));
+    const bg = body.match(/(?:^|;)\s*background\s*:\s*([^;]+)/);
+    if (!bg) continue;
+    const value = bg[1].trim();
+    const isDarkTheme = selector.includes('data-theme="dark"');
+    if (isDarkTheme) continue;
+    assert.doesNotMatch(
+      value,
+      /#(0|1|2)[0-9a-fA-F]{5}\b/,
+      `浅色/基色规则又把命令输出写死成深底了：${selector.trim()} → ${value}`,
+    );
+  }
+});

@@ -25,8 +25,13 @@
  * @param onItemError    (item, index, error) → void，**必须**为这一项落一条结果；
  *                       省略时异常被吞掉（保持"不炸循环"），但转录会缺一条结果 ——
  *                       所以正常调用点一律要传。
+ * @param maxParallel    一段里同时在跑的上限，默认 DEFAULT_MAX_PARALLEL；≤0 或非数按默认。
  */
-export async function runOrderedToolSegments(items, segmentKeyOf, execute, isLive = () => true, onItemError = null) {
+/** 一段里同时在跑的工具上限。 */
+export const DEFAULT_MAX_PARALLEL = 10;
+
+export async function runOrderedToolSegments(items, segmentKeyOf, execute, isLive = () => true, onItemError = null, maxParallel = DEFAULT_MAX_PARALLEL) {
+  const limit = Math.max(1, Math.floor(Number(maxParallel))) || DEFAULT_MAX_PARALLEL;
   const runOne = async (item, index) => {
     try {
       await execute(item, index);
@@ -44,13 +49,22 @@ export async function runOrderedToolSegments(items, segmentKeyOf, execute, isLiv
     }
     let end = index;
     const segment = [];
-    while (end < items.length && segmentKeyOf(items[end], end) === key) {
-      const current = end++;
-      segment.push(runOne(items[current], current));
-    }
+    while (end < items.length && segmentKeyOf(items[end], end) === key) segment.push(end++);
+    // 同段并行，但**有上限**。原来整段一次 Promise.allSettled 起跑，没有数值上限：一轮 12 个
+    // read_file 一起回来，每条都占满自己那档上限，合计撞上 60k 的每轮预算，fair-share 把每条
+    // 压到 1.2k 地板——模型要的那一个文件反而读不全。上限取 10，和 Claude Code 的
+    // CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY 同值；超出的在段内排队，段语义（同段并行、
+    // 段间硬屏障、顺序）一个字不变。
+    let cursor = 0;
+    const lane = async () => {
+      while (cursor < segment.length) {
+        const current = segment[cursor++];
+        await runOne(items[current], current);
+      }
+    };
     // runOne 自己不会 reject，这里用 allSettled 是第二层保险：将来有人在 runOne 之外
-    // 往 segment 里塞 promise 时，Promise.all 会让整段的第一个 reject 吃掉其余全部结果。
-    await Promise.allSettled(segment);
+    // 往 lane 里塞 promise 时，Promise.all 会让整段的第一个 reject 吃掉其余全部结果。
+    await Promise.allSettled(Array.from({ length: Math.min(limit, segment.length) }, lane));
     index = end;
   }
 }

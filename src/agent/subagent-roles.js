@@ -125,3 +125,28 @@ export function roleCapabilities(role, write, userRoleMap = null) {
     types: [...new Set([...(read?.types || []), ...(spec?.types || [])])],
   };
 }
+
+/**
+ * 把「这个角色跑在哪个模型」的注记并进子智能体简报，**不动第 0 位的状态前缀**。
+ *
+ * 原来是无条件前置（`${note}\n\n${report}`）。而简报的状态前缀是被四处**锚在开头**的
+ * 正则消费的：
+ *   · job.status 分类两处 —— /^\[TIMEOUT\]/ → "timeout"、/^\[ERROR\]/ → "failed"；
+ *   · generate_wiki 的落盘闸 —— `report && !/^\[ERROR\]/.test(report) && root`；
+ *   · failDigest 那条 —— /^\[ERROR\]/。
+ * 前置一条 `[role:…]` 之后，`/^\[/` 仍然为真（所以简报照常交出去，看不出异样），
+ * 但 `/^\[ERROR\]/` 全部落空。后果是：**一个报错的子智能体被判成 done**，
+ * await_subagent 和自动交付都打「完成」标签；而 wiki 那条更狠——报错正文被当成 wiki
+ * 正文写进磁盘，dest 由模型给，传 README.md 就把 README 覆盖掉。
+ *
+ * 这正是同一段代码上面那条注释已经写明、却在三行之后自己踩进去的坑。
+ * 有前缀时插到**首行之后**：状态前缀留在原位，父体照样第一眼看得见换没换模型。
+ */
+export function withRoleNote(report, note) {
+  const body = String(report || "");
+  const tag = String(note || "");
+  if (!tag || !body || body.includes(tag)) return body;
+  if (!/^\[/.test(body)) return `${tag}\n\n${body}`;
+  const nl = body.indexOf("\n");
+  return nl < 0 ? `${body}\n\n${tag}` : `${body.slice(0, nl)}\n${tag}${body.slice(nl)}`;
+}

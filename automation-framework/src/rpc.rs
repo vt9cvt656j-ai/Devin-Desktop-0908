@@ -446,22 +446,7 @@ impl RpcServer {
                 let probe = method == "screen.probe";
                 // 目标解析：pid 最准，app 是给调用方按名字指的（模型只知道名字）。
                 // 两者都没有才读前台——那是九成的用法，省一次 window.list 往返。
-                let pid = match params.get("pid").and_then(|v| v.as_i64()) {
-                    Some(p) if p > 0 => p as i32,
-                    _ => match params.get("app").and_then(|v| v.as_str()).map(str::trim) {
-                        Some(a) if !a.is_empty() => crate::platform::macos_tree::pid_of(a)
-                            .ok_or_else(|| {
-                                // 名字对不上就**报错**，绝不"退回读前台"：那会让模型以为
-                                // 自己读的是 A，实际读的是别的应用，然后基于这份内容去点。
-                                Error::Other(anyhow::anyhow!(
-                                    "没有找到名字里含「{a}」的运行中应用；用 window.list 看准确名字，或直接给 pid"
-                                ))
-                            })?,
-                        _ => crate::platform::macos_tree::frontmost_pid().ok_or_else(|| {
-                            Error::Other(anyhow::anyhow!("读不到当前前台应用；给 app 或 pid 参数指定目标"))
-                        })?,
-                    },
-                };
+                let pid = Self::resolve_ax_pid(&params)?;
                 let t0 = std::time::Instant::now();
                 let (nodes, page) = if probe {
                     crate::platform::macos_tree::snapshot_probe(pid, cap)
@@ -509,15 +494,145 @@ impl RpcServer {
                 crate::platform::macos_tree::act(r, action, value, want_pid)
                     .map_err(|e| Error::Other(anyhow::anyhow!(e)))
             }
+            // 截屏（新口径）：在壳里缩到模型建议的尺寸并回传精确换算关系。
+            // 老口径（原图 + 一句「除以 2」的提示）仍在 agent.screen_capture 里给 Windows 用；
+            // macOS 走这里，不碰 Agent，所以可以挂在 accept 线程之外。
+            "screen.capture" => {
+                let num = |k: &str| params.get(k).and_then(|v| v.as_f64()).map(|n| n as i32);
+                let region = match (num("x"), num("y"), num("width"), num("height")) {
+                    (Some(x), Some(y), Some(w), Some(h)) => Some((x, y, w, h)),
+                    (None, None, None, None) => None,
+                    _ => return Err(crate::error::Error::System(
+                        "区域截图要同时给 x/y/width/height 四个参数；一个都不给就是整屏".into(),
+                    )),
+                };
+                let max_side = capture_max_side(&params);
+                let png = crate::system::capture_screen_png(region)?;
+                let screen = crate::system::main_display_points()
+                    .ok_or_else(|| Error::System("读不到主屏尺寸".into()))?;
+                let prepared = crate::vision::prepare(&png, max_side, region, screen).map_err(Error::System)?;
+                let out = crate::vision::encode_png(&prepared.image).map_err(Error::System)?;
+                Ok(capture_json(&prepared.geometry, &out, region, None))
+            }
+            // Set-of-Marks：可访问性树 + 截图叠在一起。编号 = read_screen 的 ref（下标 + 1），
+            // 快照同时装好句柄表，所以模型认出 ⑦ 就能直接 screen.act ref:7。
+            // 静态文本和分组不画框：它们不可点，画上只会把真正的控件糊住。
+            "screen.marked" => {
+                let cap = params.get("cap").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
+                let max_marks = params.get("max_marks").and_then(|v| v.as_u64())
+                    .map(|n| n as usize).unwrap_or(crate::vision::DEFAULT_MAX_MARKS);
+                let max_side = capture_max_side(&params);
+                let pid = Self::resolve_ax_pid(&params)?;
+                let t0 = std::time::Instant::now();
+                let (nodes, page) = crate::platform::macos_tree::snapshot(pid, cap);
+                let app_name = crate::platform::macos_tree::name_of(pid).unwrap_or_default();
+                let base = |v: &mut serde_json::Value| {
+                    v["elements"] = serde_json::json!(nodes);
+                    v["count"] = serde_json::json!(nodes.len());
+                    v["truncated"] = serde_json::json!(nodes.len() >= cap);
+                    v["took_ms"] = serde_json::json!(t0.elapsed().as_millis() as u64);
+                    v["pid"] = serde_json::json!(pid);
+                    v["app"] = serde_json::json!(app_name);
+                    v["refs_installed"] = serde_json::json!(true);
+                    v["page"] = serde_json::json!(page);
+                    if crate::system::screen_locked() {
+                        v["screen_locked"] = serde_json::json!(true);
+                    }
+                };
+                // **目标在屏幕上一扇窗口都没有就不出图。** 可访问性树读的是那个进程自己的界面，
+                // 截图拍的是屏幕——它最小化了、在别的桌面上，图里就没有它，框只会画在别的应用上。
+                // 这时只回元素（ref 照样能用，AX 动作不要求可见），把「谁在前面」作为事实交回去，
+                // 话由调用方拼。窗口在但被部分盖住的情况在下面逐元素判。
+                let stack = crate::system::window_stack();
+                if !stack.iter().any(|w| w.pid == pid) {
+                    let front = crate::platform::macos_tree::frontmost_pid();
+                    let mut v = serde_json::json!({
+                        "image": serde_json::Value::Null,
+                        "occluded": {
+                            "target_pid": pid,
+                            "front_pid": front,
+                            "front_app": front.and_then(crate::platform::macos_tree::name_of),
+                            "reason": "no_onscreen_window",
+                        },
+                    });
+                    base(&mut v);
+                    return Ok(v);
+                }
+                let png = crate::system::capture_screen_png(None)?;
+                let screen = crate::system::main_display_points()
+                    .ok_or_else(|| Error::System("读不到主屏尺寸".into()))?;
+                let mut prepared = crate::vision::prepare(&png, max_side, None, screen).map_err(Error::System)?;
+                // 只给**可交互的叶子控件**画框。容器（Window / SplitGroup / ScrollArea / Outline /
+                // Table / Toolbar…）和静态文本一律不画：它们不是点击目标，画上只会盖住真正的控件；
+                // 单元格（Cell）也不画——它总在一个 Row 里，Row 才是被选中的那一级。
+                const MARKABLE: &[&str] = &[
+                    "Button", "Link", "TextField", "SecureTextField", "TextArea", "SearchField",
+                    "CheckBox", "RadioButton", "PopUpButton", "MenuButton", "MenuItem", "MenuBarItem",
+                    "Tab", "Slider", "Incrementor", "ComboBox", "DisclosureTriangle", "Row",
+                    "ColorWell", "Switch", "Toggle", "Stepper", "ScrollBar",
+                ];
+                // Image 只在**带名字**时才标（桌面图标、带标签的图片按钮）：没名字的图标几乎都躺在
+                // 按钮 / 行里，它自己不是目标，标了只是一行三个号。
+                // 被别的窗口盖住的元素也不标（按元素中心点对 z 序判），数出来告诉调用方。
+                let mut hidden = 0usize;
+                let marks = crate::vision::marks_for(
+                    &prepared.geometry,
+                    nodes.iter().enumerate()
+                        .filter(|(_, n)| MARKABLE.contains(&n.role.as_str()) || (n.role == "Image" && !n.text.trim().is_empty()))
+                        .filter(|(_, n)| {
+                            let seen = crate::vision::point_visible(
+                                pid, &stack, n.x as f64 + n.w as f64 / 2.0, n.y as f64 + n.h as f64 / 2.0,
+                            );
+                            if !seen { hidden += 1; }
+                            seen
+                        })
+                        .map(|(i, n)| (i, (n.x, n.y, n.w, n.h))),
+                    max_marks,
+                );
+                crate::vision::draw_marks(&mut prepared.image, &marks);
+                let out = crate::vision::encode_png(&prepared.image).map_err(Error::System)?;
+                let mut v = capture_json(&prepared.geometry, &out, None, Some(marks.len()));
+                v["image"] = v["data_url"].take();
+                v["marks_hidden"] = serde_json::json!(hidden);
+                // 排查遮挡判断用：把参与判断的窗口栈（前→后）原样交出去。
+                if params.get("debug").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    v["window_stack"] = serde_json::json!(stack.iter().map(|w| serde_json::json!({
+                        "pid": w.pid, "x": w.x, "y": w.y, "w": w.w, "h": w.h,
+                    })).collect::<Vec<_>>());
+                }
+                base(&mut v);
+                Ok(v)
+            }
             _ => unreachable!("screen_method 只处理 needs_no_agent 里列出的方法"),
         }
+    }
+
+    /// 读屏类方法的目标进程：pid > app 名（精确优先于子串）> 前台。三个方法共用这一份，
+    /// 不然「同一个 app 参数在 elements 找得到、在 marked 找不到」这种事迟早发生。
+    /// 名字对不上就**报错**，绝不"退回读前台"：那会让模型以为自己读的是 A，实际读的是别的应用。
+    #[cfg(all(feature = "system", target_os = "macos"))]
+    fn resolve_ax_pid(params: &serde_json::Value) -> Result<i32> {
+        Ok(match params.get("pid").and_then(|v| v.as_i64()) {
+            Some(p) if p > 0 => p as i32,
+            _ => match params.get("app").and_then(|v| v.as_str()).map(str::trim) {
+                Some(a) if !a.is_empty() => crate::platform::macos_tree::pid_of(a)
+                    .ok_or_else(|| {
+                        Error::Other(anyhow::anyhow!(
+                            "没有找到名字里含「{a}」的运行中应用；用 window.list 看准确名字，或直接给 pid"
+                        ))
+                    })?,
+                _ => crate::platform::macos_tree::frontmost_pid().ok_or_else(|| {
+                    Error::Other(anyhow::anyhow!("读不到当前前台应用；给 app 或 pid 参数指定目标"))
+                })?,
+            },
+        })
     }
 
     fn execute_method(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         // 分流放在拿锁之前。走到这里的 screen.* 只可能来自 recorder.replay 的
         // re-dispatch（正常路径在 accept 那一层就被挪走了）。详见 screen_method 上面那段。
         #[cfg(all(feature = "system", target_os = "macos"))]
-        if matches!(method, "screen.elements" | "screen.probe" | "screen.act") {
+        if matches!(method, "screen.elements" | "screen.probe" | "screen.act" | "screen.capture" | "screen.marked") {
             return Self::screen_method(method, params);
         }
         let mut agent = self.agent.lock().unwrap();
@@ -1330,12 +1445,52 @@ impl Job {
             if matches!(
                 self.rpc_method.as_deref(),
                 Some("screen.elements") | Some("screen.probe") | Some("screen.act")
+                    | Some("screen.capture") | Some("screen.marked")
             ) {
                 return true;
             }
         }
         false
     }
+}
+
+/// 截图最长边。`raw:true` 或 `max_side:0` = 原图（要真实像素做 OCR/取证时用）；默认 1280。
+/// 上限 4096：再大既超各家视觉 API 的预算，也没有任何模型在那个尺寸上更准。
+#[cfg(all(feature = "system", target_os = "macos"))]
+fn capture_max_side(params: &serde_json::Value) -> u32 {
+    if params.get("raw").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return 0;
+    }
+    match params.get("max_side").and_then(|v| v.as_u64()) {
+        Some(n) => n.min(4096) as u32,
+        None => crate::vision::DEFAULT_MAX_SIDE,
+    }
+}
+
+/// 截图回执。**坐标空间是图上像素**，换算关系一并给出，壳按它换算，模型不换算。
+#[cfg(all(feature = "system", target_os = "macos"))]
+fn capture_json(
+    g: &crate::vision::Geometry,
+    png: &[u8],
+    region: Option<(i32, i32, i32, i32)>,
+    marks: Option<usize>,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "data_url": format!("data:image/png;base64,{}", crate::system::base64_encode(png)),
+        "image_px": { "width": g.image_w, "height": g.image_h },
+        "points_origin": { "x": g.origin_x, "y": g.origin_y },
+        "points_size": { "width": g.points_w, "height": g.points_h },
+        "points_per_image_px": g.points_per_image_px,
+        "coordinate_space": "image_px_top_left",
+        "region": region.map(|(x, y, w, h)| serde_json::json!({"x": x, "y": y, "width": w, "height": h})),
+        "marks": marks,
+        "note": "Coordinates read off this image are IMAGE PIXELS with origin top-left. The host converts them to screen points as point = points_origin + px × points_per_image_px; do not convert them yourself.",
+    });
+    // 锁屏时这张图是全黑的，说出来（JS 拼话）。
+    if crate::system::screen_locked() {
+        v["screen_locked"] = serde_json::json!(true);
+    }
+    v
 }
 
 /// 录制文件目录：~/.michael-automation/recordings/
@@ -1398,7 +1553,7 @@ mod tests {
         }
 
         #[cfg(all(feature = "system", target_os = "macos"))]
-        for m in ["screen.elements", "screen.probe", "screen.act"] {
+        for m in ["screen.elements", "screen.probe", "screen.act", "screen.capture", "screen.marked"] {
             assert!(
                 job(Some(m), false).offloadable(),
                 "{m} 没能挪走——浏览器一忙就会把读屏和按 ref 操作重新堵死"

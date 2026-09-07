@@ -1350,9 +1350,18 @@ export function createLspManager(options) {
   }
 
   // ---- diagnostics ----
+  /// uri -> 这门语言最近一次 publishDiagnostics 到达的时刻。
+  ///
+  /// LSP 对**干净文件**送的是空数组 —— 也就是说"没有问题"和"还没答"在 marker 上
+  /// 长得一模一样（都是 0 个 marker）。诊断门只好等满上限：一批非 JS/TS 文件改完，
+  /// 每次必然空等 4 秒，而且专挑"代码写对了"的时候罚你（写错了几百毫秒就出 marker 收工）。
+  /// JS 那条腿早就有显式完成信号（Monaco worker 的 _workerDoneAt），LSP 这条一直没有。
+  /// 记下这一笔，等的人就能分清"答过了且是干净的"和"还没答"。
+  const _publishedAt = new Map();
   async function applyDiagnostics(langId, params) {
     if (!params?.uri) return;
     const uri = params.uri;
+    try { _publishedAt.set(String(uri), Date.now()); } catch {}
     let model = findModelByUri(uri);
     if (!model) {
       // Create a lightweight model so cross-file diagnostics still surface in
@@ -2347,6 +2356,11 @@ export function createLspManager(options) {
     },
     isRunning(langId) {
       return clients.has(langId);
+    },
+    /// 这个文件最近一次收到 publishDiagnostics 是什么时候（毫秒时间戳；从没收到过返回 0）。
+    /// 诊断门用它来分辨"答过了、是干净的"和"还没答" —— 没有这一笔，干净文件必然等满上限。
+    diagnosticsPublishedAt(uri) {
+      return Number(_publishedAt.get(String(uri || ""))) || 0;
     },
     /// 这门语言正排着一次自动重启吗。状态栏据此把「未启动」写成「重启中…」——
     /// 自愈过程中界面必须看得出来它在自愈，否则用户以为它就是死了。

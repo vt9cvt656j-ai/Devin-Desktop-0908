@@ -9,7 +9,7 @@
 // 段语义是原样搬过来的，所以这个文件两头都守：**顺序不许变**，**异常不许升级成致命**。
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runOrderedToolSegments } from "../src/agent/tool-scheduler.js";
+import { runOrderedToolSegments, DEFAULT_MAX_PARALLEL } from "../src/agent/tool-scheduler.js";
 
 const alwaysLive = () => true;
 
@@ -82,6 +82,46 @@ test("按了停就不再往下推进", async () => {
     if (i === 0) live = false;
   }, () => live, () => {});
   assert.deepEqual(done, [0], "用户按停之后还在跑后续工具");
+});
+
+test("同段并行有上限：12 个读最多 10 个同时在跑，但 12 个都要跑完", async () => {
+  // 没上限时一轮 12 个 read_file 一起回来，每条占满自己那档，合计撞上 60k 的每轮预算，
+  // fair-share 把每条压到 1.2k 地板——模型要的那个文件反而读不全。上限和 Claude Code 的
+  // CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY 同值。
+  let active = 0, maxParallel = 0;
+  const done = [];
+  const items = Array.from({ length: 12 }, (_, id) => ({ k: "read", id }));
+  await runOrderedToolSegments(items, (it) => it.k, async (it) => {
+    active++; maxParallel = Math.max(maxParallel, active);
+    await new Promise((r) => setTimeout(r, 8));
+    done.push(it.id);
+    active--;
+  }, alwaysLive, () => {});
+  assert.equal(maxParallel, DEFAULT_MAX_PARALLEL, `同时在跑的峰值应恰好是上限 ${DEFAULT_MAX_PARALLEL}`);
+  assert.equal(done.length, 12, "超出上限的那几个被丢了——每个 tool_call 都得有结果");
+  assert.deepEqual(done.slice().sort((a, b) => a - b), items.map((it) => it.id));
+});
+
+test("上限可以按调用指定；填 1 就退化成严格串行且顺序不变", async () => {
+  let active = 0, maxParallel = 0;
+  const order = [];
+  const items = Array.from({ length: 5 }, (_, id) => ({ k: "read", id }));
+  await runOrderedToolSegments(items, (it) => it.k, async (it) => {
+    active++; maxParallel = Math.max(maxParallel, active);
+    await new Promise((r) => setTimeout(r, 3));
+    order.push(it.id);
+    active--;
+  }, alwaysLive, () => {}, 1);
+  assert.equal(maxParallel, 1);
+  assert.deepEqual(order, [0, 1, 2, 3, 4], "上限 1 时必须按声明顺序逐个跑");
+});
+
+test("上限填了垃圾（0 / 负数 / 非数）按默认值，不许变成 0 并发把段卡死", async () => {
+  for (const bad of [0, -3, "x", null, undefined, NaN]) {
+    const done = [];
+    await runOrderedToolSegments([{ k: "r" }, { k: "r" }], (it) => it.k, async (it, i) => { done.push(i); }, alwaysLive, () => {}, bad);
+    assert.deepEqual(done.sort(), [0, 1], `maxParallel=${String(bad)} 时段没跑完`);
+  }
 });
 
 test("并行段里多项同时抛：每一项都要被单独报出来", async () => {

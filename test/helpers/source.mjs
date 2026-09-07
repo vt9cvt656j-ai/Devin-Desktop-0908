@@ -107,6 +107,23 @@ export const TOOL_CATALOG_SRC = readFileSync(join(dirname(MAIN_PATH), "agent", "
 
 export const CODE = stripComments(SRC);
 
+export function decodeXd(encoded) {
+  const k = [0x4D, 0x52, 0x44, 0x41, 0x59];
+  const b = Buffer.from(encoded, "base64");
+  for (let i = 0; i < b.length; i++) b[i] ^= k[i % k.length];
+  return b.toString("utf8");
+}
+
+export function allDecodedStrings(text) {
+  const re = /_xd\("([A-Za-z0-9+/=]+)"\)/g;
+  const results = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    try { results.push(decodeXd(m[1])); } catch {}
+  }
+  return results;
+}
+
 // ---------------------------------------------------------------------------
 // 按名字取真源码：整个 test/ 目录唯一的一份提取器
 // ---------------------------------------------------------------------------

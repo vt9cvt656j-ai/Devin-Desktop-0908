@@ -16,6 +16,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # /health 的挑战应答要算 SHA-256。工作区锁文件里已有 sha2 v0.10，加它不引入新的下载。
 sha2 = "0.10"
+# 截图后处理：缩到模型建议的尺寸、画 Set-of-Marks 编号框（src/vision.rs），以及 Windows 把
+# GDI 抓到的 BGRA 编成 PNG。default-features 关掉，只留 png——不需要 jpeg/gif/webp 那堆解码器。
+image = { version = "0.25", default-features = false, features = ["png"] }
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
@@ -27,9 +30,6 @@ tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["cors"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# 只为了把 GDI 抓到的原始 BGRA 编成 PNG。default-features 关掉，只留 png——
-# 不需要 jpeg/gif/webp 那一堆解码器。
-image = { version = "0.25", default-features = false, features = ["png"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

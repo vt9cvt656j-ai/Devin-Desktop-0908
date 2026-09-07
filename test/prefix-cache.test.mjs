@@ -11,7 +11,7 @@ import test from "node:test";
 import fs from "node:fs";
 // 按名字取真源码 + 拼依赖闭包跑起来，只有一份实现：test/helpers/source.mjs。
 // 这个文件的源码断言历来跑在**原文**上，所以 SRC 仍绑定 main.js 原文，不动。
-import { SRC, fnSource as grab, load } from "./helpers/source.mjs";
+import { SRC, CODE, fnSource as grab, load } from "./helpers/source.mjs";
 
 const stable = load("_sessionStableSemanticProfile", ["_sessionStableSemanticProfile"]);
 const profileOf = load("_ideSemanticProfile", ["_ideSemanticProfile"]);
@@ -21,7 +21,8 @@ test("a turn that classifies narrower does not drop the session's blocks", () =>
 
   // Turn 1, the real classifier shape for "fix the login page and run it".
   const t1 = stable(session, profileOf({ ui: true, workspaceAction: "modify", applies: true }));
-  assert.equal(t1, "2.5:engineering,design,design_implementation,design_verification");
+  // 2026-09-05 起裁决没落定的会话最前面带一位 unjudged（不粘，模型判过就消失）。
+  assert.equal(t1, "2.5:unjudged,engineering,design,design_implementation,design_verification");
 
   // Turn 5 of the same session: "still broken, check why the window won't show". Nothing in that
   // sentence reads as UI work, so the per-turn classifier drops every design flag. Before this
@@ -54,7 +55,10 @@ test("stickiness is per session, so a new session starts focused", () => {
   // Not a global accumulator: the full flag set assembles an 84KB prefix against 26KB here, and
   // blocks the model does not need are more instructions competing with the ones it does.
   const b = {};
-  assert.equal(stable(b, profileOf({ applies: true })), "2.5:engineering");
+  assert.equal(stable(b, profileOf({ applies: true })), "2.5:unjudged,engineering");
+  // 判过的会话不带 unjudged。
+  const c = { _semanticProfileFromModel: true };
+  assert.equal(stable(c, profileOf({ applies: true })), "2.5:engineering");
 });
 
 test("no session (background/one-shot request) passes through unchanged", () => {
@@ -95,85 +99,56 @@ test("every profile write goes through the sticky merge", () => {
   }
 });
 
-test("a brand-new session waits, briefly and once, before sending an empty profile", () => {
-  // 画像是同步算出来的，而全新会话没有 _intentState 也没有缓存命中，本地证据函数又只返回
-  // URL 列表——所以第一轮的画像是空的：决定整个做法的那一轮拿不到 agent_engineering。
-  // 而且粘性画像让这件事在缓存上也要付账：第一轮空、第二轮有 flag，等于每个会话必然在第二轮
-  // 把整条对话的前缀作废一次——正是粘性本身要防的那个失败。
-  // 这条断言原来写的是 `bound <= 2000`，把 1500 当成了「有界成本」的正解。生产网关实测
-  // 打脸：裁决用的是用户选的模型（刻意不降级），claude-opus-5 出这份 JSON 的响应头延迟是
-  // 6931ms / 7607ms。1500 的上限意味着这场 race **每次都由 timer 赢**——等待存在、全绿、
-  // 无日志，而主回合照旧带着空画像出门。所以正确的不变量不是「够短」，是「够得上裁决」：
-  // 必须 >= 前台窗口，且两个值同源，否则又会漂回那个恒定失败的组合。
-  assert.match(SRC, /const _FIRST_TURN_INTENT_WAIT_MS = _INTENT_FOREGROUND_WAIT_MS;/,
-    "the first-turn wait must be derived from the foreground window, not an independent literal"
-    + " — two separate numbers is how it drifted into a race the timer always wins");
-  // 上面那段"必须够得上裁决"的推理，被 2026-08-18 的生产日志推翻了一半：上游首响应头
-  // 延迟是 claude-opus-5 平均 8.3s、gpt-5.5 平均 10.8s、gpt-5.6-sol 平均 18.4s（且 45%
-  // 以 502 结束）。裁决走同一个模型，所以"够得上"意味着窗口要开到十几二十秒——而窗口只在
-  // 裁决赶不上的轮次才生效，于是它就变成每条消息实打实多付的墙钟时间。用户实拍："同一个
-  // API 在 Claude Code / Codex 里飞快，在我软件里巨慢"，这就是我们自己加在上游之上的那一段。
-  //
-  // 正确的不变量因此换了一条：窗口**有界且小**，赶不上就照常发车，由下面那条
-  // _applyLateIntentIfLanded 在循环边界补齐。第一轮画像弱一点是一次性代价，
-  // 每轮多等十几秒不是。
+test("a brand-new session sends at once and says `unjudged` instead of waiting for the verdict", () => {
+  // 画像是同步算出来的，而全新会话没有 _intentState 也没有缓存命中——第一轮的画像是空的。
+  // 原来这里用一个 6 秒窗口等裁决：生产读数（2026-09-05）里完整裁决中位 80 秒才落地，
+  // 一半的 run 根本等不到，于是这道窗口每个新会话固定多付 4~6 秒静默却几乎买不到东西。
+  // 现在第一发不等：请求头带 unjudged 这一位，网关据此在 agent 模式先按工程任务挂块
+  // （模式级默认，不按原文分类），裁决落定后由循环边界补进画像，粘性并集保证只作废一次前缀。
+  assert.doesNotMatch(CODE, /_FIRST_TURN_INTENT_WAIT_MS|_intentWaitPaid|_waitStartedAt/,
+    "the first-turn wait is back — it costs every new session seconds of silence to wait for a"
+    + " verdict that lands at a median of 80s in production");
+  // 前台窗口仍然给意图裁决那场 race 封顶（超时回 null，裁决在后台继续）：有界且小。
   const windowMs = Number(/const _INTENT_FOREGROUND_WAIT_MS = (\d+);/.exec(SRC)[1]);
   assert.ok(windowMs > 0 && windowMs <= 8000,
     `${windowMs}ms window: this arm only fires when the verdict is slower than it — sizing it for`
     + " the slow case means every message pays that wall-clock time on top of an already slow upstream");
 
-  // 「画像还空吗」现在抽成了 _profileStillEmpty —— 因为快通道的**发送**要用同一个判据，
-  // 而发送不该看 _intentWaitPaid（看了就会连发送一起被记账关掉）。两条性质分别钉住：
+  // 「画像还空吗」抽成了 _profileStillEmpty —— 快通道的**发送**用同一个判据。
   //
-  // 判据的**真源**从 _semanticProfileFlags 换成了 _semanticProfileFromModel。原因是执行事实
-  // 腿被提到第一发之前（按磁盘现状点亮 existing_project，零模型调用），那之后每个打开了
-  // 已有项目的会话，第 1 发结束时 flags 至少是 ["existing_project"] —— 于是第 2 发起
-  // 这道判据恒为假，**快通道整条会话再也不发车**。那正是本仓库记着「已经修好」的那个
-  // 117 轮全空的失效模式，从另一个变量上回来了。
+  // 判据的**真源**是 _semanticProfileFromModel 而不是 flags。原因是执行事实腿在第一发之前
+  // 就按磁盘现状点亮 existing_project（零模型调用），那之后每个打开了已有项目的会话，
+  // 第 1 发结束时 flags 至少是 ["existing_project"] —— 按 flags 判的话第 2 发起这道判据
+  // 恒为假，**快通道整条会话再也不发车**（本仓库记着「已经修好」的那个 117 轮全空的失效模式）。
   //
   // 要守的契约没变：判据只认**模型来源**的画像，纯磁盘事实不许冒充「模型判过了」。
   assert.match(SRC, /const _profileStillEmpty = !sess\._semanticProfileFromModel;/,
     "「画像还空吗」的真源被换掉了——换成 flags 会被执行事实腿污染，换成别的近似判据同理");
-  // 那一位只能由**模型来源**置：快通道落定、或完整裁决落定。
+  // 那一位只能由**模型来源**置：快通道落定、sendPrompt 采纳完整裁决、或循环边界迟到采纳。
   assert.match(SRC, /sess\._semanticProfileFromModel = true;/, "没有任何地方置这一位，快通道会每轮重发");
-  const fromModelSets = (SRC.match(/sess\._semanticProfileFromModel = true;/g) || []).length;
+  const fromModelSets = (SRC.match(/\b(?:sess|session)\._semanticProfileFromModel = true;/g) || []).length;
   // 置位必须**有条件**：两条腿都没回时置了，就等于宣布「模型判过了」，
   // 下一轮快通道不再发车——那和这次要修的回归是同一个形状，只是原因不同。
   const setAt = SRC.indexOf("if (_routeSource) { try { sess._semanticProfileFromModel");
   assert.ok(setAt > 0,
     "完整裁决那侧的置位没有条件——_routeSource 为空（两条腿都没回）时也会置");
-  assert.equal(fromModelSets, 2,
-    `置位点有 ${fromModelSets} 处，应为 2（快通道落定 + 完整裁决落定）。`
+  assert.equal(fromModelSets, 3,
+    `置位点有 ${fromModelSets} 处，应为 3（快通道落定 + sendPrompt 采纳完整裁决 + 循环边界迟到采纳）。`
     + "多一处很可能就是又让某个非模型来源冒充了「模型判过了」");
   // 执行事实腿绝不能置它——它一个模型调用都不需要。
   const factAt = SRC.indexOf("_executionFactSemanticFlags({ root: _curRoot");
   assert.ok(factAt > 0, "第一发的执行事实腿不见了");
   assert.doesNotMatch(SRC.slice(factAt, factAt + 400), /_semanticProfileFromModel/,
     "执行事实腿把自己标成了「模型判过了」——那就是这次要修的那个回归本身");
-  const guard = /if \(_turnIntentState && _profileStillEmpty && !sess\._intentWaitPaid\) \{/;
-  assert.match(SRC, guard,
-    "the wait must be gated on the session having no flags yet AND not having paid already —"
-    + " a plain-Q&A verdict legitimately returns zero flags, so the flags test alone makes every"
-    + " turn in a chat session pay the full window again");
 
-  // 等待必须发生在画像组装之前，否则等了也白等。
-  //
-  // 锚点必须钉在**发车前那一行**（_semanticProfileHeaderFor(_routeSource, text)）。
-  // 泛泛地找第一处 `config.ideSemanticProfile = _sessionStableSemanticProfile(sess,` 会撞上
-  // 快通道落定时那次并集写入——那一次刻意排在等待之前（它是个 .then 回调，落定时才跑），
-  // 于是这条断言会把一个正确的实现判成红。
-  const waitAt = SRC.search(guard);
-  // 要比的是**本轮请求头那一次**赋值。快通道落定后也会赋一次（在 guard 之前的 .then 里），
-  // 拿它来比会把顺序判反——所以这里按后者独有的 _semanticProfileHeaderFor 精确定位。
-  const assignAt = SRC.indexOf("config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _semanticProfileHeaderFor(");
-  assert.ok(waitAt > 0 && assignAt > waitAt,
-    "the wait must precede the profile assignment it exists to inform");
+  // 「还没判过」必须进请求头，而且不许粘住：裁决一落定它就消失（粘性并集里过滤掉）。
+  const stable = grab("_sessionStableSemanticProfile", { code: true });
+  assert.match(stable, /"unjudged"/, "请求头没有 unjudged 这一位——网关分不清「判过了没旗标」和「还没判」");
+  assert.match(stable, /flag !== "unjudged"/, "unjudged 被并进了粘性并集——裁决落定后它也撤不下来");
 
-  // 超时也要照常发车：裁决迟到由循环边界的 _applyLateIntentIfLanded 兜底，不能把一轮卡死。
-  assert.match(SRC, /_waitTimer = setTimeout\(resolve, _FIRST_TURN_INTENT_WAIT_MS\)/,
-    "the race must have a timeout arm so a slow classifier cannot stall the turn");
+  // 裁决迟到由循环边界的 _applyLateIntentIfLanded 兜底——不等之后这是完整裁决唯一的落地点。
   assert.match(SRC, /_applyLateIntentIfLanded\(run, config, task, session, body, _live, messages\);/,
-    "the late-adopt path must remain as the fallback for a verdict that misses the window");
+    "the late-adopt path must remain — after the wait was removed it is the only place a verdict lands");
 });
 
 // ---------------------------------------------------------------------------
@@ -1226,7 +1201,10 @@ test("the paint optimization that blanks WebKit is granted, not assumed", () => 
   // Declarations only. Matching every line that mentions the property would also match the
   // comment explaining the gate, which is how a source-grep test ends up passing on its own prose.
   const guarded = APP_CSS.match(/^[^\n/*]*\{[^\n}]*content-visibility: auto[^\n]*$/gm) || [];
-  assert.ok(guarded.length >= 4, "the known content-visibility rules must still be found");
+  // 3 条：.cv-safe .msg / .cv-safe .agent-tool-step,.think-card / .cv-safe .msg.is-streaming…。
+  // 原来是 4 条，第 4 条是 .cv-safe .agent-term-card——2026-09-05 终端卡改成普通
+  // .agent-tool-step 后那条规则删了（终端卡的 content-visibility 由第 2 条覆盖）。
+  assert.ok(guarded.length >= 3, "the known content-visibility rules must still be found");
   for (const rule of guarded) {
     assert.match(rule, /\.cv-safe /,
       `every content-visibility rule must be behind the engine gate: ${rule.trim()}`);
@@ -1411,7 +1389,7 @@ test("the loop stops advertising continuation machinery it does not have", () =>
   // toolReminders 也从 live 移走了（2026-09-02）：它推的是一段 367 字符的**纯静态指令**
   // （零运行时事实），一个 run 里最多重复五次、每次全价。同一句话搬进了 agent_core §4
   // ——走缓存的静态前缀，每一轮都在，成本约十分之一。计数器和 _toolReminderBlock 一起删掉。
-  for (const live of ["planGateNudges", "invalidArgNudges", "verifyNudges"]) {
+  for (const live of ["planGateNudges", "verifyNudges"]) {
     assert.ok((SRC.match(new RegExp("\\b" + live + "\\b", "g")) || []).length > 1, live);
   }
   // 搬走不是删掉：那句话必须真的在**基线层**提示词里（每一轮都加载，不受语义画像路由影响）。

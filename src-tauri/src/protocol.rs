@@ -328,6 +328,32 @@ fn anthropic_stop_sequences(stop: Option<&Value>) -> Option<Vec<String>> {
 /// 模型上自己填一个数 —— 见 `Wire::unsupported`，界面必须把这句话显示出来。
 const ANTHROPIC_DEFAULT_MAX_TOKENS: i64 = 32000;
 
+/// 这条工具结果是不是 harness 自己判的**失败**。
+///
+/// 只认 harness 会写在**整条正文第一位**的那几个标记。锚在开头不是为了省事：
+/// `[ERROR]` 出现在正文中间的情况太多了——README 讲错误处理、日志文件、测试自己打的错误行——
+/// 而那些是**工具成功取回的材料**。以〔外部数据〕抬头开始的正文一律不算：那个抬头说的
+/// 正是「下面是别人写的内容」，内容里带什么标记都不是 harness 的判决。
+fn harness_error_prefix(text: &str) -> bool {
+    let t = text.trim_start();
+    if t.starts_with('〔') {
+        return false;
+    }
+    const MARKS: [&str; 10] = [
+        "[ERROR]",
+        "[BLOCKED",
+        "[DENIED",
+        "[interrupted]",
+        "[未执行]",
+        "[失败]",
+        "[不可用]",
+        "[TIMEOUT]",
+        "[WORKSPACE_GONE]",
+        "[tool-args-invalid]",
+    ];
+    MARKS.iter().any(|m| t.starts_with(m))
+}
+
 fn oai_to_anthropic(body: &Value) -> Result<Value, String> {
     let mut system_parts: Vec<Value> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
@@ -349,11 +375,18 @@ fn oai_to_anthropic(body: &Value) -> Result<Value, String> {
                         .get("tool_call_id")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let block = json!({
+                    let text = oai_content_text(m.get("content"));
+                    // 工具结果的成败原来只活在正文前缀里（[ERROR] / [BLOCKED] / [interrupted]…），
+                    // 翻成 Anthropic 形状时 `is_error` 一直没带上——模型分不清「工具跑了、
+                    // 打印了 [ERROR]」和「harness 没跑成」。判据见 harness_error_prefix。
+                    let mut block = json!({
                         "type":"tool_result",
                         "tool_use_id": tcid,
-                        "content": oai_content_text(m.get("content")),
+                        "content": text,
                     });
+                    if harness_error_prefix(&block["content"].as_str().unwrap_or("")) {
+                        block["is_error"] = json!(true);
+                    }
                     let can_group = messages.last().is_some_and(|last| {
                         last.get("role").and_then(Value::as_str) == Some("user")
                             && last
@@ -1760,5 +1793,62 @@ mod tests {
         for id in PROTOCOLS {
             assert_eq!(Wire::of(Some(id)).id(), id, "PROTOCOLS 里的 {id} 解析不回自己");
         }
+    }
+}
+
+#[cfg(test)]
+mod harness_error_prefix_tests {
+    use super::{harness_error_prefix, oai_to_anthropic};
+    use serde_json::json;
+
+    #[test]
+    fn harness_markers_at_line_start_are_errors() {
+        for m in [
+            "[ERROR] 这个工具执行时抛出异常",
+            "[BLOCKED] 只读模式",
+            "[BLOCKED_COMMAND_BATCH] 这条没有执行",
+            "[interrupted]",
+            "[未执行]",
+            "[失败] 没找到可停止的任务终端",
+            "[不可用] 桌面专用",
+            "[TIMEOUT] 子智能体超时",
+            "[WORKSPACE_GONE] 工作目录不存在",
+            "[tool-args-invalid] 参数缺失",
+            "   [ERROR] 前面有空白也算",
+        ] {
+            assert!(harness_error_prefix(m), "{m:?} 该判成 harness 失败");
+        }
+    }
+
+    #[test]
+    fn material_that_merely_contains_markers_is_not_an_error() {
+        for m in [
+            "文件 README.md:\n[ERROR] 这一节讲错误处理",
+            "命令输出:\n[ERROR] 程序自己打的日志",
+            "〔外部数据〕\n[ERROR] 网页里写的一句",
+            "〔外部数据〕[失败] 别人的文案",
+            "ok",
+            "",
+        ] {
+            assert!(!harness_error_prefix(m), "{m:?} 是材料，不是 harness 的判决");
+        }
+    }
+
+    #[test]
+    fn tool_role_gets_is_error_only_for_harness_failures() {
+        let body = json!({
+            "messages": [
+                {"role": "tool", "tool_call_id": "a", "content": "[ERROR] 这个工具执行时抛出异常，未能完成：boom"},
+                {"role": "tool", "tool_call_id": "b", "content": "文件 x.js:\n[ERROR] 文件里的内容"},
+                {"role": "tool", "tool_call_id": "c", "content": "〔外部数据〕\n[BLOCKED] 网页里写的"}
+            ]
+        });
+        let out = oai_to_anthropic(&body).expect("翻译不该失败");
+        let blocks = out["messages"][0]["content"].as_array().expect("连续的工具结果并进同一个 user 轮");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["is_error"], json!(true), "harness 报的失败要带 is_error");
+        assert!(blocks[1].get("is_error").is_none(), "正文里含 [ERROR] 的成功读取不许被标成失败");
+        assert!(blocks[2].get("is_error").is_none(), "〔外部数据〕抬头之后的标记是别人写的");
+        assert_eq!(blocks[0]["tool_use_id"], json!("a"));
     }
 }
