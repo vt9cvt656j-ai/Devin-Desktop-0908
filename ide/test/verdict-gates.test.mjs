@@ -17,6 +17,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CODE, fnSource, load, loadConst } from "./helpers/source.mjs";
+import { auxEffortFor as _auxEffortFor } from "../src/agent/aux-effort.js";
 
 const intentText = load("_aiIntentText");
 const intentList = load("_aiIntentList", { _aiIntentText: intentText });
@@ -102,6 +103,9 @@ test("缓存与会话状态的准入同判：半份裁决既不缓存也不落�
     const cache = new Map();
     const commits = [];
     const profile = load("_aiIntentProfile", {
+      // 档位封顶搬进了 src/agent/aux-effort.js —— load() 把模块包进块作用域，
+      // 里面的符号看不见，必须显式注进来（本仓库为这类注入清单栽过）。
+      auxEffortFor: _auxEffortFor,
     // 2026-08-27 新增的线路闸：内置提示词不出网关（见 test/ip-does-not-leave-gateway.test.mjs）。
     // 这里桩成恒真，把这条测试隔离在它本来要测的那一层上。
     _ipSafeRoute: () => true,
@@ -334,6 +338,9 @@ test("画像机器的门槛不许写 inTauri：web 构建照样有画像", () =>
 
 test("补全通道缺席才返回 null；工作区取证拿不到就降级成 hasWorkspace:false", async () => {
   const fast = load("_fastRoutingFlags", {
+    // 档位封顶搬进了 src/agent/aux-effort.js —— load() 把模块包进块作用域，
+    // 里面的符号看不见，必须显式注进来（本仓库为这类注入清单栽过）。
+    auxEffortFor: _auxEffortFor,
     // 快通道现在也判 domain（路由旗标的最后一块）：提示词要展开语料域名单，解析侧要
     // 对着真实目录名归一。注入清单是**手工**维护的，漏一个就是整段 ReferenceError——
     // 表现成"这个测试挂了"，而不是"少测一项"。

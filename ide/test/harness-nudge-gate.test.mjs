@@ -10,19 +10,21 @@
 // 这个文件守住那个开关和那份计数真的成立。
 import assert from "node:assert/strict";
 import test from "node:test";
-import { load } from "./helpers/source.mjs";
 // 豁免名单从**源码那一份**来，测试不自己再抄一遍：抄了就会出现「改了源码没改测试、
 // 两边说法不同却全绿」的假绿（本仓库栽过好几次）。
 import { NUDGE_GATE_EXEMPT, TOOL_WINDOW_NUDGES, USER_VOICE_NUDGES } from "../src/agent/nudge-gate.js";
+// 提醒管理器搬进了 agent/nudge-manager.js：这里 import 产品代码做真往返，不再 load() 抠源码
+//（抠源码验得到行为，验不到「这个函数在真实调用链上还在不在」）。
+import { createNudgeManager } from "../src/agent/nudge-manager.js";
 import { SRC } from "./helpers/source.mjs";
 import * as acorn from "acorn";
 
 const mk = (on) => {
   const messages = [{ role: "user", content: "u0" }, { role: "assistant", content: "a0" }];
   const run = {};
-  const push = load("_pushNudge", {
-    messages, run, _nudgeReg: new Map(), _nudgeRank: () => 1, _ORCH_NOTE: "〔编排〕",
-    _nudgeTurnFloor: 0, _harnessNudgesEnabled: () => on, _NUDGE_GATE_EXEMPT: NUDGE_GATE_EXEMPT,
+  const { push } = createNudgeManager({
+    messages, run, orchNote: "〔编排〕", floor: () => 0,
+    isEnabled: () => on, exempt: NUDGE_GATE_EXEMPT,
   });
   return { messages, run, push };
 };
@@ -73,13 +75,17 @@ test("默认是开的——这一版不改任何人的行为", async () => {
 
 // ── 闸只挡劝诫，不许顺手把动态工具编排打断 ─────────────────────────────────
 test("装了工具的那几条不受闸门管——只挡消息的话工具进了窗口却没人说为什么", () => {
-  const { messages, push } = mk(false);   // 闸关掉
-  const before = messages.length;
-  for (const c of TOOL_WINDOW_NUDGES) push(c, `${c}-说明`);
-  assert.equal(messages.length, before + TOOL_WINDOW_NUDGES.length,
-    "这四条旁边都跟着 _applyToolPayloadWindow：工具已经进了这一轮的窗口。"
-    + "只挡消息，模型就会看到工具数组里凭空多出 web_search / package_search 而没有任何理由——"
-    + "那不是少了一条提醒，是动态工具编排整条哑掉。");
+  const { messages, run, push } = mk(false);   // 闸关掉
+  for (const c of TOOL_WINDOW_NUDGES) {
+    push(c, `${c}-说明`);
+    // 逐条看「刚推的这条进没进」：它们都是建议类，同时只留 1 条，后一条会顶掉前一条——
+    // 用最终条数比会把正常淘汰误判成被闸门挡住。
+    assert.equal(messages.at(-1)?.content, `〔编排〕${c}-说明`,
+      "这四条旁边都跟着 _applyToolPayloadWindow：工具已经进了这一轮的窗口。"
+      + "只挡消息，模型就会看到工具数组里凭空多出 web_search / package_search 而没有任何理由——"
+      + "那不是少了一条提醒，是动态工具编排整条哑掉。");
+  }
+  assert.equal(run._nudgeSuppressed, undefined, "豁免的类别不该计入被压制");
   // 而纯劝诫照旧被挡住：这道开关还是那道开关。
   const n = messages.length;
   for (const c of ["stuck", "diag", "buildFix"]) push(c, "x");

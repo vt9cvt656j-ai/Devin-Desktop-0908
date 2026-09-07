@@ -16,6 +16,11 @@ export function parseSkillDocument(text, sourcePath) {
   let name = parts.length > 1 ? parts[parts.length - 2] : "Skill";
   let desc = "";
   let tools = [];
+  // Agent Skills 规范里另外两个键：
+  //   disable-model-invocation: true → 只有用户敲 /名字 才触发，模型目录里不列（零上下文开销）；
+  //   argument-hint → 选择器里提示 /名字 后面该跟什么。
+  let userInvoked = false;
+  let argumentHint = "";
   const frontmatter = prompt.match(/^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/);
   if (frontmatter) {
     /*
@@ -33,7 +38,7 @@ export function parseSkillDocument(text, sourcePath) {
     const lines = frontmatter[1].split("\n");
     const indentOf = (s) => (s.match(/^[ \t]*/) || [""])[0].length;
     for (let i = 0; i < lines.length; i++) {
-      const match = lines[i].match(/^([ \t]*)(name|description|allowed-tools|allowedtools)[ \t]*:[ \t]*(.*?)[ \t]*$/i);
+      const match = lines[i].match(/^([ \t]*)(name|description|allowed-tools|allowedtools|disable-model-invocation|disablemodelinvocation|argument-hint|argumenthint)[ \t]*:[ \t]*(.*?)[ \t]*$/i);
       if (!match) continue;
       const keyIndent = match[1].length;
       const key = match[2].toLowerCase().replace(/-/g, "");
@@ -75,6 +80,8 @@ export function parseSkillDocument(text, sourcePath) {
       if (key === "allowedtools" && value) {
         tools = value.split(/[,\n]/).map((v) => v.replace(/^[-\s]+/, "").trim()).filter(Boolean).slice(0, 32);
       }
+      if (key === "disablemodelinvocation") userInvoked = /^(true|yes|on|1)$/i.test(value);
+      if (key === "argumenthint" && value) argumentHint = value.replace(/\s+/g, " ").trim().slice(0, 160);
     }
   }
   if (!desc) {
@@ -115,6 +122,8 @@ export function parseSkillDocument(text, sourcePath) {
     sourcePath: normalizedPath,
     baseDir: normalizedPath.slice(0, normalizedPath.lastIndexOf("/")) || ".",
     ...(tools.length ? { tools } : {}),
+    ...(userInvoked ? { userInvoked: true } : {}),
+    ...(argumentHint ? { argumentHint } : {}),
     _readonly: true,
   };
 }

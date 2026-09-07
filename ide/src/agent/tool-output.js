@@ -21,7 +21,22 @@
  * 段长没有任何计数或字节闸，10 个并行 read 就是 600,000 字进一轮上下文。上游只剩两道
  * 数量级之外的兜底（整条 transcript 10M、请求体 3.5MB），600,000 两道都过。
  */
-export const TURN_TOOL_RESULTS_MAX_CHARS = 200_000;
+// 200_000 是当初为了止住「10 个并行 read = 600,000 字」加的闸。它**止住了灾难，但从来
+// 没按延迟调过** —— 200,000 字符 ≈ 55,000 token，而线上实测每一轮真正追加多少：
+//
+//     p50 2,554 / p75 6,048 / p90 13,782 / p99 68,627 / max 108,811 token（1446 步）
+//
+// 也就是说旧闸只在 **p99 以上**才生效，等于没有上限。而那条肥尾不是一次性的：一轮灌进去
+// 68k token，这个会话**剩下的每一个请求**都要把它再驮一遍（压缩刻意攒着不做，为的是保
+// 前缀缓存；最近 8 条还不折）。线上一个请求 21万–57万字节里约 82% 是这样攒出来的历史，
+// 而首字延迟 6~14 秒的大头正是它。
+//
+// 60_000 ≈ 16,700 token，刚好落在 p90 之上：**十轮里九轮逐字节不变**（不碰 p90 以下的
+// 任何一轮，前缀缓存照旧全命中），只钳住最差的那约 8%。
+//
+// 收紧不销毁证据：超出的部分由 `makeOverflowSink` 整份落盘、回执里给出路径，模型要就取。
+// 每条结果的地板 PER_RESULT_FLOOR 仍是 1,200 字，10 条并行读也各有 6,000 字可用。
+export const TURN_TOOL_RESULTS_MAX_CHARS = 60_000;
 
 /** 每条结果无论如何都要留下的字符数——宁可整轮略超，也绝不让某一条被压成空。 */
 export const PER_RESULT_FLOOR = 1_200;
@@ -120,7 +135,26 @@ export function capTurnToolResults(messages, maxTotal = TURN_TOOL_RESULTS_MAX_CH
     const room = Math.max(120, want - marker.length - note.length);
     const head = Math.max(1, Math.floor(room * 0.5));
     const tail = Math.max(1, room - head);
-    out[i] = { ...list[i], content: orig.slice(0, head) + marker + orig.slice(-tail) + note };
+    // **削了正文就得同时改账。**
+    //
+    // 读取结果的执行事实（覆盖了哪些行、内容签名、完不完整）挂在 `_ideMeta` 上，是在
+    // **产生结果那一刻**记的；而这里的削减发生在**投递前**。原来只换 content、
+    // `_ideMeta` 原样带过去 —— from/to/total/complete 一个字没改。于是账本仍然说
+    // 「这个文件本轮已完整读过」，而模型手上只剩五分之一。
+    //
+    // 三个下游只认这本账、不认正文实际有多长：
+    //   · `_blindOverwritePrecheck` 据此放行整文件重写 —— **盲覆写闸就此哑掉**；
+    //   · 压缩期的同版本读取去重会拿这条被削的去顶掉完整的那条；
+    //   · `_syncRunReadCoverageFromMessages` 重建覆盖时把它算成完整覆盖。
+    //
+    // 「正文不在上下文里了就置 contextAvailable:false」本来就是这套账本的既有不变量
+    // （折叠、去重两处都在用）。这里是唯一一个削正文却不参与它的裁剪器，补上即可，
+    // 不新增字段、不新增语义。
+    const _clipped = { ...list[i], content: orig.slice(0, head) + marker + orig.slice(-tail) + note };
+    if (_clipped._ideMeta && typeof _clipped._ideMeta === "object") {
+      _clipped._ideMeta = { ..._clipped._ideMeta, contextAvailable: false };
+    }
+    out[i] = _clipped;
   }
   return out;
 }
@@ -151,19 +185,33 @@ export function overflowNote(path, total, delivered) {
 }
 
 /**
- * @param {{writeText:(p:string,t:string)=>unknown, dir:string, minOmitted?:number}} io
+ * 不管丢了多少都要落盘的结果种类。
+ *
+ * 命令输出的上限是 8k、落盘地板是 12k：一条 8k–20k 的命令输出会被掐掉中间**又不落盘**，
+ * 而注记里那句「用 read_file 取回剩下的」对命令来说等于**重跑一遍**——正是那条注记自己
+ * 警告的事（可能有副作用、而且重跑还会被同样截断）。读文件不一样：丢几百字用 offset/limit
+ * 再读一次就是了。所以按种类分：命令一类只要丢了字就落盘。
+ */
+export const ALWAYS_PERSIST_KINDS = new Set(["cmd", "termtask", "termread"]);
+
+/**
+ * @param {{writeText:(p:string,t:string)=>unknown, dir:string, minOmitted?:number, alwaysPersistKinds?:Set<string>}} io
  * @returns {(raw:string, deliveredLen:number, kind:string)=>string} 要追加的正文；不落盘时空串
  */
 export function makeOverflowSink(io) {
   const dir = String(io?.dir || "").replace(/[\\/]+$/, "");
   const write = io?.writeText;
   const floor = Number.isFinite(io?.minOmitted) ? io.minOmitted : OVERFLOW_MIN_OMITTED_CHARS;
+  const always = io?.alwaysPersistKinds instanceof Set ? io.alwaysPersistKinds : ALWAYS_PERSIST_KINDS;
   let seq = 0;
   return (raw, deliveredLen, kind) => {
     const text = String(raw ?? "");
     const delivered = Math.max(0, Number(deliveredLen) || 0);
+    const omitted = text.length - delivered;
+    if (!dir || typeof write !== "function" || omitted <= 0) return "";
     // 只在**真丢了一大块**时才落盘：丢几百字不值得写一个文件，而首尾预览已经把差额说清了。
-    if (!dir || typeof write !== "function" || text.length - delivered < floor) return "";
+    // 例外是 ALWAYS_PERSIST_KINDS：那些种类「再取一次」的代价是重跑命令，丢多少都落盘。
+    if (omitted < floor && !always.has(String(kind || ""))) return "";
     const tag = String(kind || "out").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || "out";
     const path = `${dir}/tool-${String(++seq).padStart(4, "0")}-${tag}.txt`;
     try { void write(path, text); } catch { return ""; }   // 写不出去就不许承诺路径

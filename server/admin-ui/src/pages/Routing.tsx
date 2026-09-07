@@ -1226,6 +1226,9 @@ function ConnectionDialog({
           // 判据是「填了没有」，不是「填的是不是正数」：入价出价都填 0 = 这个模型一分不收，
           // 是一种**有意的定价**，必须原样发给后端。按 >0 过滤会把它整个丢掉，
           // 后端看不到覆盖就落回官方目录价 —— 运维以为开了免费线路，用户照样被扣钱。
+          //
+          // admin_update 是**整体替换**，不是 merge——只保留有手填价的模型，
+          // 其它的不出现就等于清掉旧覆盖，自动跟随目录现价。
           model_prices: Object.fromEntries(
             on
               .filter((r) => priceNum(r.pin) !== null && priceNum(r.pout) !== null)

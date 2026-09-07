@@ -137,7 +137,7 @@ impl Config {
             redis_url: opt("REDIS_URL", "redis://127.0.0.1:6379"),
             jwt_secret: jwt_secret()?,
             bind_addr: opt("BIND_ADDR", "0.0.0.0:8080"),
-            db_max_connections: opt("DB_MAX_CONNECTIONS", "20").parse().unwrap_or(20),
+            db_max_connections: opt("DB_MAX_CONNECTIONS", "50").parse().unwrap_or(50),
             // 显式写 1/true 才开。缺省缺失都按关处理（fail-closed）。
             compression_enabled: matches!(
                 opt("MICHAEL_COMPRESSION_ENABLED", "0").trim().to_ascii_lowercase().as_str(),

@@ -47,6 +47,9 @@ pub mod browser;
 /// 人类化输入运动学（纯函数：轨迹 + 敲键节奏），browser 那套 CDP 输入用它。
 pub mod human_input;
 
+/// 截图缩放、坐标换算与 Set-of-Marks 编号框。纯函数，不碰 Agent。
+pub mod vision;
+
 #[cfg(feature = "system")]
 pub mod system;
 

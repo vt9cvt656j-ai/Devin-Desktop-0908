@@ -97,6 +97,7 @@ async fn fetch_ids(http: &reqwest::Client, base_url: &str, key: &str) -> Result<
         .get(&url)
         .header("authorization", format!("Bearer {key}"))
         .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
         .send()
         .await
         // 不回显 reqwest 的原文：它带完整 URL，而有些转卖商要求密钥写在查询串里。
@@ -111,15 +112,7 @@ async fn fetch_ids(http: &reqwest::Client, base_url: &str, key: &str) -> Result<
     }
     let text = resp.text().await.unwrap_or_default();
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| "返回的不是 JSON".to_string())?;
-    let ids: Vec<String> = v
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids: Vec<String> = crate::models::parse_model_ids(&v);
     if ids.is_empty() {
         // 200 但一款都没有：多半是返回结构不一样，不是真的空。当作没问成。
         return Err("清单是空的（返回结构可能不同）".into());

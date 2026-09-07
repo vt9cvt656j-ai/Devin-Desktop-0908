@@ -923,6 +923,79 @@ pub async fn verify_code(
     Ok(Json(json!({ "token": token, "user": user })))
 }
 
+#[derive(Deserialize)]
+pub struct ResetPasswordReq {
+    pub email: String,
+    pub code: String,
+    pub password: String,
+    /// See `LoginReq::device`.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// See `LoginReq::device_id`.
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+/// `POST /api/auth/reset-password` — 用邮箱验证码给**已有**账号设一个新密码，并当场登录。
+///
+/// 在这之前产品里没有任何一条改密码的路：注册对已存在的邮箱直接拒绝，登录只认旧密码，
+/// 第三方登录建的账号密码是空的。忘了密码的人只能找管理员去数据库里改——2026-09-05 真的
+/// 发生了一次。这条路复用发码 / 验码那套预算（每码 5 次、每小时 20 次、每天 12 封）和
+/// 注册用的 bcrypt 成本，不另立一套。
+///
+/// 顺序是安全属性：先查账号存不存在、再消费验证码——和 register 同一个理由，别把重试者的
+/// 码烧掉；「尚未注册」这条消息和 verify_code 一致，而 check-email 本来就公开这件事。
+///
+/// 密码换了 = 这个人此刻在场。**其它设备上的登录一律作废**：丢密码的常见原因是设备丢了，
+/// 不作废的话拿着旧令牌的人照样能用 30 天。本次请求随后 start_session 开一条新会话，
+/// 所以调用方自己不会被登出。登录失败计数也一并清掉，否则刚重置完还被锁着。
+pub async fn reset_password(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ResetPasswordReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !valid_email(&req.email) {
+        return Err(AppError::bad("邮箱格式不正确"));
+    }
+    if req.password.len() < 6 {
+        return Err(AppError::bad("密码至少 6 位"));
+    }
+    let user = find_user(&state, &req.email)
+        .await?
+        .ok_or_else(|| AppError::bad("该邮箱尚未注册，请先注册"))?;
+    if !take_code(&state, &req.email, &req.code).await? {
+        return Err(AppError::bad("验证码错误或已过期"));
+    }
+    let hash = bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)?;
+    sqlx::query(
+        "UPDATE users SET password_hash = $1, updated_at = now(), last_login_at = now() WHERE id = $2",
+    )
+    .bind(&hash)
+    .bind(user.id)
+    .execute(&state.db)
+    .await?;
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL")
+        .bind(user.id)
+        .execute(&state.db)
+        .await?;
+    {
+        let mut conn = state.redis.clone();
+        let _: Result<(), _> = redis::cmd("DEL")
+            .arg(format!("login_fail:{}", normalize_email(&req.email)))
+            .query_async(&mut conn)
+            .await;
+    }
+    let token = start_session(&state, &user, &headers, req.device.as_deref(), req.device_id.as_deref()).await?;
+    crate::realtime::record_event(
+        &state,
+        Some(user.id),
+        "password_reset",
+        json!({ "email": user.email }),
+    )
+    .await;
+    Ok(Json(json!({ "token": token, "user": user })))
+}
+
 /// `GET /api/authz` —— nginx `auth_request` 的目标。204 = 已登录，401 = 没登录。
 ///
 /// ## 为什么必须和 /api/me 分开
@@ -1124,6 +1197,14 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
         obj.insert(
             "free_points_daily_member".into(),
             json!(crate::models::free_points_daily_member()),
+        );
+        // 一个点值多少人民币分。客户端拿它把点数写成钱 —— 不发的话它只能自己写死一个
+        // 数字，而那正是刚踩过的坑：客户端硬编码 ¥0.05/点，后台设定却是 ¥0.01/点
+        // （100 积分 = ¥1），界面上的钱数一直比真实值大 5 倍。
+        // 加字段，老客户端忽略它（和 free_fallback_to_paid / raw_cents_per_credit_usd 同一类下发）。
+        obj.insert(
+            "cny_cents_per_point".into(),
+            json!(crate::models::CNY_CENTS_PER_POINT),
         );
         obj.insert(
             "michael_compression".into(),
@@ -1514,6 +1595,64 @@ pub async fn delete_user(
         return Err(AppError::bad("用户不存在"));
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod password_reset_tests {
+    /// 「忘记密码」这条路的不变式，守在源码上（这里没有 DB / Redis 的集成台，和本文件
+    /// 其它守卫一个做法）。
+    #[test]
+    fn reset_route_is_registered() {
+        let main_src = include_str!("main.rs");
+        assert!(
+            main_src.contains(".route(\"/api/auth/reset-password\", post(auth::reset_password))"),
+            "reset-password 没挂到路由表——功能写了等于没写",
+        );
+    }
+
+    #[test]
+    fn reset_checks_the_account_before_burning_the_code_and_revokes_other_sessions() {
+        let src = include_str!("auth.rs");
+        let at = src.find("\npub async fn reset_password(").expect("reset_password 改名了");
+        let end = src[at + 1..]
+            .find("\npub async fn ")
+            .map(|i| at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[at..end];
+        let find_at = body.find("find_user(").expect("必须先查账号");
+        let take_at = body.find("take_code(").expect("必须消费验证码");
+        assert!(
+            find_at < take_at,
+            "先消费验证码再查账号：账号不存在也把重试者的码烧掉了（register 踩过同一个坑）",
+        );
+        assert!(
+            body.contains("bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)"),
+            "散列成本要和注册一致",
+        );
+        assert!(
+            body.contains("UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL"),
+            "换密码没有作废其它设备的登录——丢了设备的人换完密码，旧令牌还能用 30 天",
+        );
+        assert!(body.contains("start_session("), "重置完要当场登录，否则用户还得再输一遍");
+        assert!(body.contains("req.password.len() < 6"), "密码下限要和注册一致");
+        assert!(body.contains("\"password_reset\""), "要进事件流，管理台才看得到");
+    }
+
+    /// 两个登录入口都要有「忘记密码」：网页登录页、桌面端登录框。缺一个，那个入口上的人
+    /// 就只能找管理员——这条路存在的全部理由。
+    #[test]
+    fn every_sign_in_surface_offers_the_reset_path() {
+        let gate = include_str!("../../ide/gate/gate.html");
+        assert!(gate.contains("/api/auth/reset-password"), "网页登录页没有接重置接口");
+        assert!(gate.contains("id=\"resetForm\""), "网页登录页没有重置表单");
+        let shell = include_str!("../../ide/src/app/Shell.jsx");
+        assert!(shell.contains("id=\"loginForgotBtn\""), "桌面端登录框没有「忘记密码」入口");
+        let main_js = include_str!("../../ide/src/main.js");
+        assert!(
+            main_js.contains("_michaelAuth(\"reset-password\""),
+            "桌面端没有调用重置接口",
+        );
+    }
 }
 
 #[cfg(test)]

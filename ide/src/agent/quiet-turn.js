@@ -87,8 +87,17 @@ export function decideQuietTurn(f) {
     labels.push("new_diagnostics_unresolved");
   }
 
+  // 「推过一次、而那一轮模型没有产生任何新的成功编辑」＝ 这条提醒没起作用。
+  //
+  // 再推一次，模型收到的是**一模一样**的那句话，它只能把答案换个说法重写，然后撞到连续
+  // 静默 2 轮才收尾 —— 白烧一整个付费轮（线上一轮 54k token、首字 6~14 秒）。
+  // 判定不开火，就该收尾。这条规则 ① 诊断门早就有了（见上面那段注释记的那次事故），
+  // ②③ 一直没接：于是「构建修不好」和「计划做不下去」各自还能白烧两轮。
+  const wentNowhere = (nudges) => (nudges || 0) >= 1 && !(f.lastSuccessfulEdits > 0);
+
   // ② 红构建：模型**自己声明为验证**的命令退出码非零。观测到失败，是「已完成」为假的直接证据。
   if (f.buildFail) {
+    if (wentNowhere(f.buildFixAttempts)) { labels.push("build_failing"); return nope(); }
     if (canResume && (f.buildFixAttempts || 0) < 2) {
       counters.buildFixAttempts = (f.buildFixAttempts || 0) + 1;
       counters.quietResumePool = pool - 1;
@@ -102,6 +111,7 @@ export function decideQuietTurn(f) {
   // 而上面三条门没有一条读计划。有界（2 次，和另外两道门对齐——全局池只有 3）。
   const pending = Number(f.pendingPlanSteps) || 0;
   if (pending > 0 && f.planActionable) {
+    if (wentNowhere(f.planFinishNudges)) { labels.push(`plan_steps_pending:${pending}`); return nope(); }
     if (canResume && (f.planFinishNudges || 0) < 2) {
       counters.planFinishNudges = (f.planFinishNudges || 0) + 1;
       counters.quietResumePool = pool - 1;

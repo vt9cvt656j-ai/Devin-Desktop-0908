@@ -91,6 +91,19 @@ export const _TOOL_ALIASES = {
   readterminal: "read_terminal", get_terminal_output: "read_terminal", tail_terminal: "read_terminal",
   readlogs: "read_logs", read_log: "read_logs", get_logs: "read_logs", tail_logs: "read_logs", log_reader: "read_logs",
   listterminals: "list_terminals", list_tasks: "list_terminals", running_terminals: "list_terminals",
+  // 生产 30 天回执里模型编出来、归一化落空的名字（model_usage.emitted_tool 对照 tools.json
+  // 逐个跑过 _canonicalToolName）：pwsh 34 次、CheckCommandStatus 14、Task 3、StopCommand 2、
+  // terminate_terminal / get_weather / browser_navigate / browser_action 各 1。落空 = 模型收到
+  // 「未知工具」再重发，一整轮白烧。
+  // 键写成**归一化之后**的形状（小写、CamelCase 已拆成下划线），所以 CheckCommandStatus 在这里
+  // 是 check_command_status。只指向语义无歧义的目标；OpenPreview / job_list 这类没有对应工具的
+  // 故意不写——宁可让模型收到「未知工具 + 最接近的候选」，也不能静默执行错的工具。
+  pwsh: "run_cmd", powershell: "run_cmd", power_shell: "run_cmd", run_code: "run_cmd", execute_code: "run_cmd", code_exec: "run_cmd",
+  check_command_status: "read_terminal", command_status: "read_terminal", get_command_output: "read_terminal", read_command_output: "read_terminal",
+  task: "run_subagent", agent: "run_subagent", dispatch_agent: "run_subagent", spawn_agent: "run_subagent",
+  stop_command: "stop_terminal", terminate_terminal: "stop_terminal", kill_terminal: "stop_terminal", close_terminal: "stop_terminal",
+  get_weather: "live_environment", weather: "live_environment", weather_forecast: "live_environment",
+  browser_navigate: "browser", browser_action: "browser", browser_click: "browser", browser_screenshot: "browser", navigate: "browser", goto: "browser", open_page: "browser", open_browser: "browser",
 };
 
 /** 编辑距离，长度差 >2 直接返回 3（调用方的阈值是 <3，早退省一趟 DP）。 */

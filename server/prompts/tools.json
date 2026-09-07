@@ -3474,7 +3474,7 @@
     "type": "function",
     "function": {
       "name": "read_screen",
-      "description": "Read the accessibility tree of an application: role, name, value, enabled state and screen coordinates of each element. A browser exposes its rendered page too (links, buttons, fields, text), which is how you operate the user's own already-running browser: read here, then act by ref with ui_click — nothing with an AX action needs coordinates. By default it reads the frontmost app; pass app or pid to read one that is not in front (for instance when the front window is Mr. Day One) without stealing focus. An empty result names its cause (permission missing / read incomplete / windows minimized / the app exposes nothing); only the last means a retry is pointless.",
+      "description": "Read the accessibility tree of an application: role, name, value, enabled state and screen coordinates of each element. A browser exposes its rendered page too (links, buttons, fields, text), which is how you operate the user's own already-running browser: read here, then act by ref with ui_click — nothing with an AX action needs coordinates. By default it reads the frontmost app; pass app or pid to read one that is not in front (for instance when the front window is Mr. Day One) without stealing focus. An empty result names its cause (permission missing / read incomplete / windows minimized / the app exposes nothing); only the last means a retry is pointless. By default the result also carries a screenshot in which each element's ref is drawn as a numbered box (only elements actually visible on screen are boxed), and that image is the coordinate reference for computer.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3489,6 +3489,10 @@
           "pid": {
             "type": "integer",
             "description": "Read the app with this process id; wins over app when both are given."
+          },
+          "image": {
+            "type": "boolean",
+            "description": "default true: also return the screenshot with refs drawn as numbered boxes; false for a cheaper re-read (elements only)."
           }
         },
         "required": []
@@ -3928,7 +3932,7 @@
     "type": "function",
     "function": {
       "name": "automation",
-      "description": "Desktop automation RPC: real OS mouse and keyboard events, a CDP browser, and record/replay. Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) → the browser tool, which addresses elements by node number and is more reliable and cheaper than pixels. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → this tool. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser — re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. Call system.init before anything else the first time. Use it as a state machine: confirm the precondition first (URL, window, node, sign-in state), then perform the action, then verify the postcondition with browser.content / browser.eval / screen.capture or the recorder result — issuing a click or some typing is not the same as succeeding. When a selector goes stale, re-read the page/nodes; when navigation is slow, wait and then check the URL/DOM; when sign-in, a captcha or a system permission blocks you, state the specific blocker and continue via background monitoring. Read screen.info first: when input_permission says denied, macOS silently discards every synthetic mouse and keyboard event while the calls still return ok — switch to browser, shell or file tools and tell the user to grant Accessibility in System Settings. screen.info, read_screen, window.list and mouse.move share one coordinate space (screen points, origin top-left): pass those numbers straight through and never multiply by scale_factor. Methods: system.init / mouse.move / mouse.click{x,y,button} (moves and clicks in one call and reports the position it acted at) / mouse.double_click / mouse.position / mouse.drag{from_x,from_y,to_x,to_y} / mouse.scroll{delta_y} / sleep{ms} / keyboard.type{text} / keyboard.press{key} / keyboard.combo{keys:[mod,s]} (mod = Cmd on macOS, Ctrl on Windows; write win only for the Windows key) / keyboard.down / keyboard.up / keyboard.paste{text} (use it for long text) / browser.* (browser.start, goto, click, type, wait, eval, screenshot, content, close — routed to the browser tool: there is one browser and one sign-in state, so call browser directly) / recorder.save / recorder.replay / recorder.list / window.list / window.activate{title} / window.minimize{title} / window.restore{title} (both confirmed by read-back) / screen.info / screen.capture{x,y,width,height} (real screen pixels, the whole screen when all four are omitted — the only way to see native apps, games, video or PDFs; browser.screenshot captures only the CDP page) / clipboard.get / clipboard.set{text}. browser.start profile: isolated (default, a clean throwaway instance) for public pages and your own dev server; session (persistent, keeps its sign-ins) when the task needs the user signed in — if it still hits a login wall, start again with headless=false so the user signs in once. The account in the user's own everyday browser is unreachable from any CDP instance: go through system open → read_screen → ui_click. Before driving another application, find its window with window.list and bring it to the front with window.activate. The browser.* methods here are routed to the browser tool — there is one browser and one sign-in state, so call browser directly.",
+      "description": "Deprecated alias of computer: same actions, same coordinate rules — new calls use computer. Kept for older conversations, and for raw sidecar methods that have no computer action (method + params in screen points: browser.*, recorder.*, system.init, sleep).",
       "parameters": {
         "type": "object",
         "properties": {
@@ -4168,48 +4172,111 @@
     "type": "function",
     "function": {
       "name": "computer",
-      "description": "Desktop mouse, keyboard, window, screen and clipboard operations for native (non-browser) applications. Get the real state first with window.list / screen.info, act, then verify with read_screen (nodes) or screen.capture (real pixels). Elements that expose an accessibility action are better driven by read_screen + ui_click; use these for what has none — native dialogs, drag-and-drop, key combinations. For web pages use browser, except the user's own already-running browser, which is reached via system open → read_screen → ui_click. The separate screenshot tool only renders an http/https URL and never sees a native app.",
+      "description": "Drive the desktop the way a person at the screen would: look, act, look again. screenshot returns a scaled image of the whole screen; every coordinate you pass is a pixel of the LAST screenshot or read_screen image you received (origin top-left) — the host converts it to screen points, so never scale or guess coordinates, and take a screenshot before the first click. Prefer read_screen + ui_click for anything that has an accessibility ref (the numbered boxes in the read_screen image ARE those refs); use coordinates for what has none: canvas, games, custom-drawn controls, drag-and-drop, native dialogs. Use it as a state machine: confirm the precondition first (window in front, element visible, sign-in state), act, then verify the postcondition with screenshot or read_screen — issuing a click or some typing is not the same as succeeding. When an element moved or a ref went stale, re-read the screen instead of retrying blind; when sign-in, a captcha or a system permission blocks you, name the blocker and hand that step to the user. Target lives INSIDE a web page (DOM nodes, forms, buttons, text) → the browser tool, which addresses elements by node number and is cheaper and more reliable than pixels. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → this tool; the user's own already-running browser is reached with read_screen → ui_click. Both drive the same browser brand (one setting decides for both). Do not reach for computer just because a click failed in browser — re-read the nodes first; and do not drive a web page through computer coordinates when browser can address it by node.",
       "parameters": {
         "type": "object",
         "properties": {
-          "method": {
+          "action": {
             "type": "string",
             "enum": [
-              "mouse.click",
-              "mouse.double_click",
-              "mouse.triple_click",
-              "mouse.down",
-              "mouse.up",
-              "mouse.move",
-              "mouse.position",
-              "mouse.drag",
-              "mouse.scroll",
-              "keyboard.type",
-              "keyboard.press",
-              "keyboard.combo",
-              "keyboard.down",
-              "keyboard.up",
-              "keyboard.hold",
-              "keyboard.paste",
-              "screen.info",
-              "screen.displays",
-              "screen.capture",
-              "clipboard.get",
-              "clipboard.set",
-              "window.list",
-              "window.activate",
-              "window.minimize",
-              "window.restore"
+              "screenshot",
+              "zoom",
+              "left_click",
+              "right_click",
+              "middle_click",
+              "double_click",
+              "triple_click",
+              "left_click_drag",
+              "mouse_move",
+              "left_mouse_down",
+              "left_mouse_up",
+              "cursor_position",
+              "scroll",
+              "type",
+              "key",
+              "hold_key",
+              "wait",
+              "paste",
+              "screen_info",
+              "window_list",
+              "window_activate",
+              "window_minimize",
+              "window_restore",
+              "clipboard_get",
+              "clipboard_set",
+              "recorder_save",
+              "recorder_replay",
+              "recorder_list"
             ],
-            "description": "The desktop action. screen.capture returns real screen pixels as an image (the whole screen when x/y/width/height are all omitted; give all four or none) — the only way to see native apps, games, video or PDFs."
+            "description": "screenshot: the screen (max_side to change its size). zoom: region [x0,y0,x1,y1] of the last screenshot at full resolution, for reading small text; coordinates stay in the full-screenshot space. Clicks take coordinate (omit to click where the pointer is) and text as held modifiers (\"cmd\", \"shift+alt\"). left_click_drag: start_coordinate → coordinate. scroll: scroll_direction + scroll_amount at coordinate. type: text verbatim. key: one key or a combo (\"Return\", \"cmd+s\", \"ctrl+shift+p\"), repeat to press it n times. hold_key: text + duration seconds. wait: duration seconds (max 60). paste: put text on the clipboard and paste it (fast for long text). window_activate / window_minimize / window_restore: title from window_list. clipboard_get / clipboard_set {text}. recorder_save / recorder_replay {name}, recorder_list."
           },
-          "params": {
-            "type": "object",
-            "description": "Action parameters. Clicks: {x,y} (omit to click where the pointer is), {button:\"left|right|middle\"}, {keys:[\"cmd\",\"shift\"]} to hold modifiers for the click (shift-click range select, cmd-click multi-select or open in a new tab, alt-drag copy). mouse.triple_click selects a line/paragraph. mouse.down/up hold a press you release yourself (sliders, rubber-band selection, dragging between applications). mouse.scroll: {delta_y} (positive = down), optional {delta_x} and {x,y} for the pane under the pointer. keyboard.hold: {key, ms} (default 500, max 10000). keyboard.combo: {keys:[...]}. screen.displays lists every monitor in the same global coordinates (screen.info describes only the main one). Others: {title}, {text}."
+          "coordinate": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 2,
+            "maxItems": 2,
+            "description": "[x, y] in pixels of the last screenshot"
+          },
+          "start_coordinate": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 2,
+            "maxItems": 2,
+            "description": "left_click_drag: where the drag starts"
+          },
+          "text": {
+            "type": "string",
+            "description": "type / paste / clipboard_set: the text; key / hold_key: the key; clicks, drag, scroll: modifiers to hold"
+          },
+          "scroll_direction": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ]
+          },
+          "scroll_amount": {
+            "type": "integer",
+            "description": "scroll clicks, default 3"
+          },
+          "duration": {
+            "type": "number",
+            "description": "seconds, for wait / hold_key"
+          },
+          "region": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 4,
+            "maxItems": 4,
+            "description": "zoom: [x0, y0, x1, y1] in pixels of the last screenshot"
+          },
+          "repeat": {
+            "type": "integer",
+            "description": "key: press it this many times (max 100)"
+          },
+          "title": {
+            "type": "string",
+            "description": "window_activate / window_minimize / window_restore: the window title"
+          },
+          "name": {
+            "type": "string",
+            "description": "recorder_save / recorder_replay: the recording name"
+          },
+          "max_side": {
+            "type": "integer",
+            "description": "screenshot / zoom: longest side in pixels (default 1280; 0 = original pixels)"
           }
         },
         "required": [
-          "method"
+          "action"
         ]
       }
     }

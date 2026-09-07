@@ -18,7 +18,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource, decodeXd } from "./helpers/source.mjs";
 // truthfulness.txt 拆成了 truth_core（每轮必带的证据纪律）+ no_flattery（反谄媚；chat/plan/explorer/reviewer 常驻，agent 用 load_guide 自取）。
 const TRUTH = readFileSync(join(HERE, "..", "..", "server", "prompts", "no_flattery.txt"), "utf8");
 const TRUTH_CORE = readFileSync(join(HERE, "..", "..", "server", "prompts", "truth_core.txt"), "utf8");
@@ -31,12 +31,12 @@ function fnBody(name, len = 1400) {
   return RAW_SRC.slice(i, i + len);
 }
 
-/** 本地兜底那条共用尾巴——五个模式都拼它。 */
+/** 本地兜底那条共用尾巴——五个模式都拼它。值已做 XOR 编码，这里解码后检查。 */
 function fallbackTail() {
-  const i = RAW_SRC.indexOf("_HUMAN_EVIDENCE_FALLBACK = `");
-  assert.ok(i >= 0, "共用尾巴不见了：五个模式会一起失去这条约束");
-  const j = RAW_SRC.indexOf("`;", i);
-  return SRC.slice(i, j);
+  const re = /_HUMAN_EVIDENCE_FALLBACK\s*=\s*_xd\("([A-Za-z0-9+/=]+)"\)/;
+  const m = RAW_SRC.match(re);
+  assert.ok(m, "共用尾巴不见了：五个模式会一起失去这条约束");
+  return decodeXd(m[1]);
 }
 
 test("网关提示词里必须有反谄媚这一节", () => {

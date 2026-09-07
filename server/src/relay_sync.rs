@@ -426,6 +426,8 @@ async fn check_margin_after_change(
         output_per_mtok: f64,
         cached_per_mtok: Option<f64>,
         cache_write_per_mtok: Option<f64>,
+        per_request: Option<f64>,
+        calls: i64,
     }
     // 只算**这个出口**过去 7 天真的跑过、而且现在有自动价的模型。
     // 没跑过的模型涨价不影响任何东西，把它算进来只会稀释判据。
@@ -445,7 +447,8 @@ async fn check_margin_after_change(
         // 老行没有这一位（NULL）时的兜底和对账同源：`cached > prompt` 就说明 prompt 不含它。
         "SELECT u.revenue_micro_usd AS revenue_micro, u.prompt_tokens, u.completion_tokens, \
                 u.cached_tokens, u.cache_write_tokens, \
-                p.input_per_mtok, p.output_per_mtok, p.cached_per_mtok, p.cache_write_per_mtok \
+                p.input_per_mtok, p.output_per_mtok, p.cached_per_mtok, p.cache_write_per_mtok, \
+                p.per_request, u.calls \
          FROM ( \
              SELECT endpoint_id, model_id, SUM(revenue_micro_usd)::bigint AS revenue_micro_usd, \
                     SUM(CASE WHEN COALESCE(prompt_includes_cached, \
@@ -454,7 +457,8 @@ async fn check_margin_after_change(
                              ELSE GREATEST(prompt_tokens, 0) END)::bigint AS prompt_tokens, \
                     SUM(completion_tokens)::bigint AS completion_tokens, \
                     SUM(cached_tokens)::bigint AS cached_tokens, \
-                    SUM(cache_creation_tokens)::bigint AS cache_write_tokens \
+                    SUM(cache_creation_tokens)::bigint AS cache_write_tokens, \
+                    COUNT(*)::bigint AS calls \
              FROM endpoint_model_usage WHERE day > current_date - $2::int GROUP BY endpoint_id, model_id \
          ) u \
          JOIN endpoint_auto_price p \
@@ -488,7 +492,12 @@ async fn check_margin_after_change(
             + r.cached_tokens.max(0) as f64 * cache_read_price
             + r.cache_write_tokens.max(0) as f64 * cache_write_price
             + r.completion_tokens.max(0) as f64 * r.output_per_mtok)
-            / 1_000_000.0;
+            / 1_000_000.0
+            // 上游**按次**收的钱。单位是美元/次，不除以一百万。
+            // 不读这一位的话，一条 input/output 都是 0、只按次计价的出口成本恒为 0 →
+            // 毛利恒等于收入的 100% → 这道自动止血闸对它**结构性哑掉**：亏到底也不会停。
+            // 线上 366 条自动价里有 32 条正是这种形状。
+            + r.calls.max(0) as f64 * r.per_request.unwrap_or(0.0);
     }
 
     let (guard, floor): (bool, f64) = sqlx::query_as(

@@ -98,7 +98,11 @@ export function Settings() {
   const [confirmDenom, setConfirmDenom] = useState(false);
   const [confirmText, setConfirmText] = useState("");
   /** 两档共用一个换算：1 点 = raw_cents_per_point 真实计费分（服务端下发的只读常量）。 */
+  // 每日赠送折成多少真实计费分。换算由服务端推导后下发（100 积分 = ¥1 + 后台汇率），
+  // 前端不再自己假设一个点价 —— 那正是两边会漂开的地方。
   const dailyCost = (points: number) => cents(Math.round(points * live.raw_cents_per_point));
+  /** 每日赠送折成人民币，直接说出来：这一屏的数字里只有它是运营真正在决定的。 */
+  const dailyCny = (points: number) => (points * (live.cny_cents_per_point ?? 1) / 100).toFixed(2);
   const freePoints = Number.parseInt(freeInput, 10) || 0;
   const memberTrimmed = memberInput.trim();
   const memberSet = memberTrimmed !== "";
@@ -331,21 +335,21 @@ export function Settings() {
 
               <Hint>
                 非会员当前 <span className="tabular-nums">{live.free_points_daily}</span> 点，
-                每人每天 {dailyCost(live.free_points_daily)} 的真实成本。
+                每人每天 ¥{dailyCny(live.free_points_daily)}（{dailyCost(live.free_points_daily)} 真实成本）。
                 {hasMemberTier &&
                   (live.free_points_daily_member == null ? (
                     <> 会员<strong className="font-medium text-foreground">没单独配</strong>，跟随非会员这一档。</>
                   ) : (
                     <>
                       {" "}会员当前 <span className="tabular-nums">{live.free_points_daily_member}</span> 点，
-                      每人每天 {dailyCost(live.free_points_daily_member)}
+                      每人每天 ¥{dailyCny(live.free_points_daily_member)}（{dailyCost(live.free_points_daily_member)}）
                       {live.free_points_daily_member > live.free_points_daily && (
-                        <>（比非会员每人每天多 {dailyCost(live.free_points_daily_member - live.free_points_daily)}）</>
+                        <>（比非会员每人每天多 ¥{dailyCny(live.free_points_daily_member - live.free_points_daily)}）</>
                       )}
                       。
                     </>
                   ))}
-                {" "}1 点 = {live.raw_cents_per_point} 真实计费分，两档同一个换算。非会员那格
+                {" "}100 积分 = ¥1（1 点 = {live.raw_cents_per_point.toFixed(4)} 真实计费分），两档同一个换算。非会员那格
                 填 0 等于关掉免费额度。
                 {hasMemberTier && (
                   <>
@@ -523,10 +527,14 @@ export function Settings() {
         <Panel title="不在这里改的" bodyClassName="p-5">
           <dl className="grid gap-4 sm:grid-cols-2">
             <div>
-              <dt className="text-sm font-medium">1 点 = {live.raw_cents_per_point} 真实计费分</dt>
+              <dt className="text-sm font-medium">
+                100 积分 = ¥1（1 点 = {live.raw_cents_per_point.toFixed(4)} 真实计费分）
+              </dt>
               <dd className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                编译期常量，由面值和点价手工推导而来。它是每次调用的换算除数，改错会立刻影响所有
-                在线用户的扣费，所以刻意留在代码里。
+                积分就是人民币面值的钱包额度，消耗按 token 走和钱包同一条计价，只在最后一步换算成点。
+                这个换算**不是**手填的常量：由「1 点 = 1 人民币分」和下面那格汇率推导，
+                改汇率它自动跟上。（曾经硬编码成 5 分/点，也就是 1 点 ≈ ¥0.355 —— 比设定大 35 倍，
+                而且汇率改了不会跟。）
               </dd>
             </div>
             <div>

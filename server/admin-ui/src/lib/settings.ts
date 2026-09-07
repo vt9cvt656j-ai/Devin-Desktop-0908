@@ -44,7 +44,12 @@ export type AdminSettings = {
     /** 旧网关不下发。它的**存在与否**就是「这台网关认不认第二档」的探针。 */
     free_points_daily_member?: [number, number];
   };
+  /** 1 点值多少真实计费分。**不再是编译期常量**：由「100 积分 = ¥1」和后台汇率推导。 */
   raw_cents_per_point: number;
+  /** 同一个数换个刻度（micro-USD/点），扣费实际用的就是它。 */
+  micro_usd_per_point?: number;
+  /** 1 点等于多少人民币分。100 积分 = ¥1 → 1。 */
+  cny_cents_per_point?: number;
 };
 
 /** 网关答复之前的兜底，逐字等于改造前的硬编码值——首屏渲染行为不变。 */
@@ -64,7 +69,11 @@ const FALLBACK: AdminSettings = {
   free_points_daily: 40,
   plans: [],
   limits: { raw_cents_per_credit_usd: [1, 100000], free_points_daily: [0, 1000000] },
-  raw_cents_per_point: 5,
+  // 兜底值按「100 积分 = ¥1」+ 默认汇率推导（1408 micro/点 ÷ 10000）≈ 0.14 真实分。
+  // 原来这里是 5 —— 那是 1 点 ≈ ¥0.355 的旧口径，和后台设定差 35 倍。
+  raw_cents_per_point: 0.1408,
+  micro_usd_per_point: 1408,
+  cny_cents_per_point: 1,
 };
 
 let snapshot: AdminSettings = FALLBACK;

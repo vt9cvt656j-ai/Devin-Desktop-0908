@@ -28,32 +28,44 @@ const succeeded = load("_toolExecutionSucceeded", {
 const dispatch = fnSource("_runAgenticLoop", { code: true }) || SRC;
 
 test("计划门和调研门给的是两句不同的话", () => {
-  assert.match(SRC, /const _planFirst = techIssue\.startsWith\("\[BLOCKED_PLAN_FIRST\]"\)/,
+  assert.match(SRC, /const _planFirst = techIssue\.startsWith\("\[无计划的首次落盘\]"\)/,
     "两道门又合流了——用户会被告知去做一件他没被要求做的事");
-  assert.match(SRC, /_planFirst \? "先写计划再动手" : "先查一下再选"/,
-    "徽章文案没有按门分开");
-  assert.match(SRC, /code: _planFirst \? "plan_first" : "tech_research"/,
-    "失败码没有按门分开——恢复指令会走错分支");
+  // 两道门原来合流在同一条打回路径上，靠 _planFirst 三元分流文案和失败码。
+  // 计划门现在**根本不打回**了（所有者决定：update_plan 由模型自决，对齐 Claude Code），
+  // 于是这条路径上只剩查包门一家，分流本身没有存在的必要 —— 守的改成
+  // 「计划门确实走的是另一条（挂事实）」和「查包门的文案没被带走」。
+  assert.match(SRC, /_settleToolStep\(it\.step, blocked, "先查一下再选"\)/,
+    "查包门的徽章文案被计划门的降级带走了");
+  assert.match(SRC, /failure: \{ code: "tech_research" \}/,
+    "这条打回路径上只该剩查包门一家");
+  assert.match(SRC, /it\._planFactNote = /, "计划门没走「挂事实」那条路");
+  assert.doesNotMatch(SRC, /_planFirst \? "plan_first" : "tech_research"/, "旧分流回来了");
 });
 
 test("拦截本身一个都没被放行（改文案不许顺带把门改松）", () => {
   // 这条是反向断言。只钉「文案分开了」是绿的摆设：把整段拦截删掉它照样绿。
   assert.match(SRC, /const techIssue = _planBeforeBuildIssue\(run, it\.call\) \|\| _newTechResearchIssue\(run, it\.call\)/,
     "门的调用点没了");
-  assert.match(SRC, /if \(_planFirst\) run\._planStopUsed = true;\s*\n\s*else run\._techResearchStopUsed = true;/,
-    "「一个 run 只拦一次」的记号没置——门会反复拦同一轮");
+  // 两个记号都还在，只是分在两支里：计划那支置完记号就去挂事实（不打回），
+  // 查包那支置完记号继续走打回。缺任何一个，对应的门都会在同一轮里反复触发。
+  // 记号挪到了追加成功的那一刻（设值到追加之间有三条路会把事实整条丢掉，配额在那儿
+  // 白吃）。这里仍然正面钉住它必须被置，只是钉在新落点上——缺了它门会反复触发同一轮。
+  assert.match(SRC, /toolMsgs\[_i\]\.content = [^\n]*\+ _note;\s*\n\s*run\._planStopUsed = true;/,
+    "计划门「一个 run 只说一次」的记号没置");
+  assert.match(SRC, /run\._techResearchStopUsed = true;/,
+    "查包门「一个 run 只拦一次」的记号没置——门会反复拦同一轮");
   assert.match(SRC, /it\.rawResult = blocked;/, "拦截结果没有落到 item 上");
 });
 
 // ── ② 「真实失败」要对得上事实 ────────────────────────────────────────
 const isPreBlock = load("_isPreExecutionBlock", {
   _PRE_EXECUTION_BLOCK_CODES: new Set([
-    "plan_first", "tech_research", "read_before_edit", "mutation_batch", "command_batch",
+    "tech_research", "read_before_edit", "mutation_batch", "command_batch",
   ]),
 });
 
 test("预执行拦截这一族认得全，且不误收跑过之后才有的结局", () => {
-  for (const code of ["plan_first", "tech_research", "read_before_edit", "mutation_batch", "command_batch"]) {
+  for (const code of ["tech_research", "read_before_edit", "mutation_batch", "command_batch"]) {
     assert.equal(isPreBlock({ failure: { code } }), true, `${code} 应算门拦`);
   }
   // 这两个是**跑过了**才有的结局：请求发出去了、监控起来了。把它们算成「没跑过」，
@@ -74,7 +86,7 @@ test("预执行拦截这一族的成员是钉死的", () => {
   assert.ok(m, "_PRE_EXECUTION_BLOCK_CODES 不见了");
   const codes = [...m[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1]).sort();
   assert.deepEqual(codes,
-    ["command_batch", "mutation_batch", "plan_first", "read_before_edit", "tech_research"],
+    ["command_batch", "mutation_batch", "read_before_edit", "tech_research"],
     "成员变了。每一个进来的都必须满足「门在运行前拦下、磁盘一个字节都没写」——"
     + "http_redirect / monitor_uncheckable 是**跑过了**才有的结局，收进来就会把一次真实结局"
     + "说成「前项被门拦下」，用户又一次读到错的理由");
@@ -84,7 +96,7 @@ const blockedEarlier = load("_preExecutionBlockedEarlier", { _isPreExecutionBloc
 
 test("同批更早的门拦认得出来", () => {
   const items = [
-    { rawResult: { ok: false, failure: { code: "plan_first" } } },
+    { rawResult: { ok: false, failure: { code: "tech_research" } } },
     { call: { type: "cmd" } },
   ];
   assert.equal(blockedEarlier(items, 1), true);
@@ -231,7 +243,7 @@ test("门拦的写入不许把自己标成「没尝试过」（标了就从台�
 // 那份输出**根本不存在**。模型被指去找一个不存在的东西，找不到就只能猜，一轮白烧。
 const PRE_BLOCK = load("_isPreExecutionBlock", {
   _PRE_EXECUTION_BLOCK_CODES: new Set([
-    "plan_first", "tech_research", "read_before_edit", "mutation_batch", "command_batch",
+    "tech_research", "read_before_edit", "mutation_batch", "command_batch",
   ]),
 });
 const cmdBatch = load("_commandBatchBlockResult", {
@@ -281,11 +293,11 @@ test("写入批次同理，而且要说清是哪道门", () => {
     { call: { type: "edit", path: "README.md" }, rawResult: { ok: false, failure: { code } } },
     { call: { type: "cmd", command: "chmod +x examples/*.sh" } },
   ];
-  const planFirst = mutBatch(RUN, blocked("plan_first"), 1);
+  const planFirst = mutBatch(RUN, blocked("tech_research"), 1);
   assert.ok(planFirst, "门拦的前项之后不再停止后续写入了");
   assert.equal(planFirst.failure.code, "mutation_batch");
   assert.match(planFirst.content, /\[BLOCKED_MUTATION_BATCH\]/);
-  assert.match(planFirst.content, /计划门/, "没说清是哪道门，模型不知道该去补哪一步");
+  assert.match(planFirst.content, /查一下|资料|依赖|tech/i, "没说清是哪道门，模型不知道该去补哪一步");
   assert.match(planFirst.content, /没有产生任何失败输出/);
   assert.doesNotMatch(planFirst.content, /前一项真实错误/, "真失败那套话漏过来了");
 
@@ -347,12 +359,15 @@ test("真该拦的一个都没漏（反向断言，否则上面那条是绿的�
     "另写了一份路径名单——它和取证门那份必然漂开，且漂开时没有任何报错");
 });
 
-test("门拦的正文要当场堵住「已保存」那句话", () => {
-  const blocked = planGate(zeroRun, { type: "write", path: "src/app.ts" });
-  assert.match(blocked, /\[BLOCKED_PLAN_FIRST\]/, "标记不能变");
-  assert.match(blocked, /这次调用没有执行，磁盘一个字节都没改/,
-    "没当场说清这次没写成——模型会照着说「已更新」（用户现场实拍：文件 17 分钟后才第一次被写入）");
-  assert.match(blocked, /原样重发/, "没说清补完之后该怎么办，模型只能猜");
+test("真的拦下时才说「没保存」；计划门不再拦，就不许再这么说", () => {
+  // 计划门降级成「照常执行 + 把事实挂在结果上」（所有者决定：update_plan 由模型自决，
+  // 对齐 Claude Code）。这次调用**真的写盘了**，再说「磁盘一个字节都没改」就成了新的假话
+  // ——而这条测试当初存在的理由，正是不许在这里说假话。
+  const noted = planGate(zeroRun, { type: "write", path: "src/app.ts" });
+  assert.match(noted, /\[无计划的首次落盘\]/, "标记不能变");
+  assert.match(noted, /照常执行/, "调用真的执行了，必须说清楚");
+  assert.doesNotMatch(noted, /没有执行|一个字节都没改|原样重发/, "硬拦时代的话术还在，现在它是假的");
+  assert.match(noted, /你自己判断/, "判断权要明确交回给模型");
   const techGate = load("_newTechResearchIssue", {
     _introducesNewTech: () => true,
     _addedPackageNames: () => [],
@@ -362,11 +377,10 @@ test("门拦的正文要当场堵住「已保存」那句话", () => {
 });
 
 // ── ⑧ 三道门的恢复指令不再落 generic 兜底 ─────────────────────────────
-test("plan_first / tech_research / command_batch 各有确定的下一步", () => {
+test("tech_research / command_batch 各有确定的下一步", () => {
   // generic 兜底那支引用 _CAPABILITY_ROUTES；下面的反向用例会走到它，不注入就是 ReferenceError。
   const recover = load("_blockedToolRecoveryInstruction", { _CAPABILITY_ROUTES: "（能力路由清单）" });
   for (const [code, want] of [
-    ["plan_first", /update_plan/],
     ["tech_research", /package_search/],
     ["command_batch", /前提/],
   ]) {
@@ -377,12 +391,12 @@ test("plan_first / tech_research / command_batch 各有确定的下一步", () =
   }
   // 反向：真正未知的码仍要走兜底，不许被这三条顺手吞掉
   const unknown = recover("[BLOCKED] x", { type: "write", path: "a.ts" }, { failure: { code: "no_such_code_xyz" } });
-  assert.notEqual(unknown?.kind, "plan_first", "未知失败码被错认成了计划门");
+  assert.notEqual(unknown?.kind, "tech_research", "未知失败码被错认成了查包门");
 });
 
 test("cmd 在写入批次里要有主语", () => {
   const out = mutBatch(RUN, [
-    { call: { type: "edit", path: "README.md" }, rawResult: { ok: false, failure: { code: "plan_first" } } },
+    { call: { type: "edit", path: "README.md" }, rawResult: { ok: false, failure: { code: "tech_research" } } },
     { call: { type: "cmd", command: "chmod +x examples/*.sh" } },
   ], 1);
   assert.equal(out.path, "chmod +x examples/*.sh",

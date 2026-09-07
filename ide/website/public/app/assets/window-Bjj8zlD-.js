@@ -1,0 +1,1 @@
+import{dt as e,ft as t}from"./vendor-ZlW_aUeQ.js";t();export{e as getCurrentWindow};

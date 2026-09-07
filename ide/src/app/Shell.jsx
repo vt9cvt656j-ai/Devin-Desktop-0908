@@ -283,22 +283,27 @@ export function Shell() {
               <div className="diff-view__body" id="diffBody"></div>
             </div>
             <div className="welcome" id="welcome">
-              <h1 data-i18n="welcome.title">Mr. Day One</h1>
-              <p data-i18n="welcome.desc">A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
-              <div className="welcome__actions">
-                <Button size="lg" className="welcome__btn welcome__btn--primary" id="welcomeOpenBtn" type="button">
-                  <svg className="ic"><use href="#i-folder" /></svg>
-                  <span data-i18n="explorer.openBtn">打开文件夹</span>
-                </Button>
-              </div>
-              <div className="welcome__recent" id="welcomeRecent" hidden>
-                <h3 data-i18n="welcome.recent">最近项目</h3>
-                <ul className="welcome__recent-list" id="recentList"></ul>
-              </div>
-              <div className="welcome__tips">
-                <span className="kbd-tip"><kbd>Ctrl</kbd><kbd>O</kbd> <span data-i18n="explorer.openBtn">打开文件夹</span></span>
-                <span className="kbd-tip"><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>P</kbd> <span data-i18n="menu.commandPalette">命令面板</span></span>
-                <span className="kbd-tip" data-kbd-combo="enter"><span data-i18n="welcome.tipAsk">询问助手</span></span>
+              {/* 正文单独一层、且只有它滚动；版权行留在外面当固定页脚。
+                  以前两者同在 .welcome 里，版权行绝对定位钉底、正文居中排版，两套机制互不知情——
+                  终端一拖高盒子被压矮，正文就压在版权行上，再溢出到终端标签栏上（图层问题的根）。 */}
+              <div className="welcome__scroll">
+                <h1 data-i18n="welcome.title">Mr. Day One</h1>
+                <p data-i18n="welcome.desc">A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
+                <div className="welcome__actions">
+                  <Button size="lg" className="welcome__btn welcome__btn--primary" id="welcomeOpenBtn" type="button">
+                    <svg className="ic"><use href="#i-folder" /></svg>
+                    <span data-i18n="explorer.openBtn">打开文件夹</span>
+                  </Button>
+                </div>
+                <div className="welcome__recent" id="welcomeRecent" hidden>
+                  <h3 data-i18n="welcome.recent">最近项目</h3>
+                  <ul className="welcome__recent-list" id="recentList"></ul>
+                </div>
+                <div className="welcome__tips">
+                  <span className="kbd-tip"><kbd>Ctrl</kbd><kbd>O</kbd> <span data-i18n="explorer.openBtn">打开文件夹</span></span>
+                  <span className="kbd-tip"><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>P</kbd> <span data-i18n="menu.commandPalette">命令面板</span></span>
+                  <span className="kbd-tip" data-kbd-combo="enter"><span data-i18n="welcome.tipAsk">询问助手</span></span>
+                </div>
               </div>
               <div className="welcome__copyright">© 2026 Digital Bang Intelligence LLC. All rights reserved.</div>
             </div>
@@ -503,6 +508,7 @@ export function Shell() {
               </div>
               <Button className="w-full" type="button" id="loginSubmitBtn" data-i18n="login.submit">登录</Button>
               <div className="login-alt">
+                <button className="login-link" type="button" id="loginForgotBtn" data-i18n="login.forgot" hidden>忘记密码？</button>
                 <button className="login-link" type="button" id="loginUseCodeBtn" data-i18n="login.useCode">使用验证码登录</button>
                 <button className="login-link" type="button" id="loginBackBtn" data-i18n="login.back">返回</button>
               </div>

@@ -79,7 +79,7 @@ const MAX_LABEL: usize = 60;
 const MAX_NOTE: usize = 200;
 const MAX_URL: usize = 400;
 
-fn admin_only(claims: &Claims) -> ApiResult<()> {
+pub(crate) fn admin_only(claims: &Claims) -> ApiResult<()> {
     if claims.role != "admin" {
         return Err(AppError::forbidden("需要管理员权限"));
     }
@@ -2931,6 +2931,29 @@ async fn merge_route_pricing(
         serde_json::Value::Object(out)
     }
 
+    // **每条价必须两个数都带齐。**
+    //
+    // 每模型价在 `effective_token_prices` 里是第一优先级 —— 它一旦存在就**盖掉实时目录价**，
+    // 所以一条 `{"in": 0, "out": 75}` 不是「输入价还没填」，而是「输入永久免费」。
+    // 后果不止输入那一条腿：`effective_cache_prices` 在有每模型覆盖时按 `输入价 × 倍率`
+    // 算缓存读/写，输入价 0 → 缓存两条腿一起归零，而缓存是 Claude 这类模型账单里最大的一项。
+    // 反过来只填输入价的话，输出按 0 白送，而各家出价是入价的 3~5 倍。
+    //
+    // 前端已经收紧了（`RouteEndpoints.tsx` / `Routing.tsx` 都要求两个框都填），这里是第二道：
+    // 「只填一边」这种形状不许再有第二个入口。**显式填 0 照旧放行** —— 那是一种有意的定价。
+    if let Some(p) = &req.model_prices {
+        for (model, v) in p.as_object().into_iter().flatten() {
+            if v.is_null() {
+                continue; // null = 删掉这一条覆盖，退回目录价
+            }
+            let num = |k: &str| v.get(k).and_then(|x| x.as_f64()).filter(|n| n.is_finite() && *n >= 0.0);
+            if num("in").is_none() || num("out").is_none() {
+                return Err(AppError::bad(format!(
+                    "模型 {model} 的单价只填了一半：输入价和输出价必须同时给出（都填 0 = 这个模型免费，是允许的）。                     只给一边会把另一边按 0 永久覆盖掉目录价，连缓存价也一起归零。"
+                )));
+            }
+        }
+    }
     let prices = match &req.model_prices {
         Some(p) => merge(&route.model_prices, p),
         None => route.model_prices.clone(),
@@ -3171,6 +3194,7 @@ pub async fn admin_available(
         .get(&url)
         .header("authorization", format!("Bearer {key}"))
         .header("x-api-key", &key)
+        .header("anthropic-version", "2023-06-01")
         .send()
         .await
         // 和探测同一条规矩：不回显 reqwest 的错误原文，它带完整 URL，
@@ -3186,15 +3210,7 @@ pub async fn admin_available(
         }));
     }
     let data: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-    let ids: Vec<String> = data
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids: Vec<String> = crate::models::parse_model_ids(&data);
     let allowed = crate::models::allowed_ids(&route);
     let here: Vec<String> = allowed.iter().filter(|m| ids.contains(m)).cloned().collect();
     let missing: Vec<String> = allowed.iter().filter(|m| !ids.contains(m)).cloned().collect();

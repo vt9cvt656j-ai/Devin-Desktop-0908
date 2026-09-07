@@ -126,11 +126,36 @@ fn image_capability(modalities: &[String]) -> Option<bool> {
 ///
 /// 所以判据改成事实：目录说这个模型支持这一档，就照发。目录没收录的模型仍然走手工开关，
 /// 行为不变。
+/// 记住每个 `(模型, 档位)` 见过的「目录说支持」。**只记 true，从不记 false。**
+///
+/// 目录每 6 小时刷新一次，收尾是 `*CATALOG.write() = map` **整表替换**。某一轮上游没
+/// 返回这个模型、或它的 `efforts` 少了一项，`supports_effort` 就翻成 false —— 同一段
+/// 对话里 `output_config.effort` 于是从 `"max"` 掉成 `"high"`。
+///
+/// 而按 Anthropic 的缓存失效规则，**改 effort 总是作废整个 messages 缓存**（官方
+/// prompt-caching 文档的失效表，2026-09 核对）。也就是说：目录抖一下，所有进行中的
+/// 长对话前缀全部重写一遍，按 1.25~2 倍写入价。这是「一次外部抖动 = 全站缓存清空」。
+///
+/// 「这一轮没查到」和「这个模型不支持」是两件事，而它们在这里返回同一个值。记住正面
+/// 答案就把这两件事分开了。方向是刻意的单向：记错的代价是发一个上游可能不认的档位词
+/// （2026-08-16 实测过 xhigh / max 都 HTTP 200，从没发生过），记漏的代价是上面那条。
+static EFFORT_SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, String)>>> =
+    std::sync::Mutex::new(None);
+
 pub fn supports_effort(model_id: &str, effort: &str) -> bool {
-    match lookup(model_id) {
+    let live = match lookup(model_id) {
         Some(e) => e.efforts.iter().any(|x| x == effort),
         None => false,
+    };
+    let Ok(mut guard) = EFFORT_SEEN.lock() else {
+        return live;
+    };
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    if live {
+        seen.insert((model_id.to_string(), effort.to_string()));
+        return true;
     }
+    seen.contains(&(model_id.to_string(), effort.to_string()))
 }
 
 /// 这个模型能不能自己看图。`None` = 目录里没有它/没给模态，调用方回落按名字猜。
@@ -541,9 +566,12 @@ fn parse_endpoints(eps: &[serde_json::Value]) -> (Vec<i64>, Option<i64>) {
 
 
 /// 某个模型挂在哪条线路上（base_url + 解密后的 key）。探测要用真实凭据直连上游。
-async fn route_for_model(state: &AppState, model_id: &str) -> Option<(String, String)> {
-    let row: (String, String) = sqlx::query_as(
-        "SELECT base_url, api_key FROM models
+/// 探测要用的线路坐标。**协议必须一起带上**：探测打错端点的话，上游 404，而探测
+/// 把任何非 2xx 都读成「这个长度装不下」—— 于是一条 Anthropic 线路上的模型会被探成
+/// 「一档都过不了」，客户端的上下文预算和压缩阈值全按这个错数走，且不报错。
+async fn route_for_model(state: &AppState, model_id: &str) -> Option<(String, String, String)> {
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT base_url, api_key, protocol FROM models
          WHERE active = true AND $1 = ANY(enabled_models)
          ORDER BY sort LIMIT 1",
     )
@@ -552,12 +580,12 @@ async fn route_for_model(state: &AppState, model_id: &str) -> Option<(String, St
     .await
     .ok()
     .flatten()?;
-    let (base_url, api_key) = row;
+    let (base_url, api_key, protocol) = row;
     let key = crate::models::model_key(&api_key);
     if key.is_empty() {
         return None;
     }
-    Some((base_url, key))
+    Some((base_url, key, protocol))
 }
 
 async fn refresh(state: &AppState) -> anyhow::Result<usize> {
@@ -648,10 +676,12 @@ async fn refresh(state: &AppState) -> anyhow::Result<usize> {
             map.insert(key, prev);
             continue;
         }
-        let Some((base_url, api_key)) = route_for_model(state, model).await else {
+        let Some((base_url, api_key, protocol)) = route_for_model(state, model).await else {
             continue;
         };
-        if let Some(entry) = crate::model_probe::probe_context(&base_url, &api_key, model).await {
+        if let Some(entry) =
+            crate::model_probe::probe_context(&base_url, &api_key, &protocol, model).await
+        {
             source_ids.insert(key.clone(), format!("probed:{model}"));
             map.insert(key, entry);
             probed += 1;
@@ -809,6 +839,36 @@ async fn persist(
 
 #[cfg(test)]
 mod tests {
+    /// 目录抖一下，不能把进行中对话的思考档位改掉。
+    ///
+    /// 判据是**行为**：先让目录说支持，再把这个模型从目录里抹掉（模拟整表替换时它没
+    /// 被返回），答案必须不变。改 effort 会作废整个 messages 缓存 —— 一次目录抖动
+    /// 就是所有长对话的前缀全部按 1.25~2 倍写入价重写一遍。
+    #[test]
+    fn a_catalog_refresh_that_loses_a_model_does_not_change_its_effort() {
+        // 进程级共享状态 + cargo 并行跑测试 → 用一个这条测试独占的模型名。
+        let id = "test-only/effort-stickiness-probe";
+        assert!(!super::supports_effort(id, "max"), "没见过就不该说支持");
+
+        super::seed_for_test(&[(
+            id,
+            super::Entry { efforts: vec!["high".into(), "max".into()], ..Default::default() },
+        )]);
+        assert!(super::supports_effort(id, "max"));
+        assert!(!super::supports_effort(id, "xhigh"), "目录没给的档位不许凭空说支持");
+
+        // 整表替换的一轮里这个模型没回来。
+        if let Ok(mut c) = super::CATALOG.write() {
+            c.remove(&super::normalize(id));
+        }
+        assert!(
+            super::supports_effort(id, "max"),
+            "目录抖一下就把档位从 max 降成 high —— 所有进行中长对话的缓存当场作废"
+        );
+        // 反向仍然是错的：从没见过的档位不会因为记忆而变成 true。
+        assert!(!super::supports_effort(id, "xhigh"));
+    }
+
     use super::*;
 
     #[test]

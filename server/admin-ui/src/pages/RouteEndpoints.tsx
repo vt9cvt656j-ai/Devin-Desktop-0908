@@ -542,6 +542,18 @@ function ProbeBadge({ ok, ms, note }: { ok: boolean | null; ms: number | null; n
   );
 }
 
+/// 一个价格输入框里的字符串 → 数,或 `null` 表示**没填**。
+///
+/// 「填了 0」和「留空」必须分得开:填 0 = 有意的免费定价,要原样发给后端;
+/// 留空 = 没有覆盖,后端应当落回实时目录价。用 `Number(x) || 0` 会把两者抹平。
+/// 和 `Routing.tsx` 的 `priceNum` 是同一条判据 —— 两处必须同解。
+const priceNum = (s: string): number | null => {
+  const t = s.trim();
+  if (!t) return null;
+  const n = parseFloat(t);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+};
+
 export function RouteEndpoints() {
   const [routes, setRoutes] = useState<Route[] | null>(null);
   // 「按哪个模型看」。空 = 全部模型合计（老行为）。
@@ -607,10 +619,22 @@ export function RouteEndpoints() {
           capacity: draft.capacity.trim() ? Number(draft.capacity) : null,
           // 只把**改动过的**送上去，服务端做合并而不是覆盖 ——
           // 整份覆盖会把线路上别的模型的价抹掉。
+          // **两个框都得填。** 原来是 `in || out`（有一个就提交）加 `Number(v.in) || 0`，
+          // 于是「只改了输出价」提交的是 {in: 0, out: 新值} —— 而每模型价在
+          // `effective_token_prices` 里是**第一优先级**，它会盖掉实时目录价。
+          // 输入价被清成 0 的后果不止输入白送：`effective_cache_prices` 在有每模型覆盖时
+          // 按 `输入价 × 倍率` 算缓存读/写，输入价 0 → 缓存两条腿一起归零。
+          // 而缓存正是 Claude 这类模型账单里最大的一项。
+          //
+          // 判据是「填了没有」，不是「填的是不是正数」：两边都填 0 = 有意的免费定价，
+          // 必须原样发上去（和 Routing.tsx 那一处同解）。
+          // merge_route_pricing 是 merge 模式——不出现的键会保留旧值。
+          // 所以清空价格（跟随现价）必须显式发 null 让后端把旧覆盖删掉。
           model_prices: Object.fromEntries(
-            Object.entries(draft.prices)
-              .filter(([, v]) => v.in.trim() || v.out.trim())
-              .map(([k, v]) => [k, { in: Number(v.in) || 0, out: Number(v.out) || 0 }]),
+            Object.entries(draft.prices).map(([k, v]) => {
+              const hasPrice = priceNum(v.in) !== null && priceNum(v.out) !== null;
+              return [k, hasPrice ? { in: priceNum(v.in) ?? 0, out: priceNum(v.out) ?? 0 } : null];
+            }),
           ),
           model_names: Object.fromEntries(
             Object.entries(draft.names).filter(([, v]) => v.trim()),
@@ -712,6 +736,18 @@ export function RouteEndpoints() {
   const list = routes ?? [];
   /// 编辑出口时要知道它属于哪条线路 —— 那条线路开放的模型就是这个出口的可选范围。
   const routeOf = (id: string) => list.find((r) => r.id === id);
+  /// 库里**已经存着**的每模型价,字符串形态。改一半时另一半从这里回填 ——
+  /// 回填空串的话,提交判据一收紧就会把这一条整个丢掉(等于运维改一半就撤销了另一半)。
+  const storedPrice = (m: string, side: "in" | "out"): string => {
+    const v = draft ? routeOf(draft.route_id)?.model_prices?.[m]?.[side] : undefined;
+    return v === undefined || v === null ? "" : String(v);
+  };
+  /// 这个模型的两个价是不是都有(草稿里填的,或库里已存的)。
+  /// 目录查不到价的模型必须两个都有才能开放 —— 只填输入价就勾上的话,
+  /// 输出 token 会按 0 永久免费,而 Claude/DeepSeek 的出价是入价的 3~5 倍。
+  const bothPriced = (m: string): boolean =>
+    priceNum(draft?.prices[m]?.in ?? storedPrice(m, "in")) !== null &&
+    priceNum(draft?.prices[m]?.out ?? storedPrice(m, "out")) !== null;
   // 只数**在轮转里**的。停用的单独说 —— 把它们混进「额外出口」会让人以为有那么多在接流量。
   const extra = list.reduce((n, r) => n + r.endpoints.filter((e) => e.active).length, 0);
   const parked = list.reduce((n, r) => n + r.endpoints.filter((e) => !e.active).length, 0);
@@ -1399,8 +1435,8 @@ export function RouteEndpoints() {
                       >
                         <input
                           type="checkbox"
-                          checked={on && (!noPrice || !!draft.prices[m]?.in)}
-                          disabled={noPrice && !draft.prices[m]?.in}
+                          checked={on && (!noPrice || bothPriced(m))}
+                          disabled={noPrice && !bothPriced(m)}
                           onChange={(ev) => {
                             const all = routeOf(draft.route_id)?.models ?? [];
                             const cur = draft.enabled_models.length ? draft.enabled_models : all;
@@ -1435,10 +1471,7 @@ export function RouteEndpoints() {
                           className="h-7 w-full text-xs"
                           placeholder="输入价"
                           value={
-                            draft.prices[m]?.in ??
-                            (routeOf(draft.route_id)?.model_prices?.[m]?.in
-                              ? String(routeOf(draft.route_id)!.model_prices[m].in)
-                              : "")
+                            draft.prices[m]?.in ?? storedPrice(m, "in")
                           }
                           onClick={(ev) => ev.preventDefault()}
                           onChange={(ev) =>
@@ -1446,7 +1479,7 @@ export function RouteEndpoints() {
                               ...draft,
                               prices: {
                                 ...draft.prices,
-                                [m]: { in: ev.target.value, out: draft.prices[m]?.out ?? "" },
+                                [m]: { in: ev.target.value, out: draft.prices[m]?.out ?? storedPrice(m, "out") },
                               },
                             })
                           }
@@ -1455,10 +1488,7 @@ export function RouteEndpoints() {
                           className="h-7 w-full text-xs"
                           placeholder="输出价"
                           value={
-                            draft.prices[m]?.out ??
-                            (routeOf(draft.route_id)?.model_prices?.[m]?.out
-                              ? String(routeOf(draft.route_id)!.model_prices[m].out)
-                              : "")
+                            draft.prices[m]?.out ?? storedPrice(m, "out")
                           }
                           onClick={(ev) => ev.preventDefault()}
                           onChange={(ev) =>
@@ -1466,7 +1496,7 @@ export function RouteEndpoints() {
                               ...draft,
                               prices: {
                                 ...draft.prices,
-                                [m]: { in: draft.prices[m]?.in ?? "", out: ev.target.value },
+                                [m]: { in: draft.prices[m]?.in ?? storedPrice(m, "in"), out: ev.target.value },
                               },
                             })
                           }
@@ -1481,7 +1511,7 @@ export function RouteEndpoints() {
                           <Badge
                             variant="outline"
                             className="shrink-0 border-destructive/40 text-destructive"
-                            title="目录里查不到这个模型的官方价。在左边填上输入价/输出价（每百万 token 美元）就能开放 —— 那是用户付的价，不是你的进价。不填的话用户一分不付、上游照收你的钱。"
+                            title="目录里查不到这个模型的官方价。在左边两个价都填上（每百万 token 美元）就能开放 —— 那是用户付的价，不是你的进价。不填的话用户一分不付、上游照收你的钱。"
                           >
                             要填价
                           </Badge>

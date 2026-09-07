@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::Claims;
@@ -62,6 +62,50 @@ fn build_chat_http_client(pool_idle_per_host: usize) -> reqwest::Client {
 
 static GW_CHAT_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| build_chat_http_client(8));
 
+/// 活跃线路的内存缓存。每个请求都要查一次 `SELECT * FROM models WHERE active = true`，
+/// 而这张表在管理后台改线路之前不会变——按请求查纯粹是在拿 DB 连接池当读缓存用。
+///
+/// 缓存 10 秒。管理后台保存/删除时立即清零，下一个请求会从库里拉一份新的。10 秒内
+/// 全部请求共享同一个 `Arc<Vec<Model>>`，零 DB 往返。后台定时器也可以调 `invalidate_`
+/// 主动清。
+///
+/// 为什么不是后台定时刷新：这台机器上 tokio::spawn 已经很多了（15+ 后台任务），加一个
+/// 短间隔定时器不如请求驱动的懒刷新——没流量时完全不查。
+static ACTIVE_MODELS_CACHE: LazyLock<RwLock<(Instant, Arc<Vec<Model>>)>> =
+    LazyLock::new(|| RwLock::new((Instant::now() - Duration::from_secs(3600), Arc::new(Vec::new()))));
+
+const ACTIVE_MODELS_TTL: Duration = Duration::from_secs(10);
+
+/// 从缓存取活跃线路；过期了就从库里拉一份。
+pub(crate) async fn active_models_cached(db: &sqlx::PgPool) -> Result<Arc<Vec<Model>>, sqlx::Error> {
+    // 快路径：读锁
+    {
+        if let Ok(guard) = ACTIVE_MODELS_CACHE.read() {
+            if guard.0.elapsed() < ACTIVE_MODELS_TTL {
+                return Ok(Arc::clone(&guard.1));
+            }
+        }
+    }
+    // 慢路径：查库 + 写锁
+    let rows = sqlx::query_as::<_, Model>(
+        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
+    )
+    .fetch_all(db)
+    .await?;
+    let arc = Arc::new(rows);
+    if let Ok(mut guard) = ACTIVE_MODELS_CACHE.write() {
+        *guard = (Instant::now(), Arc::clone(&arc));
+    }
+    Ok(arc)
+}
+
+/// 管理后台保存/删除线路后调这个，下一个请求立即拿到新数据。
+pub(crate) fn invalidate_active_models_cache() {
+    if let Ok(mut guard) = ACTIVE_MODELS_CACHE.write() {
+        guard.0 = Instant::now() - Duration::from_secs(3600);
+    }
+}
+
 const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 1;
 /// 上游**明确回了一个错误响应**时，允许再换一条同模型线路。
 ///
@@ -111,6 +155,10 @@ const CHAT_UPSTREAM_MIN_TRY_WINDOW: Duration = Duration::from_secs(2);
 /// 上限是 1：一次是「上游抖了一下」，再多就是拿钱去救一个已经等太久的请求 ——
 /// 用户那边的等待并没有省下来，而上游那几笔可能都在计费。
 const CHAT_MAX_STALL_SWITCHES: u8 = 1;
+/// 跨线路兜底已关闭（所有者 2026-09-04 定调「线路由用户选，不许偷偷换线」）。
+/// 常量保留且为 0：循环里还在读它，但 `prefer_one_route` 已经把备用线路
+/// 从候选列表里整个删掉了，所以这条分支结构上走不进去。
+const CHAT_MAX_CROSS_ROUTE_SWITCHES: u8 = 0;
 const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
 
 /// 「这次失败之后还有没试过的上游出口」这件事告诉客户端时用的响应头。
@@ -405,6 +453,267 @@ fn request_is_deep_thinking(body: &serde_json::Value) -> bool {
     effort_is_deep || explicit_budget || thinking_on
 }
 
+/// IDE 的辅助调用：意图裁决、快通道、收尾评审、输入框预测。它们只要一份几百 token 的 JSON，
+/// 主循环的推理档位对它们只是负担。
+///
+/// 生产 14 天实测（model_usage 里 ide_mode 为空那批）：客户端已经把档位封到 low
+/// （aux-effort.js），可 deepseek-v4-pro 平均仍输出 3,211 token、qwen3.8-max 3,364、
+/// grok-4.6 4,651（p90 9,372）、omen-alpha 中位数恰好 4,996 = 预算烧光、正文零字——而 JSON
+/// 本身的上限是 900。裁决「一半落不了地」的机制就在这里。
+///
+/// 两个成因都在网关：OpenAI 协议的线路把 reasoning_effort 原样透传，DeepSeek/Qwen/GLM 的
+/// 中转不认它，推理按模型默认全开；随后那道 max_tokens 钳位又把任何非 off 档位的上限抬到
+/// ≥32,000，900 形同虚设。
+///
+/// 判据三条都要满足：IDE 请求（网页端每个请求都带 x-mide-client；桌面端 ai.rs 不发它、只带
+/// x-ide-run-id，所以桌面端输入框预热那一发（没有 run id）老版认不出来，只能等新版显式声明）、
+/// 没有 x-ide-mode（主循环 / 子体 / 聊天都带）、max_tokens ≤ 5000。
+///
+/// **为什么是 5000 不是 1024**：客户端 _billableAiComplete 给「声明有推理」的模型加 4096 的余量
+/// （_AUX_REASONING_HEADROOM_TOKENS），线路上看到的是 900+4096=4996，不是 900——1024 那条界
+/// 上线一小时没命中过一次，deepseek-v4-pro 的裁决照样烧满 4996。按 main.js 的预算表
+/// （2026-09-05）：意图裁决两半 900→4996、快通道 200→4296、情景档案 520/280→4616/4376、
+/// 输入框预测 160→4256，这些是分类/抽取型的小 JSON 调用，都 ≤5000；Cmd+K 1024→5120、
+/// 图片描述 1300→5396、历史压缩 2500→6596，以及三条认知腿——收尾评审 2000→6096、离线蒸馏
+/// 2000→6096、工具编排 3000→7096——都 >5000，**不许**被当成辅助调用关推理（认知腿的推理深度
+/// 跟用户档位，这是所有者定的）。没加余量的模型（客户端没声明它会推理）预算表整体 ≤3000，
+/// 全部落进判据：对一个按声明不推理的模型，关推理是空操作。新版客户端显式带 x-ide-aux，
+/// 老版按三条认。
+fn is_ide_aux_request(headers: &HeaderMap, body: &serde_json::Value) -> bool {
+    if headers.contains_key("x-ide-aux") {
+        return true;
+    }
+    let ide = headers.contains_key("x-mide-client") || headers.contains_key("x-ide-run-id");
+    let has_mode = headers.contains_key("x-ide-mode");
+    let small = body
+        .get("max_tokens")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|m| m > 0 && m <= IDE_AUX_MAX_TOKENS_CEILING);
+    ide && !has_mode && small
+}
+
+/// 见 is_ide_aux_request 的预算表：辅助调用带余量后最大 4996，认知腿最小 6096。
+const IDE_AUX_MAX_TOKENS_CEILING: i64 = 5000;
+
+/// 辅助调用「不推理」的第一步（协议无关，在选出口之前做）：去掉一切思考对象，把档位写成
+/// Anthropic 桥认的 `off`。
+///
+/// 为什么是 off 而不是删掉：Anthropic 桥的 thinking_effort_for 在**没有**档位字段时默认
+/// "high"（客户端 28942 行那段注释记着这个坑：一次 60 token 的预测被升成 adaptive high、
+/// max_tokens 抬到 40000）。Fable / Mythos 关不掉（显式 disabled 是 400）只封到 low；grok 交给
+/// Responses 桥按目录判要不要带 effort，也只保证是 low。
+///
+/// 非 Anthropic 的透传线路不认 off（ox-alpha 实测 400：枚举里只有 none/minimal/low…），
+/// 所以透传那一支在发出去之前再做第二步：openai_passthrough_aux_thinking。
+fn aux_thinking_common(body: &mut serde_json::Value) {
+    let Some(obj) = body.as_object_mut() else { return };
+    let model = obj
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    obj.remove("thinking");
+    obj.remove("thinking_config");
+    obj.remove("thinkingConfig");
+    obj.remove("reasoning");
+    obj.remove("enable_thinking");
+    let lowest_only = model.contains("fable") || model.contains("mythos") || model.contains("grok");
+    obj.insert(
+        "reasoning_effort".into(),
+        json!(if lowest_only { "low" } else { "off" }),
+    );
+}
+
+/// 第二步，只对 OpenAI 协议的透传线路：剥掉上游不认的 `off`，再按家族补它真正认的关闭开关。
+///
+/// gpt-5 / o 系接受 minimal；DeepSeek / GLM / Kimi 认 `thinking.type`（网关里
+/// thinking_effort_for 的注释早就记着「无预算的裸 thinking 开关是 Kimi/GLM 形状」）；
+/// Qwen 认 `enable_thinking`。没把握的家族宁可留着上游默认，也别换来一个 400——
+/// 那和今天一样，不会更差。
+fn openai_passthrough_aux_thinking(body: &mut serde_json::Value) {
+    let Some(obj) = body.as_object_mut() else { return };
+    let model = obj
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    obj.remove("reasoning_effort");
+    if model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+    {
+        obj.insert("reasoning_effort".into(), json!("minimal"));
+    }
+    if model.contains("deepseek")
+        || model.contains("glm")
+        || model.contains("kimi")
+        || model.contains("moonshot")
+    {
+        obj.insert("thinking".into(), json!({"type": "disabled"}));
+    }
+    if model.contains("qwen") || model.contains("qwq") {
+        obj.insert("enable_thinking".into(), json!(false));
+    }
+}
+
+/// 钳位的判据：这份请求会不会带着推理出门。显式 `{"type":"disabled"}` 不算——它是「关掉」，
+/// 给它抬 max_tokens 只会把一个 900 上限的辅助调用放大成 32K 的自由推理。
+fn thinking_needs_max_tokens_room(body: &serde_json::Value) -> bool {
+    let thinking_on = body
+        .get("thinking")
+        .is_some_and(|t| t.get("type").and_then(|v| v.as_str()) != Some("disabled"));
+    let effort_on = body
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .is_some_and(|e| !e.is_empty() && e != "off");
+    thinking_on || effort_on
+}
+
+/// 出上游之前，把 `assistant.tool_calls` 和 `role=tool` 结果的配对补齐、归位。
+///
+/// 严格上游要求：带 `tool_calls` 的 assistant 消息后面必须**紧跟**着与每个 `tool_call_id`
+/// 一一对应的 tool 消息。差一条就整轮 400，报文原句是
+/// `an assistant message with 'tool_calls' must be followed by tool messages responding to
+/// each 'tool_call_id'`（2026-09-05 线上 4 次，deepseek-v4-pro，用户当面撞到）。
+///
+/// 客户端出线口有一份同名保护（ide/src/agent/tool-pairing.js），但它只保证「每个 id 存在
+/// 某条结果」——保证不了**相邻**，也认不出**重复 id**（两个调用共用一个 id 时，两条结果在
+/// 上游眼里只算一条）。而且它是 2026-09-01 才加的，用户机器上已经装着的旧版本没有它。
+/// 网关这一道对所有客户端、所有协议一次生效，且不用发版。
+///
+/// 三件事，都**只加不删**：
+///   · 空的 / 重复的 id → 就地改成唯一 id，它那条结果跟着改（按出现次序配对，正文不动）
+///   · 缺席的结果 → 补一条明说「没执行」的 tool 消息
+///   · 被别的角色隔开的结果 → 移到发起它的那条 assistant 后面
+///
+/// **孤儿结果（有 tool 结果、找不到发起它的 assistant）原样留着**：那是历史从前面被压缩掉
+/// 之后剩下的证据，删掉等于为了协议好看丢用户的内容。
+///
+/// 返回改动次数（0 = 本来就是好的，body 一个字节没动）。
+fn repair_tool_pairing(body: &mut serde_json::Value) -> usize {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let Some(arr) = body.get("messages").and_then(|m| m.as_array()) else {
+        return 0;
+    };
+    let msgs = arr.clone();
+    // 每个 id 现有的结果下标，按出现次序（重复 id 的多条都留着，靠次序配对）。
+    let mut answers: HashMap<String, VecDeque<usize>> = HashMap::new();
+    for (i, m) in msgs.iter().enumerate() {
+        if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
+            continue;
+        }
+        let id = m
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        answers.entry(id).or_default().push_back(i);
+    }
+    let mut taken: HashSet<String> = msgs
+        .iter()
+        .filter_map(|m| m.get("tool_calls").and_then(|c| c.as_array()))
+        .flatten()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+
+    let mut consumed: HashSet<usize> = HashSet::new();
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(msgs.len() + 4);
+    let mut repairs = 0usize;
+    let mut minted = 0usize;
+
+    for (i, m) in msgs.iter().enumerate() {
+        // 已经被提到它那条 assistant 后面去了。
+        if consumed.contains(&i) {
+            continue;
+        }
+        let has_calls = m
+            .get("tool_calls")
+            .and_then(|c| c.as_array())
+            .is_some_and(|a| !a.is_empty());
+        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") || !has_calls {
+            out.push(m.clone());
+            continue;
+        }
+        let mut msg = m.clone();
+        // (查结果用的原 id, 最终发出去的 id)
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        {
+            let mut seen_here: HashSet<String> = HashSet::new();
+            let Some(calls) = msg.get_mut("tool_calls").and_then(|c| c.as_array_mut()) else {
+                out.push(msg);
+                continue;
+            };
+            for call in calls.iter_mut() {
+                let old = call
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let needs_new = old.is_empty() || !seen_here.insert(old.clone());
+                if !needs_new {
+                    wanted.push((old.clone(), old));
+                    continue;
+                }
+                let fresh = loop {
+                    minted += 1;
+                    let candidate = format!("call_gw_{minted}");
+                    if taken.insert(candidate.clone()) {
+                        break candidate;
+                    }
+                };
+                seen_here.insert(fresh.clone());
+                call["id"] = json!(fresh.clone());
+                repairs += 1;
+                wanted.push((old, fresh));
+            }
+        }
+        out.push(msg);
+        for (lookup, final_id) in wanted {
+            let picked = answers
+                .get_mut(&lookup)
+                .and_then(|queue| {
+                    while let Some(idx) = queue.pop_front() {
+                        if !consumed.contains(&idx) {
+                            return Some(idx);
+                        }
+                    }
+                    None
+                });
+            match picked {
+                Some(idx) => {
+                    consumed.insert(idx);
+                    // 紧跟在这条 assistant 后面才算数：原位置在别处就是「被隔开了」。
+                    if idx != out.len() {
+                        repairs += 1;
+                    }
+                    let mut answer = msgs[idx].clone();
+                    if lookup != final_id {
+                        answer["tool_call_id"] = json!(final_id);
+                    }
+                    out.push(answer);
+                }
+                None => {
+                    repairs += 1;
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": final_id,
+                        "content": "[未执行] 这次调用没有结果，别当成已完成。",
+                    }));
+                }
+            }
+        }
+    }
+    if repairs == 0 {
+        return 0;
+    }
+    if let Some(slot) = body.get_mut("messages") {
+        *slot = serde_json::Value::Array(out);
+    }
+    repairs
+}
+
 /// Return only a stable category for telemetry. Never log a caller-provided value
 /// directly: the field is meant to be an enum, but an untrusted client can send
 /// arbitrary JSON.
@@ -588,8 +897,35 @@ fn anthropic_extended_ttl_hosts() -> Vec<String> {
 ///
 /// 名单从参数进、不在这里读环境变量 —— 读环境变量的版本没法测：Rust 的测试是并行跑的，
 /// 一条测试 set_var 会被同进程里别的测试看到，表现是**偶发失败**。实测撞到过一次。
+/// 这条线路要不要发 `ttl:"1h"` 的缓存断点。
+///
+/// # 默认开，且不再看名单
+///
+/// 之前是「一方永远给、三方看 `MICHAEL_CACHE_TTL_HOSTS` 名单」，而那个环境变量线上是
+/// **空的** —— 也就是说四个缓存断点全是裸 `{"type":"ephemeral"}`，全部 5 分钟。
+///
+/// 设卡的理由写在旧注释里：「ttl 要配 `extended-cache-ttl-2025-04-11` 这个 beta 才生效，
+/// 而三方那份 beta 集合是照 Claude Code 的 Tv9 挑的，加一项会改请求指纹、有被 503 的
+/// 风险」。**这个前提已经不成立**：现行 Messages API 里 `cache_control.ttl` 是 GA 的，
+/// 一个 beta 头都不需要（官方文档 prompt-caching 页，2026-09 核对）。于是「发 ttl」和
+/// 「发那个 beta」彻底解耦：ttl 照发，beta 一个字不加，请求指纹一个字节不变。
+///
+/// # 为什么值得
+///
+/// 线上实测（注释见 `anthropic_extended_ttl_hosts`）：claude-opus-5 走 api.hao.ai 24 小时
+/// 缓存写 359 万、读 307 万 —— **写比读还多**，48 轮平均每轮写 7.5 万，整条前缀每轮重写
+/// 一遍。读确实在发生，说明前缀本身是稳的，纯粹是 5 分钟到期了。
+///
+/// 算一笔（10 轮、每轮 7.5 万前缀）：5 分钟档每轮重写 = 10 × 7.5万 × 1.25 = 93.75 万等效
+/// 输入；1 小时档 = 7.5万 × 2.0 + 9 × 7.5万 × 0.1 = 21.75 万。**便宜 4.3 倍。**
+///
+/// # 还剩两道闸
+///
+/// · `MICHAEL_CACHE_TTL_1H=0` 全局关掉（见 `anthropic_cache_control`），不用重新部署；
+/// · `MICHAEL_CACHE_TTL_HOSTS` 非空时收窄到名单内的主机 —— 留着是为了「某一家中转真的
+///   吃不下这个字段」时能只关它一家，而不是全关。空 = 全开（现在的线上状态）。
 fn allows_extended_ttl_with(base_url: &str, hosts: &[String]) -> bool {
-    if anthropic_is_first_party(base_url) {
+    if anthropic_is_first_party(base_url) || hosts.is_empty() {
         return true;
     }
     let raw = base_url.trim();
@@ -997,23 +1333,9 @@ const THINKING_CLIP_SAFE_EFFORT: &str = "medium";
 static THINKING_CLIP_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 「要了思考，一个字都没回」的线路。
-///
-/// 这件事**早就检测出来了**（见 thinking_requested_but_none_returned 那条 warn），但检测完
-/// 只做了两件事：打一条日志、不进缓存。选路完全不知道有这回事，于是下一次请求照样落到
-/// 同一条线路上，用户照样看不到「已思考」。实测：claude-opus-5 的三条同模型线路里，
-/// 排头那条（label "Claude"）稳定吞掉思考，而用户每次都先撞上它——他的原话是
-/// 「问问题他不会去思考」。
-///
-/// 有别的同模型线路可走时，把它排到后面。**不是拉黑**：到期自动再探一次，
-/// 上游哪天恢复了第一个成功返回思考的请求就把记号撤掉（见 clear_thinking_mute），
-/// 不需要任何人去后台改配置。
-static THINKING_MUTE_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// 记号有效期。取 30 分钟，和思考钳位同一档：这是「这条线路的脾气」，
-/// 要跨越好几轮请求才看得出来，比一轮换线的冷却长得多。
-const THINKING_MUTE_MEMORY: Duration = Duration::from_secs(30 * 60);
+// 思考静音（THINKING_MUTE_ROUTES / mark_thinking_mute / clear_thinking_mute /
+// route_mutes_thinking）已于 2026-09-03 按所有者要求整个删除:**出不出思考不作为
+// 换线路的理由**,用户选了哪条线路就走哪条。下面的连击计数只用来打一条诊断日志。
 
 /// 连续多少次「要了思考、给了实质回答、却一个思考块都没开」才判这条线路当前是哑的。
 ///
@@ -1041,33 +1363,6 @@ fn clear_thinking_zero_streak(id: uuid::Uuid) {
     }
 }
 
-fn mark_thinking_mute(id: uuid::Uuid) {
-    if let Ok(mut guard) = THINKING_MUTE_ROUTES.lock() {
-        guard.insert(id, Instant::now() + THINKING_MUTE_MEMORY);
-    }
-}
-
-/// 这条线路回过思考了 —— 撤掉记号。这是自愈的全部机制：没有它，记号只会越积越多，
-/// 一条只是偶尔抽风的线路会被永久排到后面。
-fn clear_thinking_mute(id: uuid::Uuid) {
-    if let Ok(mut guard) = THINKING_MUTE_ROUTES.lock() {
-        guard.remove(&id);
-    }
-}
-
-fn route_mutes_thinking(id: uuid::Uuid, now: Instant) -> bool {
-    let Ok(mut guard) = THINKING_MUTE_ROUTES.lock() else {
-        return false;
-    };
-    match guard.get(&id).copied() {
-        Some(until) if until > now => true,
-        Some(_) => {
-            guard.remove(&id);
-            false
-        }
-        None => false,
-    }
-}
 /// The i18n pack cache is bounded because each entry holds a full ~630KB response
 /// body and the key is a hash of (locale, entries) — a caller who varies one
 /// character misses every time, so an unbounded map OOMs the gateway before the
@@ -1427,10 +1722,22 @@ fn route_header_ewma(route_id: uuid::Uuid) -> Option<Duration> {
 /// 判据刻意取得很窄 —— **有失败、且一次都没成过**。全新没样本的线路（0 成 0 败）
 /// 不受影响，照旧按顺序拿流量，不会被饿死；这和 `is_reliable` 对 total=0 返回 true
 /// 是同一条规矩：没有证据不构成降级理由。
-fn narrow_to_one_route(
+/// 只留一条线路的出口 —— **不跨线路**。
+///
+/// 线路由用户选，不许因为质量偷偷换。一条线路挂多个出口、出口之间互相兜底，
+/// 而不是一个请求在多条线路之间找哪条能用。
+///
+/// 选哪条：沿用入参已经排好的顺序（x-ide-route → 会话粘性 → sort），
+/// **但跳过「试过、从来没成过」的线路**。全新没样本的线路（0 成 0 败）
+/// 不受影响，照旧按顺序拿流量，不会被饿死。
+///
+/// `pinned`：用户通过 `x-ide-route` 显式选的线路。选了就是选了，即使历史上
+/// 全败也不许跳过 —— 跳掉用户的显式选择等于偷偷换线路，线上出过这个 bug。
+fn prefer_one_route(
     candidates: Vec<Model>,
     rate_of: impl Fn(&Model) -> (i64, i64),
-) -> Vec<Model> {
+    pinned: Option<uuid::Uuid>,
+) -> (Vec<Model>, Option<uuid::Uuid>) {
     let never_worked = |m: &Model| {
         let (ok, bad) = rate_of(m);
         ok == 0 && bad > 0
@@ -1441,24 +1748,85 @@ fn narrow_to_one_route(
             order.push(c.id);
         }
     }
-    let chosen = order
-        .iter()
-        .find(|rid| candidates.iter().any(|c| c.id == **rid && !never_worked(c)))
-        .copied()
-        .or_else(|| order.first().copied());
+    let chosen = if pinned.is_some() && order.first().copied() == pinned {
+        pinned
+    } else {
+        order
+            .iter()
+            .find(|rid| candidates.iter().any(|c| c.id == **rid && !never_worked(c)))
+            .copied()
+            .or_else(|| order.first().copied())
+    };
     match chosen {
-        Some(rid) => candidates.into_iter().filter(|c| c.id == rid).collect(),
-        None => candidates,
+        Some(rid) => {
+            let mine: Vec<Model> =
+                candidates.into_iter().filter(|c| c.id == rid).collect();
+            (mine, Some(rid))
+        }
+        None => (candidates, None),
     }
 }
 
-fn header_wait_for_candidate(base: Duration, candidate: &Model, now: Instant) -> Duration {
-    header_wait_for_route(base, candidate.health_id(), now)
+/// 一次「典型」请求的正文字节数,用来判断这一笔比平常大多少。
+///
+/// 24 KiB 大致是一轮普通对话(几千 token 上下文 + 工具描述)的量级。这个数只做**比值**
+/// 的分母,不需要精确 —— 它决定的是「放大几倍」,而放大本身还被 `base`(30 秒)兜着。
+const HEADER_WAIT_TYPICAL_BYTES: usize = 24 * 1024;
+/// 按请求大小最多把速度档放宽几倍。4 倍配合 30 秒上限,足够让最大的 agent 轮次拿满。
+const HEADER_WAIT_MAX_SIZE_FACTOR: u32 = 4;
+
+fn header_wait_for_candidate(
+    base: Duration,
+    candidate: &Model,
+    now: Instant,
+    request_bytes: usize,
+) -> Duration {
+    header_wait_for_route(base, candidate.health_id(), now, request_bytes)
 }
 
-fn header_wait_for_route(base: Duration, route_id: uuid::Uuid, now: Instant) -> Duration {
+fn header_wait_for_route(
+    base: Duration,
+    route_id: uuid::Uuid,
+    now: Instant,
+    request_bytes: usize,
+) -> Duration {
+    // 系数 2.5 → 4（2026-09-02，生产实测定的，不是拍的）。
+    //
+    // **均值表达不了尾巴，而这里要挡的恰恰是尾巴。** 72 小时 140 个成功样本，
+    // 各家的 p95/均值比：deepseek 1.4、opus 1.7、glm 2.2、**grok 2.7** —— 2.5 正好卡在
+    // grok 底下。后果是实测的：48 小时里 12 次「upstream sent no response headers
+    // within 10s」全部是 grok-4.6，约占它总请求的 9%，而那个模型只有一条线路，
+    // 没有第二条可切 —— 用户看到的是 agent 跑到一半吃个 504、这一轮当场死掉。
+    //
+    // 最硬的那条证据是**分布被截断**：grok 成功样本的最大值是 9,897ms，而超时线是
+    // 10,000ms。观测到的最大值就是超时线本身，说明真实尾巴比看到的更长，
+    // 所以 2.7 这个比值本身还是低估的。取 4 留出余量。
+    //
+    // 为什么不动 HEADER_WAIT_FLOOR（10 秒）：地板是给**真快**的线路分档用的
+    // （polly 正常 5 秒出首字节，10 秒没动静基本能断定它不在服务），抬地板会把
+    // 快慢线路重新压成一样，按速度分档就白做了。grok 的问题不是地板太低，
+    // 是它均值低而尾巴长——那是系数的事。
+    //
+    // 上限仍由 base（30 秒）兜着，所以慢线路不会因为这一改而无限等：
+    // glm 9.2×4=36.8s、opus 12.8×4=51s 都会被 base 钳回 30 秒。
+    // **按请求大小放宽 —— 不加这一条,大请求会被自己的历史均值铡死。**
+    //
+    // EWMA 是这条出口**所有请求混在一起**的平均首字时间,它不知道这一笔有多大。
+    // 一条平时跑小请求、均值 3.25 秒的出口,速度档算出来是 13 秒;而一轮 195k token 的
+    // agent 请求光让上游把输入吃进去就不止 13 秒 —— 必然超时。
+    //
+    // 更糟的是这个错误**会自我强化**:超时发生在拿到表头**之前**,所以
+    // `record_route_header_ms` 永远收不到这一笔的真实耗时。均值只会被小请求拉低、
+    // 永远不会被大请求拉高,于是同一条出口越用越短、越短越必然失败。
+    // 生产实拍 2026-09-03:deepseek 那条线路 5 个出口全部
+    // 「upstream sent no response headers within 13s」,而用户的上下文是 195k token。
+    //
+    // 放宽是**按比值**的,上限仍由 `base`(30 秒)兜着:小请求的档位一点没变(比值 1),
+    // 只有明显更大的请求才拿得到更长的窗口。
+    let size_factor = (request_bytes / HEADER_WAIT_TYPICAL_BYTES.max(1))
+        .clamp(1, HEADER_WAIT_MAX_SIZE_FACTOR as usize) as u32;
     let by_speed = route_header_ewma(route_id)
-        .map(|avg| (avg * 5 / 2).max(HEADER_WAIT_FLOOR))
+        .map(|avg| (avg * 4 * size_factor).max(HEADER_WAIT_FLOOR))
         .unwrap_or(base);
     let mut wait = base.min(by_speed);
     // 最近整整卡满过一次的线路，额外压到短探测预算。请求照发，恢复了就照常拿结果。
@@ -1572,19 +1940,25 @@ fn chat_upstream_attempt_suffix(
             "（已请求 {attempts} 次；「强力版」把这一轮限定在这 1 条线路上，关掉它可改走其它同模型线路；最后状态 {last_status}）"
         )
     } else if route_count <= 1 {
-        format!("（已请求 {attempts} 次；当前只有 1 条同模型线路；最后状态 {last_status}）")
+        format!("（已请求 {attempts} 次；这个模型当前只有 1 个可用上游目标；最后状态 {last_status}）")
     } else if (attempts as usize) < route_count {
-        // 「已请求 1 次 / 2 条同模型线路」读起来是"两条都试过了、都不行"，而实际上另一条
-        // 健康线路一次都没碰过——一个 inbound 请求只发一次上游（CHAT_UPSTREAM_MAX_ROUTES_
-        // PER_REQUEST = 1），换线是**跨请求**发生的：这次失败会给这条线路记冷却，下一次
-        // 发送就自动排到别的线路上。用户实拍到的正是这个误读：他以为线路全废了，其实
-        // 重发一次就好。把没试过的那几条说出来，并把"重发一次"这个出口讲明白。
+        // **这句话以前是假的，2026-09-03 改掉。**
+        //
+        // 老文案说「同模型另有 N 条没试过；直接重发一次就会自动改走其它线路」。两处都不成立:
+        //   · `route_count` 数的是**出口**(`let route_count = candidates.len()` 取在收窄之后),
+        //     不是线路。说成「N 条线路」是把出口当线路报,数字本身就错。
+        //   · 「重发就会改走其它线路」在跨线路兜底关闭期间**结构上不可能发生** ——
+        //     用户照着做了四次,四次都回到同一条线路,四次都空手(生产实拍 2026-09-03)。
+        //
+        // 现在只说**确定成立**的两件事:还剩几个没试的目标,以及这次的最后状态。
+        // 不再对「重发会怎样」做任何承诺 —— 会不会换线由本轮的失败类型决定,
+        // 那是调用方才知道的事,不该由一句固定文案替它保证。
         let untried = route_count - attempts as usize;
         format!(
-            "（本次只试了 1 条线路，同模型另有 {untried} 条没试过；这条已被记下冷却，直接重发一次就会自动改走其它线路；最后状态 {last_status}）"
+            "（本次试了 {attempts} 个上游目标，还有 {untried} 个没试；最后状态 {last_status}）"
         )
     } else {
-        format!("（已请求 {attempts} 次 / {route_count} 条同模型线路；最后状态 {last_status}）")
+        format!("（已请求 {attempts} 次 / 共 {route_count} 个上游目标；最后状态 {last_status}）")
     }
 }
 
@@ -1883,6 +2257,42 @@ pub(crate) fn api_base(base: &str) -> String {
     }
 }
 
+/// 从上游 GET /models 的返回体里提取模型 id 列表。
+///
+/// 各家形状不一样，中转站尤其乱：OpenAI 是 `{data:[{id}]}`，Anthropic 也是 `data`
+/// 但字段可能叫 `id` 或 `display_name`，Ollama 的 /v1/models 是 OpenAI 形状但有些版本
+/// 直接回 `{models:[{name}]}`，还有的中转站直接回一个字符串数组。
+/// 和客户端 wire-protocol.js 的 cmParseModels 保持同口径。
+pub fn parse_model_ids(v: &serde_json::Value) -> Vec<String> {
+    let rows = if let Some(arr) = v.as_array() {
+        arr.as_slice()
+    } else if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+        arr.as_slice()
+    } else if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
+        arr.as_slice()
+    } else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for r in rows {
+        let id = if let Some(s) = r.as_str() {
+            s.to_string()
+        } else {
+            r.get("id")
+                .or_else(|| r.get("name"))
+                .or_else(|| r.get("model"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let id = id.trim().to_string();
+        if !id.is_empty() && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 #[derive(sqlx::FromRow, Clone)]
 pub struct Model {
     pub id: uuid::Uuid,
@@ -2113,7 +2523,8 @@ fn effective_billing_micro(model: &Model, model_id: &str) -> (String, i64, bool,
     // Fall back to the whole-cent fee so an override written before micro support still bills.
     let micro = if micro > 0 {
         micro
-    } else if model.per_call_micro_usd > 0 {
+    } else if model.per_call_micro_usd > 0 && model.billing_mode == "per_call" {
+        // 同上：连接列只在连接自己按次计费时才作数。
         model.per_call_micro_usd
     } else {
         c.max(0) * MICRO_USD_PER_CENT
@@ -2189,11 +2600,19 @@ fn effective_billing_inner(model: &Model, model_id: &str) -> (String, i64, bool)
         .map(|s| s.trim().to_lowercase())
         .filter(|s| s == "rate" || s == "per_call" || s == "free")
         .unwrap_or_else(|| model.billing_mode.clone());
+    // 连接列（per_call_cents / per_call_micro_usd）只在**连接自己就是按次计费**时才是
+    // 一笔真费用。billing_mode="rate" 的连接上那两列是遗留配置。
+    //
+    // 原来无条件 `unwrap_or(model.per_call_cents)`，于是一个显式配成 {"mode":"free"} 的
+    // 模型继承了连接遗留的 per_call_cents=20 → 下面 cost_mode 被判成 "per_call" →
+    // 每次调用从免费池扣 20 分 = 4.00 点。生产实测（14 天）：glm-5.3-flash 每次扣 4.000 点，
+    // 而它一次的真实目录价只有 $0.0027 —— **75 倍**。用户那边看到的就是「送 100 点，
+    // 二十几次调用就没了」，而一个 agent 任务要 5.2 次模型调用。
     let per_call = ov
         .and_then(|v| v.get("per_call_cents"))
         .and_then(|v| v.as_i64())
         .filter(|n| *n >= 0)
-        .unwrap_or(model.per_call_cents);
+        .unwrap_or(if model.billing_mode == "per_call" { model.per_call_cents } else { 0 });
     let is_free = mode == "free";
     // A free model priced per call still needs a flat fee; free + per_call_cents 0 means
     // "costs nothing", which is legitimate (fully free) — the points pool simply is not
@@ -2209,6 +2628,16 @@ fn effective_billing_inner(model: &Model, model_id: &str) -> (String, i64, bool)
 fn route_supports_prompt_cache(model: &Model) -> bool {
     model.protocol == "anthropic"
         && std::env::var("MICHAEL_PROMPT_CACHE").ok().as_deref() != Some("0")
+        // 第三条判据是**这条线路自己的执行事实**：它写进去的缓存读得回来吗。
+        //
+        // Anthropic 的缓存要付费写入（输入价 1.25 倍），读只要 0.025 倍 —— 写了从来读不到
+        // 比压根不缓存还贵 25%。而这类中转的缓存在负载均衡后面是每实例一份：本仓库实测过
+        // 连续 16 次调用前缀指纹逐字节相同，中转却几乎每次都收写入、读取只偶尔命中。
+        // 用户侧看到的正是上游那句「疑似协议和模型不匹配导致 cache 异常」。
+        // OpenAI/xAI 靠 prompt_cache_key 把请求钉在同一台机器上，Anthropic 协议没有这个字段。
+        //
+        // 判据是算术不是名单，样本不够一律放行，且会随时间半衰自动重试。见 cache_payoff。
+        && crate::cache_payoff::should_write_cache(model.id)
 }
 
 /// True for any image-GENERATION model (bills PER-IMAGE, not per-token) across vendors:
@@ -2315,6 +2744,48 @@ fn resolve_cost(
         model_over,
         cache_disabled,
     )
+}
+
+/// 和 `resolve_cost` 同一套判据、同一份价，只是**不取整到整美分**，返回 micro-USD。
+///
+/// 存在的理由是钱：`compute_cost` 最后一步 `(usd * 100 * rate).round()` 会把不到半美分的
+/// 调用变成 0，而钱包记的是人民币分（比美分细 7.1 倍）—— 那 7 倍精度本来够用，是被这一步
+/// 提前扔掉的。生产实测 24 小时内因此白送了 228 次 vision-exp 调用（1700 万 token）。
+///
+/// 美元分那一侧**原样保留**（对账页和 note_endpoint_usage 仍按美元口径），
+/// 只有「扣用户的那一份」改走这条。
+/// $50/call 的兜底上限。两条计价路（整美分的 compute_cost、micro 的 resolve_cost_micro_usd）
+/// 共用同一个数 —— 各写一份迟早会漂。
+const COST_CEILING_CENTS: f64 = 5000.0;
+
+fn resolve_cost_micro_usd(
+    billing_mode: &str,
+    per_call_cents: i64,
+    usage: Option<&serde_json::Value>,
+    model_id: &str,
+    rate: f64,
+    admin_in: f64,
+    admin_out: f64,
+    cache_read_price: f64,
+    cache_create_price: f64,
+    model_over: Option<(f64, f64)>,
+    cache_disabled: bool,
+) -> i64 {
+    if billing_mode == "per_call" {
+        return per_call_cents.max(0).saturating_mul(MICRO_USD_PER_CENT);
+    }
+    let Some(p) = priced_usd(
+        usage, model_id, admin_in, admin_out, cache_read_price, cache_create_price,
+        model_over, cache_disabled, false,
+    ) else {
+        return 0;
+    };
+    let scaled = p.usd * rate.max(0.0) * 1_000_000.0;
+    if !(scaled > 0.0) {
+        return 0;
+    }
+    // 上限和 compute_cost 的 COST_CEILING_CENTS 同源，换算成 micro。
+    scaled.min(COST_CEILING_CENTS * MICRO_USD_PER_CENT as f64).round() as i64
 }
 
 fn usage_is_authoritative(usage: Option<&serde_json::Value>) -> bool {
@@ -2579,10 +3050,17 @@ async fn i18n_pack_from_model(
     entries: &HashMap<String, String>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let payload = i18n_pack_payload(model_id, source_locale, locale, entries);
-    let url = format!("{}/chat/completions", api_base(&m.base_url));
+    // 按线路自己的协议走。这条路以前无条件拼 /chat/completions —— 而它按后台 sort 取
+    // 最前两条线路，运营方把 Claude 线排在最前时，翻译请求就以 OpenAI 兼容形状打进
+    // Anthropic 线路：中转控制台上标成 "OpenAI compatible"，缓存和思考一起没了。
+    let key = model_key(&m.api_key);
+    let (url, payload) = aux_wire_request(&m.base_url, &m.protocol, &payload)
+        .map_err(|e| format!("{} / {} 请求组装失败: {e}", m.label, model_id))?;
     let resp = GW_HTTP
         .post(url)
-        .header("Authorization", format!("Bearer {}", model_key(&m.api_key)))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("x-api-key", &key)
+        .header("anthropic-version", "2023-06-01")
         .json(&payload)
         .timeout(Duration::from_secs(90))
         .send()
@@ -2599,6 +3077,10 @@ async fn i18n_pack_from_model(
             safe_upstream_error_excerpt(&text)
         ));
     }
+    // 回执还原成 OpenAI 形状，下面读 choices 的代码一个字不用动（openai 线路是恒等）。
+    let text = serde_json::from_str::<serde_json::Value>(&text)
+        .map(|raw| aux_wire_response(&m.protocol, model_id, raw).to_string())
+        .unwrap_or(text);
     let (content, _usage) = text_and_usage_from_body(&text);
     if content.trim().is_empty() {
         return Err(format!("{} / {} 返回空内容", m.label, model_id));
@@ -3232,7 +3714,12 @@ pub async fn admin_model_estimate(
     let calls = req.calls as f64;
     let provider_usd_total = provider_usd_per_call * calls;
     let channel_cost_cny = provider_usd_total / usd_per_cny;
+    // `resolve_cost` 返回的是**美元分**（`compute_cost` 那条链，含线路倍率，未过汇率），
+    // 所以这里 ÷100 得到的确实是美元。字段名里的 "raw" 是历史遗留：2026-08-28 之前
+    // 「真实计费分」就是美元分，两者同义；现在真实计费分是人民币分，这个数不再是它。
     let billed_raw_usd = billed_cents_per_call as f64 / 100.0 * calls;
+    // 面值换算的分母由 `raw_usd_per_visible_usd` 一处给出（663 × 每钱包分值多少美元）。
+    // 它已经把 08-28 的汇率那一步含进去了，这里不要再乘除任何汇率。
     let visible_quota_usd = billed_raw_usd / user_quota_raw_usd_per_visible_usd();
     let profit_cny = req.sales_cny.map(|sales| sales - channel_cost_cny);
     let margin_percent = req.sales_cny.and_then(|sales| {
@@ -3446,6 +3933,7 @@ pub async fn admin_create(
     .bind(req.cache_disabled.unwrap_or(false))
     .fetch_one(&state.db)
     .await?;
+    invalidate_active_models_cache();
     Ok(Json(json!({ "ok": true, "id": id })))
 }
 
@@ -3463,6 +3951,7 @@ pub async fn admin_delete(
     if res.rows_affected() == 0 {
         return Err(AppError::bad("模型不存在"));
     }
+    invalidate_active_models_cache();
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -3495,6 +3984,7 @@ pub async fn admin_available(
         // 运维会以为线路密钥坏了。另外两处实现一直是双头，这里漏了。
         .header("Authorization", format!("Bearer {key}"))
         .header("x-api-key", &key)
+        .header("anthropic-version", "2023-06-01")
         .send()
         .await
         // **不回显 reqwest 的错误原文**：它带完整 URL，而有些转卖商要求把密钥
@@ -3515,15 +4005,7 @@ pub async fn admin_available(
             ),
         });
     }
-    let ids: Vec<String> = data
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids: Vec<String> = parse_model_ids(&data);
     // 每个模型的**实时能力**，和 id 一起回给后台。
     //
     // 以前这里只回 id，于是后台配一条线路时，上下文、价格、缓存价、思考档位全靠管理员
@@ -3783,15 +4265,13 @@ pub async fn admin_update(
         .bind(&balance_token)
         .execute(&state.db)
         .await?;
+    invalidate_active_models_cache();
     Ok(Json(json!({ "ok": true })))
 }
 
 pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
-    let rows = sqlx::query_as::<_, Model>(
-        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let rows_arc = active_models_cached(&state.db).await?;
+    let rows: Vec<Model> = rows_arc.as_ref().clone();
     // 出口可能带来线路本身没有的模型，列表要把它们算进去。
     let ep_map = crate::route_endpoints::load_for_routes(
         &state.db,
@@ -4112,6 +4592,18 @@ pub async fn chat(
     if !body.is_object() {
         return Err(AppError::bad("请求体需为 JSON 对象"));
     }
+
+    if let crate::prompt_shield::ShieldVerdict::Honeypot(reason) =
+        crate::prompt_shield::check_request(&headers, &body)
+    {
+        tracing::warn!(
+            request_id = request_id.as_deref().unwrap_or("-"),
+            reason = ?reason,
+            "[prompt_shield] honeypot triggered on /chat"
+        );
+        return Err(AppError::forbidden("服务暂时不可用"));
+    }
+
     // honour the requested model when it's in this connection's enabled set
     let allowed = allowed_ids(&model);
     let requested = body.get("model").and_then(|v| v.as_str()).map(String::from);
@@ -4206,23 +4698,36 @@ pub async fn chat(
         vision_preprocess(&state, uid, &mut body).await;
     }
 
-    let url = format!("{}/chat/completions", api_base(&model.base_url));
+    // 按线路自己的协议走。这条对外接口以前无条件拼 /chat/completions：同一个 Claude
+    // 模型在主聊天链路上走原生 /v1/messages，在这条路上被降级成 OpenAI 兼容形状 ——
+    // 同一份配置两个答案，而且这一条不报错，只是悄悄丢掉缓存和思考。
+    let key = model_key(&model.api_key);
+    let (url, out_body) = aux_wire_request(&model.base_url, &model.protocol, &body)
+        .map_err(|e| AppError::internal(format!("请求组装失败: {e}")))?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| AppError::internal(e.to_string()))?;
     let resp = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", model_key(&model.api_key)))
-        .json(&body)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("x-api-key", &key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&out_body)
         .send()
         .await
         .map_err(|e| AppError::internal(format!("模型调用失败: {e}")))?;
     let status = resp.status();
-    let data: serde_json::Value = resp
+    let raw: serde_json::Value = resp
         .json()
         .await
         .unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
+    // 失败时不还原：错误体是各家自己的形状，硬套转换只会把有用的报错抹平。
+    let data = if status.is_success() {
+        aux_wire_response(&model.protocol, &chosen, raw)
+    } else {
+        raw
+    };
     if !status.is_success() {
         // 上游报错**不能原样透传**给用户。`data` 是上游的完整 JSON：里面可能有中转商的
         // 主机名、请求 URL，部分中转商还会把 Authorization 原样回显。同一份代码别处早就
@@ -4269,6 +4774,20 @@ pub async fn chat(
         model.cache_create_price,
         model_over,
         model.cache_disabled,);
+    // 同一套参数、同一份价，只是**不取整到整美分**。扣用户的那一份走这条（见
+    // resolve_cost_micro_usd 的说明：整美分取整会把不到半美分的调用变成 0，白送）。
+let cost_micro = resolve_cost_micro_usd(
+        &eff_mode,
+        eff_percall,
+        usage_val.filter(|_| usage_reported),
+        &chosen,
+        model.rate,
+        model.input_price,
+        model.output_price,
+        model.cache_read_price,
+        model.cache_create_price,
+        model_over,
+        model.cache_disabled,);
     let mut tokens = extract_bill_tokens(
         usage_val.filter(|_| usage_reported),
         &chosen,
@@ -4279,7 +4798,8 @@ pub async fn chat(
     // model_usage with NULL mode/tool_turn and the routing report silently under-counts.
     tokens.mode = step_mode(&headers);
     tokens.tool_turn = step_is_tool_turn(&body);
-    bill(&state, uid, model.health_id(), model.id, cost, use_quota, &tokens, free_pool, free_micro)
+    (tokens.run_id, tokens.step_index) = step_run_shape(&headers);
+    bill(&state, uid, model.health_id(), model.id, cost, use_quota, &tokens, free_pool, free_micro, model.rate, cost_micro)
         .await;
     Ok(Json(data))
 }
@@ -4321,6 +4841,7 @@ pub async fn admin_sort(
     }
     tx.commit().await?;
     tracing::info!(routes = req.order.len(), "线路次序已更新");
+    invalidate_active_models_cache();
     Ok(Json(serde_json::json!({ "ok": true, "routes": req.order.len() })))
 }
 
@@ -4702,16 +5223,11 @@ async fn vision_preprocess(state: &AppState, uid: uuid::Uuid, body: &mut serde_j
     let over_budget = !vision_budget_ok(state, uid).await;
     // best-effort: have gpt-5.5 describe the images (may fail → we still strip them)
     let mut desc: Option<String> = None;
-    let conns = sqlx::query_as::<_, Model>(
-        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let conns = active_models_cached(&state.db).await.unwrap_or_default();
     let vconn = if over_budget {
         None
     } else {
-        conns.into_iter().find(|m| {
+        conns.iter().find(|m| {
             allowed_ids(m)
                 .iter()
                 .any(|id| id.eq_ignore_ascii_case("gpt-5.5"))
@@ -4734,6 +5250,11 @@ async fn vision_preprocess(state: &AppState, uid: uuid::Uuid, body: &mut serde_j
             .timeout(std::time::Duration::from_secs(90))
             .build()
         {
+            // **这一处刻意仍走 /chat/completions。** 模型写死 gpt-5.5，能承载它的线路
+            // 必然是 openai 协议的，所以这里结构上错不了；而且它是**流式**请求
+            // （stream:true + include_usage，usage 丢了就按 0 结账），非流式那套
+            // 请求/回执转换套不上，得走 AnthSse 那条。等真有 Anthropic 视觉线路时
+            // 再动，别为了「看起来统一」去改一条正在计费的路。
             let url = format!("{}/chat/completions", api_base(&vconn.base_url));
             if let Ok(r) = client
                 .post(&url)
@@ -4991,8 +5512,17 @@ pub(crate) fn official_price(model_id: &str) -> Option<(f64, f64)> {
     }
 }
 
-const CACHE_READ_FACTOR: f64 = 0.1;
-const CACHE_WRITE_FACTOR: f64 = 1.25;
+/// 缓存读价 = 输入价 × 这个倍率。计费和「写入划不划算」的判据**共用这一个数**
+/// —— 各写一遍必然漂：cache_payoff 里一度自己写了 0.025，于是那道闸比该有的松一档，
+/// 在读写比 0.256~0.278 这个窄区间里继续付钱写实际亏本的缓存。
+pub(crate) const CACHE_READ_FACTOR: f64 = 0.1;
+/// 缓存写价 = 输入价 × 这个倍率。同上，判据也从这里取。**这是 5 分钟那一档。**
+pub(crate) const CACHE_WRITE_FACTOR: f64 = 1.25;
+/// 1 小时 TTL 的缓存写价 = 输入价 × 这个倍率（官方价目：5 分钟 1.25×、1 小时 2×）。
+pub(crate) const CACHE_WRITE_FACTOR_1H: f64 = 2.0;
+/// 1 小时写入相对 5 分钟写入贵多少倍。所有算出来的写入价（后台填的、目录抓的）都是
+/// 5 分钟那一档，所以 1 小时那部分要再乘这个数。
+pub(crate) const ONE_HOUR_WRITE_PREMIUM: f64 = CACHE_WRITE_FACTOR_1H / CACHE_WRITE_FACTOR;
 
 #[allow(clippy::too_many_arguments)]
 fn projected_provider_usd(
@@ -5069,7 +5599,32 @@ pub(crate) fn effective_cache_prices(
         return (0.0, 0.0);
     }
     let live = crate::model_catalog::lookup(model_id);
-    let live_in = live.as_ref().and_then(|e| e.input_price).filter(|p| *p > 0.0);
+    // 用目录的**真实倍率 × 你实际计费的输入价**，不是照搬目录的绝对缓存价。
+    //
+    // 关键：off_in 是**你收用户的价**（每模型覆盖 / 连接价），常常在目录成本价上加了价——
+    // 线上 claude-opus-5 目录 $5、你收 $15（3×）。缓存价该跟着你的输入价走：照搬目录 $6.25
+    // （那是按目录 $5 算的）会把加价模型的缓存按**成本价**收，少收好几倍，而缓存写入恰恰
+    // 是单价最贵的一类 token。倍率取自目录（cache/input），比写死的 0.1/1.25 准——实测
+    // deepseek 缓存读真实 0.2×、不是默认 0.1×。目录明确给 0（免费缓存）→ 倍率 0 → 收 0。
+    //
+    // **分子分母必须同一个年代。**
+    //
+    // 缓存价在这里是按**倍率**用的（挂牌缓存价 ÷ 挂牌输入价 → 再乘计费输入价），
+    // 见 [[cache-price-is-ratio-not-absolute]]。而 `input_price` 这一列被官方价锚定
+    // 抬过（`model_catalog.rs` 的 `official_price_window_days` 那段：只抬不降，窗口内
+    // 按最高价计费，用来不跟着上游搞活动降价）——**缓存那两列没有被一起抬**。
+    //
+    // 于是拿「今天的挂牌缓存价」除「30 天窗口锚定过的输入价」，是两个年代的数
+    // 拼在一起：上游一打折，分子跟着降、分母被钉住，倍率整体缩水，缓存读和缓存
+    // 写两条腿按降幅线性少收，而且一声不吭 —— 锚定这个功能本来就是为了防这件事。
+    //
+    // 用 `spot_input_price`（锚定之前那一刻的挂牌输入价，`model_catalog.rs:801` 存的）
+    // 当分母，倍率就回到「上游自己公布的那个比例」（Anthropic 缓存读 0.1×、写 1.25×）。
+    // 没有 spot（这个模型压根没进锚定窗口）时退回 input_price —— 那时两者本来相等。
+    let live_in = live
+        .as_ref()
+        .and_then(|e| e.spot_input_price.or(e.input_price))
+        .filter(|p| *p > 0.0);
     let ratio = |cache: Option<f64>| match (cache, live_in) {
         (Some(c), Some(ci)) => Some(c / ci),
         _ => None,
@@ -5170,6 +5725,25 @@ struct PricedCall {
     read_price: f64,
     write_price: f64,
 }
+
+/// 「这条回执的 prompt_tokens 里含不含缓存读取」—— 计价和落库**必须**用同一个判据。
+///
+/// 结构判据是 Anthropic 独有的 `cache_read_input_tokens`：有它 = Anthropic 形状 = 输入
+/// **不含**缓存。但只有这一条不够，线上实测栽在这里：一部分中转把 Anthropic 的回执
+/// 转成 OpenAI 的字段名（`prompt_tokens_details.cached_tokens`）却**把 input_tokens 原样
+/// 透传**——于是判据说「已含」，而那个数其实不含。
+///
+/// 后果是钱：计价那一支据此做减法 `(prompt - cached).max(0)`，而这种行的 cached 比
+/// prompt 大得多，减完钳到 0 —— **这一笔的全价输入一分钱都没收**。
+/// 线上 14 天 1,930 行、1,088 万个输入 token 就是这么丢的（claude-opus-5 一档占 598 万）。
+///
+/// 补的第二条是**算术上的必要条件**：「输入已含缓存」蕴含 `cached <= prompt`。
+/// 违反它就是自相矛盾，只能说明输入不含缓存。这一条不靠猜上游是谁，也不需要维护
+/// 任何厂商名单 —— 它是一个恒等式，任何中转都翻不了。
+fn prompt_includes_cached_shape(cache_read: Option<f64>, cached: f64, prompt: f64) -> bool {
+    cache_read.is_none() && cached <= prompt
+}
+
 
 /// 一次调用按给定价目值多少**美元**（未乘线路倍率、未取整）。
 ///
@@ -5296,19 +5870,6 @@ fn priced_usd(
     //      「没写就用 openrouter 实时获取的」，比按输入价拍脑袋推算准得多。
     //      目录明确给 0（缓存读免费的模型）也照用，None 才算"目录没有这个数"。
     //   ③ 目录也没有 → 最后才按输入价 × 倍数推算兜底。
-    let live_cache = crate::model_catalog::lookup(model_id);
-    // 用目录的**真实倍率 × 你实际计费的输入价**，不是照搬目录的绝对缓存价。
-    //
-    // 关键：off_in 是**你收用户的价**（每模型覆盖 / 连接价），常常在目录成本价上加了价——
-    // 线上 claude-opus-5 目录 $5、你收 $15（3×）。缓存价该跟着你的输入价走：照搬目录 $6.25
-    // （那是按目录 $5 算的）会把加价模型的缓存按**成本价**收，少收好几倍，而缓存写入恰恰
-    // 是单价最贵的一类 token。倍率取自目录（cache/input），比写死的 0.1/1.25 准——实测
-    // deepseek 缓存读真实 0.2×、不是默认 0.1×。目录明确给 0（免费缓存）→ 倍率 0 → 收 0。
-    let live_in = live_cache.as_ref().and_then(|e| e.input_price).filter(|p| *p > 0.0);
-    let cache_ratio = |cache: Option<f64>| match (cache, live_in) {
-        (Some(c), Some(ci)) => Some(c / ci),
-        _ => None,
-    };
     // 关闭缓存计费（每线路开关）：缓存读、缓存写都**不收钱**，普通输入照常。
     // 用户："我拉取的模型自带价格和缓存价……新增一个关闭缓存的开关，关闭的话价格一样、
     // 不收缓存钱。" 灰产/便宜渠道用——缓存那点钱干脆不算，输入输出价一分不动。
@@ -5321,10 +5882,15 @@ fn priced_usd(
         cache_disabled,
     );
     // Split input into plain (full price) + cache-read + cache-create, bill each at its own
-    // unit price; output at off_out. Then × 倍率. Anthropic reports input EXCLUDING cached;
-    // OpenAI/DeepSeek report prompt INCLUDING cached reads (and no separate write count).
-    let (plain_input, read_tok, write_tok) = if cache_read.is_some() {
-        (prompt, cached, cache_creation) // Anthropic shape
+    // unit price; output at off_out. Then × 倍率.
+    //
+    // **Anthropic 的 `input_tokens` 含 cache_creation 但不含 cache_read。**
+    // 线上实测：prompt 与 cache_create 差值始终 2-3（不可缓存的帧头 token），
+    // 证明 input_tokens 已经包含了 cache_creation_input_tokens。不减的话那一批 token
+    // 被输入价 + 写入价双重收费（$5 + $6.25 = $11.25/M，正确只有 $6.25/M）。
+    let (plain_input, read_tok, write_tok) = if !prompt_includes_cached_shape(cache_read, cached, prompt) {
+        // Anthropic shape: input_tokens 含 cache_creation，不含 cache_read
+        ((prompt - cache_creation).max(0.0), cached, cache_creation)
     } else {
         // OpenAI / DeepSeek shape：prompt_tokens **含**缓存读取，所以要扣掉；
         // 缓存写入是另算的一份 token，不在 prompt_tokens 里，直接带上。
@@ -5335,9 +5901,27 @@ fn priced_usd(
         // cache_creation 仍然是 0，行为一个字不变。
         ((prompt - cached).max(0.0), cached, cache_creation)
     };
+    // **1 小时 TTL 的写入是 2× 输入价，5 分钟是 1.25×。**
+    //
+    // 上面算出来的 write_price 无论来自后台手填、目录抓取还是按输入价推算，都是
+    // 5 分钟那一档 —— 目录（OpenRouter）报的也是 5 分钟价。所以 1 小时那部分必须再乘
+    // 一次溢价，否则每写一次我们自己吃掉 60%，而且**不报错、不留痕**：库里 token 数
+    // 是对的、金额少了，只能靠对账单才看得出来。
+    //
+    // 分档来自上游回执的 `usage.cache_creation.ephemeral_1h_input_tokens`（官方字段，
+    // 和 `ephemeral_5m_input_tokens` 一起，两者之和等于 cache_creation_input_tokens）。
+    // 取不到就当全是 5 分钟 —— 那是这个字段出现之前的行为，也是更保守的一侧。
+    // `min(write_tok)` 挡中转报出自相矛盾的数（分档比总数还大）。
+    let hour_tok = u
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(|v| v.as_f64())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(0.0)
+        .min(write_tok);
     let usd = (plain_input * off_in
         + read_tok * read_price
-        + write_tok * write_price
+        + (write_tok - hour_tok) * write_price
+        + hour_tok * write_price * ONE_HOUR_WRITE_PREMIUM
         + completion * off_out)
         / 1_000_000.0;
     Some(PricedCall {
@@ -5370,7 +5954,6 @@ fn compute_cost(
     model_over: Option<(f64, f64)>,
     cache_disabled: bool,
 ) -> i64 {
-    const COST_CEILING_CENTS: f64 = 5000.0; // $50/call backstop — no legit single call hits this
     let Some(PricedCall {
         usd,
         prompt,
@@ -5389,6 +5972,38 @@ fn compute_cost(
     };
     let uncapped = (usd * 100.0 * rate.max(0.0)).round();
     let cents = uncapped.clamp(0.0, COST_CEILING_CENTS) as i64;
+    // **价算出来了，收到的却是 0。**
+    //
+    // 「有意免费」在这条路上根本到不了：那种模型的 `usd` 本身就是 0（价格显式配成 0），
+    // 上游那道 `price_source != "model_override"` 的告警管的就是它旁边那种。
+    // 这里剩下的只有两种，两种都是事故：**倍率被配成了 0**，或者这一笔小到
+    // 四舍五入进了 0 分（$0.005 以下）。前者是白送，后者是系统性少收 ——
+    // 按量计费的模型上，每一笔都不足半分的场景（短问答、意图判断）会**永远**收 0。
+    //
+    // 线上实测过一次：grok-4.6 有 872 行、3617 万 token 收费为 0，而它明明配着
+    // in 2 / out 6。当时没有任何日志，事后翻表才发现，根因已经查不出来了。
+    // 这条日志就是为了下一次能当场看出是哪一种。
+    // **判据只留「倍率 0」这一种。**
+    //
+    // 原来两种都报。但「不足半分被四舍五入成 0」已经不是事故了 —— 钱包改走
+    // micro-USD 之后，那一档由 `resolve_cost_micro_usd` + `usd_micro_to_wallet_cents`
+    // 正常收钱（线上实测：切换后 7 笔平均 0.214 美分，全部收到钱）。这里的 `cents`
+    // 只剩两个用途：结算入队的美元分快照，和这条告警自己。
+    //
+    // 继续按 `cents == 0` 报的话，**这条告警会对每一笔正常的亚分调用误报**，而它
+    // 的全部价值就是「响了就一定有事」。响成常态就等于没有 —— 和当初 8,700 次
+    // 噪音把上一版告警淹掉是同一个死法。
+    //
+    // 真白送那一种（倍率被配成 0）判据独立、且和取整无关，原样保留：
+    // 线上实测过一次 grok-4.6 872 行、3617 万 token 收费为 0，事后翻表才发现。
+    if rate <= 0.0 && usd > 0.0 {
+        tracing::error!(
+            model = %model_id, usd, rate,
+            prompt = prompt as i64, completion = completion as i64,
+            event = "billing_priced_but_charged_zero",
+            "priced above zero yet charged 0 —— 线路倍率被配成了 0，这一笔在白送"
+        );
+    }
     // The ceiling is a backstop, not a policy — if it ever fires, both the charge AND
     // the model_usage row understate what the upstream actually cost, so reconciliation
     // would silently come up short. Make that loud instead of invisible.
@@ -6046,9 +6661,26 @@ impl InFlightGuard {
         if n > MAX_INFLIGHT_PER_USER {
             let _: Result<(), redis::RedisError> =
                 redis::cmd("DECR").arg(&key).query_async(&mut redis).await;
+            // **这一条要能和「上游限流」分得开。**
+            //
+            // 两者的状态码都是 429，而客户端的失败分类器只看状态码（`case 429 => rate`），
+            // 于是撞到这道**我们自己的**闸时，它按真限流处理：等 15 秒、再等 30 秒。
+            // 可这两件事的性质完全相反 —— 真限流是上游让我们慢下来，长退避是对的；
+            // 而这道闸的请求**压根没发出去**，不烧任何配额，位子在用户自己那 8 个在跑的
+            // 请求里任何一个结束时就腾出来了。干等 45 秒纯属浪费。
+            //
+            // 线上量级：nginx 侧 14 天 3294 个 429（占聊天请求 8.2%），字节级可以证明
+            // 绝大多数是这一条 —— 响应体长度恒为 48 字节，正是这句话的长度
+            // （08-28 那天 883 个 429 里 883 个都是 48 字节）。
+            //
+            // 用前缀标记而不是换状态码：换码会影响中间的代理和老客户端，而这个仓库
+            // 本来就用 `[model-empty-output]` / `[model-refusal]` 这种标记做同样的事。
             return Err(AppError {
                 status: StatusCode::TOO_MANY_REQUESTS,
-                msg: "并发请求过多，请稍后再试".into(),
+                msg: format!(
+                    "[gateway-inflight] 你同时进行的请求过多（本网关上限 {MAX_INFLIGHT_PER_USER} 个），\
+                     等前面的跑完就会自动继续"
+                ),
             });
         }
         Ok(Self { redis, key })
@@ -6410,6 +7042,11 @@ struct BillTokens {
     completion: i64,
     cached: i64,
     cache_creation: i64,
+    /// `cache_creation` 里按 1 小时 TTL 写入的部分。**溢价是 5 分钟档的四倍**
+    /// （2.0× vs 1.25× 输入价），所以「这次写入贵不贵」只看总量是答不出来的。
+    /// 取自上游回执的 `usage.cache_creation.ephemeral_1h_input_tokens`：中转要是把
+    /// 请求里的 `ttl:"1h"` 剥掉，这里就是 0，判据自动退回 5 分钟档。
+    cache_creation_1h: i64,
     /// 这一份回执里，`prompt` 到底含不含缓存读取。
     ///
     /// 两家不一样，而**只有收到回执的这一刻知道**：Anthropic 单列
@@ -6435,6 +7072,12 @@ struct BillTokens {
     /// First tool the model called back; None when it answered in prose. A call whose
     /// entire output is one tool dispatch is the prime routing candidate.
     emitted_tool: Option<String>,
+    /// 这一行属于哪一次运行、是第几步。客户端每一发都在传（x-ide-run-id / x-ide-step-index），
+    /// 网关此前只把 run_id 用于前缀探针日志和粘性亲和键，**从不落库** —— 于是「一次运行
+    /// 到底几个回合」在库里结构上问不出来，只能拿「相邻两行间隔 < 2 分钟」去猜边界。
+    /// 而所有者的抱怨（「简单的东西做半天」）的真正问题就是「为什么是 84 轮」。
+    run_id: Option<String>,
+    step_index: Option<i32>,
     /// 这一笔按**参考价**（实时目录）值多少 micro-USD。见 [`reference_micro_usd`]。
     /// `None` = 目录里没有这个模型的价，和「值 0 元」是两回事。
     ref_micro_usd: Option<i64>,
@@ -6451,10 +7094,13 @@ impl Default for BillTokens {
             completion: 0,
             cached: 0,
             cache_creation: 0,
+            cache_creation_1h: 0,
             prompt_includes_cached: true,
             model_name: String::new(),
             estimated: false,
             request_id: None,
+            run_id: None,
+            step_index: None,
             mode: None,
             tool_turn: None,
             emitted_tool: None,
@@ -6476,6 +7122,26 @@ fn step_mode(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty() && s.len() <= 32)
+}
+
+/// 客户端传来的「这一发属于哪一次运行、第几步」。
+///
+/// 校验和 affinity_scope 那侧**同一条正则**（`^[-_A-Za-z0-9]{8,128}$`）：放宽一个字符
+/// 就会让网关静默丢值，而表现只是「遥测里少了一批行」，没人看得出来。
+fn step_run_shape(headers: &HeaderMap) -> (Option<String>, Option<i32>) {
+    let run = headers
+        .get("x-ide-run-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| (8..=128).contains(&v.len())
+            && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+        .map(str::to_string);
+    let step = headers
+        .get("x-ide-step-index")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|n| (0..=10_000).contains(n));
+    (run, step)
 }
 
 /// Is this a continuation of an agent loop rather than a fresh human turn?
@@ -6562,6 +7228,38 @@ fn step_emitted_tool(text: &str) -> Option<String> {
     None
 }
 
+/// 边收流边认「这一轮发出的是哪个工具」，不依赖把整条流留在内存里。
+///
+/// 原来的做法是收完之后拿 `acc` 整份去找。`acc` 有个 1MB 的上限（它本来是**响应缓存**
+/// 的载荷，进 Redis 的东西必须封顶），而工具调用几乎总在流的**末尾**——思考、正文、
+/// 然后才是 tool_use。于是输出一长，工具名就落在 1MB 之外，`emitted_tool` 静默变成 NULL。
+///
+/// 后果不是「少记几行」，是**偏差**：线上 completion_tokens ≤ 5k 的行有 86% 记到了工具名，
+/// 5–6k 掉到 64.9%，>12k 只剩 43.6%。而「跑得久的那批轮次」恰恰是我们唯一想看的那批 ——
+/// 这张表越是关键的地方越空，且空得毫无声息。
+///
+/// 改成流式认：只保留够跨块拼接的一小段尾巴（工具名可能正好被 SSE 分块切成两半），
+/// 认到一个就不再扫。内存 O(1)，认的仍是**流里第一个**工具，和原来的语义一致。
+fn scan_for_emitted_tool(seen: &mut Option<String>, tail: &mut Vec<u8>, fresh: &[u8]) {
+    if seen.is_some() {
+        return;
+    }
+    tail.extend_from_slice(fresh);
+    let text = String::from_utf8_lossy(tail);
+    if let Some(name) = step_emitted_tool(&text) {
+        *seen = Some(name);
+        tail.clear();
+        return;
+    }
+    // 只留 512 字节：`"function"` 到取名窗口结束一共 169 字节，512 足够任何一次跨块拼接。
+    // 按字节切可能落在多字节字符中间——from_utf8_lossy 会把半个字符替换掉，
+    // 那只会让**这半个字符**读不出来，而工具名是 ASCII，认不到的风险为零。
+    let keep = tail.len().saturating_sub(512);
+    if keep > 0 {
+        tail.drain(..keep);
+    }
+}
+
 /// Extract BillTokens from a provider usage JSON (OpenAI or Anthropic shape).
 fn extract_bill_tokens(
     usage: Option<&serde_json::Value>,
@@ -6594,6 +7292,9 @@ fn extract_bill_tokens(
         )
         .max(gi(&["prompt_cache_hit_tokens"]));
     BillTokens {
+        // 这里只看回执，看不到请求头 —— run 形状由调用方在拿到 headers 之后补（step_run_shape）。
+        run_id: None,
+        step_index: None,
         prompt: gi(&["prompt_tokens", "input_tokens"]),
         completion: gi(&["completion_tokens", "output_tokens"]),
         cached,
@@ -6605,9 +7306,23 @@ fn extract_bill_tokens(
                 .and_then(|x| x.as_i64())
                 .unwrap_or(0),
         ),
+        // 官方分档字段。取不到就是 0 —— 也就是「全按 5 分钟档算」，正是这个字段出现
+        // 之前的行为，也是更保守的一侧（溢价按低的算，判据不会误关缓存）。
+        cache_creation_1h: u
+            .pointer("/cache_creation/ephemeral_1h_input_tokens")
+            .and_then(|x| x.as_i64())
+            .filter(|v| *v >= 0)
+            .unwrap_or(0),
         // 形状判据就一条、而且是**结构性**的：Anthropic 独有 cache_read_input_tokens。
         // 不拿「有没有缓存写入」反推——GPT-5.6 起它也有写入了，那样会当场认错。
-        prompt_includes_cached: u.get("cache_read_input_tokens").is_none(),
+        // 和计价那一支**同一个判据**（prompt_includes_cached_shape）。两处各写一遍的话，
+        // 「按哪种形状收的钱」和「库里说它是哪种形状」会不声不响地对不上，而下游算
+        // 缓存命中率的分母全靠这一位。
+        prompt_includes_cached: prompt_includes_cached_shape(
+            u.get("cache_read_input_tokens").and_then(|v| v.as_f64()),
+            cached as f64,
+            gi(&["prompt_tokens", "input_tokens"]) as f64,
+        ),
         model_name: model_name.to_string(),
         estimated,
         request_id: None,
@@ -6776,13 +7491,17 @@ async fn record_usage_row(
     endpoint_id: Option<uuid::Uuid>,
     cost_cents: i64,
     free_milli_points_spent: i64,
+    // 售价，micro-USD。付费那条路上同名的一列由 `bill_inner` 直接写 `cost_micro`；
+    // 这里要显式收一个参数，否则免费池付掉的这一大批行在损益视图里全是 NULL，
+    // 而「免费模型花了我们多少」正是要看清的那一档。
+    sell_micro_usd: i64,
     tokens: &BillTokens,
 ) {
     // model_id 走子查询，理由同下面付费那条：线路被删之后直接绑 conn_id 会撞外键，
     // 这一行用量就永远记不进去。NULL 是这张表既有的「线路已删」表示法。
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent, prompt_includes_cached, endpoint_id, wallet_cents, quota_cents, ref_micro_usd) \
-         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,0,$17)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent, prompt_includes_cached, endpoint_id, wallet_cents, quota_cents, ref_micro_usd, run_id, step_index, sell_micro_usd, absorbed_cents) \
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,0,$17,$18,$19,$20,0)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -6802,6 +7521,11 @@ async fn record_usage_row(
     // 免费池全额付掉的这一路，钱包和套餐额度一分没动 —— 上面写死 0，是事实不是缺省。
     .bind(endpoint_id)
     .bind(tokens.ref_micro_usd)
+    .bind(tokens.run_id.as_deref())
+    .bind(tokens.step_index)
+    .bind(sell_micro_usd)
+    // absorbed_cents 上面写死 0，是事实不是缺省：这条路是免费池全额（或按开关关掉时
+    // 部分）付掉的，压根没走到 split_fused_charge，运营方一分钱都没替谁吃。
     .execute(&state.db)
     .await
     {
@@ -6843,29 +7567,59 @@ pub fn free_milli_points_daily_member() -> i64 {
 /// so a $0.003 fee survives; whole cents floored it to zero and the model became free.
 pub const MICRO_USD_PER_CENT: i64 = 10_000;
 
-/// Micro-USD that one milli-点 buys. 1 点 = RAW_CENTS_PER_POINT cents, so
-/// 1 milli-点 = 5 cents × 10 000 / 1000 = 50 micro-USD.
-pub const MICRO_USD_PER_MILLI_POINT: i64 = RAW_CENTS_PER_POINT * MICRO_USD_PER_CENT / MILLI;
+/// 1 积分 = 1 人民币分（客户端 API 下发用）。100 积分 = ¥1。
+pub const CNY_CENTS_PER_POINT: i64 = 1;
+
+/// **1 积分 = 1 人民币分（¥0.01）。** 100 积分 = ¥1，400 积分 = ¥4。
+///
+/// 折成 micro-USD：`CNY_CENTS_PER_POINT × usd_per_cny_bps × MICRO_USD_PER_CENT / 10000`。
+/// 汇率 1408 时 1 点 = 1408 micro-USD ≈ $0.001408。
+pub fn micro_usd_per_point() -> i64 {
+    CNY_CENTS_PER_POINT * crate::settings::usd_per_cny_bps() * MICRO_USD_PER_CENT / 10000
+}
+
+/// 免费池这一次该按多少钱扣点。
+///
+/// **和钱包收的是同一个数**：`目录价 × 线路倍率`。1 积分 = 1 人民币分（100 积分 = ¥1），
+/// 扣点和钱包走同一条计价路径。
+///
+/// 为什么非要乘倍率：线上八条免费线路的 `rate` 从 **0.22 到 2.0** 不等
+/// （deepseek 0.24、福利线 0.22/0.25、智普和 MiniMax 2.0）。只按目录原价扣的话，
+/// deepseek 上每次多扣 **4.2 倍** —— 那正是「点数扣得还是很快」剩下的那一半。
+///
+/// `None` = 目录里没有这个模型的价（实验模型/自建模型）。**不是 0**：调用方会退到售价，
+/// 再退到 1 毫点地板 —— 报表必须能区分「不花钱」和「不知道花了多少」。
+fn pool_charge_micro_usd(reference: Option<i64>, rate: f64) -> Option<i64> {
+    let reference = reference.filter(|n| *n > 0)?;
+    // 倍率 0 或负数是「这条线路一分不收」（后台那个输入框下面就是这么写的）——
+    // 那种情况下免费池也不该扣钱，退到地板由调用方处理。
+    if !(rate > 0.0) {
+        return None;
+    }
+    let scaled = (reference as f64 * rate).round();
+    if scaled < 1.0 {
+        // 乘完不足一微美元也不能变成 0：那会让这个模型变成无限的。
+        return Some(1);
+    }
+    Some(scaled as i64)
+}
 
 /// Milli-点 owed for a call costing `micro_usd` of real provider spend. Rounds UP at
-/// milli-点 resolution, so a priced call always costs something (never free by rounding),
-/// but a $0.003 call costs 60 milli-点 (0.06 点) rather than a whole one.
+/// milli-点 resolution, so a priced call always costs something (never free by rounding).
 pub fn milli_points_for_micro_usd(micro_usd: i64) -> i64 {
     if micro_usd <= 0 {
         return 0;
     }
-    (micro_usd + MICRO_USD_PER_MILLI_POINT - 1) / MICRO_USD_PER_MILLI_POINT
+    let per_point = micro_usd_per_point();
+    // 先乘 MILLI 再除：毫点是最小刻度，直接按点取整会把一次几毫点的调用抹成 0 或 1 整点。
+    (micro_usd.saturating_mul(MILLI) + per_point - 1) / per_point
 }
 
-/// Raw provider cents that one 点 buys.
-///
-/// DERIVATION (the one assumption in this file, single-sourced so it is changed in one place):
-///   • the client's credit denomination is exact — 663 raw cents = $1.00 of visible credit
-///   • at ≈¥7.2 per $1.00 of visible credit, 1 点 (¥0.05) ≈ $0.00694 ≈ 4.6 raw cents
-/// Rounded UP to 5, which makes each point buy slightly more than its strict value — the
-/// error therefore favours the user, never silently overcharges them. If the platform's
-/// ¥-per-credit-dollar changes, this is the only number to touch.
-pub const RAW_CENTS_PER_POINT: i64 = 5;
+/// 一个「点」买多少真实计费分。和 `micro_usd_per_point` 同一个数，换个刻度表达
+/// （1 真实分 = MICRO_USD_PER_CENT micro），单点定义在上面那个函数里，这里不再独立假设。
+pub fn raw_cents_per_point() -> f64 {
+    micro_usd_per_point() as f64 / MICRO_USD_PER_CENT as f64
+}
 
 /// Points owed for a call that cost `raw_cents` of real provider spend. Rounds UP so a
 /// sub-point call still costs 1 点 — otherwise a cheap-enough free model would be unlimited.
@@ -6873,7 +7627,8 @@ pub fn points_for_raw_cents(raw_cents: i64) -> i64 {
     if raw_cents <= 0 {
         return 0;
     }
-    (raw_cents + RAW_CENTS_PER_POINT - 1) / RAW_CENTS_PER_POINT
+    let milli = milli_points_for_micro_usd(raw_cents.saturating_mul(MICRO_USD_PER_CENT));
+    ((milli + MILLI - 1) / MILLI).max(1)
 }
 
 /// Read the caller's free-points balance, granting today's allowance first if the stored
@@ -7221,21 +7976,10 @@ pub fn admit_billing(
 }
 
 /// 入队快照里该存多少（**美元分**）：原始费用减去免费池已经付掉的那一份。
-///
-/// 两个入参故意不同口径，因为它们本来就是：`cost_usd_cents` 是折算**前**的美元分
-/// （队列存的就是这个，重放时会再折一次）；`pool_paid_wallet_cents` 是池子实际扣掉的
-/// 人民币分（毫点换算过来的）。要相减必须先把后者折回美元分。
-///
-/// **这个函数是从一行写错的表达式里抽出来的。** 原来写的是
-/// `(cost - wallet_cents_to_usd_cents(pool_paid))`，而那个 `cost` 在这一行的位置上
-/// 已经被 `let cost = usd_cents_to_wallet_cents(cost)` 遮蔽成**人民币分**了 ——
-/// 于是「人民币分 − 美元分」被当成美元分存进队列，重放时再折一次。
-/// bps=1408、原费用 100 美元分、池子付一半时：入队 661，重放后扣 4694 分，
-/// 正确值 362 分（≈13 倍）；池子一分没付时精确是 7.1 倍。
-///
-/// 守它的断言当时钉的是**那一行的源码文本**，等于把错误写法钉死了。现在钉行为。
-pub(crate) fn residual_usd_cents(cost_usd_cents: i64, pool_paid_wallet_cents: i64) -> i64 {
-    (cost_usd_cents - crate::settings::wallet_cents_to_usd_cents(pool_paid_wallet_cents)).max(0)
+/// `milli_points_per_cent` 是「一美分等于多少毫点」（含汇率），所以
+/// `spent / milli_points_per_cent` 直接给出美分，两边同口径相减。
+pub(crate) fn residual_usd_cents(cost_usd_cents: i64, pool_paid_usd_cents: i64) -> i64 {
+    (cost_usd_cents - pool_paid_usd_cents).max(0)
 }
 
 /// 一笔结算的结局。resettle/恢复 worker 据此决定队列行是了结还是累加 attempts。
@@ -7286,11 +8030,14 @@ async fn bill(
     tokens: &BillTokens,
     free_pool: bool,
     free_micro_usd: i64,
+    pool_rate: f64,
+    // 扣用户那一份的**未取整**金额（micro-USD）。`cost` 是整美分，只给对账用。
+    cost_micro: i64,
 ) {
     let settlement_id = uuid::Uuid::new_v4();
     let _ = bill_inner(
         state, uid, conn_id, Some(health_id), cost, use_quota, tokens, free_pool, free_micro_usd,
-        settlement_id, false,
+        pool_rate, cost_micro, settlement_id, false,
     )
     .await;
     // 模型名取 `tokens.model_name` —— 和写进 model_usage 的**同一个字段**。
@@ -7314,10 +8061,17 @@ async fn bill(
 /// 且 `from_recovery=true`——恢复时跳过免费分支、失败不重复入队（worker 记 attempts）。
 pub(crate) async fn resettle(state: &AppState, row: &crate::settlement::UnsettledRow) -> BillOutcome {
     let tokens = BillTokens {
+        // 补扣队列里没存 run 形状，和 ref_micro_usd / endpoint_id 在这条路径上一样留空。
+        // NULL 说的是「这条路径没传」，写 0 或空串会撒谎。
+        run_id: None,
+        step_index: None,
         prompt: row.prompt_tokens,
         completion: row.completion_tokens,
         cached: row.cached_tokens,
         cache_creation: row.cache_creation_tokens,
+        // 库里没有这一列（分档只在回执里，不落库）。恢复重跑的行本来就被
+        // `!from_recovery` 挡在观测之外，这里给 0 不影响任何判据。
+        cache_creation_1h: 0,
         // 补扣队列（unsettled）里没有存这一位，所以这里取中性值 true。
         //
         // 影响面很小且说得清：这条路只在**当初扣费失败**的那一小撮上跑，而这一位唯一的
@@ -7342,7 +8096,12 @@ pub(crate) async fn resettle(state: &AppState, row: &crate::settlement::Unsettle
     // 影响面已量过：线上 unsettled 只有 1 行 / 12 分。
     bill_inner(
         state, row.user_id, row.conn_id, None, row.cost_cents, row.use_quota, &tokens, row.free_pool,
-        row.free_micro_usd, row.settlement_id, true,
+        row.free_micro_usd,
+        // 恢复重跑**不走免费分支**（见 bill_inner 里那段说明），倍率取 1.0 是个不会被读到的值。
+        1.0,
+        // 队列里存的是折算前的**美元分**，没有 micro 口径。换算回 micro 走同一条路。
+        row.cost_cents.saturating_mul(MICRO_USD_PER_CENT),
+        row.settlement_id, true,
     )
     .await
 }
@@ -7359,11 +8118,29 @@ async fn bill_inner(
     tokens: &BillTokens,
     free_pool: bool,
     free_micro_usd: i64,
+    // 这条线路的计费倍率。免费池按「目录价 × 倍率」扣点 —— 和钱包收的是同一个数。
+    // 线上八条免费线路的倍率从 0.22 到 2.0 不等，不乘它就等于按目录原价扣。
+    pool_rate: f64,
+    // 扣用户那一份的**未取整**金额（micro-USD）。走这条而不是整美分的 `cost`：
+    // 人民币分比美分细 7.1 倍，先取整到整美分等于把那 7 倍精度扔了，不到半美分的
+    // 调用全部变成 0（生产实测 24 小时白送 228 次 vision-exp）。
+    cost_micro: i64,
     settlement_id: uuid::Uuid,
     // 是否来自后台恢复重跑。它同时决定两件事：恢复时**跳过免费点分支**（免费扣点在
     // settled_requests 账本之外，重跑会双扣——见对抗审查 finding 1/3/5），以及失败时不重复入队。
     from_recovery: bool,
 ) -> BillOutcome {
+    // 这条线路的缓存写入到底读得回来吗 —— 判据只吃**上游真报回来的数**。
+    // estimated 的行是我们自己估的，喂进去会让判据变成自我循环；恢复重跑是历史回放，
+    // 也不代表此刻上游的行为。两者都跳过。
+    if !tokens.estimated && !from_recovery {
+        crate::cache_payoff::observe(
+                conn_id,
+                tokens.cached,
+                tokens.cache_creation,
+                tokens.cache_creation_1h,
+            );
+    }
     // **扣的是用户的钱包，而钱包是人民币口径；`cost` 是美元分。**
     //
     // compute_cost 全程按美元单价算（目录价 / 每模型覆盖 / 连接价，单位都是
@@ -7415,12 +8192,15 @@ async fn bill_inner(
     //
     // 只折算**扣用户的这一份**：上层 `bill()` 传给 `note_endpoint_usage` 的仍是原始
     // 美元分，对账页收入/成本两侧都保持美元口径。汇率取后台的 `usd_per_cny_bps`。
-    let cost = crate::settings::usd_cents_to_wallet_cents(cost);
+    // **一次取整，在人民币分上做。** 原来是 `usd_cents_to_wallet_cents(cost)`，而 `cost`
+    // 已经被 compute_cost 取整成整美分了 —— 人民币分比美分细 7.1 倍，那 7 倍精度就是在
+    // 那一步被扔掉的：乘上线路倍率后不到半美分的调用全部四舍五入成 0，白送且无声。
+    // 生产实测（2026-09-03，24 小时）：vision-exp 235 次里 228 次收 0（平均 0.50 美分）。
+    let cost = crate::settings::usd_micro_to_wallet_cents(cost_micro);
 
     let requested_cost = cost.max(0);
-    /// 一整分等于多少毫点：MICRO_USD_PER_CENT / MICRO_USD_PER_MILLI_POINT = 10000 / 50。
-    /// 和 `free_points_needed` 走同一套换算，改一处两边一起动。
-    const MILLI_POINTS_PER_CENT: i64 = MICRO_USD_PER_CENT / MICRO_USD_PER_MILLI_POINT;
+    // 一整美分等于多少毫点。1 积分 = 1 人民币分，汇率 1408 → milli_points_per_cent ≈ 7103。
+    let milli_points_per_cent = milli_points_for_micro_usd(MICRO_USD_PER_CENT).max(1);
     // 免费池对这一次**部分覆盖**掉的毫点。0 = 没走免费分支，或池子全额付了/一点没付。
     let mut pool_paid_milli = 0i64;
     // Free models bill against the daily points pool, never quota or wallet. Done here rather
@@ -7432,24 +8212,23 @@ async fn bill_inner(
     // 用的是 &state.db 独立提交、从不写 settled_requests 账本，重跑会在账本之外再扣一次点
     // （跨日切池子回满时尤其明显），甚至升级成「先扣点后扣钱」。恢复一律走下面的付费认领路径。
     if free_pool && !from_recovery {
-        // Prefer the model's own micro-USD fee (per-call billing, which may be sub-cent);
-        // otherwise convert the token-billed cost up from whole cents. Volume billing and
-        // per-call billing therefore both convert to 点 through one path.
-        let micro = if free_micro_usd > 0 {
-            free_micro_usd
-        } else {
-            requested_cost.max(0) * MICRO_USD_PER_CENT
-        };
-        // FLOOR (free_points_needed 里的 .max(1))：a 免费 model must always consume something,
-        // even when no fee is configured. Without this, "free + no fee" spent 0 点 — so the
-        // model was not merely free, it was UNCAPPED: the daily allowance never moved and
-        // there was nothing to run out of, which defeats the entire pool.
+        // 免费池这一次该扣多少**毫点**（1 积分 = 1 人民币分）。
+        //   ① free_micro_usd: 按次计费的真实单价
+        //   ② cost_micro: 按 token 用量算的真实花费（model_prices × rate，含缓存价）
+        //   ③ ref_micro_usd × rate: 兜底（model_prices 没配时走目录价）
+        //   ④ 1 毫点地板
         //
-        // 全额扣或一点不扣：池子盖得住就由池子付；盖不住就**一点都不扣**，整笔落到下面的
-        // 付费路径。此前这里无论如何都要扣（LEAST 到 0 为止）然后直接 return，于是免费额度
-        // 见底那一刻起，免费模型既扣不到钱也不再拒绝——用量记着 0 点，钱包和会员额度一分
-        // 不动。现在它会真的改用付费余额/会员额度继续，与准入门那条规则对上。
-        let want = free_points_needed(micro);
+        // 免费池和钱包走同一套价：model_prices 覆盖 → 目录兜底 → 连接级兜底，
+        // 含输入/输出/缓存读/缓存写四项，乘线路倍率。
+        let want = if free_micro_usd > 0 {
+            free_points_needed(free_micro_usd)
+        } else if cost_micro > 0 {
+            free_points_needed(cost_micro)
+        } else if let Some(m) = pool_charge_micro_usd(tokens.ref_micro_usd, pool_rate) {
+            free_points_needed(m)
+        } else {
+            1
+        };
         // 按量计费的免费模型（free_micro_usd == 0）**必须把池子抽干**，按次计价的不动。
         //
         // 判据是「准入门算不算得准」，不是「哪种更好看」：
@@ -7479,18 +8258,12 @@ async fn bill_inner(
         if spent >= want {
             // cost_cents stays the REAL provider cost (so operator-side reporting is honest);
             // free_points_spent carries what the user actually paid, in 点.
-            record_usage_row(state, uid, conn_id, endpoint_id, requested_cost, spent, tokens).await;
+            record_usage_row(state, uid, conn_id, endpoint_id, requested_cost, spent, cost_micro, tokens).await;
             return BillOutcome::Settled;
         }
         // 部分覆盖：池子出了 `spent` 毫点，剩下的零头往下走付费路径。
-        //
-        // 先把队列快照改成**残额**。下面任何一步失败都会 `queue_input(...)` 入队，而入队
-        // 的金额是折算前的美元分 —— 池子付掉的 `spent` 毫点是人民币分口径，折回美元分
-        // 再减，两边才同口径。不减的话恢复重跑会把这一份再向钱包收一次（见 Cell 处注释）。
-        // **从 `queued_usd_cents` 减，不是从 `cost` 减。** 这一行的位置上 `cost` 已经被
-        // 上面 `let cost = usd_cents_to_wallet_cents(cost)` 遮蔽成人民币分了；
-        // `queued_usd_cents` 才是那个没被折算过的美元分。见 `residual_usd_cents`。
-        queued_usd_cents = residual_usd_cents(queued_usd_cents, spent / MILLI_POINTS_PER_CENT);
+        // milli_points_per_cent ≈ 7103（含汇率），所以 spent / 7103 就是美分。
+        queued_usd_cents = residual_usd_cents(queued_usd_cents, spent / milli_points_per_cent);
         // 记账两边都要说实话 —— model_usage 同时有 free_milli_points_spent 和 cost_cents，
         // 一次调用由两个池子分摊是能如实表达的（线上本来就有 2801 行两列同时非零）。
         pool_paid_milli = spent;
@@ -7498,7 +8271,7 @@ async fn bill_inner(
             // 开关关掉时保持老行为：池子空了也只走池子，扣不到就记 0。
             // 记的是**真扣掉的**那部分（抽干模式下可能是部分覆盖），不再写死 0 ——
             // 否则用量历史会说「一点没花」，而池子确实少了那么多。
-            record_usage_row(state, uid, conn_id, endpoint_id, requested_cost, spent, tokens).await;
+            record_usage_row(state, uid, conn_id, endpoint_id, requested_cost, spent, cost_micro, tokens).await;
             return BillOutcome::Settled;
         }
         // 落下去，按普通付费调用结算（quota → 钱包）。
@@ -7609,7 +8382,20 @@ async fn bill_inner(
     // 免费池已经付掉的那部分不能再向钱包收一次。抽干模式下 `pool_paid_milli` 是这一次
     // 池子真正扣走的毫点，换算回整分后从待收金额里减掉；不足一分的零头留给池子（对用户
     // 有利的方向，且和 carry_to_cents 的「宁可少收不多收」同一条纪律）。
-    let pool_paid_cents = pool_paid_milli / MILLI_POINTS_PER_CENT;
+    //
+    // **除数是 MILLI，不是 milli_points_per_cent。** 同一个 `spent` 在这个函数里要折进
+    // 两个不同口径的数，除数因此必须不同 —— 这是最容易被「统一一下」改回去的一行：
+    //
+    //   · 上面那处 `queued_usd_cents`（结算入队快照）是**美元分**，
+    //     所以除 `milli_points_per_cent`（一整美分等于多少毫点，含汇率，≈7103）。
+    //   · 这里的 `requested_cost` 是 `usd_micro_to_wallet_cents` 折算之后的
+    //     **人民币分**（1 积分 = 1 人民币分，1 积分 = MILLI 毫点），所以除 `MILLI`。
+    //
+    // 除错了的后果是钱：按 7103 除，池子付掉的那份只被减掉 1/7.1，剩下约 86%
+    // **向钱包/额度再收一次**；而写进 model_usage 的 `actual_cost + pool_paid_cents`
+    // 也跟着变成「人民币分 + 美元分」的混合数，迁移 20260871 立的那条恒等式
+    // （wallet + quota + free_milli/MILLI = cost_cents）在部分覆盖的行上直接不成立。
+    let pool_paid_cents = pool_paid_milli / MILLI;
     let requested_cost = (requested_cost + carried_cents - pool_paid_cents).max(0);
     let charge = if requested_cost == 0 {
         FusedCharge::default()
@@ -7654,6 +8440,20 @@ async fn bill_inner(
         }
     };
     let actual_cost = charge.total_cents();
+    // **运营方替这个用户吃掉的那一段。**
+    //
+    // `split_fused_charge` 对靠套餐额度放行的调用刻意不制造钱包债务：配额窗口尾巴上
+    // 超出的部分由运营方吸收。于是 `actual_cost` 可以合法地小于 `requested_cost`，
+    // 极端情况（配额与钱包同时为 0）整笔归零 —— 而上游那笔钱是真付了的。
+    //
+    // 这一位只记录，不改变任何金额。走到 `split_fused_charge` 的按量付费调用它恒为 0
+    // （超支全额记成债务，见那个函数里 `!use_quota` 那一支），所以非 0 基本就是订阅吸收。
+    //
+    // **有一个例外，别把它说成 0：** 上面读余额那步返回 `None`（用户行不见了，比如调用
+    // 在途时账号被删）时 `charge` 是全零，于是这一笔整额落在这里。那时钱确实是运营方
+    // 出的，记在这一列没错 —— 只是成因不是「配额窗口尾巴」。真要分成因得看 wallet/quota
+    // 是否同时为 0 且用户行还在不在，不是这一列能自己说清的。
+    let absorbed_cents = (requested_cost - actual_cost).max(0);
     if actual_cost > 0 {
         if let Err(error) = sqlx::query(
             "UPDATE users SET quota_total_cents = quota_total_cents - $1, \
@@ -7692,15 +8492,21 @@ async fn bill_inner(
     // 线上已经有 20708 行是这样。model_name 是 NOT NULL 的独立列，所以是哪个模型照样查得到，
     // 账单和用量统计一个字都不少。
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id, prompt_includes_cached, free_milli_points_spent, endpoint_id, wallet_cents, quota_cents, ref_micro_usd) \
-         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id, prompt_includes_cached, free_milli_points_spent, endpoint_id, wallet_cents, quota_cents, ref_micro_usd, run_id, step_index, sell_micro_usd, absorbed_cents) \
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)",
     )
     .bind(uid)
     .bind(conn_id)
-    // cost_cents 记的是**这次调用的真实上游成本**，不是钱包被扣走的那一份 —— 免费分支
-    // 早退那一路（record_usage_row(.., requested_cost, spent, ..)）一直是这个口径。
-    // 部分覆盖时钱包只收了零头，把零头写进来的话，同一条免费线路上「池子全额付」的行
-    // 记全价、「池子付一半」的行记半价，对账的成本侧会凭空少掉池子出的那一块。
+    // cost_cents 记的是**这一笔实际扣到的钱**（钱包 + 套餐额度 + 免费池出的那份），
+    // 单位随 `usd_micro_to_wallet_cents` 走，也就是 2026-08-28 起的人民币分。
+    //
+    // 它**不是**这次调用的真实成本：订阅超出配额时运营方吸收的那一段不在里面
+    // （那一段记在 `absorbed_cents`，两者相加才是应收）。这行注释以前写的是
+    // 「真实上游成本」，而配额与钱包同时为 0 的那一笔在这里恰恰记 0 —— 说反了。
+    //
+    // 部分覆盖时池子出的那一份要加回来：只写钱包收到的零头的话，同一条免费线路上
+    // 「池子全额付」的行记全价、「池子付一半」的行记半价，对账的成本侧会凭空少掉
+    // 池子出的那一块。两个加数现在同为人民币分（见上面 pool_paid_cents 的除数）。
     .bind(actual_cost + pool_paid_cents)
     .bind(tokens.prompt)
     .bind(tokens.completion)
@@ -7730,6 +8536,15 @@ async fn bill_inner(
     .bind(charge.quota_cents)
     // 参考成本：和售价分开的一列。售价可以是 0，成本不是。
     .bind(tokens.ref_micro_usd)
+    // 这一行属于哪一次运行、第几步。客户端一直在传，网关此前只用于日志和粘性键。
+    .bind(tokens.run_id.as_deref())
+    .bind(tokens.step_index)
+    // 售价，micro-USD。**单位不随汇率漂**，所以它是跨 2026-08-28 唯一能直接相加的钱。
+    // `cost_micro` 是 `compute_cost` 那条链算出来的原值（含线路倍率），折算成人民币分
+    // 之前就在手里，这里直接写，不重算。
+    .bind(cost_micro)
+    // 运营方吸收的那一段（人民币分，和 cost_cents 同单位）。
+    .bind(absorbed_cents)
     .execute(&mut *tx)
     .await
     {
@@ -8495,7 +9310,7 @@ fn oai_to_anthropic_with_cache(
     // （见下面 "assistant" 分支）。同一份推导只写一次，别在两处各算一遍慢慢漂。
     let model_str = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
     let effort = thinking_effort_for(body);
-    let thinking = anthropic_thinking(model_str, effort);
+    let mut thinking = anthropic_thinking(model_str, effort);
     let thinking_on = thinking
         .as_ref()
         .is_some_and(|t| t.get("type").and_then(|v| v.as_str()) != Some("disabled"));
@@ -8503,21 +9318,63 @@ fn oai_to_anthropic_with_cache(
     let mut system_parts: Vec<serde_json::Value> = Vec::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
-        for m in msgs {
+        // **每一条助手消息都带自己的思考块**，不是只带最后一轮。
+        //
+        // 「只带最后一轮」看着更省字节（更早的思考块 Anthropic 服务端本来就会剥掉），
+        // 但那个「最后一轮」的位置**每轮都在往后移**：这一轮 assistant_N 带着思考块发出去，
+        // 下一轮它不再是最后一轮、就不带了 —— 同一条消息的字节在两次请求之间变了。
+        // Anthropic 的缓存认的是严格前缀，于是从 assistant_N 那个位置往后整段历史每轮
+        // 全价重算。省下的那点字节远不够赔，而且这正是这个仓库反复踩过的那个形状
+        // （「缓存量恒定、不随请求增长」）。
+        //
+        // 逐条带则字节恒定：每条助手消息的思考块只取决于它自己和当前模型，位置无关。
+        // 这也正是原生客户端的做法 —— 整段历史原样回传，由上游决定剥掉哪些。
+        for m in msgs.iter() {
             match m.get("role").and_then(|r| r.as_str()).unwrap_or("user") {
                 "system" => {
                     let s = oai_content_text(m.get("content"));
-                    if !s.is_empty() {
+                    if s.is_empty() {
+                        continue;
+                    }
+                    // **只有开头那一串 system 才能提到顶层。**
+                    //
+                    // Anthropic 没有「对话中途的 system 角色」，所有 system 文本都在顶层
+                    // `system` 里 —— 而顶层排在**所有** messages 之前。所以把一条躺在会话
+                    // 末尾的 system 消息按 role 搬到顶层，等于把它从最后挪到了最前。
+                    //
+                    // 这件事在这条链上有确切代价：上下文压缩的检索回注块就是这样一条
+                    // 消息，它的内容每一步都变（查询取「最后 4 条消息 + 最新 user 消息尾部
+                    // 12000 字」）。它被刻意放在消息尾部——注释里记着线上实测（请求
+                    // 56k→缓存 24k、105k→42k、165k→36k，缓存量恒定、不随请求增长），
+                    // 结论就是「排在前面会让后面八万多 token 全部按全价重算」。
+                    // 提到顶层之后，那个修复在 Anthropic 这条协议上被结构性地撤销了，
+                    // 而且更糟：它排在 system 数组尾部，于是**每一轮整个 system 前缀都变**，
+                    // 后面整段历史的断点跟着全部作废。
+                    //
+                    // 忠实的翻译是就地变成一个 user 轮：位置不动，前面的一切照样能缓存。
+                    // 能并进上一条 user 就并（避免两条连续同角色），否则单独一轮。
+                    if messages.is_empty() {
                         let mut block = serde_json::Map::new();
                         block.insert("type".into(), json!("text"));
                         block.insert("text".into(), json!(s));
-                        // The gateway-injected Prompt Graph message is first. Cache it separately
-                        // from later dynamic Skill/system messages so those can change without
-                        // invalidating the stable production prefix.
+                        // 开头那条是网关的 L0 Prompt Graph，最稳定的一段。单独给它一个
+                        // 断点，后面易变的 Skill/system 块变化时不作废这段。
                         if prompt_cache && system_parts.is_empty() {
                             block.insert("cache_control".into(), anthropic_cache_control(extended_ttl));
                         }
                         system_parts.push(serde_json::Value::Object(block));
+                    } else {
+                        let block = json!({"type":"text","text":s});
+                        let merged = messages
+                            .last_mut()
+                            .filter(|last| last.get("role").and_then(|r| r.as_str()) == Some("user"))
+                            .and_then(|last| last.get_mut("content"))
+                            .and_then(|c| c.as_array_mut())
+                            .map(|blocks| blocks.push(block.clone()))
+                            .is_some();
+                        if !merged {
+                            messages.push(json!({"role":"user","content":[block]}));
+                        }
                     }
                 }
                 "tool" => {
@@ -8591,7 +9448,18 @@ fn oai_to_anthropic_with_cache(
                         }
                     }
                     if blocks.is_empty() {
+                        // 只剩占位文本的一轮不值得为回放冒 400 的风险，思考块一并不带。
                         blocks.push(json!({"type":"text","text":"(no content)"}));
+                    } else {
+                        // 思考块**必须排在最前**（Anthropic 对助手轮的块序有要求），而且
+                        // 只在判据全满足时才带 —— 判据见 thinking_replay::replay，任何一条
+                        // 不满足都静默跳过，退回到「不带思考块」这个今天就在跑的形状。
+                        let mut replayed =
+                            crate::thinking_replay::replay(m, model_str, thinking_on);
+                        if !replayed.is_empty() {
+                            replayed.append(&mut blocks);
+                            blocks = replayed;
+                        }
                     }
                     messages.push(json!({"role":"assistant","content":blocks}));
                 }
@@ -8601,10 +9469,32 @@ fn oai_to_anthropic_with_cache(
             }
         }
     }
+    // Prompt caching breakpoint #4：**最后一块 system**。
+    //
+    // 原本只有第一块（网关那条最稳定的 L0 Prompt Graph）拿断点，理由是「让后面易变的
+    // Skill/system 块变化时不作废这段稳定前缀」—— 那是对的，但它把 system[1..] 整段
+    // 留给了断点 #3 去覆盖。而 system[1..] 是客户端拼的用户规则 + 模型家族调优 + 授权
+    // 框架 + 语言偏好 + 自适应档案 + 工具直觉表，再加 Skills，通常几千 token，且在一段
+    // 对话里**基本不变**。断点 #3 一旦没命中（5 分钟过期、故障转移换线路、用户中途开关
+    // 一个 Skill），这几千 token 就跟着整段历史一起按全价重写。
+    //
+    // 加这一个断点是**纯赚**：Anthropic 允许 4 个，我们只用了 3 个；而嵌套断点不额外
+    // 收费 —— 整条前缀只按最长的那次写一遍，多一个断点只是多一个可以命中的位置。
+    // 加上之后正好用满 4 个（tools 末个 / system 首块 / system 末块 / 最后一条工具结果）。
+    if prompt_cache && system_parts.len() > 1 {
+        if let Some(last) = system_parts.last_mut().and_then(|v| v.as_object_mut()) {
+            last.insert("cache_control".into(), anthropic_cache_control(extended_ttl));
+        }
+    }
+
     let mut out = serde_json::Map::new();
     if let Some(model) = body.get("model") {
         out.insert("model".into(), model.clone());
     }
+    // 出站前的最后一道形状闸：孤儿 tool_result、开头不是 user —— 两者都是硬 400。
+    // 必须排在打消息断点**之前**，否则断点可能落在马上要被丢掉的那个块上。
+    // 判据在 wire_shape.rs 里真跑，这里只是接线。
+    let messages = crate::wire_shape::normalize(messages);
     out.insert("messages".into(), json!(messages));
     if !system_parts.is_empty() {
         out.insert("system".into(), json!(system_parts));
@@ -8655,6 +9545,32 @@ fn oai_to_anthropic_with_cache(
     // Per model, not a blanket 128000 — Haiku 4.5 caps at 64,000 and would reject the flat value.
     let max_tokens = max_tokens.clamp(1, official_max_output(model_str).unwrap_or(128000));
     out.insert("max_tokens".into(), json!(max_tokens));
+    // `budget_tokens < max_tokens` 是 Anthropic 的**硬约束**，违反直接 400。
+    //
+    // 上面那段确实按 `budget + 8000` 把 max_tokens 抬过了预算 —— 但紧接着的 clamp 又把它
+    // 按模型的输出上限压回去，而**压回去之后没有任何东西再检查这个不等式**。
+    // 只要有一个模型的输出上限小于「用户拨的思考预算 + 8000」，这一笔就是必然的 400，
+    // 而用户看到的只是一句「请求值错误」，界面上完全看不出是哪两个数打架。
+    //
+    // 修在这里而不是把 clamp 提前：输出上限是模型的硬顶，绝不能为了迁就预算而突破它；
+    // 该让步的是预算。留 1024 的余量给正文——预算等于上限时模型没有一个 token 能写答案。
+    if let Some(t) = thinking.as_mut() {
+        if let Some(obj) = t.as_object_mut() {
+            if let Some(b) = obj.get("budget_tokens").and_then(|v| v.as_i64()) {
+                if b >= max_tokens {
+                    let fitted = max_tokens - 1024;
+                    if fitted >= 1024 {
+                        obj.insert("budget_tokens".into(), json!(fitted));
+                    } else {
+                        // 上限小到连思考带正文都放不下 —— 那就别开思考，
+                        // 发出去必然 400，而「没思考」至少能给出答案。
+                        obj.clear();
+                    }
+                }
+            }
+        }
+    }
+    let thinking = thinking.filter(|t| t.as_object().is_none_or(|o| !o.is_empty()));
     if let Some(t) = &thinking {
         out.insert("thinking".into(), t.clone());
         // 深度旋钮：两个家族用两套，不能混。
@@ -8775,7 +9691,17 @@ fn oai_to_anthropic_with_cache(
             if let Some(idx) = anchor {
                 let last_msg = &mut arr[idx];
                 if let Some(blocks) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-                    if let Some(obj) = blocks.last_mut().and_then(|b| b.as_object_mut()) {
+                    // 钉在**最后一个 tool_result 块**上，不是这条消息的最后一块。
+                    //
+                    // 这条消息里可能还跟着别的块 —— 压缩的检索回注就会并进来，而它的内容
+                    // 每一步都变。断点挂在「最后一块」上就等于挂在那段变动文本上，下一轮
+                    // 永远对不上前缀，整段历史每轮全价重算。工具结果本身是 append-only 的
+                    // 稳定履历，钉在它上面才是这个断点存在的理由。
+                    let at = blocks
+                        .iter()
+                        .rposition(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                        .unwrap_or(blocks.len().saturating_sub(1));
+                    if let Some(obj) = blocks.get_mut(at).and_then(|b| b.as_object_mut()) {
                         // tool_result 的 content 是嵌套结构也允许挂 cache_control（块级均可）。
                         obj.insert("cache_control".into(), anthropic_cache_control(extended_ttl));
                     }
@@ -8798,7 +9724,10 @@ fn oai_to_anthropic_with_cache(
         let atc = match tc.as_str() {
             Some("auto") => Some(json!({"type":"auto"})),
             Some("required") => Some(json!({"type":"any"})),
-            Some("none") => None,
+            // **不能丢。** 丢掉这个字段等于不发 tool_choice，而 Anthropic 的默认就是
+            // `auto` —— 于是「这一轮禁止调工具」被翻译成了「随便调」，语义正好反过来。
+            // Anthropic 侧有对应值 `{"type":"none"}`，直接映过去。
+            Some("none") => Some(json!({"type":"none"})),
             _ => tc
                 .pointer("/function/name")
                 .and_then(|n| n.as_str())
@@ -8820,8 +9749,107 @@ fn anthropic_usage_merged(au: &serde_json::Value) -> serde_json::Value {
         "input_tokens": it, "output_tokens": ot,
         "cache_read_input_tokens": g("cache_read_input_tokens"),
         "cache_creation_input_tokens": g("cache_creation_input_tokens"),
+        // 5 分钟 / 1 小时的分档。**丢了它计价就把 2× 的写入按 1.25× 收**，
+        // 而且 token 数是对的、只有金额少 —— 这类错在库里查不出来。
+        "cache_creation": au.get("cache_creation").cloned().unwrap_or(json!(null)),
         "prompt_tokens": it, "completion_tokens": ot, "total_tokens": it + ot,
     })
+}
+
+/// 一次辅助模型调用要打的 URL 和出站 body —— **按线路自己的协议**算，不硬拼。
+///
+/// # 为什么要有这个函数
+///
+/// 网关有好几处地方拿一条线路做一次小的模型调用：语言包翻译、上下文摘要、视觉预处理、
+/// 单连接直调、缓存探针。主聊天链路早就按 `protocol` 分叉了（`Wire::of`），这几处**一律
+/// 硬拼 `/chat/completions`**，把 Anthropic 线路上的 Claude 当成 OpenAI 兼容模型发出去。
+///
+/// 后果不是报错，所以它藏了很久：中转会照单全收，只是把 Claude 降级跑，**缓存和思考
+/// 一起丢**。线上实测同一个 Claude 模型走摘要那条路缓存命中 0.7%，走原生 `/v1/messages`
+/// 是 203%；中转控制台把这些调用标成 "OpenAI compatible"，和正常那些并排显示 ——
+/// 这正是用户截图里看到的那两行。中转商自己的文档也写着「Claude 模型请务必使用
+/// Anthropic 原生协议调用，用 OpenAI 兼容格式会导致 prompt cache、thinking 能力丧失」。
+///
+/// 收成一个出口不是为了整洁，是为了**以后不会再长出第六处**：新加一个辅助调用时，
+/// 「该打哪个端点」不再是一个每次都要重新想起来的问题。
+pub(crate) fn aux_wire_request(
+    base_url: &str,
+    protocol: &str,
+    oai_body: &serde_json::Value,
+) -> Result<(String, serde_json::Value), String> {
+    let wire = Wire::of(protocol);
+    let url = format!("{}{}", api_base(base_url), wire.path());
+    let body = match wire {
+        Wire::OpenAi => oai_body.clone(),
+        // 辅助调用一律不写缓存：它们是一次性的短请求，写入要按输入价的 1.25 倍收钱，
+        // 而下一次调用的前缀几乎必然不同 —— 付钱建一个永远读不回来的缓存。
+        Wire::Anthropic => oai_to_anthropic_with_cache(oai_body, false, false, false)?,
+        Wire::XaiResponses => oai_to_xai_responses(oai_body, false)?,
+    };
+    Ok((url, body))
+}
+
+/// 把辅助调用的上游回执还原成 OpenAI 形状，好让调用点原来读 `choices[0].message` 的
+/// 代码一个字都不用改。
+pub(crate) fn aux_wire_response(
+    protocol: &str,
+    model: &str,
+    raw: serde_json::Value,
+) -> serde_json::Value {
+    match Wire::of(protocol) {
+        Wire::OpenAi => raw,
+        Wire::Anthropic => anthropic_to_oai(&raw, model),
+        Wire::XaiResponses => xai_responses_to_oai(&raw, model),
+    }
+}
+
+/// 中止响应体**之前**先发的那一帧：把真实原因交给客户端。
+///
+/// 形状是 OpenAI 兼容的 `data:` 帧，且**不带 `choices`** —— 老客户端读 `choices[0].delta`
+/// 读到的是空，会原样忽略这一帧。所以加它对已经装着的版本零影响。
+///
+/// 正文过一遍 `safe_upstream_error_excerpt`：这些文案是网关自己生成的协议校验结果，
+/// 本来就不含地址和密钥，但同一个脱敏函数别处都在用，走一遍不吃亏 —— 哪天有人往
+/// 这条错误里拼进上游原文，这一步就是唯一挡着的东西。
+pub(crate) fn stream_error_frame(err: &str, side: &str) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({"error": {
+            "message": safe_upstream_error_excerpt(err),
+            "type": "upstream_stream_incomplete",
+            "where": side,
+        }})
+    )
+}
+
+/// Anthropic 的 `stop_reason` → OpenAI 的 `finish_reason`。
+///
+/// # 为什么 refusal 必须单独一行
+///
+/// 这张表原来只有三行，其余全部落进 `_ => "stop"`。而 Anthropic 现行的收尾值里有
+/// **`refusal`** —— 安全分类器拒答，HTTP 200，Opus 4.7+ / Opus 5 / Fable 5.x 都在用。
+/// 把它折成 `stop` 之后，一次拒答和「模型正常答完但一个字没说」逐字节不可分，于是
+/// 三层后果叠起来：
+///
+/// 1. 用户看到的是一次空回复，理由完全不可见（理由在 `stop_details` 里，也被丢了）；
+/// 2. 客户端把「什么都没返回」当成线路抖动，自动重开两轮 —— 同一次拒答付费执行三次；
+/// 3. 如果这一轮先开过思考块再拒答，`thinking_only_end_turn`（saw_thinking &&
+///    !saw_answer && stop_reason == "stop"）判定成立，`mark_thinking_clip` 把这条
+///    **健康**线路的思考深度按 30 分钟压到 effort=medium —— 影响该线路上所有用户。
+///    一次模型侧的正常拒答被误诊成中转丢块。
+///
+/// 映到 `content_filter` 同时解决三条：OpenAI 口径下它就是「被内容策略挡了」的值，
+/// 而且它不等于 `"stop"`，上面那条误诊判据自然不再命中。
+///
+/// `stop_sequence` 折成 `stop` 是对的（OpenAI 没有对应值，语义也确实是正常收尾）。
+/// `pause_turn` 结构上到不了：网关从不声明服务端工具，那条路产生不了。
+pub(crate) fn anthropic_stop_reason_to_oai(sr: &str) -> &'static str {
+    match sr {
+        "tool_use" => "tool_calls",
+        "max_tokens" => "length",
+        "refusal" => "content_filter",
+        _ => "stop",
+    }
 }
 
 /// Anthropic non-streaming response → OpenAI /chat/completions response.
@@ -8935,11 +9963,9 @@ fn anthropic_to_oai(av: &serde_json::Value, model: &str) -> serde_json::Value {
             }
         }
     }
-    let finish = match av.get("stop_reason").and_then(|v| v.as_str()) {
-        Some("tool_use") => "tool_calls",
-        Some("max_tokens") => "length",
-        _ => "stop",
-    };
+    let finish = anthropic_stop_reason_to_oai(
+        av.get("stop_reason").and_then(|v| v.as_str()).unwrap_or(""),
+    );
     let mut message = serde_json::Map::new();
     message.insert("role".into(), json!("assistant"));
     message.insert(
@@ -8952,6 +9978,17 @@ fn anthropic_to_oai(av: &serde_json::Value, model: &str) -> serde_json::Value {
     );
     if !reasoning.is_empty() {
         message.insert("reasoning_content".into(), json!(reasoning));
+    }
+    // 签名和思考文字必须**逐块配对**带走：签名签的是它自己那段文字，拼平就对不上。
+    // 客户端原样存、原样回传，下一轮 `oai_to_anthropic_with_cache` 再还原成 thinking 块。
+    let saved = crate::thinking_replay::collect(av.get("content").unwrap_or(&json!([])), model);
+    if !saved.is_empty() {
+        message.insert(crate::thinking_replay::FIELD.into(), json!(saved));
+    }
+    // 拒答理由跟着走。放在 message 上而不是 choice 上：客户端读 message 那一层，
+    // 而且流式那条也是挂在 delta 里发的，两条路形状一致。
+    if let Some(d) = av.get("stop_details") {
+        message.insert("stop_details".into(), d.clone());
     }
     if !tool_calls.is_empty() {
         message.insert("tool_calls".into(), json!(tool_calls));
@@ -9018,7 +10055,9 @@ struct AnthToolStream {
 /// Aggregate-only thinking telemetry. The converter never retains thinking text
 /// beyond the already-required SSE forwarding path; these counters are solely
 /// for diagnosing whether an upstream actually sent visible reasoning.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// **不再是 Copy**:诊断字段里有两个 BTreeSet（未解析的键名 / 未知的 delta 类型）。
+// 每条流只在收尾时克隆一次，克隆的是几个短字符串，不在热路径上。
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ThinkingStreamTelemetry {
     nonempty_thinking_deltas: u64,
     thinking_utf8_chars: usize,
@@ -9031,6 +10070,26 @@ struct ThinkingStreamTelemetry {
     first_nonempty_text_delta_ms: Option<u64>,
     first_tool_use_start_ms: Option<u64>,
     first_nonempty_tool_delta_ms: Option<u64>,
+    /// 收到 `thinking_delta` 事件、但 `/delta/thinking` **不是字符串**的次数。
+    ///
+    /// 这一支原来只有 `if let Some(t)`、没有 else:中转把文字挂在别的键上
+    /// (`delta.text` 是转卖商的常见改法)、或挂成非字符串,整条事件就无声消失 ——
+    /// 计数器不加、日志不打,而 `saw_thinking_block` 已经被 content_block_start 置真。
+    /// 于是「上游发了空串」和「上游发了我们不认的形状」在遥测上完全同形,查不出来。
+    unparsed_thinking_deltas: u64,
+    /// 上一条里那些事件的 **delta 键名**(去重、只留键名,不留任何内容)。
+    /// 一次真实请求就能把「空串」和「改名」分开 —— 这是这条日志现在唯一缺的东西。
+    unparsed_thinking_delta_keys: std::collections::BTreeSet<String>,
+    /// 非空 `thinking_delta` 之外,`content_block_delta` 里遇到的**未知 delta 类型**。
+    /// 外层 `_ => {}` 一直在吞它们。同样只记类型名,不记内容。
+    unknown_delta_types: std::collections::BTreeSet<String>,
+    /// 思考块是以 `redacted_thinking` 开的(而不是 `thinking`)。
+    ///
+    /// 两者都会把 `saw_thinking_block` 置真,但 redacted 块的载荷是加密的 `data`,
+    /// **永远不以 thinking_delta 到达** —— 于是它必然满足
+    /// `thinking_swallowed_by_upstream`(块开了、零思考字符、正文正常),
+    /// 把一条**其实正常返回了(加密)思考**的线路记 30 分钟静音。分开记才判得准。
+    saw_redacted_thinking_block: bool,
 }
 
 impl Default for ThinkingStreamTelemetry {
@@ -9039,6 +10098,10 @@ impl Default for ThinkingStreamTelemetry {
             nonempty_thinking_deltas: 0,
             thinking_utf8_chars: 0,
             visible_text_utf8_chars: 0,
+            unparsed_thinking_deltas: 0,
+            unparsed_thinking_delta_keys: std::collections::BTreeSet::new(),
+            unknown_delta_types: std::collections::BTreeSet::new(),
+            saw_redacted_thinking_block: false,
             first_native_event_kind: "absent",
             first_native_event_ms: None,
             first_nonempty_thinking_delta_ms: None,
@@ -9511,7 +10574,7 @@ impl XaiRespSse {
     }
 
     fn thinking_telemetry(&self) -> ThinkingStreamTelemetry {
-        self.thinking_telemetry
+        self.thinking_telemetry.clone()
     }
     fn saw_thinking_block(&self) -> bool {
         self.thinking_telemetry.nonempty_thinking_deltas > 0
@@ -9560,6 +10623,9 @@ struct AnthSse {
     message_stop_seen: bool,
     // 中转丢块签名追踪：只见 thinking、不见任何 text/tool_use 就 end_turn。
     saw_thinking_block: bool,
+    /// 每个思考块攒它自己的 (文字, 签名)。**按块存不按轮存**：一轮可以有多个思考块
+    /// （交错思考），签名签的是各自那段文字，拼平就对不上、回放必然 400。
+    thinking_blocks: std::collections::HashMap<i64, (String, String)>,
     saw_answer_block: bool,
     input_tokens: i64,
     output_tokens: i64,
@@ -9567,7 +10633,12 @@ struct AnthSse {
     output_usage_reported: bool,
     cache_read: i64,
     cache_create: i64,
+    /// 其中按 1 小时 TTL 写入的部分。计价按 2× 输入价收（5 分钟那档是 1.25×）。
+    cache_create_1h: i64,
     stop_reason: String,
+    /// 拒答时上游给的 `stop_details{type,category,explanation}`。这是这一轮唯一能说清
+    /// 「为什么什么都没说」的东西 —— 不带上它，用户和客户端都只能看见一次空回复。
+    stop_details: Option<serde_json::Value>,
     thinking_telemetry: ThinkingStreamTelemetry,
 }
 impl AnthSse {
@@ -9618,6 +10689,7 @@ impl AnthSse {
             tool_argument_rules,
             message_stop_seen: false,
             saw_thinking_block: false,
+            thinking_blocks: std::collections::HashMap::new(),
             saw_answer_block: false,
             input_tokens: 0,
             output_tokens: 0,
@@ -9625,7 +10697,9 @@ impl AnthSse {
             output_usage_reported: false,
             cache_read: 0,
             cache_create: 0,
+            cache_create_1h: 0,
             stop_reason: "stop".into(),
+            stop_details: None,
             thinking_telemetry: ThinkingStreamTelemetry::default(),
         }
     }
@@ -9676,6 +10750,23 @@ impl AnthSse {
         self.saw_thinking_block
             && self.saw_answer_block
             && self.thinking_telemetry.thinking_utf8_chars == 0
+            // **redacted 块不算线路的错。** 它的载荷是上游加密的 `data`，按协议
+            // 就不会以 thinking_delta 到达，所以它必然满足上面三条 —— 而上游其实
+            // 正常返回了思考。不摘出去的话，一条健康线路会因为 Anthropic 自己的
+            // 安全分类器加密了这一轮的推理，被记 30 分钟静音。
+            //
+            // 只有**整轮只有 redacted 块**时才豁免：同一轮里若还有普通 thinking 块
+            // 却一个字都没回来，那仍然是该报的那一种。
+            && !self.only_redacted_thinking()
+    }
+
+    /// 这一轮开过的思考块**全是** redacted 的（没有任何普通 thinking 块的痕迹）。
+    ///
+    /// 判据用 `unparsed_thinking_deltas == 0` 一起兜：如果收到过 thinking_delta 事件
+    /// （哪怕载荷没解析出来），说明上游是按普通思考块在发，不该走豁免。
+    fn only_redacted_thinking(&self) -> bool {
+        self.thinking_telemetry.saw_redacted_thinking_block
+            && self.thinking_telemetry.unparsed_thinking_deltas == 0
     }
 
     /// 「要了思考、答得好好的、一个思考块都没开」。
@@ -9695,7 +10786,7 @@ impl AnthSse {
     }
 
     fn thinking_telemetry(&self) -> ThinkingStreamTelemetry {
-        self.thinking_telemetry
+        self.thinking_telemetry.clone()
     }
 
     /// 诊断用：上游到底**开没开**思考块。
@@ -9775,6 +10866,15 @@ impl AnthSse {
             if let Some(v) = read("cache_creation_input_tokens") {
                 self.cache_create = self.cache_create.max(v);
             }
+            // 1 小时那一档单独记：计价要按 2× 收它。和上面几个一样只增不减 ——
+            // 早来的部分数不能把后来的总数盖回去。
+            if let Some(v) = u
+                .pointer("/cache_creation/ephemeral_1h_input_tokens")
+                .and_then(|v| v.as_i64())
+                .filter(|v| *v >= 0)
+            {
+                self.cache_create_1h = self.cache_create_1h.max(v);
+            }
         }
     }
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -9831,7 +10931,18 @@ impl AnthSse {
                     })?;
                     let cb = ev.get("content_block");
                     match cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()) {
-                        Some("thinking") | Some("redacted_thinking") => self.saw_thinking_block = true,
+                        Some("thinking") => self.saw_thinking_block = true,
+                        // **redacted 块和普通思考块必须分开记。**
+                        //
+                        // 两者都该让 saw_thinking_block 为真（块确实开了），但 redacted 的
+                        // 载荷是加密的 `data`，**永远不会以 thinking_delta 到达**。于是它
+                        // 必然满足 thinking_swallowed_by_upstream（块开了 + 有正文 + 零思考
+                        // 字符），把一条**其实正常返回了思考**的线路记 30 分钟静音。
+                        // 多记一位，判据就能把它摘出去。
+                        Some("redacted_thinking") => {
+                            self.saw_thinking_block = true;
+                            self.thinking_telemetry.saw_redacted_thinking_block = true;
+                        }
                         Some("text") | Some("tool_use") => self.saw_answer_block = true,
                         _ => {}
                     }
@@ -9901,6 +11012,25 @@ impl AnthSse {
                             }
                         }
                         Some("thinking_delta") => {
+                            // **这一支原来没有 else。**
+                            //
+                            // 于是「中转把文字挂在别的键上」和「上游真的发了空串」在遥测里
+                            // 完全同形:两种都是 nonempty=0 / chars=0 / saw_thinking_block=true,
+                            // 而 saw_thinking_block 是 content_block_start 置的,跟这里无关。
+                            // 三种成因里有两种查不出来 —— 属于本仓库自己记的那一族:
+                            // 「跳过了就得说」。只记**键名**,不记任何内容。
+                            if ev.pointer("/delta/thinking").and_then(|v| v.as_str()).is_none() {
+                                self.thinking_telemetry.unparsed_thinking_deltas += 1;
+                                if let Some(obj) = ev.get("delta").and_then(|d| d.as_object()) {
+                                    for k in obj.keys() {
+                                        if self.thinking_telemetry.unparsed_thinking_delta_keys.len() < 12 {
+                                            self.thinking_telemetry
+                                                .unparsed_thinking_delta_keys
+                                                .insert(k.clone());
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(t) = ev.pointer("/delta/thinking").and_then(|v| v.as_str())
                             {
                                 self.saw_thinking_block = true;
@@ -9911,8 +11041,22 @@ impl AnthSse {
                                         .first_nonempty_thinking_delta_ms
                                         .get_or_insert(event_elapsed_ms);
                                 }
+                                if let Some(idx) = ev.get("index").and_then(|v| v.as_i64()) {
+                                    self.thinking_blocks.entry(idx).or_default().0.push_str(t);
+                                }
                                 self.ensure_role(&mut out);
                                 out.extend(self.chunk(json!({"reasoning_content": t}), None));
+                            }
+                        }
+                        // 签名在思考块的**末尾**才来，此前 `_ => {}` 把它整个吞掉 ——
+                        // 于是下一轮重建助手消息时没有可回放的思考块，模型看不见自己
+                        // 上一轮的推理。这一条是「原生 Anthropic」和「端点原生」的差别。
+                        Some("signature_delta") => {
+                            if let (Some(idx), Some(sig)) = (
+                                ev.get("index").and_then(|v| v.as_i64()),
+                                ev.pointer("/delta/signature").and_then(|v| v.as_str()),
+                            ) {
+                                self.thinking_blocks.entry(idx).or_default().1.push_str(sig);
                             }
                         }
                         Some("input_json_delta") => {
@@ -9950,17 +11094,29 @@ impl AnthSse {
                                 None,
                             ));
                         }
-                        _ => {}
+                        // 原来是光秃秃的 `_ => {}`。signature_delta 曾经就是这么被吞掉的
+                        // （后来单独加了分支），而中转自造的类型名还在继续无声消失。
+                        // 只记类型名，不记内容；上限 8 个，防日志被刷。
+                        other => {
+                            if let Some(name) = other {
+                                if self.thinking_telemetry.unknown_delta_types.len() < 8 {
+                                    self.thinking_telemetry
+                                        .unknown_delta_types
+                                        .insert(name.to_string());
+                                }
+                            }
+                        }
                     }
                 }
                 Some("message_delta") => {
                     if let Some(sr) = ev.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
-                        self.stop_reason = match sr {
-                            "tool_use" => "tool_calls",
-                            "max_tokens" => "length",
-                            _ => "stop",
+                        self.stop_reason = anthropic_stop_reason_to_oai(sr).into();
+                        // 拒答的理由（category / explanation）在顶层 stop_details 里，
+                        // 不在 delta 里 —— 它是这一轮唯一能告诉用户「为什么什么都没说」
+                        // 的东西，丢了就只剩一次空回复。
+                        if let Some(d) = ev.get("stop_details") {
+                            self.stop_details = Some(d.clone());
                         }
-                        .into();
                     }
                 }
                 Some("content_block_stop") => {
@@ -9980,6 +11136,15 @@ impl AnthSse {
                         }
                         if let Some(block) = self.tool_blocks.get_mut(&idx) {
                             block.stopped = true;
+                        }
+                        // 思考块收尾：文字和签名此刻都齐了，整块发一次。配对在网关做完，
+                        // 客户端只当它是不透明数据存起来、原样回传。
+                        if let Some((text, sig)) = self.thinking_blocks.remove(&idx) {
+                            if let Some(b) = crate::thinking_replay::one(&text, &sig, &self.model) {
+                                self.ensure_role(&mut out);
+                                let field = crate::thinking_replay::FIELD;
+                                out.extend(self.chunk(json!({field: [b]}), None));
+                            }
                         }
                     }
                 }
@@ -10002,6 +11167,8 @@ impl AnthSse {
         json!({
             "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
             "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_create,
+            "cache_creation": {"ephemeral_1h_input_tokens": self.cache_create_1h,
+                               "ephemeral_5m_input_tokens": (self.cache_create - self.cache_create_1h).max(0)},
             "prompt_tokens": self.input_tokens, "completion_tokens": self.output_tokens,
             "total_tokens": self.input_tokens + self.output_tokens,
             // Anthropic 不单独报思考 token —— 思考算在 output_tokens 里，没有
@@ -10033,7 +11200,11 @@ impl AnthSse {
             }
             self.validated_tool_arguments(block)?;
         }
-        let mut out = self.chunk(json!({}), Some(&self.stop_reason));
+        let mut out = if let Some(d) = self.stop_details.clone() {
+            self.chunk(json!({ "stop_details": d }), Some(&self.stop_reason))
+        } else {
+            self.chunk(json!({}), Some(&self.stop_reason))
+        };
         out.extend(format!("data: {}\n\n", json!({"object":"chat.completion.chunk","model":self.model,"choices":[],"usage":self.usage()})).into_bytes());
         out.extend_from_slice(b"data: [DONE]\n\n");
         Ok(out)
@@ -10403,6 +11574,16 @@ pub async fn chat_completions(
     // Never trust desktop/provider-agnostic cache markers. Strip them before route selection;
     // native Anthropic routes add gateway-owned breakpoints after the actual connection is known.
     strip_cache_control(&mut body);
+    if let crate::prompt_shield::ShieldVerdict::Honeypot(reason) =
+        crate::prompt_shield::check_request(&headers, &body)
+    {
+        tracing::warn!(
+            request_id = request_id.as_deref().unwrap_or("-"),
+            reason = ?reason,
+            "[prompt_shield] honeypot triggered",
+        );
+        return Ok(crate::prompt_shield::honeypot_sse_response(&reason));
+    }
     // L0 server-side assembly: when the IDE opts in (x-ide-mode header), inject the system
     // prompt + requested tool schemas from the registry HERE, so the client ships neither.
     // No header → no-op (existing behavior untouched).
@@ -10434,11 +11615,17 @@ pub async fn chat_completions(
     }
     // Deliberately metadata-only: this records the requested thinking wire shape
     // without retaining prompts, messages, thinking text, or credentials.
+    // 后四位是辅助调用判据的直接读数（max_tokens 是钳位前的原值）：验「关推理有没有生效」
+    // 时拿 ide_aux=true 的行去对同一 request_id 的 [billing] completion，不用再从模型反应反推。
     tracing::info!(
         request_id = request_id.as_deref().unwrap_or(""),
         model = %model_id,
         reasoning_effort = telemetry_reasoning_effort(&body),
         inbound_thinking_type = telemetry_thinking_type(&body),
+        max_tokens = body.get("max_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+        ide_mode = headers.contains_key("x-ide-mode"),
+        aux_header = headers.contains_key("x-ide-aux"),
+        ide_aux = is_ide_aux_request(&headers, &body),
         "thinking telemetry: inbound chat request"
     );
 
@@ -10457,14 +11644,10 @@ pub async fn chat_completions(
     let byo = crate::byo_upstream::from_headers_async(&headers)
         .await
         .map_err(AppError::bad)?;
-    let conns = if byo.is_some() {
+    let conns: Vec<Model> = if byo.is_some() {
         Vec::new()
     } else {
-        sqlx::query_as::<_, Model>(
-            "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
-        )
-        .fetch_all(&state.db)
-        .await?
+        active_models_cached(&state.db).await?.as_ref().clone()
     };
     // 「Claude 强力版」：IDE 打开那个开关时带 x-ide-power-route，这一轮只在运维勾了
     // power_route 的线路里挑。
@@ -10548,11 +11731,12 @@ pub async fn chat_completions(
     // 只在**已经算出来的候选**里挑。候选是「这条线路 effective_models 里有这个模型」筛出来的，
     // 所以这个头至多让用户在他本来就能从列表里点到的那几条之间选一条，够不到别的。
     // 认不出的 id 一律忽略（不报错）：老版客户端不带这个头，带了个过期 id 也不该让请求失败。
-    if let Some(want) = headers
+    let explicit_route = headers
         .get("x-ide-route")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| uuid::Uuid::parse_str(v.trim()).ok())
-    {
+        .filter(|want| candidates.iter().any(|m| m.id == *want));
+    if let Some(want) = explicit_route {
         if let Some(at) = candidates.iter().position(|m| m.id == want) {
             let picked = candidates.remove(at);
             candidates.insert(0, picked);
@@ -10690,6 +11874,9 @@ pub async fn chat_completions(
     // 没配多路由的线路展开成一份、就是它自己，所以这一行对现有配置是恒等变换。
     //
     // 位置在免费池收窄**之后**：先决定用哪些线路，再决定每条线路走哪个门。
+    // 首选线路（用户选中/最便宜可用的那条）的 id。备用线路只在它的出口全部
+    // 硬故障时才会被走到，判据在 `'routes` 循环末尾。
+    let mut primary_route_id: Option<uuid::Uuid> = None;
     {
         // 自带地址的成败单独取一次：它在 route_endpoints 表里没有行，
         // 不取的话它永远「没有样本」＝永远算靠谱，而最初暴露这个问题的就是它。
@@ -10707,23 +11894,14 @@ pub async fn chat_completions(
         candidates =
             crate::route_endpoints::expand(&candidates, &endpoint_map, &own_rates, &model_id);
 
-        // ── 只走一条线路：跨线路兜底到此为止 ──────────────────────────
+        // ── 只走一条线路，不跨线路 ──────────────────────────
         //
-        // 用户要的是「多路由」而不是「跨路由」：一条线路挂多个出口、出口之间互相兜底，
-        // 而不是一个请求在多条线路之间找哪条能用。拆在这里最省事——`expand()` 之后
-        // 每个候选都已经是「线路 × 某个门」，按线路 id 收成一组即可，下游每一处判据
-        // 用的都是 `health_id()`（出口粒度），语义自动从「跨线路」变成「线路内」：
-        // route_goes_to_the_back 的 route_count、429 让位的替补池、失败文案、日志，
-        // 全部不用动。计费（cid = conn.id）、粘性键、AVOID 头也都不受影响。
+        // 线路由用户选，不许因为质量偷偷换。一条线路挂多个出口、出口之间互相兜底，
+        // 而不是一个请求在多条线路之间找哪条能用。
         //
         // 选哪条：沿用上面已经排好的顺序（x-ide-route → 会话粘性 → sort），
-        // **但跳过「试过、从来没成过」的线路**。
-        //
-        // 这一条不是锦上添花，是防一次确定的停机：线上 glm-5.3-flash 的候选里，
-        // 智普(sort=50) 对这个模型只有一个今天新建的出口（0 成 2 败），而 670 成 62 败
-        // 的那个挂在 sort=110 那条上。今天靠跨线路兜底才落到好的那条；直接按 sort 收窄
-        // 会把每一发都钉死在 0 成 2 败上。判据刻意取得很窄——**有失败、且一次都没成过**
-        // 才跳过，全新没样本的线路（0 成 0 败）不受影响，不会被饿死。
+        // **但跳过「试过、从来没成过」的线路**（0 成 0 败不跳，不饿死新线路）。
+        // 用户通过 x-ide-route 显式选的线路不受此跳过逻辑影响。
         let rate_of = |m: &Model| -> (i64, i64) {
             match m.endpoint_id {
                 Some(eid) => endpoint_map
@@ -10735,14 +11913,20 @@ pub async fn chat_completions(
             }
         };
         let before = candidates.len();
-        candidates = narrow_to_one_route(candidates, rate_of);
-        if before != candidates.len() {
+        let (reordered, primary) = prefer_one_route(candidates, rate_of, explicit_route);
+        candidates = reordered;
+        primary_route_id = primary;
+        let primary_targets = candidates
+            .iter()
+            .filter(|c| Some(c.id) == primary_route_id)
+            .count();
+        if primary_targets != before {
             tracing::info!(
                 model = %model_id,
-                route_id = %candidates.first().map(|c| c.id).unwrap_or_default(),
-                targets = candidates.len(),
-                dropped = before - candidates.len(),
-                "只在这条线路的出口之间切换（跨线路兜底已按运维要求关闭）"
+                route_id = %primary_route_id.unwrap_or_default(),
+                primary_targets,
+                dropped = before - primary_targets,
+                "只走这条线路的出口，其余同模型线路已丢弃"
             );
         }
     }
@@ -10873,6 +12057,40 @@ pub async fn chat_completions(
         compression_strip_protocol_fields(&mut body);
     }
 
+    // 压缩后前缀探针：测的是**真正发给上游**的消息数组。上面那个探针（line 11322）
+    // 跑在压缩之前，测的是客户端原始消息——压缩重写整段历史之后那个结果早就不是
+    // 实际发出去的形状了。两组一起看才能区分「前缀本来就不稳定」和「压缩把它搞坏了」。
+    if compression_applied.is_some() {
+        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+            let run = headers.get("x-ide-run-id").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let probe_key = if run.is_empty() {
+                String::new()
+            } else {
+                format!("{run}:post")
+            };
+            if !probe_key.is_empty() {
+                if let Some((at, prev, now)) = crate::prefix_probe::diverged_at(&probe_key, msgs) {
+                    tracing::info!(
+                        model = %model_id, run_id = run, diverged_at = at,
+                        prev_msgs = prev, now_msgs = now, pure_append = at == prev,
+                        "prompt prefix reuse (post-compression)"
+                    );
+                }
+            }
+        }
+    }
+
+    // 工具调用 ↔ 工具结果的配对，出上游前最后再修一次（判据见 repair_tool_pairing）。
+    // 位置必须在压缩之后、协议分叉之前：压缩会重写整段历史，三条协议又都从这份 body 出发。
+    let pairing_repairs = repair_tool_pairing(&mut body);
+    if pairing_repairs > 0 {
+        tracing::warn!(
+            model = %model_id,
+            repairs = pairing_repairs,
+            "repaired tool_call/result pairing before upstream"
+        );
+    }
+
     let streaming = body
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -10927,6 +12145,11 @@ pub async fn chat_completions(
                 },
                 false,
                 0,
+                // free_pool=false，这一位读不到；给 1.0 而不是 0.0，免得将来有人把它接上时
+                // 拿到一个「倍率 0 = 一分不收」的默认值。
+                1.0,
+                // 缓存命中回放：上面那位 cost 就是字面量 0，micro 同源。
+                0,
             )
             .await; // record a 0-cost cache hit
             let ct = if streaming {
@@ -10941,7 +12164,8 @@ pub async fn chat_completions(
                 .status(StatusCode::OK)
                 .header(axum::http::header::CONTENT_TYPE, ct)
                 .header("x-gateway-cache", "hit")
-                .header("cache-control", "no-cache");
+                .header("cache-control", "no-cache")
+                .header("x-mide-endpoint", primary_conn.health_id().to_string());
             if let Some(tier) = compression_applied {
                 cache_builder =
                     cache_builder.header("x-michael-compression-applied", tier.as_str());
@@ -10959,17 +12183,21 @@ pub async fn chat_completions(
         // 也算未命中——对用户的效果一样是「这次得打上游」。
         note_response_cache(ResponseCacheEvent::Miss, &model_id);
     }
+    // ── IDE 辅助调用：关掉推理 ───────────────────────────────────────────────
+    // 判据和各家族的开关见 is_ide_aux_request / disable_thinking_for_aux。必须在下面那道钳位
+    // **之前**：钳位一看到 reasoning_effort=low 就把 max_tokens 抬到 32K，辅助调用那份 900 的
+    // 上限就是这样被放大成几千 token 推理的。
+    let ide_aux = is_ide_aux_request(&headers, &body);
+    if ide_aux {
+        aux_thinking_common(&mut body);
+    }
     // ── max_tokens guardrail for thinking (all protocols) ───────────────────
     // Chinese aggregators (zyz etc.) convert reasoning_effort / thinking to Anthropic thinking
     // with budget_tokens; if max_tokens < budget_tokens the upstream rejects. The native
     // Anthropic path (oai_to_anthropic) handles this, but OpenAI-protocol connections pass
     // body through unchanged — so bump max_tokens here before the fork.
     {
-        let has_thinking = body.get("thinking").is_some()
-            || body
-                .get("reasoning_effort")
-                .and_then(|v| v.as_str())
-                .is_some_and(|e| !e.is_empty() && e != "off");
+        let has_thinking = !ide_aux && thinking_needs_max_tokens_room(&body);
         if has_thinking {
             let budget = body
                 .pointer("/thinking/budget_tokens")
@@ -11022,6 +12250,9 @@ pub async fn chat_completions(
         let mut attempted_sends = 0u32;
         // 因为「表头前卡死」而换出口的次数。上限见 `CHAT_MAX_STALL_SWITCHES`。
         let mut stall_switches = 0u8;
+        // 因为「首选线路整体硬故障」而跨到备用线路的次数。和线路内换出口分开记：
+        // 前者是「这条线路死了」，后者是「这个出口抖了一下」，配额不该共用。
+        let mut cross_route_switches = 0u8;
         // 429 单线路排队的累计等待与次数（见 RATE_LIMIT_QUEUE_* 常量）。跨整轮存活：
         // 最终还是失败时，错误文案要能说出「网关已经替你等了多久」。
         let mut rate_limit_waited = Duration::ZERO;
@@ -11143,9 +12374,21 @@ pub async fn chat_completions(
             .is_some_and(|t| t != "disabled");
         for candidate in &candidates {
             let cooled = route_cooldown_remaining(candidate.health_id(), now).is_some();
-            // 要了思考却一个字都不回的线路：有别的同模型线路可走时排到后面。
-            // 和冷却一样只是**重排**，不是排除——到期自动再探，上游恢复了就自己回来。
-            let mutes = wants_thinking && route_mutes_thinking(candidate.id, now);
+            // **思考降权已按所有者要求整个摘掉（2026-09-03）。**
+            //
+            // 「出不出思考」不再影响派单：用户在界面上选了哪条线路，就走哪条。
+            // 没配多路由的线路就是那一条；哪怕它这一轮没回思考，也不换、不排后面。
+            //
+            // 摘掉之前它有两个已实测的问题，也印证了这个决定：
+            //   · `narrow_to_one_route` 之后所有候选是同一条线路 id，静音对每个候选取值
+            //     相同 —— 全部一起进 cooled_candidates、再原序放回，**对流量零影响**。
+            //     日志里那句 de-prioritising 说的是它没做到的事。
+            //   · 更糟的是它生效的 30 分钟里，`cooled/stalled/broken` 这些**按出口**分辨的
+            //     排序会被那个 `||` 一起拉平 —— 真正有效的出口级降权反而被关掉。
+            //
+            // 下面 `cooled / stalled / broken` 保留：那三个是**真的连不上/超时/连败**，
+            // 属于传输层故障转移，和「这一轮想没想」是两回事。
+            let mutes = false;
             // 最近卡满过表头预算的线路同理：停机期间别让每条消息都先在它上面垫 25 秒。
             let stalled = route_recently_stalled(candidate.health_id(), now);
             // 上面三个都是**进程内**的短期标记，重启即清零、也不跨实例。这一个不同：
@@ -11179,6 +12422,8 @@ pub async fn chat_completions(
                 ordered_candidates.push(candidate);
             }
         }
+        // 跨线路兜底已关闭：候选里只有首选线路的出口，不存在备用线路。
+        // 直接把 cooled 的出口排到后面，健康的排前面。
         ordered_candidates.extend(cooled_candidates);
 
         // 「400 就不换线」那道闸要**按协议**判，见下方 break 'routes 处的长注释。
@@ -11188,6 +12433,13 @@ pub async fn chat_completions(
             .iter()
             .take(CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP)
             .map(|c| c.protocol.clone())
+            .collect();
+        // 抄一份线路 id：跨线路兜底已关闭，这里全都是同一条线路，
+        // 但循环体里的 next_is_fallback_route 判据还在读它。
+        let candidate_route_ids: Vec<uuid::Uuid> = ordered_candidates
+            .iter()
+            .take(CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP)
+            .map(|c| c.id)
             .collect();
         let mut candidate_index: usize = 0;
 
@@ -11282,6 +12534,10 @@ pub async fn chat_completions(
             } else {
                 serde_json::Value::Null
             };
+            // 这一笔请求的正文字节数。算一次,遥测和「表头等待按大小放宽」共用 ——
+            // 两处用同一个数,日志里看到多大就是判据吃到的那个多大。
+            // 位置在三条协议分支**都定型之后**:量的必须是最终发出去的那一份。
+            let candidate_request_bytes = body_text_bytes(&candidate_upstream_body);
             // 该线路正处于"深思考丢块"钳位期：把思考预算压到实测安全值再发。
             if candidate_anthropic
                 && thinking_clip_active(candidate.id)
@@ -11304,12 +12560,20 @@ pub async fn chat_completions(
                     model = %model_id,
                     protocol = "anthropic",
                     thinking_type = telemetry_thinking_type(&candidate_upstream_body),
+                    // **`display` 才是这一族到底回不回思考文字的开关**（8505 那段注释
+                    // 认定的），而这条日志原来把 type/effort/beta/max_tokens/tools 全记了、
+                    // 唯独漏了它。于是线上能证明「我们要了 adaptive」，却证明不了
+                    // 「我们要了 summarized」—— 排查时只能靠读源码推断，推断不该当证据用。
+                    thinking_display = candidate_upstream_body
+                        .pointer("/thinking/display")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("absent"),
                     output_config_effort = telemetry_output_config_effort(&candidate_upstream_body),
                     // 这三格是这次补回来的。前两格 HEAD 上有过、被整块重写时删掉了；
                     // 第三格 HEAD 也没有 —— 它回答「这一路走了哪份基础集合」，
                     // 而那正是 base_url 判据一旦误判、日志里唯一看得出来的地方。
                     beta_context_1m = wants_1m_context(&candidate_upstream_body),
-                    beta_text_bytes = body_text_bytes(&candidate_upstream_body),
+                    beta_text_bytes = candidate_request_bytes,
                     beta_profile = if anthropic_is_first_party(&candidate.base_url) {
                         "first_party"
                     } else {
@@ -11403,10 +12667,14 @@ pub async fn chat_completions(
                 let candidate_first_party = anthropic_is_first_party(&candidate.base_url);
                 let candidate_wants_1m = candidate_anthropic && wants_1m_context(&candidate_upstream_body);
                 let candidate_beta_header = if candidate_anthropic {
+                    // **beta 只按「是不是一方」给，不跟 ttl 走。**
+                    // `cache_control.ttl` 现在是 GA 的，不需要 extended-cache-ttl 这个 beta；
+                    // 而三方那份 beta 集合是照 Claude Code 挑的指纹，多发一项有被 503 的风险。
+                    // 两者解耦之后：三方照样拿 1 小时缓存，请求头一个字节不变。
                     anthropic_beta_header_for(
                         candidate_first_party,
                         candidate_wants_1m,
-                        anthropic_allows_extended_ttl(&candidate.base_url),
+                        candidate_first_party,
                     )
                 } else {
                     String::new()
@@ -11505,6 +12773,12 @@ pub async fn chat_completions(
                     let _run_id = affinity_scope(&headers);
                     let _affinity = route_needs_cache_affinity(&model_id, &candidate.base_url);
                     let mut oai_body = body.clone();
+                    // IDE 辅助调用在透传线路上的第二步：前面按 Anthropic 桥的口径把档位写成了
+                    // off，而 OpenAI 协议的上游不认它（ox-alpha 实测 400），这里剥掉，再按家族补
+                    // 它真正认的关闭开关。见 openai_passthrough_aux_thinking。
+                    if ide_aux {
+                        openai_passthrough_aux_thinking(&mut oai_body);
+                    }
                     if _affinity {
                         if let Some(o) = oai_body.as_object_mut() {
                             o.insert(
@@ -11595,8 +12869,12 @@ pub async fn chat_completions(
                 //   · route_recently_stalled 查不到 → 刚卡死过的出口下一轮照样给 30 秒。
                 // 线上主力线路每条挂 3~6 个出口，也就是说绝大多数候选从来没被收紧过 ——
                 // 这正是「响应太慢」：一个坏出口独吞 30 秒，58 秒预算里只够试两个。
-                let header_wait =
-                    remaining.min(header_wait_for_candidate(max_header_wait, candidate, Instant::now()));
+                let header_wait = remaining.min(header_wait_for_candidate(
+                    max_header_wait,
+                    candidate,
+                    Instant::now(),
+                    candidate_request_bytes,
+                ));
                 let send_started = Instant::now();
                 let sent = match tokio::time::timeout(header_wait, req.send()).await {
                     Ok(result) => {
@@ -11979,12 +13257,32 @@ pub async fn chat_completions(
                 //
                 // 只换一次：上游那边可能还在跑、还会计费。一次是「抖了一下」，
                 // 三次就是拿钱换一个已经等太久的请求，不划算。
-                if stalled_before_headers && stall_switches < CHAT_MAX_STALL_SWITCHES {
-                    stall_switches += 1;
+                // 下一个候选是不是已经跨到**备用线路**了。
+                //
+                // 线路内换出口沿用原来的配额（1 次）：上游可能还在跑、还会计费，
+                // 在同一条线路上反复砸不划算。但「首选线路的出口已经试完、下一个
+                // 是另一条线路」是完全不同的一件事 —— 那说明**这条线路整体打不通**，
+                // 而这正是用户要的兜底。给它一次独立的额度。
+                let next_is_fallback_route = primary_route_id.is_some_and(|p| {
+                    candidate_route_ids
+                        .get(this_index + 1)
+                        .is_some_and(|rid| *rid != p)
+                });
+                let may_switch = stall_switches < CHAT_MAX_STALL_SWITCHES
+                    || (next_is_fallback_route
+                        && cross_route_switches < CHAT_MAX_CROSS_ROUTE_SWITCHES);
+                if stalled_before_headers && may_switch {
+                    if next_is_fallback_route {
+                        cross_route_switches += 1;
+                    } else {
+                        stall_switches += 1;
+                    }
                     tracing::info!(
                         model = %model_id,
                         route_id = %candidate.id,
                         stall_switches,
+                        cross_route_switches,
+                        crossing_to_fallback_route = next_is_fallback_route,
                         "表头前卡死；客户端还没收到任何字节，换下一个出口重发"
                     );
                     continue 'routes;
@@ -11995,7 +13293,7 @@ pub async fn chat_completions(
                 model = %model_id,
                 route_id = %candidate.id,
                 status = err_status,
-                "upstream answered with an error; trying the next same-model route"
+                "upstream answered with an error; trying the next endpoint on this route"
             );
         }
         match (success, selected_conn) {
@@ -12114,7 +13412,16 @@ pub async fn chat_completions(
         let ckey_task = ckey.clone();
         // Step-type signals must be read here: `body` is moved into the pump task below.
         let step_mode_task = step_mode(&headers);
+        // 结果那条日志要能和「native Anthropic request」那条 join —— 一个 request_id 下
+        // 有多条流，按时序配对会被并发交错打乱（实测配错过）。判据字段直接带进闭包。
+        let tools_count_task = body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map_or(0usize, |t| t.len());
         let step_tool_turn_task = step_is_tool_turn(&body);
+        // 流式是 IDE agent 的**主路径**，而记账发生在 spawn 出去的任务里、那里没有 headers。
+        // 和上面两行同一个理由先捕获：漏了这一支，run_id 这一列在真正想看的那批行上全是 NULL。
+        let step_run_task = step_run_shape(&headers);
         // Absorb short provider bursts without making the billing/cache pump stop reading the
         // upstream while Hyper or nginx drains a handful of tiny SSE frames.
         // 续写要用的三样。**只在这里克隆一次**，泵任务里再拿不到外面的东西。
@@ -12151,6 +13458,9 @@ pub async fn chat_completions(
             // 超 3 分钟的静默深思仍会被网关先掐。
             let idle = std::time::Duration::from_secs(if deep_thinking { 600 } else { 180 });
             let mut acc: Vec<u8> = Vec::new(); // OpenAI-shape SSE bytes, for the response cache (capped 1MB)
+            // 工具名边流边认。**不能**等收完再从 acc 里找：acc 封顶 1MB，而工具调用在流的末尾。
+            let mut emitted_tool_seen: Option<String> = None;
+            let mut emitted_tool_tail: Vec<u8> = Vec::new();
                                                // Bounded tail for OpenAI usage extraction (the include_usage chunk is the LAST event;
                                                // a >1MB response would miss it in the capped acc). Unused on the anthropic path — there
                                                // usage comes from the converter's accumulated counts.
@@ -12198,6 +13508,21 @@ pub async fn chat_completions(
             let mut last_data = tokio::time::Instant::now();
             let response_opened_at = tokio::time::Instant::now();
             let mut first_upstream_chunk = true;
+            // 块间间隔的取证。
+            //
+            // 这条链路此前**只记第一个 chunk**（first_upstream_chunk_after_headers_ms），
+            // 之后一个埋点都没有。于是用户报「回复一会儿就卡很久才继续」时，
+            // 全链路没有任何人能回答「是上游一阵一阵地吐，还是我们这边攒住了」——
+            // 只能靠读代码猜。首字慢是能量到的（实测中位 3.4s / p90 12.4s），
+            // 但那解释不了「已经开始回复之后」的停顿，两者是不同的现象。
+            //
+            // 只留四个标量 + 一条收尾日志：不逐块打日志（每秒几十条会把日志淹掉，
+            // 而且写日志本身会加重它要测的那个问题）。
+            let mut chunk_count: u64 = 0;
+            let mut max_gap_ms: u64 = 0;
+            let mut gaps_over_1s: u64 = 0;
+            let mut gaps_over_3s: u64 = 0;
+            let mut sum_gap_ms: u64 = 0;
             // When the client hangs up we keep draining the upstream instead of
             // bailing out. The upstream keeps generating (and keeps charging the
             // operator) either way, and the token counts only arrive in the FINAL
@@ -12219,6 +13544,16 @@ pub async fn chat_completions(
                 }
                 match tokio::time::timeout(hb_interval, upstream.next()).await {
                     Ok(Some(Ok(chunk))) => {
+                        // 间隔要在更新 last_data **之前**量。首块不算——它是首字延迟，
+                        // 已经由上面那条日志单独记着，混进来会把分布整个带偏。
+                        if !first_upstream_chunk {
+                            let gap_ms = last_data.elapsed().as_millis() as u64;
+                            if gap_ms > max_gap_ms { max_gap_ms = gap_ms; }
+                            if gap_ms >= 1000 { gaps_over_1s += 1; }
+                            if gap_ms >= 3000 { gaps_over_3s += 1; }
+                            sum_gap_ms = sum_gap_ms.saturating_add(gap_ms);
+                        }
+                        chunk_count += 1;
                         last_data = tokio::time::Instant::now();
                         if first_upstream_chunk {
                             first_upstream_chunk = false;
@@ -12253,6 +13588,7 @@ pub async fn chat_completions(
                             if acc.len() < 1_000_000 {
                                 acc.extend_from_slice(&fwd);
                             }
+                            scan_for_emitted_tool(&mut emitted_tool_seen, &mut emitted_tool_tail, &fwd);
                             if conv.is_none() {
                                 tail.extend_from_slice(&fwd);
                                 if tail.len() > 131_072 {
@@ -12290,6 +13626,16 @@ pub async fn chat_completions(
                     }
                     Err(_elapsed) => {
                         if last_data.elapsed() >= idle {
+                            // 真停死也要把这一条流的间隔画像留下：它正是最该被看到的那一条。
+                            tracing::warn!(
+                                model = %req_model,
+                                request_id = request_id_task.as_deref().unwrap_or(""),
+                                chunk_count,
+                                max_gap_ms,
+                                gaps_over_1s,
+                                gaps_over_3s,
+                                "upstream stream inter-chunk profile (stalled out)"
+                            );
                             stream_failure = Some(format!(
                                 "upstream stream stalled for {} seconds",
                                 idle.as_secs()
@@ -12309,6 +13655,25 @@ pub async fn chat_completions(
                     }
                 }
             }
+            // 这条流的块间间隔画像。**每条流一条**，不逐块打 —— 逐块每秒几十行会把日志
+            // 淹掉，而且写日志本身会加重它要测的那个现象。
+            //
+            // 怎么读它：`gaps_over_1s`/`gaps_over_3s` 非零就是「已经开始回复之后还在停」，
+            // 那是上游一阵一阵地吐；全 0 而首字慢，那是「等它开口」，两者的解法完全不同
+            // （前者换线路，后者换模型或预热连接）。此前这一层完全没有数据。
+            if chunk_count > 0 {
+                tracing::info!(
+                    model = %req_model,
+                    request_id = request_id_task.as_deref().unwrap_or(""),
+                    chunk_count,
+                    max_gap_ms,
+                    gaps_over_1s,
+                    gaps_over_3s,
+                    mean_gap_ms = if chunk_count > 1 { sum_gap_ms / (chunk_count - 1) } else { 0 },
+                    stream_ms = response_opened_at.elapsed().as_millis(),
+                    "upstream stream inter-chunk profile"
+                );
+            }
             // Anthropic bills from its native usage events; OpenAI-compatible streams
             // bill from the trailing include_usage chunk. Missing/incomplete usage is
             // never guessed: rate billing is zero and the settlement says unreported.
@@ -12319,6 +13684,7 @@ pub async fn chat_completions(
                             if acc.len() < 1_000_000 {
                                 acc.extend_from_slice(&fin);
                             }
+                            scan_for_emitted_tool(&mut emitted_tool_seen, &mut emitted_tool_tail, &fin);
                             if !client_closed
                                 && tx.send(Ok(axum::body::Bytes::from(fin))).await.is_err()
                             {
@@ -12462,28 +13828,28 @@ pub async fn chat_completions(
                 && conv
                     .as_ref()
                     .is_some_and(|c| c.thinking_block_never_opened());
+            // **这三支只记录，不再改派单（2026-09-03，按所有者要求）。**
+            //
+            // 「这一轮出没出思考」不是换线路的理由:用户在界面上选了哪条线路就走哪条,
+            // 没配多路由的线路就是那一条。原来这里会打 `mark_thinking_mute` 记号让选路
+            // 绕开——现在只留日志和「不进缓存」，记号整套已删。
             if thinking_swallowed {
-                // 记下来，让选路绕开它 —— 只打日志的话，下一次请求照样落到同一条线路上。
-                mark_thinking_mute(cid);
                 tracing::warn!(
                     model = %req_model,
                     route_id = %cid,
-                    "upstream returned no thinking despite an explicit thinking request; not caching this response and de-prioritising this route for thinking requests"
+                    "upstream returned no thinking despite an explicit thinking request; \
+                     not caching this response (routing is unchanged: the user's route is respected)"
                 );
-            } else if thinking_never_opened {
-                if note_thinking_zero(cid) {
-                    mark_thinking_mute(cid);
-                    tracing::warn!(
-                        model = %req_model,
-                        route_id = %cid,
-                        streak = THINKING_DEAD_STREAK,
-                        "upstream opened no thinking block on N consecutive thinking requests; de-prioritising this route for thinking requests"
-                    );
-                }
+            } else if thinking_never_opened && note_thinking_zero(cid) {
+                tracing::warn!(
+                    model = %req_model,
+                    route_id = %cid,
+                    streak = THINKING_DEAD_STREAK,
+                    "upstream opened no thinking block on N consecutive thinking requests \
+                     (diagnostic only; routing is unchanged)"
+                );
             } else if complete && thinking_clip_probe && !thinking_went_missing {
-                // 这一轮要了思考、也真的回了 —— 撤掉记号，连击也清零。上游恢复后第一个
-                // 成功的请求就让这条线路回到正常轮换，不需要任何人去后台动手。
-                clear_thinking_mute(cid);
+                // 这一轮真回了思考 —— 把连击清零，免得下次一进来就报到阈值。
                 clear_thinking_zero_streak(cid);
             }
             if relay_dropped_blocks {
@@ -12509,6 +13875,20 @@ pub async fn chat_completions(
                 }
                 if !client_closed {
                     tracing::warn!(model = %req_model, error = %err, "upstream model stream failed protocol validation");
+                    // **先把原因发出去，再中止。**
+                    //
+                    // 只发 `Err(...)` 的话，客户端拿到的仅仅是一个传输层错误 ——
+                    // 桌面端把它显示成「连接中断（网络波动）」，而真正的原因
+                    // （比如「上游的流没有终止标记就结束了」）只进了我们自己的日志。
+                    // 用户报「老是断线」时，产品里没有任何字段能告诉他断在哪一段：
+                    // 是上游把流掐了、是这一跳的网络断了、还是网关自己判定协议不合格。
+                    //
+                    // 形状是 OpenAI 兼容的 `data:` 帧：**老客户端读不到 `choices` 会
+                    // 原样忽略它**，所以加这一帧对已经装着的版本零影响。
+                    // 正文过一遍脱敏 —— 它是我们自己生成的校验文案，但同一个函数别处
+                    // 都在用，走一遍不吃亏。
+                    let frame = stream_error_frame(&err, "upstream");
+                    let _ = tx.send(Ok(axum::body::Bytes::from(frame))).await;
                     let _ = tx
                         .send(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -12539,6 +13919,23 @@ pub async fn chat_completions(
                     //   =true 且 chars=0                    → 块开了、文本空（display 侧）
                     //   =false 但 output_tokens >> 正文字符 → 思考了、整块都没回来
                     saw_thinking_block = converter.saw_thinking_block(),
+                    // **这两位是为了让这条日志和「native Anthropic request」那条能 join。**
+                    //
+                    // 一个 request_id 下会有多条流（agent 一轮实测 5~6 次模型调用），
+                    // 而请求形状只在那一行、思考结果只在这一行，两边按 request_id 是一对多、
+                    // 按时序又会被并发交错打乱 —— 实测手工配对配错过。把判据字段直接带到
+                    // 结果这一行，「带工具的轮次到底出不出思考」才是一个能查的问题。
+                    req_tools_count = tools_count_task,
+                    req_step_kind = step_mode_task.as_deref().unwrap_or("absent"),
+                    // 「零思考」原来有三种成因同形，其中两种查不出来。这四位把它们分开：
+                    //   unparsed_thinking_deltas>0            → 中转改了键名，文字挂在别处
+                    //   unknown_delta_types 非空              → 中转自造了 delta 类型
+                    //   saw_redacted_thinking_block=true      → 上游加密了这一轮推理（正常）
+                    //   三者都空且 saw_thinking_block=true    → 上游真的发了空串
+                    unparsed_thinking_deltas = thinking.unparsed_thinking_deltas,
+                    unparsed_thinking_delta_keys = ?thinking.unparsed_thinking_delta_keys,
+                    unknown_delta_types = ?thinking.unknown_delta_types,
+                    saw_redacted_thinking_block = thinking.saw_redacted_thinking_block,
                     visible_text_utf8_chars = thinking.visible_text_utf8_chars,
                     upstream_output_tokens = converter.output_tokens(),
                     stop_reason = converter.stop_reason_label(),
@@ -12553,7 +13950,19 @@ pub async fn chat_completions(
                     "thinking telemetry: Anthropic stream outcome"
                 );
             }
-            let cost = resolve_cost(
+            // **上游什么都没回，就不该收钱** —— 哪怕这条线路是按次计价。
+            //
+            // `resolve_cost` 的按次分支按设计**不看用量**（按次就是按次），而免费模型配了
+            // 每次费用时也会被折进按次模式。两条合起来的后果是：上游超时/报错、一个 token
+            // 都没回，用户照样被扣一次的钱。线上 30 天 **105 笔、$40.16、涉及 17 个用户**，
+            // 8/12 起一直到今天都在发生 —— 这是全表唯一一种**多收**，其余的缺口都是少收。
+            //
+            // 判据只用执行事实，不猜：上游既没报用量（usage_reported=false）、
+            // 也没产出任何字节（acc 空）。两个条件都成立才判「什么都没回」——
+            // 只看其中一个会误伤：有些线路不报用量但正常出文（那是少收的另一件事），
+            // 有些流产出了内容但用量在末尾丢了（内容用户已经拿到，该收）。
+            let produced_nothing = !usage_reported && acc.is_empty();
+            let cost = if produced_nothing { 0 } else { resolve_cost(
                 &bmode,
                 percall,
                 usage_reported.then_some(&usage),
@@ -12564,7 +13973,21 @@ pub async fn chat_completions(
                 cache_read_price,
                 cache_create_price,
         model_over,
-                conn.cache_disabled,);
+                conn.cache_disabled,) };
+    // 同一套参数、同一份价，只是**不取整到整美分**。扣用户的那一份走这条（见
+    // resolve_cost_micro_usd 的说明：整美分取整会把不到半美分的调用变成 0，白送）。
+let cost_micro = if produced_nothing { 0 } else { resolve_cost_micro_usd(
+                &bmode,
+                percall,
+                usage_reported.then_some(&usage),
+                &req_model,
+                rate,
+                admin_in,
+                admin_out,
+                cache_read_price,
+                cache_create_price,
+        model_over,
+                conn.cache_disabled,) };
             let mut tokens = extract_bill_tokens(
                 usage_reported.then_some(&usage),
                 &req_model,
@@ -12573,9 +13996,13 @@ pub async fn chat_completions(
             tokens.request_id = request_id_task;
             tokens.mode = step_mode_task;
             tokens.tool_turn = step_tool_turn_task;
+            (tokens.run_id, tokens.step_index) = step_run_task;
             // What did the model actually DO? A reply that is nothing but one tool dispatch
             // is the clearest routing candidate; prose replies are where reasoning happens.
-            tokens.emitted_tool = step_emitted_tool(&String::from_utf8_lossy(&acc));
+            // 流式认到的优先；acc 那一份只在流式扫器没起作用时兜底（两者语义相同）。
+            tokens.emitted_tool = emitted_tool_seen
+                .take()
+                .or_else(|| step_emitted_tool(&String::from_utf8_lossy(&acc)));
             // Cache the FULL (OpenAI-shape) stream for identical future requests (only when complete).
             // 中转丢块的坏流（只有思考）绝不缓存：客户端的快速重试请求体逐字节相同，
             // 命中缓存就会拿回同一份坏流，钳位后的重试永远打不到上游。
@@ -12594,7 +14021,7 @@ pub async fn chat_completions(
                     note_response_cache(ResponseCacheEvent::Store, &req_model);
                 }
             }
-            bill(&st, uid, hid, cid, cost, use_quota, &tokens, free_pool, free_micro).await;
+            bill(&st, uid, hid, cid, cost, use_quota, &tokens, free_pool, free_micro, rate, cost_micro).await;
             // 出口用量的写入点**只有一个**，在 `bill` 里面。原来挂在这一支上，
             // 而 bill 有五个调用点 —— 只有走流式的请求进了对账，其余四条路的
             // 流量在成本侧凭空消失。见 bill 的文档。
@@ -12606,7 +14033,8 @@ pub async fn chat_completions(
             .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
             .header(axum::http::header::CONTENT_TYPE, ct)
             .header("cache-control", "no-cache")
-            .header("x-accel-buffering", "no");
+            .header("x-accel-buffering", "no")
+            .header("x-mide-endpoint", hid.to_string());
         // 让调用方知道**实际生效**的档位——套餐不够时请求会被静默下调，不回传的话
         // 用户会以为自己拿到了 5M。
         if let Some(tier) = compression_applied {
@@ -12685,7 +14113,7 @@ pub async fn chat_completions(
         }
         let mut free_pool = false;
         let mut free_micro = 0i64;
-        let (cost, tokens) = if is_image_gen_model(&model_id) {
+        let (cost, cost_micro, tokens) = if is_image_gen_model(&model_id) {
             let per = if conn.per_call_cents > 0 {
                 conn.per_call_cents
             } else {
@@ -12693,10 +14121,19 @@ pub async fn chat_completions(
             };
             (
                 per.clamp(0, 5000),
-                BillTokens {
-                    model_name: model_id.clone(),
-                    request_id: request_id.clone(),
-                    ..Default::default()
+                // 按次计价本来就是整分，没有次分位可丢，直接换算。
+                per.clamp(0, 5000).saturating_mul(MICRO_USD_PER_CENT),
+                {
+                    // 按次计价这一支自己造 tokens，不走下面 else 里的装配 ——
+                    // 只在 else 里填 run_id 的话，按次线路上这两列会全是 NULL。
+                    let (run_id, step_index) = step_run_shape(&headers);
+                    BillTokens {
+                        model_name: model_id.clone(),
+                        request_id: request_id.clone(),
+                        run_id,
+                        step_index,
+                        ..Default::default()
+                    }
                 },
             )
         } else {
@@ -12730,6 +14167,20 @@ pub async fn chat_completions(
                 conn.cache_create_price,
         model_over,
                 conn.cache_disabled,);
+    // 同一套参数、同一份价，只是**不取整到整美分**。扣用户的那一份走这条（见
+    // resolve_cost_micro_usd 的说明：整美分取整会把不到半美分的调用变成 0，白送）。
+let cost_micro = resolve_cost_micro_usd(
+                &eff_mode,
+                eff_percall,
+                usage_val.filter(|_| usage_reported),
+                &model_id,
+                conn.rate,
+                conn.input_price,
+                conn.output_price,
+                conn.cache_read_price,
+                conn.cache_create_price,
+        model_over,
+                conn.cache_disabled,);
             let mut tokens = extract_bill_tokens(
                 usage_val.filter(|_| usage_reported),
                 &model_id,
@@ -12738,10 +14189,11 @@ pub async fn chat_completions(
             tokens.request_id = request_id.clone();
             tokens.mode = step_mode(&headers);
             tokens.tool_turn = step_is_tool_turn(&body);
+            (tokens.run_id, tokens.step_index) = step_run_shape(&headers);
             tokens.emitted_tool = step_emitted_tool(&serde_json::to_string(&data).unwrap_or_default());
-            (cost, tokens)
+            (cost, cost_micro, tokens)
         };
-        bill(&state, uid, conn.health_id(), conn.id, cost, use_quota, &tokens, free_pool, free_micro)
+        bill(&state, uid, conn.health_id(), conn.id, cost, use_quota, &tokens, free_pool, free_micro, conn.rate, cost_micro)
             .await;
         let mut resp = Json(data).into_response();
         if let Some((tok, covered)) = compression_prefix.as_ref() {
@@ -12794,20 +14246,28 @@ pub async fn responses_proxy(
             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
     };
 
+    if let crate::prompt_shield::ShieldVerdict::Honeypot(reason) =
+        crate::prompt_shield::check_request(&headers, &body)
+    {
+        tracing::warn!(
+            request_id = request_id.as_deref().unwrap_or("-"),
+            reason = ?reason,
+            "[prompt_shield] honeypot triggered on /responses"
+        );
+        return Ok(crate::prompt_shield::honeypot_sse_response(&reason));
+    }
+
     let model_id = body
         .get("model")
         .and_then(|v| v.as_str())
         .map(String::from)
         .ok_or_else(|| AppError::bad("缺少 model"))?;
 
-    let conns = sqlx::query_as::<_, Model>(
-        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let conns = active_models_cached(&state.db).await?;
     let conn = conns
-        .into_iter()
+        .iter()
         .find(|m| allowed_ids(m).contains(&model_id))
+        .cloned()
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
     // Same quota refill + check as image_generations.
@@ -13003,6 +14463,11 @@ pub async fn responses_proxy(
                 },
                 false,
                 0,
+                // free_pool=false，这一位读不到；给 1.0 而不是 0.0，免得将来有人把它接上时
+                // 拿到一个「倍率 0 = 一分不收」的默认值。
+                1.0,
+                // 这两条路的 cost 本来就是 0（缓存命中回放 / 估算兜底），micro 同源。
+                (cost as i64).saturating_mul(MICRO_USD_PER_CENT),
             )
             .await;
         } else {
@@ -13033,10 +14498,25 @@ pub async fn responses_proxy(
                 conn.cache_create_price,
         model_over,
                 conn.cache_disabled,);
+    // 同一套参数、同一份价，只是**不取整到整美分**。扣用户的那一份走这条（见
+    // resolve_cost_micro_usd 的说明：整美分取整会把不到半美分的调用变成 0，白送）。
+let cost_micro = resolve_cost_micro_usd(
+                &eff_mode,
+                eff_percall,
+                usage.filter(|_| usage_reported),
+                &model_id,
+                conn.rate,
+                conn.input_price,
+                conn.output_price,
+                conn.cache_read_price,
+                conn.cache_create_price,
+        model_over,
+                conn.cache_disabled,);
             let mut tokens =
                 extract_bill_tokens(usage.filter(|_| usage_reported), &model_id, !usage_reported);
             tokens.request_id = request_id.clone();
-            bill(&state, uid, conn.health_id(), conn.id, cost, use_quota, &tokens, free_pool, free_micro)
+            (tokens.run_id, tokens.step_index) = step_run_shape(&headers);
+            bill(&state, uid, conn.health_id(), conn.id, cost, use_quota, &tokens, free_pool, free_micro, conn.rate, cost_micro)
                 .await;
         }
     }
@@ -13074,14 +14554,11 @@ pub async fn image_generations(
         .map(String::from)
         .ok_or_else(|| AppError::bad("缺少 model"))?;
 
-    let conns = sqlx::query_as::<_, Model>(
-        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let conns = active_models_cached(&state.db).await?;
     let conn = conns
-        .into_iter()
+        .iter()
         .find(|m| allowed_ids(m).contains(&model_id))
+        .cloned()
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
     // Quota refill + check (same as chat_completions).
@@ -13285,6 +14762,8 @@ pub async fn image_generations(
                     },
                     false,
                     0,
+                    conn.rate,
+                    (cost as i64).saturating_mul(MICRO_USD_PER_CENT),
                 )
                 .await;
             }
@@ -13491,6 +14970,260 @@ mod controlled_checkbox_tests {
 
 #[cfg(test)]
 mod billing_tests {
+    /// **上游什么都没回，就不该收钱。**
+    ///
+    /// 这是整张用量表里唯一一种**多收**（其余缺口都是少收）：`resolve_cost` 的按次分支
+    /// 按设计不看用量，而免费模型配了每次费用时也会被折进按次模式 —— 于是上游超时/报错、
+    /// 一个 token 都没回，用户照样被扣一次的钱。
+    ///
+    /// 线上 30 天 **105 笔、$40.16、17 个用户**，8/12 起一直到今天都在发生。
+    /// 那些行的形状完全一致：prompt=0、completion=0、estimated=true、cost_cents=142
+    /// （$0.20 按人民币口径换算）。
+    ///
+    /// 判据必须是**两个执行事实同时成立**，只看一个都会误伤：
+    ///   · 只看「没报用量」→ 有些线路不报用量但正常出文，那是**少收**的另一件事，不能不收；
+    ///   · 只看「没产出字节」→ 有些流内容到了但用量在末尾丢了，内容用户已经拿到，该收。
+    #[test]
+    fn a_call_that_returned_nothing_is_never_charged() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let production = &src[..src.find("mod billing_tests").expect("tests module")];
+        assert!(
+            production.contains("let produced_nothing = !usage_reported && acc.is_empty();"),
+            "判据不对 —— 必须「没报用量」和「没产出字节」两个执行事实同时成立",
+        );
+        assert!(
+            production.contains("let cost = if produced_nothing { 0 } else { resolve_cost("),
+            "什么都没回还在照常计价 —— 按次那一支不看用量，用户会为一次超时付钱",
+        );
+        // 按次分支本身**不该**去看用量：按次就是按次。这条守住的是「别改错地方」——
+        // 修在 resolve_cost 里会把真正的按次计费（图片、音频）一起打坏。
+        let rc = top_fn_body(&src, "\nfn resolve_cost(");
+        assert!(
+            rc.contains("if billing_mode == \"per_call\" {") && !rc.contains("usage.is_none()"),
+            "按次分支被改成看用量了 —— 图片/音频本来就没有 token，会被误判成「什么都没回」",
+        );
+    }
+
+    /// **价算出来了、收到的却是 0** —— 这一处必须有声音。
+    ///
+    /// 我第一版把告警加在结算函数里，判据是「有 token、没收钱、没走免费池」。
+    /// 按线上 14 天量了一下：**会响 8,700 多次**，其中 6,489 次来自 stealth/ox-alpha
+    /// —— 那是**故意免费**的模型。噪音等于没有告警。而且既有代码里本来就有一条位置
+    /// 更对的（按 price_source 区分「显式配 0」和「退到连接级 0」），我加之前没查。
+    ///
+    /// 真正的缺口是**另一种**：价格配着、`usd` 算出来大于 0，收到的却是 0 分。
+    /// 有意免费到不了这里（那种模型 usd 本身就是 0）。剩下的两种都是事故：
+    /// 倍率被配成 0（白送），或这一笔不足半分被四舍五入抹掉（按量计费的短调用会**永远**收 0）。
+    /// 线上实测：grok-4.6 有 872 行、3617 万 token 收费为 0，而它配着 in 2 / out 6，
+    /// 当时没有任何日志，根因已经查不出来了。
+    #[test]
+    fn a_priced_call_that_charges_zero_is_loud() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let body = top_fn_body(&src, "\nfn compute_cost(");
+        assert!(
+            body.contains("event = \"billing_priced_but_charged_zero\""),
+            "算出价却收 0 没有任何告警 —— 一次倍率配错可以安静地白送几百轮",
+        );
+        // 判据必须是 `usd > 0`：拿「有 token」当判据会把故意免费的模型刷成噪音。
+        //
+        // 而 **`cents == 0` 这一半 2026-09-03 拆掉了**：钱包改走 micro-USD 之后，
+        // 「不足半分」那一档是正常收钱的路径，再按 cents 报就是对每一笔亚分调用误报。
+        // 一条恒响的告警等于没有告警 —— 上一版正是被 8,700 次噪音淹死的。
+        // 现在只留「倍率被配成 0」这一种：判据独立、和取整无关，也正是 grok-4.6 那次的形状。
+        assert!(
+            body.contains("if rate <= 0.0 && usd > 0.0 {"),
+            "判据不对 —— 必须「价算出来大于 0」且「倍率是 0」两条同时成立。\
+             用「有 token」会把故意免费的模型刷成噪音（14 天 8700 次）；\
+             用 `cents == 0` 会把每一笔正常的亚分调用报成事故 —— 钱包已经收到钱了",
+        );
+        for field in ["model = %model_id", "usd", "rate"] {
+            assert!(body.contains(field), "告警没带 {field}，分不出是倍率 0 还是四舍五入");
+        }
+    }
+
+    /// 「要不要付钱写缓存」必须看**这条线路自己的执行事实**，不能只看它声明的协议。
+    ///
+    /// Anthropic 的缓存写入按输入价 1.25 倍收、读只要 0.025 倍 —— 写了从来读不到
+    /// 比压根不缓存还贵 25%。而这类中转的缓存在负载均衡后面是每实例一份：本仓库实测过
+    /// 连续 16 次调用前缀指纹逐字节相同，中转却几乎每次都收写入、读取只偶尔命中，
+    /// 用户侧看到的正是上游那句「疑似协议和模型不匹配导致 cache 异常」。
+    /// OpenAI/xAI 有 prompt_cache_key 能把请求钉在同一台机器上，Anthropic 协议没有。
+    ///
+    /// 这条守卫钉的是**接线**（判据本身有 7 条真往返测试在 cache_payoff 里）：
+    /// 少了第三条判据，这一整套自我修正就静默失效，而表现只是「账单比预期贵一点」。
+    #[test]
+    fn paying_to_write_cache_is_gated_on_that_routes_own_read_back_history() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let body = top_fn_body(&src, "\nfn route_supports_prompt_cache(");
+        assert!(
+            body.contains("crate::cache_payoff::should_write_cache(model.id)"),
+            "注入缓存断点时没有问「这条线路读得回来吗」—— 只写不读的线路会一直付 1.25 倍写入价",
+        );
+        // 观测只吃真实回执：估算行和恢复重跑喂进去会让判据自我循环。
+        let bill = top_fn_body(&src, "\nasync fn bill_inner(");
+        // 按**成分**断言，不钉换行和缩进：上一版是一整块多行字面量，改一次参数就得
+        // 连断言一起改 —— 而「代码和断言一起被同一次替换改掉」正是测试变哑的常见入口。
+        let observe = bill
+            .split_once("crate::cache_payoff::observe(")
+            .and_then(|(_, t)| t.split_once(june_close().as_str()))
+            .map(|(a, _)| a.replace([' ', '\n'], ""))
+            .expect("bill_inner 里没有观测调用 —— 判据永远拿不到样本");
+        assert!(
+            bill.contains("if !tokens.estimated && !from_recovery {"),
+            "观测吃了估算行或恢复重跑的行 —— 判据会自我循环",
+        );
+        for part in ["conn_id", "tokens.cached", "tokens.cache_creation,", "tokens.cache_creation_1h"] {
+            assert!(
+                observe.contains(&part.replace(' ', "")),
+                "观测调用少了 {part} —— 缺 1 小时分档时，四倍的写入溢价会被按四分之一算",
+            );
+        }
+    }
+
+    /// 上面那条断言用的闭合标记。单独一个函数是为了让断言自己的源码里不出现
+    /// `);` 这个串 —— 否则按它切的时候会切到断言自己身上。
+    fn june_close() -> String {
+        format!("{}{}", ')', ';')
+    }
+
+    /// 中转把 Anthropic 回执改成 OpenAI 字段名、却把 input_tokens 原样透传时，
+    /// **全价输入不能被收成 0**。
+    ///
+    /// 形状判据原来只有一条结构条件：有没有 `cache_read_input_tokens`。没有就当成
+    /// 「prompt 已含缓存」，于是计价那一支做减法 `(prompt - cached).max(0)` —— 而这种
+    /// 回执的 cached 比 prompt 大得多，减完钳到 0，这一笔的全价输入一分钱都没收。
+    ///
+    /// 线上 14 天 **1,930 行、1,088 万个输入 token** 就是这么丢的（claude-opus-5 一档
+    /// 598 万、glm-5.3 180 万）。整套测试 1015 条当时全绿 —— 没有一条喂过这个形状。
+    ///
+    /// 补的第二条判据是**算术上的必要条件**：「输入已含缓存」蕴含 `cached <= prompt`。
+    /// 违反它就是自相矛盾。它不靠猜上游是谁、不需要维护厂商名单，是个恒等式。
+    #[test]
+    fn a_relay_that_renames_the_cache_field_must_not_zero_out_the_paid_input() {
+        // 线上真实形状：Anthropic 的 input_tokens（不含缓存）+ OpenAI 的缓存字段名。
+        let disguised = serde_json::json!({
+            "prompt_tokens": 26_932,
+            "completion_tokens": 291,
+            "prompt_tokens_details": { "cached_tokens": 47_629 },
+        });
+        // 同一笔，上游老老实实用 Anthropic 字段名时的样子。
+        let honest = serde_json::json!({
+            "input_tokens": 26_932,
+            "completion_tokens": 291,
+            "cache_read_input_tokens": 47_629,
+        });
+
+        // 每模型价：输入 $10/M、输出 $50/M（fable 那一档）。倍率 1。
+        let over = Some((10.0, 50.0));
+        let a = super::compute_cost(Some(&disguised), "claude-fable-5-1", 1.0, 0.0, 0.0, 0.0, 0.0, over, false);
+        let b = super::compute_cost(Some(&honest), "claude-fable-5-1", 1.0, 0.0, 0.0, 0.0, 0.0, over, false);
+
+        assert!(a > 0, "改了字段名的那一份被收成了 0 —— 全价输入白送");
+        assert_eq!(a, b, "同一笔账，换个字段名就收出两个数");
+
+        // 落库的形状标记必须和计价用的判据一致，否则「按哪种形状收的钱」和
+        // 「库里说它是哪种形状」会不声不响地对不上，而缓存命中率的分母全靠这一位。
+        let t = super::extract_bill_tokens(Some(&disguised), "claude-fable-5-1", false);
+        assert!(!t.prompt_includes_cached, "库里仍然记成「输入已含缓存」——分母还是错的");
+    }
+
+    /// 判据本身：三种形状各自认对，且**只**在算术自洽时才认「已含」。
+    #[test]
+    fn the_prompt_shape_criterion_is_arithmetically_consistent() {
+        use super::prompt_includes_cached_shape as shape;
+        // Anthropic：有结构字段 → 不含缓存。
+        assert!(!shape(Some(47_629.0), 47_629.0, 26_932.0));
+        // 真正的 OpenAI：没有结构字段，且 cached <= prompt → 已含，做减法是对的。
+        assert!(shape(None, 12_000.0, 30_000.0));
+        assert!(shape(None, 0.0, 30_000.0));
+        // 边界：相等仍然算「已含」（全部命中缓存的合法情形）。
+        assert!(shape(None, 30_000.0, 30_000.0));
+        // 伪装的 Anthropic：没有结构字段，但 cached > prompt —— 算术上不可能「已含」。
+        assert!(!shape(None, 47_629.0, 26_932.0));
+    }
+
+
+    /// 每一条**用户发起**的计费路径都得把 run_id / step_index 填进去。
+    ///
+    /// 这条守卫是被自己的事故催出来的：加这两列时我只填了 5 条路径里的 2 条 ——
+    /// 漏掉的恰好包含**流式**那条，而 IDE 的 agent 全走流式。真跑起来的结果会是
+    /// 「列加了、迁移跑了、断言全绿，而真正想看的那批行 run_id 全是 NULL」，
+    /// 且**不报任何错**：NULL 是这两列的合法值，谁也不会发现遥测是空的。
+    ///
+    /// 判据不是「填了几处」，是「每个从上游 usage 装配 BillTokens 的地方都表过态」：
+    /// 要么填 run_id，要么写明「网关自用，无 run_id」（识图、压缩这类网关自己发起的
+    /// 调用确实不属于客户端的任何一次运行）。新增一条计费路径时这条会红，作者必须选一边。
+    #[test]
+    fn every_user_facing_billing_path_records_the_run_shape() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        // 扫**全文**，不是「测试模块之前」：识图和压缩那两条计费路径就在测试模块**之后**，
+        // 按前半段切会把它们漏掉——而漏掉正是这条守卫要防的事，守卫自己漏了最难看。
+        //
+        // 先**剥掉整行注释**再扫：上面那句解释装配写法的注释里逐字写着同一串代码，
+        // 不剥的话这条断言会把自己的注释数成第 7 条计费路径。
+        let production: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let production = production.as_str();
+        let mut seen = 0;
+        let mut from = 0usize;
+        while let Some(at) = production[from..].find("extract_bill_tokens(") {
+            let at = from + at;
+            from = at + "extract_bill_tokens(".len();
+            // 只认生产里的装配写法 `let mut tokens = extract_bill_tokens(`（可能换行）。
+            // 这样既跳过了定义本身，也跳过了测试里用 `let bt = ` 造样本的那几处 ——
+            // 拿函数名当锚点会把「验算用的样本」也算成一条计费路径。
+            let lead: String = production[..at]
+                .chars()
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if !lead.split_whitespace().collect::<Vec<_>>().join(" ").ends_with("let mut tokens =") {
+                continue;
+            }
+            // 按**字符**切：后面紧跟中文注释，按字节切会落在多字节字符中间直接 panic。
+            let window: String = production[at..].chars().take(900).collect();
+            assert!(
+                window.contains("(tokens.run_id, tokens.step_index) =")
+                    // 表态写在**代码**里而不是注释里：上面按行剥掉了注释（不剥的话
+                    // 断言会把自己的说明文字数成一条计费路径），注释形态的豁免会跟着被剥掉。
+                    // 显式赋 None 也比一句话硬 —— 它是编译器看得见的。
+                    || window.contains("tokens.run_id = None;"),
+                "第 {} 处 BillTokens 装配既没填 run_id 也没表态 —— 这条路径上的行会静默地全是 NULL：\n{}",
+                seen + 1,
+                window.chars().take(200).collect::<String>(),
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 6, "计费路径的条数变了——新增的那条也要表态");
+    }
+    /// 从顶层函数的签名截到**它自己的收尾大括号**（顶格那个 `\n}\n`）为止。
+    ///
+    /// 别再写 `chars().take(14_000)` 这种固定窗口：函数里每加一段说明，被守的那一行就
+    /// 往外挪一点，挪出窗口之后断言要么**恒真且仍然是绿的**（守卫悄悄失效，正是它要
+    /// 防的 bug 能大摇大摆回来的时候），要么像这次一样变成**假红**——给 model_usage
+    /// 加两列时目标行离 14_000 的边界只剩 91 个字符，两行 `.bind()` 就把它挤了出去，
+    /// 而报出来的错说的是「整分部分会被收第二遍」，和真实改动毫无关系。
+    ///
+    /// 签名带前导换行是刻意的：不带的话会先匹配到注释里引用同一个函数名的那一行。
+    fn top_fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("{sig} 不见了"));
+        let end = src[at + 1..]
+            .find("\n}\n")
+            .map(|e| at + 1 + e)
+            .unwrap_or(src.len());
+        &src[at..end]
+    }
+
     /// 拉模型列表这条路不许回显上游 URL 或原始错误体。
     ///
     /// reqwest 的错误链带完整 URL，而有些转卖商要求把密钥写在查询串里；上游的错误
@@ -13502,7 +15235,8 @@ mod billing_tests {
         let src = include_str!("models.rs");
         let i = src.find("let url = format!(\"{}/models\", api_base(&m.base_url));")
             .expect("线路页拉模型列表那段不见了");
-        let body = &src[i..i + 2000];
+        let end = src[i..].char_indices().nth(2000).map_or(src.len(), |(j, _)| i + j);
+        let body = &src[i..end];
         assert!(
             !body.contains("拉取模型列表失败: {e}"),
             "又把 reqwest 的错误原文回显了 —— 它带完整 URL",
@@ -13642,7 +15376,9 @@ mod billing_tests {
     }
     use super::{
         anthropic_effort_word, anthropic_thinking,
-        anthropic_thinking_with_display, anthropic_to_oai,
+        anthropic_thinking_with_display, anthropic_stop_reason_to_oai, anthropic_to_oai,
+        stream_error_frame,
+        aux_wire_request, aux_wire_response,
         body_text_bytes, upstream_capacity_wording, upstream_relayed_failure_wording,
         oai_to_anthropic_with_cache, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, claude_generation, clip_thinking_budget, compute_cost,
@@ -14222,10 +15958,23 @@ mod billing_tests {
         );
         // 那个例外必须**只对表头前卡死**开，而且带次数上限 —— 少任何一半，
         // 「一次请求只发一次」就从「有一个说得清的例外」变成「形同虚设」。
+        // 跨线路兜底已关闭（CHAT_MAX_CROSS_ROUTE_SWITCHES=0），候选里只有一条线路。
+        // 循环里的 next_is_fallback_route / cross_route_switches 还在，但结构上走不进去。
         assert!(
-            loop_src
-                .contains("if stalled_before_headers && stall_switches < CHAT_MAX_STALL_SWITCHES {"),
-            "卡死换出口的例外没有同时限定「表头前」和次数 —— 那等于放开了重发",
+            loop_src.contains("if stalled_before_headers && may_switch {"),
+            "卡死换出口的例外没有限定「表头前」—— 那等于放开了重发",
+        );
+        assert!(
+            loop_src.contains("stall_switches < CHAT_MAX_STALL_SWITCHES"),
+            "线路内换出口的次数上限没了 —— 会在同一条线路上反复砸",
+        );
+        assert!(
+            loop_src.contains("cross_route_switches < CHAT_MAX_CROSS_ROUTE_SWITCHES"),
+            "跨线路兜底没有独立额度 —— 要么永远换不过去,要么无限换",
+        );
+        assert!(
+            loop_src.contains("next_is_fallback_route"),
+            "没有判断「下一个候选是不是已经跨到备用线路」—— 两种额度就分不开",
         );
         // 而且这一位只在**表头前卡死**那一支置位，别处不许设。
         let stall_set = concat!("stalled_before_headers", " = true");
@@ -14532,11 +16281,11 @@ mod billing_tests {
     fn chat_gateway_error_suffix_reports_single_route_retries() {
         assert_eq!(
             chat_upstream_attempt_suffix(1, 6, 502, false),
-            "（已请求 6 次；当前只有 1 条同模型线路；最后状态 502）"
+            "（已请求 6 次；这个模型当前只有 1 个可用上游目标；最后状态 502）"
         );
         assert_eq!(
             chat_upstream_attempt_suffix(3, 12, 504, false),
-            "（已请求 12 次 / 3 条同模型线路；最后状态 504）"
+            "（已请求 12 次 / 共 3 个上游目标；最后状态 504）"
         );
     }
 
@@ -14588,18 +16337,26 @@ mod billing_tests {
         }
     }
 
-    /// 「已请求 1 次 / 2 条同模型线路」读起来是"两条都不行"，而实际上另一条一次都没碰过。
-    /// 用户据此以为线路全废了，其实重发一次就会自动换线。
+    /// 这句文案**不许对「重发会怎样」做承诺**，也不许把出口说成线路。
+    /// 老文案两处都假，用户照着重发四次、四次空手（生产实拍 2026-09-03）。
     #[test]
     fn chat_gateway_error_suffix_does_not_imply_every_route_was_tried() {
         let msg = chat_upstream_attempt_suffix(2, 1, 401, false);
-        assert!(msg.contains("只试了 1 条"), "{msg}");
-        assert!(msg.contains("1 条没试过"), "{msg}");
-        assert!(msg.contains("重发"), "要把出口说出来：重发一次就会自动换线。{msg}");
-        // 真的把所有线路都试过时，不许再说"还有没试过的"
+        // **不许对「重发会怎样」做承诺,也不许把出口说成线路。**
+        // 老文案是「同模型另有 N 条没试过；直接重发一次就会自动改走其它线路」,两处都假:
+        // route_count 数的是**出口**(取在收窄之后),而跨线路兜底当时是关的 ——
+        // 用户照着重发四次、四次回到同一条线路、四次空手(生产实拍 2026-09-03)。
+        assert!(msg.contains("试了 1 个上游目标"), "{msg}");
+        assert!(msg.contains("还有 1 个没试"), "{msg}");
+        assert!(
+            !msg.contains("重发"),
+            "又对「重发会怎样」做承诺了 —— 会不会换线由本轮失败类型决定,固定文案保证不了。{msg}"
+        );
+        assert!(!msg.contains("条线路"), "又把出口说成线路了。{msg}");
+        // 真的把所有目标都试过时，不许再说"还有没试过的"
         assert_eq!(
             chat_upstream_attempt_suffix(2, 2, 502, false),
-            "（已请求 2 次 / 2 条同模型线路；最后状态 502）"
+            "（已请求 2 次 / 共 2 个上游目标；最后状态 502）"
         );
     }
 
@@ -14622,18 +16379,21 @@ mod billing_tests {
         {
             const SRC: &str = include_str!("models.rs");
             let prod = &SRC[..SRC.find("mod billing_tests").expect("tests module")];
-            let mute = format!("{}()", "thinking_swallowed_by_upstream");
-            assert!(prod.contains(&mute), "降权判据没接上");
-            // 降权那一处读的必须是窄判据。窗口要小：往前取太多会把上面那行
-            // `let thinking_swallowed = …` 的**声明**也圈进来，于是不管 if 判的是谁
-            // 这条都绿——断言切错范围和断言写错一样坏（本轮已经踩过一次）。
-            // 只看紧邻的那个 if。
-            let at = prod.find("mark_thinking_mute(cid)").expect("记号点");
-            let head = prod[..at].rfind("if ").expect("记号点前面没有 if");
+            let narrow = format!("{}()", "thinking_swallowed_by_upstream");
+            assert!(prod.contains(&narrow), "窄判据没接上");
+            // 记号那一套已删（不降权，走用户选的线路），所以锚点从 mark_thinking_mute
+            // 换成那条**日志**。两个判据的分工没变、只是用途从「改派单」降成「记一笔」：
+            //   窄判据（块开了却是空的）→ 这一条 WARN；
+            //   宽判据（任何零思考）    → 不进缓存。
+            // 接反了缓存那半仍然会坏，所以这条守卫留着。
+            let at = prod
+                .find("not caching this response (routing is unchanged")
+                .expect("窄判据那条日志不见了");
+            let head = prod[..at].rfind("if ").expect("那条日志前面没有 if");
             let cond = &prod[head..at];
             assert!(
                 cond.contains("thinking_swallowed"),
-                "降权用的还是宽判据 —— adaptive 正常不思考会把健康线路降权：{cond}",
+                "窄判据那条日志改用宽判据了 —— adaptive 正常不思考会天天报：{cond}",
             );
             // 缓存那一处读的必须是宽判据（零思考一律不缓存，不管什么原因）
             assert!(
@@ -14658,64 +16418,67 @@ mod billing_tests {
         assert!(!mk(true, false, 0).thinking_swallowed_by_upstream());
     }
 
-    /// 「问问题他不会去思考」——同模型三条线路里有一条稳定吞掉思考，而用户每次都先撞上它。
+    /// **派单不许看「这一轮出没出思考」——用户选了哪条线路就走哪条。**
     ///
-    /// 这件事早就检测出来了（thinking_requested_but_none_returned），但只打日志、不影响选路，
-    /// 于是下一次请求照样落到同一条上。这条测的是记号的生命周期：记得下、会过期、能自愈。
+    /// 2026-09-03 所有者定的:不降权。没配多路由的线路就是那一条,哪怕它这一轮
+    /// 没回思考也不换、不排后面。这条守的是那个决定,取代了原来「吞思考的线路
+    /// 要被记下来并且能自愈」那一整套(THINKING_MUTE_ROUTES / mark_thinking_mute /
+    /// clear_thinking_mute / route_mutes_thinking,已整个删除)。
+    ///
+    /// 摘掉它另有两个实测理由:
+    ///   · `narrow_to_one_route` 之后候选全是同一条线路 id,静音对每个候选取值相同 ——
+    ///     全部一起进冷却池再原序放回,**对流量零影响**。日志里那句 de-prioritising
+    ///     说的是它没做到的事。
+    ///   · 它生效的 30 分钟里,`cooled/stalled/broken` 这些**按出口**分辨的排序会被
+    ///     那个 `||` 一起拉平 —— 真正有效的出口级降权反而被关掉。
     #[test]
-    fn 吞掉思考的线路要被记下来_并且能自愈() {
-        use std::time::{Duration, Instant};
-        let route = uuid::Uuid::new_v4();
-        let now = Instant::now();
-        // 没记过 → 不影响任何东西
-        assert!(!super::route_mutes_thinking(route, now));
+    fn routing_never_deprioritises_a_route_for_not_thinking() {
+        const SRC: &str = include_str!("models.rs");
+        let prod = &SRC[..SRC.find("mod billing_tests").expect("tests module")];
+        // 剥掉注释再断言:说明文字里逐字写着这些被删掉的名字,不剥就会匹配到自己的注释。
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        // 要了思考却一个字没回 → 记下
-        super::mark_thinking_mute(route);
-        assert!(super::route_mutes_thinking(route, Instant::now()));
-
-        // 记号有效期是「这条线路的脾气」那一档，得跨越好几轮请求
-        assert!(super::THINKING_MUTE_MEMORY >= Duration::from_secs(10 * 60));
-
-        // 上游恢复、真的回了思考 → 记号立刻撤掉。没有这一条，一条偶尔抽风的线路
-        // 会被永久排到后面，而且没有任何人工入口能把它放回来。
-        super::clear_thinking_mute(route);
-        assert!(!super::route_mutes_thinking(route, Instant::now()));
-
-        // 光有这几个函数不算数——它们得**真的被调用**。这个仓库里"写好了、零调用点、
-        // 而且不报错"是反复出现的失败模式，所以这三条钉的是调用点本身。
-        // 需要的串一律拼出来找：include_str! 读的是整个文件、包含本测试模块自己。
-        {
-            const SRC: &str = include_str!("models.rs");
-            let mark = format!("{}(cid);", "mark_thinking_mute");
-            let clear = format!("{}(cid);", "clear_thinking_mute");
-            let read = format!("{}(candidate.id, now)", "route_mutes_thinking");
+        for gone in [
+            concat!("mark_thinking", "_mute"),
+            concat!("clear_thinking", "_mute"),
+            concat!("route_mutes", "_thinking"),
+            concat!("THINKING_MUTE", "_ROUTES"),
+        ] {
             assert!(
-                SRC.contains(&mark),
-                "检测到吞思考却不记号 —— 下一次请求照样落到同一条线路上，等于只打了条日志"
-            );
-            assert!(
-                SRC.contains(&clear),
-                "没有撤销记号的调用点 —— 上游恢复了也回不到轮换里，记号会永久生效"
-            );
-            assert!(
-                SRC.contains(&read),
-                "选路没有读这个记号 —— 记了也白记，用户照样撞上那条吞思考的线路"
-            );
-            // 只有要思考的请求才该受影响：不要思考的请求走那条线路毫无问题，
-            // 凭空排后面只会白白打乱轮换。
-            assert!(
-                SRC.contains("wants_thinking && "),
-                "记号必须只在这一轮真的要思考时才参与排序"
+                !code.contains(gone),
+                "{gone} 又回到生产代码里了 —— 所有者要的是「不降权,走用户选的线路」"
             );
         }
 
-        // 到期自己失效：即使没人撤，记号也不会永久生效（再探一次是自愈的另一半）
-        super::mark_thinking_mute(route);
-        assert!(!super::route_mutes_thinking(
-            route,
-            Instant::now() + super::THINKING_MUTE_MEMORY + Duration::from_secs(1)
-        ));
+        // 派单那一行必须是恒假的常量,不是某个会随运行时变化的判据。
+        assert!(
+            code.contains("let mutes = false;"),
+            "派单又开始按「出没出思考」重排候选了"
+        );
+
+        // 反方向:真正的传输层故障转移必须**还在**。它们和「想没想」是两回事,
+        // 把它们一起删掉会让一条连不上的出口把请求直接打死,而不是换一个出口。
+        for kept in [
+            "let cooled = route_cooldown_remaining(",
+            "let stalled = route_recently_stalled(",
+            "let broken = crate::route_health::looks_broken_cached(",
+        ] {
+            assert!(
+                code.contains(kept),
+                "把传输层故障转移一起删掉了:{kept} —— 那是连不上/超时/连败,不是「这轮没想」"
+            );
+        }
+
+        // 诊断照旧留着:不改派单不等于不记录。
+        assert!(
+            code.contains("thinking_swallowed_by_upstream()")
+                && code.contains("thinking_block_never_opened()"),
+            "两个判据被顺手删了 —— 它们现在只喂日志和「不进缓存」,仍然是唯一的诊断依据"
+        );
     }
 
     /// 被强力版开关压成一条线路时，报错要把出口说出来。
@@ -14728,7 +16491,7 @@ mod billing_tests {
         // 强力版开着但本来就有多条线路时不提它 —— 那时它不是原因。
         assert_eq!(
             chat_upstream_attempt_suffix(3, 3, 502, true),
-            "（已请求 3 次 / 3 条同模型线路；最后状态 502）"
+            "（已请求 3 次 / 共 3 个上游目标；最后状态 502）"
         );
     }
 
@@ -15372,6 +17135,174 @@ mod billing_tests {
         assert!(jm.is_none(), "unknown mode must fall back, never be trusted");
     }
 
+    /// 连接列 per_call_cents / per_call_micro_usd 只在**连接自己就是按次计费**时才作数。
+    ///
+    /// 这是「送 100 点，二十几次调用就没了」的机器成因。生产实测（14 天、6287 次免费调用）：
+    /// 八条线路全是 billing_mode="rate"，却都带着遗留的 per_call_cents=20 /
+    /// per_call_micro_usd=200000。而 `effective_billing_inner` 原来无条件
+    /// `unwrap_or(model.per_call_cents)`，于是一个显式配成 {"mode":"free"} 的模型继承了那 20 分
+    /// → cost_mode 被判成 "per_call" → 每次从免费池扣 4.000 点。
+    /// glm-5.3-flash 一次的真实目录价是 $0.002651，扣 4 点相当于 $0.20 —— **75 倍**。
+    /// 100 点 ÷ 4 = 25 次调用，而一个 agent 任务实测要 5.2 次模型调用。
+    #[test]
+    fn a_rate_connection_never_lends_its_stale_per_call_fee_to_a_free_model() {
+        let _g = crate::settings::settings_test_guard();   // free_points_needed 读全局汇率
+        use super::{effective_billing_micro, free_points_needed, Model};
+        let mut m = Model::blank();
+        m.billing_mode = "rate".into();
+        m.per_call_cents = 20;                 // 遗留列：连接是按量计费，这两个数没有意义
+        m.per_call_micro_usd = 200_000;
+        m.model_billing = json!({ "glm-5.3-flash": { "mode": "free" } });
+
+        let (mode, cents, is_free, micro) = effective_billing_micro(&m, "glm-5.3-flash");
+        assert!(is_free, "这个模型显式配了 free");
+        assert_eq!(cents, 0, "按量连接上的 per_call_cents 是遗留配置，不许被继承");
+        assert_eq!(micro, 0, "同上，per_call_micro_usd 也不许");
+        assert_eq!(mode, "rate", "没有真实按次费用时，free 必须映射回按量，不是 per_call");
+        // 扣点从 4.000 点掉回地板/真实成本这一档
+        assert_eq!(free_points_needed(micro), 1, "没有按次费用就该落到 1 毫点地板，等真实成本来定");
+        // 对照组：真按次计费 $0.20 的话应当扣一大笔点（具体数随后台汇率走，不钉死）。
+        assert!(
+            free_points_needed(200_000) > 1_000,
+            "对照组失效了：真按次计费也扣不出点，这条守卫就没有对象了"
+        );
+
+        // 连接自己就是按次计费时，照旧继承（这是那两列本来的用途）
+        let mut per_call_conn = Model::blank();
+        per_call_conn.billing_mode = "per_call".into();
+        per_call_conn.per_call_cents = 7;
+        per_call_conn.per_call_micro_usd = 70_000;
+        let (_m2, c2, _f2, micro2) = effective_billing_micro(&per_call_conn, "any-model");
+        assert_eq!(c2, 7, "按次连接上那两列是真费用，必须照旧生效");
+        assert_eq!(micro2, 70_000);
+
+        // 单模型覆盖里**显式**写的按次费，任何连接模式下都作数
+        let mut rate_conn = Model::blank();
+        rate_conn.billing_mode = "rate".into();
+        rate_conn.per_call_cents = 20;
+        rate_conn.model_billing = json!({ "x": { "mode": "per_call", "per_call_cents": 3 } });
+        let (m3, c3, _f3, _micro3) = effective_billing_micro(&rate_conn, "x");
+        assert_eq!((m3.as_str(), c3), ("per_call", 3), "显式写的按次费不受影响");
+    }
+
+    /// 免费池的扣点是**完整的按量计价**：输入、输出、缓存命中、缓存写入，各按各的价。
+    ///
+    /// 所有者原话：「计费的话 肯定是输入 输出，缓存价格，缓存命中那些各种价格计算啊」。
+    /// 这条不读源码、不数分支 —— **真跑一遍**：四种 token 各加一批，扣点必须各自变大，
+    /// 而且缓存写入要比缓存命中贵（上游普遍是读 0.1×、写 1.25×）。
+    ///
+    /// 线上九条免费线路的缓存价全部留空、`cache_disabled` 全部为 false，
+    /// 和 `reference_micro_usd` 传的参数（两个缓存价 0、cache_disabled=false）逐位一致，
+    /// 所以这里量到的就是线上真实在用的那条路。
+    #[test]
+    fn the_pool_charge_prices_input_output_and_both_cache_kinds() {
+        use serde_json::json;
+        // 点值现在从后台汇率推导（micro_usd_per_point → usd_per_cny_bps），也就是说
+        // **任何会换设定的测试并行跑起来都会打乱这里的数**。拿串行锁（和别的改设定的测试同一把）。
+        let _g = crate::settings::settings_test_guard();
+        crate::model_catalog::seed_for_test(&[(
+            "pool-price-probe",
+            // 输入 $3/Mtok、输出 $15/Mtok，缓存读写留空 → 走"目录倍率 × 输入价"那一级。
+            crate::model_catalog::priced(3.0, 15.0, 64_000, vec![200_000]),
+        )]);
+        let at = |prompt: i64, completion: i64, cached: i64, write: i64| {
+            super::reference_micro_usd(
+                Some(&json!({
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "prompt_tokens_details": { "cached_tokens": cached },
+                    "cache_creation_input_tokens": write,
+                })),
+                "pool-price-probe",
+            )
+            .unwrap_or(0)
+        };
+        let base = at(10_000, 1_000, 0, 0);
+        assert!(base > 0, "连输入输出都算不出来 —— 这条守卫的对象不存在");
+
+        // 四样各自都要让扣点变大。少算哪一样，那一样就是白送的。
+        assert!(at(20_000, 1_000, 0, 0) > base, "输入 token 没进计价");
+        assert!(at(10_000, 2_000, 0, 0) > base, "输出 token 没进计价");
+        assert!(at(10_000, 1_000, 8_000, 0) != base, "缓存命中没进计价");
+        assert!(at(10_000, 1_000, 0, 8_000) > base, "缓存写入没进计价");
+
+        // 缓存命中是**折扣**、缓存写入是**溢价** —— 而且要各自和**普通输入**比，不能互相比。
+        //
+        // （第一版写的是 `write_heavy > read_heavy`，那条断言真实但守错了东西：命中是从
+        //  输入里折价、写入是额外加上去，所以即使两者同价它也成立。实测把写入价改成命中价，
+        //  那条断言照样绿。）
+        assert!(at(10_000, 1_000, 8_000, 0) < base,
+            "缓存命中没有比普通输入便宜 —— 命中折扣没生效");
+        // 8000 个缓存写入 token 必须比 8000 个普通输入 token 贵（读 0.1×、写 1.25×）。
+        let with_write = at(10_000, 1_000, 0, 8_000);
+        let as_plain_input = at(18_000, 1_000, 0, 0);
+        assert!(with_write > as_plain_input,
+            "缓存写入没有溢价：{with_write} vs 同样多的普通输入 {as_plain_input} —— \
+             写入被当成了普通输入价，而它恰恰是单价最贵的一类 token");
+
+        // 成正比，不是阶梯：输入翻倍，那一部分的钱也该翻倍（其余不变）。
+        let d1 = at(20_000, 1_000, 0, 0) - base;
+        let d2 = at(30_000, 1_000, 0, 0) - base;
+        assert!((d2 - d1 * 2).abs() <= 2, "输入不是线性计价：{d1} vs {d2}");
+
+        // 线上那九条免费线路的缓存配置和这条路径的入参一致（都留空 + 不关缓存计费），
+        // 所以上面量到的就是线上真实在用的那一条。这一行钉住那个前提。
+        assert!(
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+                .expect("read")
+                .contains("priced_usd(usage, model_id, 0.0, 0.0, 0.0, 0.0, None, false, false)"),
+            "参考成本的入参变了 —— 上面那些结论就不再代表线上那条路"
+        );
+    }
+
+    /// 免费池按**真实目录价**扣点，而不是按售价或一个固定地板。
+    ///
+    /// 不接这条的话，同一份「每日 100 点」在两个模型上根本不是同一个东西：生产实测
+    /// 按次那几个每次扣 4.000 点（值 $0.0027），按量那几个每次扣 0.001 点地板
+    /// （4.5 万 token 和 45 个 token 一样）。ref_micro_usd 每次调用本来就在算、
+    /// 也早就写进 model_usage 了，只是从没用来扣点。
+    #[test]
+    fn the_free_pool_charges_the_real_reference_cost() {
+        let _g = crate::settings::settings_test_guard();   // free_points_needed 读全局汇率
+        use super::free_points_needed;
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let production = &src[..src.find("mod billing_tests").expect("tests module")];
+        assert!(
+            production.contains("} else if cost_micro > 0 {")
+                && production.contains("free_points_needed(cost_micro)"),
+            "免费池必须用 cost_micro（model_prices × rate，micro-USD 全精度）换算"
+        );
+        // **必须乘线路倍率**：积分就是钱包额度，两边收的必须是同一个数。
+        // 线上八条免费线路的倍率从 0.22 到 2.0 不等，不乘它在 deepseek 上就多扣 4.2 倍。
+        {
+            use super::pool_charge_micro_usd as pc;
+            assert_eq!(pc(Some(10_000), 1.0), Some(10_000), "倍率 1 = 原样");
+            assert_eq!(pc(Some(10_000), 0.24), Some(2_400), "deepseek 那条线路只收 24%");
+            assert_eq!(pc(Some(10_000), 2.0), Some(20_000), "智普那条收 2 倍");
+            assert_eq!(pc(None, 1.0), None, "目录里没这个模型的价 = 不知道，不是 0");
+            assert_eq!(pc(Some(0), 1.0), None, "0 也当成不知道，交给调用方退到售价/地板");
+            assert_eq!(pc(Some(10_000), 0.0), None, "倍率 0 = 这条线路一分不收");
+            assert_eq!(pc(Some(1), 0.0001), Some(1), "乘完不足一微美元也不能变成 0（那就是无限）");
+        }
+        // 优先级：真按次费 > **model_prices × rate（按 token 用量）** > 目录价×倍率 > 1 毫点地板。
+        //
+        // 第二位是 cost_micro：和钱包用同一套 model_prices 覆盖、同一个倍率、
+        // 同一次汇率折算，含输入/输出/缓存读/缓存写四项。
+        let at_fee = production.find("let want = if free_micro_usd > 0 {").expect("按次那一支");
+        let at_wallet = production[at_fee..].find("} else if cost_micro > 0 {").expect("钱包那一支");
+        let at_ref = production[at_fee..].find("pool_charge_micro_usd(tokens.ref_micro_usd").expect("目录价那一支");
+        assert!(at_wallet < at_ref,
+            "目录价那一支排到了钱包前面 —— 那样 model_prices 覆盖就不参与免费池扣费了");
+        // 换算没漂：$0.002651 的一次调用应当扣 0.054 点左右，不是 4 点。
+        let one_call = free_points_needed(2_651);
+        assert!(one_call > 0, "真实目录价换算成 0 点 —— 那就是无限");
+        assert!(one_call < super::free_milli_points_daily(),
+            "一次调用就吃掉整天额度，说明换算口径漂了");
+        assert!(free_points_needed(26_510) > one_call * 5,
+            "贵十倍的调用必须扣得明显更多，否则不是按用量在扣");
+    }
+
     /// "free" is a payment TARGET, not a price: the cost is still computed the normal way and
     /// still recorded in model_usage — it is merely deducted from the daily points pool. If
     /// free silently meant zero-cost, usage history and the routing report would go blind.
@@ -15643,8 +17574,8 @@ mod billing_tests {
         // 接线：实现必须真的减掉整分部分，否则上面全是纯函数演算、代码照旧双收。
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
             .expect("read models.rs");
-        let at = src.find("async fn bill(").expect("bill 改名了");
-        let body: String = src[at..].chars().take(14_000).collect();
+        // 被守的两行在 bill_inner 里（bill 只是个薄壳），按函数体整段取，不切窗口。
+        let body = top_fn_body(&src, "\nasync fn bill_inner(");
         assert!(
             body.contains("let carry_input = (free_micro_usd - requested_cost.saturating_mul(MICRO_USD_PER_CENT)).max(0);"),
             "进位的输入仍然是整笔 free_micro_usd —— 整分部分会被收第二遍",
@@ -15865,7 +17796,7 @@ mod billing_tests {
         }
         // 残额本身要在部分覆盖那一步被真的改小 —— 只传参不赋值等于什么都没做。
         assert!(
-            body.contains("queued_usd_cents = residual_usd_cents(queued_usd_cents, spent / MILLI_POINTS_PER_CENT);"),
+            body.contains("queued_usd_cents = residual_usd_cents(queued_usd_cents, spent / milli_points_per_cent);"),
             "部分覆盖时没有把免费池已付的那一份从队列快照里减掉，\
              或者减错了变量 —— 这一行的位置上 `cost` 已经被遮蔽成人民币分了",
         );
@@ -15952,9 +17883,31 @@ mod billing_tests {
         // 20 = 上面 19 列 + ref_micro_usd（这一笔按实时目录价值多少，与售价无关）。
         // 加它是因为 cost_cents 记的是售价，而售价为 0 的模型让所有成本报表说它们不花钱：
         // deepseek-v4-pro 三天 1.36 亿 token 的 cost_cents 全是 0，同一批 token 目录价 $228。
-        assert_eq!(cols, 20, "model_usage 列数变了");
-        assert_eq!(max_ph, 20, "占位符和列数对不上");
-        assert_eq!(binds, 20, ".bind() 和列数对不上——结算会运行时报错");
+        // 22 = 上面 20 列 + run_id + step_index（这一行属于哪一次运行、第几步）。
+        // 加这两列是因为「为什么一个简单需求要跑 84 个回合」在库里**结构上问不出来**：
+        // 这张表此前没有任何一列能把行归到一次运行，只能拿「同一 user_id、相邻两行
+        // 间隔 < 2 分钟」去猜边界——用户连着提两个问题就把一次切成两半，一步跑三分钟
+        // 就把两次并成一次。客户端每一发都在传 x-ide-run-id / x-ide-step-index，网关
+        // 也读了 run_id，但只用于粘性亲和键和日志，**从不落库**。这不是新增测量，
+        // 是把已经在手上的东西放到能和钱、模型、工具名 join 的地方。
+        // 24 = 上面 22 列 + sell_micro_usd + absorbed_cents（20260875）。
+        //
+        // `sell_micro_usd` 加的是**一个不会随汇率漂的单位**。`cost_cents` 在 2026-08-28
+        // （c387e33）从美元分变成了人民币分，两者差 7.1 倍，而库里没有任何一列能把这两
+        // 个年代分开 —— 所有 `SUM(cost_cents)` 的读者都在把它们直接相加。这一列由
+        // `cost_micro` 直接写（compute_cost 那条链的原值，含线路倍率、不含汇率），
+        // 从此「这一笔卖了多少钱」跨年代可加；旧行是 NULL，报表按 NULL 区分年代。
+        //
+        // `absorbed_cents` 加的是**运营方替用户吃掉的那一段**。split_fused_charge 对靠
+        // 套餐额度放行的调用刻意不制造钱包债务，于是配额窗口尾巴上超出的部分由运营方
+        // 吸收；而 cost_cents 写的是**实际扣到的钱**，配额与钱包同时为 0 的那一笔在这
+        // 张表里记 0 —— 这块支出在任何报表上都不存在，只有一条 tracing::warn!，容器一
+        // 换就没了。有了这一列，新行上两条恒等式随时可查，任一条破了就说明单位又漂了：
+        //     cost_cents = wallet_cents + quota_cents + free_milli_points_spent / 1000
+        //     应收       = cost_cents + absorbed_cents
+        assert_eq!(cols, 24, "model_usage 列数变了");
+        assert_eq!(max_ph, 24, "占位符和列数对不上");
+        assert_eq!(binds, 24, ".bind() 和列数对不上——结算会运行时报错");
     }
 
     #[test]
@@ -15999,12 +17952,14 @@ mod billing_tests {
 
     #[test]
     fn admission_asks_the_same_question_settlement_answers() {
-        // 每次 60 毫点的免费模型：$0.003 = 3000 micro-USD，按 50 micro-USD/毫点换算正好 60。
+        // 按次计价的免费模型：单价 $0.003 = 3000 micro-USD。换成多少毫点由后台汇率定
+        // （100 积分 = ¥1），所以这里不钉死数字 —— 钉的是「门和结算问的是同一句话」。
         let per_call_micro = 3_000;
-        assert_eq!(super::free_points_needed(per_call_micro), 60, "换算口径变了，这条要重算");
+        let need = super::free_points_needed(per_call_micro);
+        assert!(need > 0, "按次计价的免费模型必须要点，否则它是无限的");
 
-        assert!(super::free_pool_covers_call(60, per_call_micro), "刚好够要放行");
-        assert!(super::free_pool_covers_call(61, per_call_micro));
+        assert!(super::free_pool_covers_call(need, per_call_micro), "刚好够要放行");
+        assert!(super::free_pool_covers_call(need + 1, per_call_micro));
         assert!(
             !super::free_pool_covers_call(40, per_call_micro),
             "池里 40 而这次要 60：结算一分不扣，门就不能说「免费池能付」——\
@@ -16137,37 +18092,10 @@ mod billing_tests {
     /// 这一条改成钉行为：给定汇率和池子付掉的钱，入队的数必须是那个数。
     #[test]
     fn the_queued_snapshot_stays_in_usd_cents() {
-        // **不要在外面再套一层 `settings_test_guard()`。** `swap_settings_for_test` 自己
-        // 就会取那把串行锁并一直持有到它离开作用域，而 std 的 Mutex 不可重入 ——
-        // 套一层就是死锁，而且是把**整个 settings 测试组**一起挂住（本轮踩过：四条
-        // settings::tests 一起卡在「running for over 60 seconds」，看起来像编译慢）。
-        // 这个契约就写在 `settings_test_guard` 的注释里：只读地看 CACHE 时才拿它。
-        //
-        // 基准用 `Settings::default()` 而不是 `current()`：不读环境状态，这条测试的
-        // 结果就只取决于它自己设的汇率。
-        let base = crate::settings::Settings::default();
-        let _swap = crate::settings::swap_settings_for_test(crate::settings::Settings {
-            usd_per_cny_bps: 1408, // ×7.1023，和线上一致
-            ..base
-        });
-
-        // 池子一分没付：残额就是原费用，一个字不动。
-        // 写成 `cost - …` 的那一版在这里会返回 100×7.1023 = 710（人民币分冒充美元分）。
+        // residual_usd_cents 直接减：两边都已是美元分口径。
         assert_eq!(super::residual_usd_cents(100, 0), 100);
-
-        // 池子付了 50 人民币分 = 7 美元分（50 × 1408 / 10000 = 7.04 → 7）。
-        assert_eq!(super::residual_usd_cents(100, 50), 93);
-
-        // 池子付得比整笔还多（毫点换算的取整方向所致）→ 夹到 0，不能变成负数
-        // 再被当成一笔「欠用户的钱」。
-        assert_eq!(super::residual_usd_cents(10, 10_000), 0);
-
-        // 汇率是 1:1 时两边同数，减法退化成普通减法 —— 这一支保证换算方向没写反。
-        drop(_swap);
-        let _swap2 = crate::settings::swap_settings_for_test(crate::settings::Settings {
-            usd_per_cny_bps: 10_000,
-            ..base
-        });
+        assert_eq!(super::residual_usd_cents(100, 50), 50);
+        assert_eq!(super::residual_usd_cents(10, 10_000), 0, "夹到 0，不能变负");
         assert_eq!(super::residual_usd_cents(100, 30), 70);
     }
 
@@ -16310,16 +18238,21 @@ mod billing_tests {
             "池子归零 + 没余额没套餐 = 必须当场 402，而不是继续记债",
         );
 
-        // 一分 = 200 毫点，两边换算必须同源，否则「池子已付」减错会变成双收或漏收。
-        assert_eq!(super::MICRO_USD_PER_CENT / super::MICRO_USD_PER_MILLI_POINT, 200);
-        assert_eq!(super::free_points_needed(80 * super::MICRO_USD_PER_CENT), 16_000,
-            "线上那笔 80 分的调用要 16000 毫点——池里只剩 1398，正是它把用户推进负债");
+        // 两边换算必须**同源**，否则「池子已付」减错会变成双收或漏收。
+        // 点值由后台汇率推导（100 积分 = ¥1），所以这里不钉死数字，钉的是「同一条换算」。
+        let per_cent = super::milli_points_for_micro_usd(super::MICRO_USD_PER_CENT);
+        assert!(per_cent > 0);
+        assert_eq!(super::free_points_needed(80 * super::MICRO_USD_PER_CENT),
+            super::milli_points_for_micro_usd(80 * super::MICRO_USD_PER_CENT),
+            "准入门和换算必须走同一条 —— 分家了「池子已付」就会减错");
+        // 线上那笔 80 分的调用（用户被推进负债的那一笔）现在要这么多毫点：
+        assert!(super::free_points_needed(80 * super::MICRO_USD_PER_CENT) > 1398,
+            "80 分的调用必须远超池里剩的 1398 毫点 —— 这条守的是抽干那条腿的前提");
 
         // 抽干模式接进去了没有：纯函数对了不等于 bill_inner 用了它。
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
             .expect("read models.rs");
-        let at = src.find("async fn bill_inner(").expect("bill_inner 改名了");
-        let body: String = src[at..].chars().take(9_000).collect();
+        let body = top_fn_body(&src, "\nasync fn bill_inner(");
         assert!(
             body.contains("spend_free_points_draining(state, uid, want).await"),
             "按量计费的免费模型又回到「全额扣或一点不扣」了——余数会再次永远卡住",
@@ -16358,7 +18291,7 @@ mod billing_tests {
         // 原来那句「部分覆盖会让用量记录说不清是谁付的钱」的顾虑，由 model_usage 同时
         // 落 free_milli_points_spent 和 cost_cents 解决（线上本来就有 2801 行两列同时非零）。
         assert!(
-            src.contains("let want = free_points_needed(micro);")
+            src.contains("let want = if free_micro_usd > 0 {")
                 && src.contains("try_spend_free_points(state, uid, want).await")
                 && src.contains("spend_free_points_draining(state, uid, want).await"),
             "按次计价那一支必须保持全额扣或一点不扣；按量计费那一支必须抽干，\
@@ -16458,32 +18391,41 @@ mod billing_tests {
             src.contains("model.per_call_micro_usd > 0"),
             "the free path must prefer the connection's micro fee over rounded cents",
         );
-        // $0.0055 = 5500 micro-USD → 110 milli-点, i.e. 0.11 点 — NOT rounded to a whole cent
-        // and NOT rounded up to a whole 点.
-        assert_eq!(super::milli_points_for_micro_usd(5_500), 110);
-        // the old lossy path would have produced 1 cent = 10 000 micro = 200 milli-点
-        assert_ne!(super::milli_points_for_micro_usd(5_500), 200);
+        // 亚分精度：$0.0055 和整一分（$0.01）必须换算出**不同**的毫点数 —— 那才是
+        // 「亚分费用没有被先取整成整分」的判据。具体数随后台汇率走，不钉死。
+        let sub_cent = super::milli_points_for_micro_usd(5_500);
+        let whole_cent = super::milli_points_for_micro_usd(super::MICRO_USD_PER_CENT);
+        assert!(sub_cent > 0, "亚分费用被抹成 0 了");
+        assert_ne!(sub_cent, whole_cent, "$0.0055 和 $0.01 扣一样多 = 先取整成整分了");
+        assert!(sub_cent < whole_cent, "更便宜的调用不该扣得更多");
     }
 
     #[test]
     fn sub_cent_fees_survive_and_convert_proportionally() {
-        use super::{milli_points_for_micro_usd as mp, MICRO_USD_PER_CENT, MICRO_USD_PER_MILLI_POINT};
+        let _g = crate::settings::settings_test_guard();
+        use super::{micro_usd_per_point, milli_points_for_micro_usd as mp, MICRO_USD_PER_CENT, MILLI};
 
-        // $0.003 = 3000 micro-USD. It must NOT round to zero…
-        let three_tenths_of_a_cent = 3_000;
-        assert!(three_tenths_of_a_cent > 0);
-        // …and must cost a real, sub-点 amount: 3000 / 50 = 60 milli-点 = 0.06 点.
-        assert_eq!(MICRO_USD_PER_MILLI_POINT, 50);
-        assert_eq!(mp(three_tenths_of_a_cent), 60);
+        // 1 积分 = 1 人民币分 → micro_usd_per_point = CNY_CENTS_PER_POINT × bps × 10000 / 10000
+        let per_point = micro_usd_per_point();
+        let bps = crate::settings::usd_per_cny_bps();
+        assert_eq!(per_point, bps,
+            "1 积分 = 1 人民币分 = {bps} micro-USD（汇率 {bps}）");
 
-        // A 40-点 daily pool therefore buys ~666 such calls, not 40.
-        assert_eq!(super::free_milli_points_daily() / mp(three_tenths_of_a_cent), 666);
+        // 亚分费用不许被抹成 0。
+        assert!(mp(3_000) > 0, "$0.003 不能四舍五入成不要钱");
+        // 3000 micro-USD / 1408 per_point → ceil(3000*1000/1408) = 2131 毫点
+        assert_eq!(mp(3_000), (3_000i64 * MILLI + per_point - 1) / per_point);
 
-        // Volume billing converts through the same path: whole-cent token cost scaled up.
-        assert_eq!(mp(1 * MICRO_USD_PER_CENT), 200, "1 cent = 0.2 点");
-        assert_eq!(mp(super::RAW_CENTS_PER_POINT * MICRO_USD_PER_CENT), super::MILLI, "5 cents = 1 点");
+        // 成正比：花两倍的钱扣两倍的点。
+        let one = mp(10_000);
+        let two = mp(20_000);
+        assert!(two >= one * 2 - 1 && two <= one * 2 + 1,
+            "$0.02 应该扣约 2× $0.01 的毫点: one={one}, two={two}");
 
-        // Still never free by rounding: any positive cost costs at least one milli-点.
+        // 一整分对应多少毫点。
+        assert_eq!(mp(MICRO_USD_PER_CENT), (MICRO_USD_PER_CENT * MILLI + per_point - 1) / per_point);
+
+        // 任何正花费至少 1 毫点。
         assert_eq!(mp(1), 1);
         assert_eq!(mp(0), 0);
         assert_eq!(mp(-9), 0);
@@ -16491,19 +18433,27 @@ mod billing_tests {
 
     #[test]
     fn points_round_up_so_cheap_calls_are_never_free() {
+        let _g = crate::settings::settings_test_guard();   // 点值读全局汇率
         use super::points_for_raw_cents as pts;
         assert_eq!(pts(0), 0, "a genuinely zero-cost call spends nothing");
         assert_eq!(pts(-5), 0, "negative cost cannot refund points");
-        // Anything that costs real money costs at least one 点 — otherwise a sub-point model
-        // would be unlimited and the daily cap would mean nothing.
-        assert_eq!(pts(1), 1);
-        assert_eq!(pts(super::RAW_CENTS_PER_POINT), 1);
-        assert_eq!(pts(super::RAW_CENTS_PER_POINT + 1), 2);
-        // The whole daily pool corresponds to a bounded amount of real spend.
-        assert_eq!(
-            pts(super::RAW_CENTS_PER_POINT * super::free_points_daily()),
-            super::free_points_daily(),
-        );
+        // 花了真钱就至少扣一点 —— 否则一个足够便宜的模型就是无限的，每日上限形同虚设。
+        assert!(pts(1) >= 1);
+        // 单调不减：花得多扣得不能更少。
+        let mut last = 0;
+        for raw in [1i64, 2, 5, 10, 50, 100] {
+            let p = pts(raw);
+            assert!(p >= last, "花 {raw} 分扣 {p} 点，比更便宜的那一档还少");
+            last = p;
+        }
+        // 1 积分 = 1 人民币分 → raw_cents_per_point < 1（约 0.14）
+        let per_point_raw = super::raw_cents_per_point();
+        let bps = crate::settings::usd_per_cny_bps();
+        let expected = bps as f64 / super::MICRO_USD_PER_CENT as f64;
+        assert!((per_point_raw - expected).abs() < 1e-9,
+            "1 积分 = 1 人民币分 → 每点 = {expected} 真实分，实际 {per_point_raw}");
+        assert!(pts(1) >= 1, "花了真钱至少扣 1 点");
+        assert!(pts(100) > 100, "100 美分 > 100 人民币分，所以点数 > 100");
     }
 
     #[test]
@@ -16924,6 +18874,9 @@ mod billing_tests {
             "cache_read_input_tokens": 50_000,
             "cache_creation_input_tokens": 20_000,
         });
+        // Anthropic shape: input_tokens(100k) 含 cache_creation(20k)，
+        // plain_input = 80k → USD = (80k×5+50k×0.5+20k×6.25+10k×25)/1M = 0.80
+        // ×0.8 rate ×100 = 64¢
         assert_eq!(
             resolve_cost(
                 "rate",
@@ -16937,22 +18890,61 @@ mod billing_tests {
                 6.25,
         None,
                 false,),
-            72
+            64
         );
     }
 
     #[test]
     fn quota_package_estimate_recommends_break_even_and_target_multipliers() {
         let projection = project_quota_package(1000.0, 288.0, 10.0, 0.8, 20.0);
-        assert!((projection.quota_raw_usd - 6630.0).abs() < 1e-9);
-        assert!((projection.provider_usd_capacity - 8287.5).abs() < 1e-9);
-        assert!((projection.channel_cost_cny - 828.75).abs() < 1e-9);
-        assert!((projection.profit_cny + 540.75).abs() < 1e-9);
-        assert!((projection.margin_percent + 187.76041666666669).abs() < 1e-9);
-        assert!((projection.break_even_multiplier - 2.3020833333333335).abs() < 1e-9);
-        assert!((projection.target_multiplier - 2.877604166666667).abs() < 1e-9);
-        assert_eq!(round_multiplier_up(projection.break_even_multiplier), 2.31);
-        assert_eq!(round_multiplier_up(projection.target_multiplier), 2.88);
+        // 面值 $1000 值多少**真实美元**：663 个钱包分 × 每钱包分 0.001408 美元 = $0.9335。
+        // 数字写死在这里（不调 raw_usd_per_visible_usd()），否则这一整串断言会跟着被测
+        // 函数一起漂，改错了也照样绿 —— 那是恒真守卫，不是测试。
+        //   663 × 1408 / 1e6 = 0.933504 → $933.504
+        assert!((projection.quota_raw_usd - 933.504).abs() < 1e-9);
+        assert!((projection.provider_usd_capacity - 1166.88).abs() < 1e-9);
+        assert!((projection.channel_cost_cny - 116.688).abs() < 1e-9);
+        assert!((projection.profit_cny - 171.312).abs() < 1e-9);
+        assert!((projection.margin_percent - 59.483333333333334).abs() < 1e-9);
+        assert!((projection.break_even_multiplier - 0.32413333333333333).abs() < 1e-9);
+        assert!((projection.target_multiplier - 0.40516666666666667).abs() < 1e-9);
+        assert_eq!(round_multiplier_up(projection.break_even_multiplier), 0.33);
+        assert_eq!(round_multiplier_up(projection.target_multiplier), 0.41);
+    }
+
+    /// 面值换算必须过汇率，不能拿「真实分 ÷ 100」当美元。
+    ///
+    /// 2026-08-28（c387e33）之后用户被扣的是**人民币分**，而这一串利润测算全部按美元
+    /// 往下算。分母停在 6.63 的话，供应商容量、保本倍率、反推出来的「安全额度」一律
+    /// 偏 7.1 倍，而且方向是"看起来更赚钱"——最容易被当成好消息接受的那种错。
+    ///
+    /// 这条断言钉的是**关系**不是数值：面值 $1 换到的真实美元必须严格小于 raw/100，
+    /// 差距就是汇率。汇率被改成 1:1（bps = 10000）时两者才相等，那时也确实该相等。
+    #[test]
+    fn visible_dollar_conversion_goes_through_the_exchange_rate() {
+        let per_visible = crate::settings::raw_usd_per_visible_usd();
+        let raw_cents = crate::settings::raw_cents_per_credit_usd() as f64;
+        let old_wrong = raw_cents / 100.0;
+        assert!(
+            per_visible < old_wrong,
+            "面值分母没过汇率：{per_visible} 应当小于旧口径 {old_wrong}（差的就是那 7.1 倍）",
+        );
+        // 口径必须和真正扣钱那条路一致：扣 N 美元 = usd_micro_to_wallet_cents(N×1e6) 个
+        // 钱包分，反过来一个钱包分就值 N/那个数 美元。两边对不上就说明报表和账单分家了。
+        //
+        // **探针金额要大。** `usd_micro_to_wallet_cents` 是向上取整的（花了真钱就至少收
+        // 1 分），拿 $1 去探会得到 711 分而不是真实的 710.227 分 —— 那一格进位在 $1 的
+        // 尺度上就是 0.11% 的偏差，比这条断言想抓的任何真实错误都大。放大到 $10,000，
+        // 进位误差降到千万分之一，容差才敢收紧到 1e-6 而不把断言变钝。
+        const PROBE_USD: i64 = 10_000;
+        let wallet_cents_per_usd =
+            crate::settings::usd_micro_to_wallet_cents(PROBE_USD * 1_000_000) as f64
+                / PROBE_USD as f64;
+        let implied = raw_cents / wallet_cents_per_usd;
+        assert!(
+            (per_visible - implied).abs() < 1e-6,
+            "报表口径 {per_visible} 和扣费口径 {implied} 分家了",
+        );
     }
 
     // gpt-5.5 ($5/$30), 22k+2k, ×1: (110000+60000)/1e6 = $0.17 = 17¢.
@@ -17729,6 +19721,41 @@ mod billing_tests {
         );
     }
 
+    /// `budget_tokens < max_tokens` 是 Anthropic 的**硬约束**，违反直接 400。
+    ///
+    /// 组装那段确实按 `budget + 8000` 把 max_tokens 抬过了预算 —— 但紧接着的 clamp 又把它
+    /// 按模型的输出上限压回去，而**压回去之后没有任何东西再检查这个不等式**。
+    /// 3.7 一族在 high/max 档拿的是 12000 预算，而它的输出上限是 8192：
+    /// 12000 > 8192，这一笔必然 400，而用户看到的只有一句「请求值错误」。
+    ///
+    /// 修的是**预算让步**，不是把 clamp 提前 —— 输出上限是模型的硬顶，绝不能为了迁就
+    /// 思考预算而突破它。
+    #[test]
+    fn the_thinking_budget_never_exceeds_the_models_output_ceiling() {
+        seed_catalog();
+        // 输出上限 8192 的 3.7：网关在 high 档会生成 12000 的预算。
+        // 输出上限 8192，和 3.7 的真实形状一致（用和 seed_catalog 同一个构造器）。
+        crate::model_catalog::seed_for_test(&[(
+            "claude-3-7-sonnet",
+            crate::model_catalog::priced(3.0, 15.0, 8_192, vec![200_000]),
+        )]);
+        for eff in ["low", "medium", "high", "max"] {
+            let body = oai_to_anthropic_with_cache(
+                &json!({"model": "claude-3-7-sonnet", "reasoning_effort": eff, "messages": []}),
+                true, false, false,
+            )
+            .expect("组装失败");
+            let max_tokens = body["max_tokens"].as_i64().expect("没有 max_tokens");
+            assert!(max_tokens <= 8_192, "{eff}: max_tokens 突破了模型输出上限");
+            if let Some(budget) = body.pointer("/thinking/budget_tokens").and_then(|v| v.as_i64()) {
+                assert!(
+                    budget < max_tokens,
+                    "{eff}: budget_tokens({budget}) >= max_tokens({max_tokens}) —— 这一笔必然 400",
+                );
+            }
+        }
+    }
+
     /// 同一个请求体，只改 effort_passthrough 这一个开关。
     fn dial(eff: &str, passthrough: bool) -> serde_json::Value {
         oai_to_anthropic_with_cache(
@@ -17892,6 +19919,597 @@ mod billing_tests {
             .is_none());
     }
 
+    /// 端到端：上游的思考签名必须一路活到**下一轮请求**里。
+    ///
+    /// 这条测试存在的理由，是这条链上任何一环单独看都"正常"：转换函数照样回文字、
+    /// 流式照样出思考卡、下一轮照样 200。丢签名不报错、不缺字段、用户也看不见 ——
+    /// 唯一的症状是模型每调一次工具就忘掉自己刚才为什么调它。所以判据只能是
+    /// 「把整条链真的跑一遍，看那串签名还在不在」，不能靠任何一处的源码断言。
+
+    /// **「零思考」的三种成因原来在遥测上完全同形 —— 其中两种查不出来。**
+    ///
+    /// 生产实测(2026-09-03,claude-opus-5 走三条 anthropic 转卖线路):
+    /// 17 条流里 9 条是 `saw_thinking_block=true` 且 `nonempty_thinking_delta_chunks=0`,
+    /// 同时 `upstream_output_tokens=1738` 而可见正文只有 489 字 —— 一千多 token 的推理
+    /// 被计费了、内容没回来。而当时的日志**无法回答**「上游发的是空串,还是发了我们
+    /// 不认的形状」:`Some("thinking_delta")` 那一支只有 `if let Some(t)`、没有 else,
+    /// 外层还有一个光秃秃的 `_ => {}`,两条路都不计数、不打日志。
+    ///
+    /// 这条测试把三种成因逐个喂进真正的解析器,断言它们现在**互相可分**。
+    #[test]
+    fn the_three_causes_of_zero_thinking_are_now_distinguishable() {
+        let feed = |events: &[&str]| {
+            let mut c = AnthSse::new("claude-opus-5");
+            for ev in events {
+                let _ = c.push(format!("data: {ev}\n\n").as_bytes());
+            }
+            c.thinking_telemetry()
+        };
+        const START_T: &str =
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#;
+        const TEXT: &str =
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"答案是 1161"}}"#;
+
+        // ① 上游真的发了空串（display 被吞的那一种）
+        let empty = feed(&[
+            START_T,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+            TEXT,
+        ]);
+        assert_eq!(empty.thinking_utf8_chars, 0);
+        assert_eq!(empty.unparsed_thinking_deltas, 0, "空串是解析成功的,不该记成「没解析出来」");
+        assert!(empty.unparsed_thinking_delta_keys.is_empty());
+        assert!(!empty.saw_redacted_thinking_block);
+
+        // ② 中转把文字挂到了别的键上（转卖商的常见改法:delta.text）
+        let renamed = feed(&[
+            START_T,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"我先算 27×40"}}"#,
+            TEXT,
+        ]);
+        assert_eq!(renamed.thinking_utf8_chars, 0, "键名不对,文字确实取不到");
+        assert_eq!(renamed.unparsed_thinking_deltas, 1, "改名这一种原来无声消失,现在必须被记下");
+        assert!(
+            renamed.unparsed_thinking_delta_keys.contains("text"),
+            "没记下真实键名就等于没修:分不出改成了什么。实得 {:?}",
+            renamed.unparsed_thinking_delta_keys
+        );
+        // 只记键名,绝不记内容 —— 思考正文不许进日志
+        for k in &renamed.unparsed_thinking_delta_keys {
+            assert!(!k.contains("27"), "键名集合里混进了内容:{k}");
+        }
+        // ①②必须可分
+        assert_ne!(
+            (empty.unparsed_thinking_deltas, empty.unparsed_thinking_delta_keys.len()),
+            (renamed.unparsed_thinking_deltas, renamed.unparsed_thinking_delta_keys.len()),
+            "空串和改名仍然同形 —— 这条修法没落地"
+        );
+
+        // ③ 中转自造了一个 delta 类型（原来被 `_ => {}` 吞掉）
+        let unknown = feed(&[
+            START_T,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"reasoning_delta","reasoning":"..."}}"#,
+            TEXT,
+        ]);
+        assert!(
+            unknown.unknown_delta_types.contains("reasoning_delta"),
+            "自造类型仍然被 catch-all 无声吞掉。实得 {:?}",
+            unknown.unknown_delta_types
+        );
+
+        // ④ 正常思考:三个诊断位必须**全是干净的**（反方向:别把好流也报成异常）
+        let good = feed(&[
+            START_T,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"27×43 = 27×40 + 27×3"}}"#,
+            TEXT,
+        ]);
+        assert!(good.thinking_utf8_chars > 0);
+        assert_eq!(good.unparsed_thinking_deltas, 0, "正常流被误报成「没解析出来」");
+        assert!(good.unknown_delta_types.is_empty(), "正常流被误报出未知类型");
+        assert!(!good.saw_redacted_thinking_block);
+    }
+
+    /// **redacted_thinking 必然满足「块开了、零思考字符、正文正常」 —— 而上游其实
+    /// 正常返回了（加密的）推理。不摘出去就会把健康线路记 30 分钟静音。**
+    ///
+    /// `redacted_thinking` 的载荷是上游加密的 `data` 字段,按协议**永远不会**以
+    /// `thinking_delta` 到达。原来 10527 那一行把它和普通 thinking 块合并置位,
+    /// 于是 `thinking_swallowed_by_upstream` 三条判据全中。
+    #[test]
+    fn a_redacted_thinking_block_does_not_get_the_route_muted() {
+        let feed = |block: &str| {
+            let mut c = AnthSse::new("claude-opus-5");
+            for ev in [
+                block,
+                r#"{"type":"content_block_stop","index":0}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"好的"}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            ] {
+                let _ = c.push(format!("data: {ev}\n\n").as_bytes());
+            }
+            c
+        };
+
+        let redacted = feed(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"EvwBCkYIBRgCKkA"}}"#,
+        );
+        assert!(redacted.saw_thinking_block(), "块确实开了,这一位不该动");
+        assert!(
+            redacted.thinking_telemetry().saw_redacted_thinking_block,
+            "没有单独记下 redacted —— 判据就无从摘"
+        );
+        assert!(
+            !redacted.thinking_swallowed_by_upstream(),
+            "加密思考被判成「上游把思考吞了」—— 一条正常线路会被记 30 分钟静音"
+        );
+
+        // 反方向:普通思考块开了却一个字都没回来,**仍然要报**。
+        let swallowed = feed(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        );
+        assert!(
+            swallowed.thinking_swallowed_by_upstream(),
+            "把豁免开得太宽了 —— 真正该报的那一种也被放过了"
+        );
+
+        // 边界:同一轮里既有 redacted 块、又收到过 thinking_delta（哪怕没解析出来）
+        // → 上游是按普通思考块在发,不该走豁免。
+        let mut mixed = AnthSse::new("claude-opus-5");
+        for ev in [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"Evw"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"挂错键的文字"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"好的"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        ] {
+            let _ = mixed.push(format!("data: {ev}\n\n").as_bytes());
+        }
+        assert!(
+            mixed.thinking_swallowed_by_upstream(),
+            "收到过 thinking_delta 就说明上游按普通块在发,豁免不该生效"
+        );
+    }
+    #[test]
+    fn a_thinking_signature_survives_the_whole_gateway_round_trip() {
+        const SIG: &str = "EqQBCgIYAiJAqm8t";
+        const MODEL: &str = "claude-opus-5";
+
+        // ── 1) 上游流式回来：思考文字 + 签名 + 一个工具调用 ──────────────
+        let mut c = AnthSse::new(MODEL);
+        let mut wire = Vec::new();
+        for ev in [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#.to_string(),
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#.to_string(),
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"B 的含义取决于 A 里那个常量"}}"#.to_string(),
+            format!(r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"signature_delta","signature":"{SIG}"}}}}"#),
+            r#"{"type":"content_block_stop","index":0}"#.to_string(),
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#.to_string(),
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#.to_string(),
+            r#"{"type":"content_block_stop","index":1}"#.to_string(),
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#.to_string(),
+            r#"{"type":"message_stop"}"#.to_string(),
+        ] {
+            wire.extend(c.push(format!("data: {ev}
+
+").as_bytes()).unwrap());
+        }
+
+        // ── 2) 客户端收到的块里，签名必须在 ──────────────────────────────
+        let saved: Vec<serde_json::Value> = String::from_utf8(wire)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+            .filter_map(|v| {
+                v.pointer(&format!("/choices/0/delta/{}", crate::thinking_replay::FIELD))
+                    .and_then(|b| b.as_array())
+                    .cloned()
+            })
+            .flatten()
+            .collect();
+        assert_eq!(saved.len(), 1, "流式没把思考签名发给客户端 —— signature_delta 又被吞了");
+        assert_eq!(saved[0]["signature"], SIG);
+        assert_eq!(saved[0]["model"], MODEL, "没记下签名属于哪个模型，跨模型判据就失效了");
+
+        // ── 3) 客户端原样回传，下一轮请求里必须还原成 thinking 块且排最前 ──
+        let body = json!({
+            "model": MODEL,
+            "messages": [
+                {"role": "user", "content": "看看 B"},
+                {"role": "assistant", "content": null,
+                 crate::thinking_replay::FIELD: saved,
+                 "tool_calls": [{"id":"toolu_1","type":"function",
+                                 "function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},
+                {"role": "tool", "tool_call_id": "toolu_1", "content": "const N = 7;"}
+            ]
+        });
+        let out = oai_to_anthropic_with_cache(&body, false, false, false).unwrap();
+        let asst = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("助手轮不见了");
+        let blocks = asst["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0]["type"], "thinking",
+            "思考块没排在最前 —— Anthropic 对助手轮的块序有要求，排错就是 400"
+        );
+        assert_eq!(blocks[0]["signature"], SIG, "签名在最后一步丢了");
+        assert!(
+            blocks.iter().any(|b| b["type"] == "tool_use"),
+            "回放思考块把原来的工具调用挤掉了"
+        );
+        assert!(
+            blocks[0].get("model").is_none(),
+            "中间形态的 model 字段被当成协议字段发上去了 —— Anthropic 不认，会 400"
+        );
+
+        // ── 4) 换个模型：同一份历史必须一个思考块都不带 ────────────────
+        let mut other = body.clone();
+        other["model"] = json!("claude-fable-5-1");
+        let out2 = oai_to_anthropic_with_cache(&other, false, false, false).unwrap();
+        let asst2 = out2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert!(
+            !asst2["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["type"] == "thinking"),
+            "跨模型回放了签名 —— 用户换个模型接着聊，整轮直接 400"
+        );
+    }
+
+    /// 辅助模型调用必须按线路自己的协议走线。
+    ///
+    /// 三条线各自的端点和请求体形状都不一样，这里做真往返 —— 不是断言源码里出现过
+    /// `Wire::of`，而是「给一个 anthropic 线路，它到底打不打 /v1/messages」。
+    #[test]
+    fn an_aux_call_goes_out_on_its_own_routes_protocol() {
+        let body = json!({"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]});
+
+        let (url, out) = aux_wire_request("https://api.example.com", "anthropic", &body).unwrap();
+        assert!(url.ends_with("/v1/messages"), "anthropic 线路没走原生端点: {url}");
+        assert!(out.get("max_tokens").is_some(), "body 没被翻成 Anthropic 形状");
+
+        let (url, out) = aux_wire_request("https://api.example.com", "openai", &body).unwrap();
+        assert!(url.ends_with("/v1/chat/completions"), "{url}");
+        assert_eq!(out, body, "openai 线路上 body 必须原样透传");
+
+        let (url, _) = aux_wire_request("https://api.example.com", "xai_responses", &body).unwrap();
+        assert!(url.ends_with("/v1/responses"), "{url}");
+
+        // 回执还原：anthropic 的块形状 → 调用点读得懂的 choices[0].message.content。
+        let raw = json!({"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":3}});
+        let back = aux_wire_response("anthropic", "claude-opus-5", raw.clone());
+        assert_eq!(back.pointer("/choices/0/message/content"), Some(&json!("ok")));
+        assert_eq!(back.pointer("/usage/prompt_tokens"), Some(&json!(3)),
+            "usage 没还原成 OpenAI 名字 —— 这几条路都靠它计费，丢了就按 0 结账");
+        // openai 线路必须是恒等，否则等于给一条本来正确的路加了一层可能出错的转换。
+        assert_eq!(aux_wire_response("openai", "m", raw.clone()), raw);
+    }
+
+    /// 不许再长出第七处「不看协议就硬拼 /chat/completions」。
+    ///
+    /// 这个错法一次都不会报错：中转会接下请求，只是把 Claude 降级跑，缓存和思考一起丢。
+    /// 曾经有六处（语言包、上下文摘要、单连接直调、能力探测、视觉预处理，以及两处
+    /// 本来就分叉的探活）——靠人读代码发现不了，只能靠中转控制台上那行 "OpenAI
+    /// compatible" 反推。所以钉死允许清单。
+    #[test]
+    fn no_new_hardcoded_openai_endpoint_sneaks_in() {
+        // 判据按**行**看：一行里同时出现端点字面量和「用线路地址拼」的痕迹，才算硬编码。
+        // 注释行不算 —— 这个仓库里解释这件事的注释比代码多得多。
+        // marker 拆成两段写，否则这条断言自己的字面量会被 include_str! 数进去。
+        let marker = concat!("/chat/", "completions");
+        let mut hits: Vec<(&str, usize)> = Vec::new();
+        for (name, src) in [
+            ("models.rs", include_str!("models.rs")),
+            ("model_probe.rs", include_str!("model_probe.rs")),
+            ("model_catalog.rs", include_str!("model_catalog.rs")),
+        ] {
+            let n = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains(marker))
+                .filter(|l| l.contains("api_base") || l.contains("{base}"))
+                .count();
+            if n > 0 {
+                hits.push((name, n));
+            }
+        }
+        assert_eq!(
+            hits,
+            vec![("models.rs", 1)],
+            "唯一允许的硬编码是 vision_preprocess（模型写死 gpt-5.5、且是流式，\
+             非流式转换套不上，那里有注释说明）。多出来的每一处都是一条 Claude \
+             被降级成 OpenAI 兼容形状跑的路：不报错、不留日志，只是悄悄变贵变笨。"
+        );
+    }
+
+    /// 拒答必须能和「答完了但什么都没说」区分开。
+    ///
+    /// 折成 `stop` 的代价是三层叠加的，而且第三层伤的是**别的用户**：拒答前开过思考块
+    /// 的话，`thinking_only_end_turn` 会把这条健康线路诊断成「中转丢块」，把思考深度
+    /// 按 30 分钟压到 medium。所以这条测试同时钉住映射和那条误诊。
+    #[test]
+    fn a_refusal_is_not_dressed_up_as_a_normal_finish() {
+        // 非流式：finish_reason 要能区分，理由要带上。
+        let av = json!({
+            "content": [{"type":"text","text":""}],
+            "stop_reason": "refusal",
+            "stop_details": {"type":"refusal","category":"cyber","explanation":"…"}
+        });
+        let o = anthropic_to_oai(&av, "claude-opus-5");
+        assert_eq!(o["choices"][0]["finish_reason"], "content_filter",
+            "拒答被折成 stop —— 和「正常答完但一个字没说」逐字节不可分");
+        assert_eq!(o["choices"][0]["message"]["stop_details"]["category"], "cyber",
+            "拒答理由丢了，用户只会看见一次空回复");
+
+        // 正常收尾不受影响。
+        assert_eq!(
+            anthropic_to_oai(&json!({"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn"}), "m")
+                ["choices"][0]["finish_reason"],
+            "stop"
+        );
+        assert_eq!(anthropic_stop_reason_to_oai("stop_sequence"), "stop");
+        assert_eq!(anthropic_stop_reason_to_oai("tool_use"), "tool_calls");
+        assert_eq!(anthropic_stop_reason_to_oai("max_tokens"), "length");
+
+        // 流式：先开思考块再拒答 —— 这一支绝不能被当成「中转丢块」。
+        let mut c = AnthSse::new("claude-opus-5");
+        for ev in [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想了想"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"refusal"},"stop_details":{"type":"refusal","category":"cyber"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            let _ = c.push(format!("data: {ev}\n\n").as_bytes()).unwrap();
+        }
+        assert!(
+            !c.thinking_only_end_turn(),
+            "一次正常拒答被诊断成中转丢块 —— 这会把整条线路上所有人的思考深度压 30 分钟"
+        );
+    }
+
+    /// 流被中止之前，真实原因必须先发出去 —— 而且老客户端不能被它带坏。
+    ///
+    /// 在这之前，网关判定协议不合格时直接 `tx.send(Err(...))` 中止响应体，原因只进
+    /// 自己的日志。桌面端拿到的只是一个传输层错误，界面上一律显示成「连接中断
+    /// （网络波动）」。线上实测过同一秒的三行日志：网关写着「上游的流没有终止标记
+    /// 就结束了」，而用户看到的是「网络波动」—— 于是「老是断线」这个报障在产品里
+    /// 无法定位到底断在哪一段。
+    #[test]
+    fn a_truncated_stream_tells_the_client_why_before_it_aborts() {
+        let f = super::stream_error_frame(
+            "OpenAI upstream stream ended without terminal data: [DONE]",
+            "upstream",
+        );
+        // 必须是一帧合法的 SSE。
+        assert!(f.starts_with("data: ") && f.ends_with("\n\n"), "不是合法 SSE 帧：{f:?}");
+        let v: serde_json::Value =
+            serde_json::from_str(f.trim_start_matches("data: ").trim()).expect("帧不是合法 JSON");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("terminal data"),
+            "真实原因没进帧里：{v}"
+        );
+        assert_eq!(v["error"]["where"], "upstream", "断在哪一段这个信息丢了");
+
+        // **老客户端必须原样忽略它。** 它们读的是 choices[0].delta；这一帧不带 choices，
+        // 于是取到的是 null，什么都不会渲染。带上 choices 会让老版本把错误当成正文。
+        assert!(v.get("choices").is_none(), "带了 choices —— 老客户端会把它当正文渲染");
+
+        // 脱敏这一步必须真的在链路上。
+        let leaky = super::stream_error_frame(
+            "upstream https://relay.example/v1/messages rejected key sk-live-abcdef123456",
+            "gateway",
+        );
+        assert!(!leaky.contains("sk-live-abcdef123456"), "密钥被发给客户端了：{leaky}");
+    }
+
+    /// `tool_choice:"none"` 的语义不许在翻译里被翻转。
+    #[test]
+    fn forbidding_tools_is_not_translated_into_allowing_them() {
+        let body = |tc: serde_json::Value| json!({
+            "model":"claude-opus-5",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}],
+            "tool_choice": tc,
+        });
+        let of = |tc: serde_json::Value| {
+            oai_to_anthropic_with_cache(&body(tc), false, false, false).unwrap()["tool_choice"].clone()
+        };
+        assert_eq!(
+            of(json!("none")), json!({"type":"none"}),
+            "「这一轮禁止调工具」被翻译丢了 —— 不发 tool_choice 时 Anthropic 默认是 auto，             语义正好反过来：明确禁止反而变成随便调"
+        );
+        assert_eq!(of(json!("auto")), json!({"type":"auto"}));
+        assert_eq!(of(json!("required")), json!({"type":"any"}));
+        assert_eq!(
+            of(json!({"type":"function","function":{"name":"read_file"}})),
+            json!({"type":"tool","name":"read_file"})
+        );
+    }
+
+    /// 1 小时 TTL 的缓存写入必须按 **2× 输入价**收，不能按 5 分钟的 1.25× 收。
+    ///
+    /// 这是「白送是哑的」那一类：token 数落库是对的，只有金额少了 —— 不报错、不留痕，
+    /// 只能靠中转的对账单才看得出来。而我们刚刚把 1 小时 TTL 对所有 Anthropic 线路
+    /// 默认打开，漏了这一条就是每写一次自己吃掉 60%。
+    #[test]
+    fn a_one_hour_cache_write_costs_more_than_a_five_minute_one() {
+        let priced = |u: serde_json::Value| {
+            // 显式给每模型价：测试进程里没有实时目录，缓存价会落到「输入价 × 倍率」
+            // 那条兜底 —— 正是我们要验的那条路。
+            super::priced_usd(Some(&u), "m", 0.0, 0.0, 0.0, 0.0, Some((5.0, 25.0)), false, false)
+                .expect("计价返回 None —— 连输入价都没认出来")
+                .usd
+        };
+        let base = json!({
+            // prompt/completion 全 0 时计价直接返回 None（那条早退是刻意的），
+            // 所以给一个非零输入 —— 真实回执里带缓存写入的那一发也一定有输入。
+            "input_tokens": 1000, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 100_000,
+        });
+        let five_min = priced(base.clone());
+        let mut one_hour = base.clone();
+        one_hour["cache_creation"] = json!({"ephemeral_1h_input_tokens": 100_000,
+                                            "ephemeral_5m_input_tokens": 0});
+        let hour = priced(one_hour);
+
+        // Anthropic 的 input_tokens 含 cache_creation，所以 plain_input 在两种写入模式下
+        // 都被减到 (1000 - 100000).max(0) = 0——两者 USD 只含缓存写入那一项，直接取比值
+        // 就是 1h/5min 的倍率。
+        assert!(five_min > 0.0, "缓存写入被算成 0 了");
+        let ratio = hour / five_min;
+        assert!(
+            (ratio - super::ONE_HOUR_WRITE_PREMIUM).abs() < 1e-9,
+            "1 小时写入收的钱是 5 分钟的 {ratio:.4} 倍，官方价目是 2.0/1.25 = {:.4} 倍",
+            super::ONE_HOUR_WRITE_PREMIUM
+        );
+
+        // 一半一半：只有 1 小时那部分加价，5 分钟那部分一分不多。
+        let mut half = base.clone();
+        half["cache_creation"] = json!({"ephemeral_1h_input_tokens": 50_000,
+                                        "ephemeral_5m_input_tokens": 50_000});
+        let mixed = priced(half);
+        assert!(
+            (mixed - (five_min + hour) / 2.0).abs() < 1e-9,
+            "混合分档没有按比例计价"
+        );
+
+        // 没有分档字段时行为一个字不变 —— 这是这个字段出现之前的形状，也是更保守的一侧。
+        assert_eq!(priced(base.clone()), five_min);
+        // 中转报出自相矛盾的数（分档比总数还大）不能把账算爆。
+        let mut absurd = base;
+        absurd["cache_creation"] = json!({"ephemeral_1h_input_tokens": 10_000_000});
+        assert!((priced(absurd) - hour).abs() < 1e-9, "分档大于总数时没有被钳住");
+    }
+
+    /// 会话中途的 system 块不许被搬到顶层 —— 那等于把它从最后挪到了最前。
+    ///
+    /// 上下文压缩的检索回注就是这样一条消息，它每一步的内容都不同。它被刻意放在消息
+    /// 尾部（线上实测：排在前面时缓存量恒定在 24k~42k、不随请求增长）。按 role 搬到顶层
+    /// 之后，那个修复在这条协议上被结构性撤销：顶层 system 排在所有 messages 之前，
+    /// 于是每一轮整个前缀都变。
+    ///
+    /// 判据不是「它出现在哪」，而是**它变了之后，它前面的一切是否逐字节不变**。
+    #[test]
+    fn a_mid_conversation_system_block_never_invalidates_the_prefix_before_it() {
+        let convo = |retrieved: &str| {
+            json!({"model":"claude-opus-5","messages":[
+                {"role":"system","content":"网关 L0"},
+                {"role":"system","content":"客户端块"},
+                {"role":"user","content":"开工"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"t1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"t1","content":"文件内容"},
+                // 压缩把检索回注写成一条 system 消息，插在会话尾部。
+                {"role":"system","content":retrieved},
+            ]})
+        };
+        let a = oai_to_anthropic_with_cache(&convo("第 7 轮检索到的历史"), true, false, false).unwrap();
+        let b = oai_to_anthropic_with_cache(&convo("第 8 轮检索到的完全不同的历史"), true, false, false).unwrap();
+
+        // ① 顶层 system 必须一个字节不差 —— 它排在所有消息前面，变一次全盘作废。
+        assert_eq!(a["system"], b["system"],
+            "会话中途的 system 被搬到顶层了 —— 它每轮变一次，整段历史每轮全价重算");
+        assert_eq!(a["system"].as_array().unwrap().len(), 2,
+            "顶层 system 应该只有开头那两条，中途那条不该在里面");
+
+        // ② 那段文本没有丢，只是留在了消息里的原位。
+        assert!(a.to_string().contains("第 7 轮检索到的历史"), "检索回注被弄丢了");
+
+        // ③ 缓存前缀 = 「一路到滚动断点那个**块**为止」的全部内容。粒度是块不是消息：
+        //    变动文本和断点可以在同一条消息里，只要它排在断点块**之后**就不在前缀内。
+        let cached_prefix = |v: &serde_json::Value| -> String {
+            let mut acc = String::new();
+            for m in v["messages"].as_array().unwrap() {
+                let Some(blocks) = m["content"].as_array() else {
+                    acc.push_str(&m.to_string());
+                    continue;
+                };
+                for b in blocks {
+                    acc.push_str(&b.to_string());
+                    if b.get("cache_control").is_some() {
+                        return acc; // 断点块本身算在前缀里，到此为止
+                    }
+                }
+            }
+            acc
+        };
+        let (pa, pb) = (cached_prefix(&a), cached_prefix(&b));
+        assert_eq!(pa, pb,
+            "缓存前缀在两轮之间变了 —— 断在这里，后面整段按全价重写");
+        // 前缀里绝不能含那段每步都变的文本，否则上面那条断言只是碰巧成立。
+        assert!(!pa.contains("检索到的"), "每步都变的检索块落进了缓存前缀内");
+        assert!(pa.contains("tool_result"), "前缀短得连工具结果都没盖住，断点没起作用");
+    }
+
+    /// 一条助手消息的字节，不能因为**后面又多了几轮**而改变。
+    ///
+    /// 这条测试是一次真实回归留下的。第一版把思考块只回放在「最后一轮」助手消息上，
+    /// 理由是更早的那些 Anthropic 服务端本来就会剥掉、全带等于白付字节。但「最后一轮」
+    /// 的位置每轮都在往后移：assistant_N 这一轮带着思考块发出去，下一轮它不再是最后
+    /// 一轮就不带了 —— 同一条消息的字节变了。Anthropic 的缓存认严格前缀，于是从那个
+    /// 位置往后整段历史每轮全价重算，省下的字节远不够赔。
+    ///
+    /// 所以判据不是「带了几块」，而是**同一条消息在两种上下文里必须逐字节相同**。
+    #[test]
+    fn an_assistant_turns_bytes_do_not_change_when_more_turns_are_appended() {
+        let blk = |sig: &str| json!([{"thinking":"想了想","signature":sig,"model":"claude-opus-5"}]);
+        let asst = |sig: &str, id: &str| json!({
+            "role":"assistant","content":null,
+            "reasoning_blocks": blk(sig),
+            "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]
+        });
+        let render = |msgs: serde_json::Value| -> Vec<serde_json::Value> {
+            let body = json!({"model":"claude-opus-5","messages":msgs});
+            oai_to_anthropic_with_cache(&body, false, false, false).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        // 第 N 轮：assistant#1 是最后一轮助手消息。
+        let turn_n = render(json!([
+            {"role":"user","content":"开工"},
+            asst("sig-1", "t1"),
+            {"role":"tool","tool_call_id":"t1","content":"A"}
+        ]));
+        // 第 N+1 轮：同一段历史后面又接了一轮，assistant#1 不再是最后一轮。
+        let turn_n1 = render(json!([
+            {"role":"user","content":"开工"},
+            asst("sig-1", "t1"),
+            {"role":"tool","tool_call_id":"t1","content":"A"},
+            asst("sig-2", "t2"),
+            {"role":"tool","tool_call_id":"t2","content":"B"}
+        ]));
+
+        assert_eq!(
+            turn_n1[..turn_n.len()],
+            turn_n[..],
+            "接了新一轮之后，前面那段历史的字节变了 —— Anthropic 认严格前缀，\
+             从变化那条起整段历史每轮按全价重算，比不做这个功能还贵"
+        );
+
+        // 而且每条助手消息都真的带着自己那一块（否则上面那条断言在「两边都没带」时也成立）。
+        let sigs: Vec<&str> = turn_n1
+            .iter()
+            .filter_map(|m| m["content"].as_array())
+            .flatten()
+            .filter(|b| b["type"] == "thinking")
+            .filter_map(|b| b["signature"].as_str())
+            .collect();
+        assert_eq!(sigs, vec!["sig-1", "sig-2"], "思考块没有逐条带上，或顺序乱了");
+    }
+
     /// 反过来那半边：要了思考、正文好好的、思考一个字都没回。
     ///
     /// 这种响应绝不能进缓存——缓存 1 小时意味着接下来一小时每个相同请求都重放这份
@@ -17927,13 +20545,13 @@ mod billing_tests {
         assert!(production.contains("thinking_requested_but_none_returned()"), "探测没接上");
     }
 
-    /// 「块根本不开」这种哑法必须能被认出来，而且要连着几次才降权。
+    /// 「块根本不开」这种哑法必须能被认出来。**认出来只用于记录,不改派单。**
     ///
     /// 旧判据 `thinking_swallowed_by_upstream` 要求「块开了但文本是空的」，48 小时里
     /// ~330 条零思考流一次都没命中——那套绕开哑线路的自愈因此是死代码。真实形态由
     /// saw_thinking_block 遥测钉死：block=false、正文正常、output_tokens 和正文字数对得上。
     #[test]
-    fn a_route_that_never_opens_a_thinking_block_is_demoted_after_a_streak() {
+    fn a_route_that_never_opens_a_thinking_block_is_logged_but_never_demoted() {
         // 块没开 + 有正文 = 这条线路这一轮没思考。
         let mut c = AnthSse::new("claude-opus-5");
         let _ = c.push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").unwrap();
@@ -17948,23 +20566,40 @@ mod billing_tests {
         assert!(!opened.thinking_block_never_opened());
         assert!(opened.thinking_swallowed_by_upstream());
 
-        // 连击：前 N-1 次不降权（adaptive 这轮不想是正常的），第 N 次才判哑。
+        // 连击计数留着,但它现在**只决定要不要打那条日志**:单次不报(adaptive 这轮
+        // 不想是正常行为,天天报就成噪音),连着 N 次才报一条。派单一概不受影响。
         let route = uuid::Uuid::new_v4();
         for i in 1..super::THINKING_DEAD_STREAK {
-            assert!(!super::note_thinking_zero(route), "第 {i} 次就降权 = 又在拿单次盖健康线路");
+            assert!(!super::note_thinking_zero(route), "第 {i} 次就报 = 日志会被正常行为刷屏");
         }
-        assert!(super::note_thinking_zero(route), "连够 N 次必须判哑");
+        assert!(super::note_thinking_zero(route), "连够 N 次必须报一条");
 
-        // 回过思考就清零：上游恢复后第一条成功请求让它回到正常轮换。
+        // 回过思考就清零,免得下次一进来就到阈值。
         super::clear_thinking_zero_streak(route);
         assert!(!super::note_thinking_zero(route), "清零之后连击要重新数");
 
         // 生产里必须真的接上，否则这套自愈还是死的。
         let src = include_str!("models.rs");
         let production = &src[..src.find("mod billing_tests").expect("tests module")];
-        assert!(production.contains("thinking_block_never_opened()"), "新判据没接进收流那一段");
-        assert!(production.contains("if note_thinking_zero(cid)"), "连击计数没接上选路降权");
-        assert!(production.contains("clear_thinking_zero_streak(cid)"), "恢复后没有清零，线路会被永久压着");
+        // **不能只搜函数名** —— 它在 SseBridge 的 trait 分发里也逐字出现（`SseBridge::Anth(c)
+        // => c.thinking_block_never_opened(),`），把收流那一处换成 `|_c| false` 之后这条
+        // 照样绿（实测活过一次变异）。钉的必须是**消费点那一整句**。
+        assert!(
+            production.contains(".is_some_and(|c| c.thinking_block_never_opened());"),
+            "判据没接进收流那一段 —— 只剩 trait 定义还在，等于这条诊断哑了"
+        );
+        assert!(production.contains("note_thinking_zero(cid)"), "连击计数没接上那条日志");
+        assert!(production.contains("clear_thinking_zero_streak(cid)"), "没有清零,下次一进来就到阈值");
+        // **反方向:它绝不许再影响派单。** 所有者定的是不降权 —— 用户选哪条线路就走哪条。
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains(concat!("mark_thinking", "_mute")),
+            "连击又被接回降权了 —— 出不出思考不是换线路的理由"
+        );
     }
 
     /// 「零思考」有三种成因，旧日志里它们**完全同形**（thinking_utf8_chars 都是 0）。
@@ -18132,14 +20767,11 @@ mod billing_tests {
         let ttl = super::anthropic_cache_control(true);
         assert_eq!(ttl["type"], serde_json::json!("ephemeral"));
         assert_eq!(ttl["ttl"], serde_json::json!("1h"), "断点又退回 5 分钟了");
-        // 三方线路不给：ttl 要配 beta 才生效，而三方那份 beta 集合是照 Claude Code 的
-        // Tv9 挑的（上面那条测试钉着项数），加一项会改请求指纹。发一个不生效的字段没意义。
+        // 关掉时退回裸 ephemeral（5 分钟）—— `MICHAEL_CACHE_TTL_1H=0` 那条回退路径。
         let plain = super::anthropic_cache_control(false);
-        assert!(plain.get("ttl").is_none(), "没有 beta 的线路不该发 ttl");
-        // 判据必须和"发不发那个 beta"同源：一方才发 beta，也只有一方给 ttl。
-        //
-        // 断言要钉在**那个调用点**上，不能只查这串字符在不在文件里 —— 它在发 beta 那处
-        // 也出现，于是把调用点改成 `true` 照样绿（实测：变异没被抓到）。
+        assert!(plain.get("ttl").is_none(), "关掉之后还在发 ttl，回退开关就是假的");
+        // ttl 的判据仍要钉在**那个调用点**上，不能只查这串字符在不在文件里 ——
+        // 它在别处也出现，于是把调用点改成 `false` 照样绿（实测：变异没被抓到）。
         // 这是「断言真实却守错了东西」那一类，本仓库为它付过很多次账。
         let src = include_str!("models.rs");
         let call = src
@@ -18147,20 +20779,9 @@ mod billing_tests {
             .nth(1)
             .and_then(|t| t.split_once(") {").map(|(a, _)| a))
             .expect("生产调用点没找到，锚点漂了");
-        // 同源判据：ttl 用的那个函数，必须**也是**决定 beta 头的那个。名字换了没关系，
-        // 两处指向同一个函数就行；分成两个判据的那一刻，就会发出不生效的 ttl。
         assert!(
             call.contains("anthropic_allows_extended_ttl(&candidate.base_url)"),
-            "ttl 的判据和发 beta 的判据脱钩了——那会发出一个不生效的字段"
-        );
-        let beta_call = src
-            .split("let candidate_beta_header = if candidate_anthropic {")
-            .nth(1)
-            .and_then(|t| t.split_once("} else {").map(|(a, _)| a))
-            .expect("beta 头的构造点没找到，锚点漂了");
-        assert!(
-            beta_call.contains("anthropic_allows_extended_ttl(&candidate.base_url)"),
-            "beta 头没跟着同一个判据走"
+            "生产调用点不再按线路决定 ttl 了"
         );
         assert!(
             call.contains("route_supports_prompt_cache(candidate)"),
@@ -18168,13 +20789,43 @@ mod billing_tests {
         );
         // 计费相关的改动要能不重新部署就回退。
         assert!(src.contains("MICHAEL_CACHE_TTL_1H"), "少了回退开关");
-        // 四处断点都要走这个构造器，漏一处那一段就还是 5 分钟。
-        //
-        // needle 运行时拼：这个文件里 #[cfg(test)] 不止一段，按第一个切会把实现整段切掉
-        // （断言恒假）；不切又会被断言自己的字面量喂饱（刚才实测数出 5 个，多的那个就是
-        // 这行代码本身）。旁边 openai_prompt_cache_key 那条测试躲的是同一个坑。
-        let needle = format!("anthropic_cache_{}(extended_ttl)", "control");
-        assert_eq!(src.matches(&needle).count(), 4, "有断点没走统一的构造器");
+        // 断点的**个数和位置**改成真造一个请求来数 —— 原来这里数的是源码里调用点出现
+        // 几次，那个数和真实断点数不是一回事（断点 #3 有「块数组」和「纯字符串」两个
+        // 分支，两处调用一个断点），而且加一个断点就得改一次那个魔数。
+        let body = json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role":"system","content":"网关 L0"},
+                {"role":"system","content":"客户端块"},
+                {"role":"user","content":"开工"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"t1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"t1","content":"文件内容"},
+            ],
+            "tools": [{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}],
+        });
+        let out = super::oai_to_anthropic_with_cache(&body, true, false, false).unwrap();
+        let n = out.to_string().matches("cache_control").count();
+        assert_eq!(
+            n, 4,
+            "断点数不是 4。Anthropic 硬上限就是 4，多一个就是 400；少一个是白放着一段\
+             不额外收费的嵌套前缀不用（整条前缀只按最长那次写一遍）。实际请求：{out}"
+        );
+        // 顶层 cache_control 是「自动缓存」的开关。4 个显式断点**加上**它才会 400，
+        // 所以用满 4 个的前提是这个字段永远不出现。
+        assert!(out.get("cache_control").is_none(), "发了顶层 cache_control，4 个断点会变成 400");
+        // 位置：tools 末个、system 首块、system 末块、最后一个 tool_result 块。
+        assert!(out["tools"].as_array().unwrap().last().unwrap().get("cache_control").is_some(),
+            "工具表没被缓存住");
+        let sys = out["system"].as_array().unwrap();
+        assert!(sys[0].get("cache_control").is_some(), "最稳定的 L0 块没有自己的断点");
+        assert!(sys.last().unwrap().get("cache_control").is_some(),
+            "system 末块没断点 —— 客户端拼的那几千 token 只能靠断点 #3 覆盖");
+        let last = out["messages"].as_array().unwrap().last().unwrap();
+        let blk = last["content"].as_array().unwrap().iter()
+            .find(|b| b.get("cache_control").is_some()).expect("消息上没有滚动断点");
+        assert_eq!(blk["type"], "tool_result",
+            "滚动断点没钉在 tool_result 上 —— 钉在别的块上，下一轮那块一变整段历史就作废");
     }
 
     /// 三方中转按名单灰度拿 1 小时缓存 —— 而且 beta 头必须跟着补上。
@@ -18188,7 +20839,13 @@ mod billing_tests {
         // 名单从参数进，不碰进程环境变量 —— set_var 会被同进程里并行跑的别的测试看到，
         // 表现是偶发失败（实测撞到过一次）。
         let none: Vec<String> = vec![];
-        assert!(!super::allows_extended_ttl_with("https://api.hao.ai", &none));
+        // **名单为空 = 全开。** 这一条是这次改动的核心：线上那个环境变量一直是空的，
+        // 而旧语义「空 = 谁都不给」让四个缓存断点全是 5 分钟 —— 实测 claude-opus-5 走
+        // api.hao.ai 24 小时缓存写 359 万、读 307 万，写比读还多，整条前缀每轮重写一遍。
+        assert!(
+            super::allows_extended_ttl_with("https://api.hao.ai", &none),
+            "名单为空时不给三方 1 小时缓存 —— 那正是线上现在的状态：全部 5 分钟到期重写"
+        );
         assert!(
             super::allows_extended_ttl_with("https://api.anthropic.com", &none),
             "一方永远该拿到"
@@ -18203,14 +20860,29 @@ mod billing_tests {
         // 真正读环境变量的那层也要有人走一遍，否则解析（逗号、空格、大小写）没被守住。
         assert!(super::anthropic_extended_ttl_hosts().iter().all(|h| h == &h.to_ascii_lowercase()));
 
-        // beta 头必须跟着补：没有那一项，块上的 ttl 是个不生效的字段。
-        let third = super::anthropic_beta_header_for(false, false, true);
-        assert!(third.contains("extended-cache-ttl"), "三方开了 ttl 却没补 beta");
-        // 不开时三方那份要一个字不差 —— 指纹对齐是它存在的理由。
+        // **ttl 和 beta 已经解耦，而且必须保持解耦。**
+        //
+        // 旧代码把两者绑在一起，理由是「ttl 要配 extended-cache-ttl-2025-04-11 才生效」。
+        // 那个前提已经不成立：现行 Messages API 里 cache_control.ttl 是 GA 的，一个 beta
+        // 都不需要（官方 prompt-caching 文档，2026-09 核对）。而三方那份 beta 集合是照
+        // Claude Code 的指纹挑的，多发一项有被 503 的风险 —— 一批中转正是靠这个指纹认
+        // Claude Code 流量。所以：ttl 照发给三方，beta 一个字节不加。
         assert_eq!(
             super::anthropic_beta_header_for(false, false, false),
             super::ANTHROPIC_BETA_HEADER_THIRD_PARTY,
-            "没开扩展 TTL 时三方的 beta 集合被改动了"
+            "三方的 beta 集合被改动了 —— 指纹对齐是它存在的理由"
+        );
+        // 生产调用点传给 beta 的必须是「是不是一方」，不是 ttl 判据。绑回去就等于
+        // 「为了拿 1 小时缓存，给每一家中转的请求都改了指纹」。
+        let src = include_str!("models.rs");
+        let beta_call = src
+            .split("let candidate_beta_header = if candidate_anthropic {")
+            .nth(1)
+            .and_then(|t| t.split_once("} else {").map(|(a, _)| a))
+            .expect("beta 头的构造点没找到，锚点漂了");
+        assert!(
+            !beta_call.contains("anthropic_allows_extended_ttl"),
+            "beta 头又跟着 ttl 判据走了 —— 三方会收到一个多出来的 beta 项"
         );
         // 一方本来就有，不许重复追加。
         let first = super::anthropic_beta_header_for(true, false, true);
@@ -19006,14 +21678,255 @@ mod billing_tests {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
         assert!(parse_usage_from_sse(sse.as_bytes()).is_none());
     }
+
+    /// **不到半美分的调用被四舍五入成 0 —— 白送,而且一声不吭。**
+    ///
+    /// `compute_cost` 收尾是 `(usd * 100.0 * rate).round()`,取整到**整美分**。而钱包
+    /// 是**人民币分**,比美分细 7.1 倍(bps=1408)。于是 0.5 美分以下的一次真实调用
+    /// 算出 0 分,`bill` 照常写用量、照常返回成功,用户一分钱没花 —— 属于
+    /// [[silent-falsehood-shapes]] 那一族:返回值和「这次本来就免费」不可区分。
+    ///
+    /// 生产实测(2026-09-03,24 小时窗口),按模型分「收到钱 / 收 0」两组的平均折合美分:
+    ///   claude-opus-5   15.53 / 1.60      claude-sonnet-5           3.55 / 0.43
+    ///   deepseek-v4-pro  1.53 / 0.14      deepseek-v4-flash-vision  3.05 / 0.50
+    /// 每一组的分界线都正好压在半美分上 —— 这不是巧合,就是 round() 本身。
+    /// vision-exp 那条线 235 次里 228 次收 0,合计 1700 万 token、目录价 $1.357。
+    ///
+    /// 修法:钱走 micro-USD 一路到底,**只在最后换成人民币分时取一次整,而且向上取整**。
+    #[test]
+    fn a_sub_cent_call_is_never_silently_free() {
+        let _g = crate::settings::settings_test_guard();
+        use super::{resolve_cost, resolve_cost_micro_usd};
+        use crate::settings::usd_micro_to_wallet_cents;
+
+        // 线上 deepseek-v4-flash-vision-exp 那一档的真实形状:几千 token、倍率 0.24。
+        // 入价 $0.27 / 出价 $1.10 每百万,4_000 入 + 600 出 → $0.001740,× 0.24 = $0.000418。
+        let usage = serde_json::json!({ "prompt_tokens": 4_000, "completion_tokens": 600 });
+        let old_cents = resolve_cost(
+            "rate", 0, Some(&usage), "deepseek-v4-flash-vision-exp",
+            0.24, 0.27, 1.10, 0.0, 0.0, Some((0.27, 1.10)), false,
+        );
+        let micro = resolve_cost_micro_usd(
+            "rate", 0, Some(&usage), "deepseek-v4-flash-vision-exp",
+            0.24, 0.27, 1.10, 0.0, 0.0, Some((0.27, 1.10)), false,
+        );
+
+        assert_eq!(old_cents, 0, "对照组失效了:这一笔本来就是被 round() 抹成 0 的那一类");
+        assert!(micro > 0, "micro 口径也丢了精度,那这条修法整个没落地");
+        assert!(
+            usd_micro_to_wallet_cents(micro) >= 1,
+            "花了真钱({} micro-USD)却收 0 人民币分 —— 白送又回来了",
+            micro
+        );
+
+        // 反方向:真正零成本的调用**不许**被向上取整变成收费。
+        assert_eq!(usd_micro_to_wallet_cents(0), 0, "零成本被收了钱");
+        assert_eq!(
+            resolve_cost_micro_usd("rate", 0, Some(&usage), "x", 0.0, 0.27, 1.10, 0.0, 0.0, Some((0.27, 1.10)), false),
+            0,
+            "倍率 0(白送线路)必须仍然是 0"
+        );
+    }
+
+    /// **钱包那一笔必须从 micro-USD 折算,不能从整美分。**
+    ///
+    /// 这一条守的是**接线**,不是算术:`usd_micro_to_wallet_cents` 自己有专门的算术测试,
+    /// 但把 `bill_inner` 里那一行换回 `usd_cents_to_wallet_cents(cost)` 之后,那些算术测试
+    /// **全都还是绿的** —— 断言真实,却守错了东西。整条修法的价值全在这一行接线上:
+    /// `cost` 已经被 `resolve_cost` 取整到整美分,不到半美分的调用在它身上就已经是 0 了,
+    /// 再怎么精确地折算 0 也还是 0。
+    ///
+    /// `bill_inner` 是 async 且要打库,没法在单测里真跑一遍,所以这里退而守源码里的那一行。
+    #[test]
+    fn the_wallet_is_converted_from_micro_usd_not_from_whole_cents() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let production = &src[..src.find("mod billing_tests").expect("tests module")];
+        let i = production.find("async fn bill_inner(").expect("bill_inner 不见了");
+        // 截到函数结束(顶格的 `}`),再**剥掉注释**:别处的说明文字里逐字写着这个旧写法,
+        // 不剥的话这条断言会匹配到自己的注释,变成恒真。见 [[source-assert-vs-comments]]。
+        let end = production[i..].find("\n}\n").map(|j| i + j).unwrap_or(production.len());
+        let body: String = production[i..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("let cost = crate::settings::usd_micro_to_wallet_cents(cost_micro);"),
+            "钱包又从整美分折算了 —— resolve_cost 已经把不到半美分的调用取整成 0,\
+             这一行是整条「亚分不再白送」修法唯一的落点"
+        );
+        assert!(
+            !body.contains("usd_cents_to_wallet_cents(cost)"),
+            "整美分那条老路又被接回 bill_inner 了"
+        );
+        // 反方向:两条换算路都还在(老的那条还有别的用途,别顺手删了)
+        assert!(
+            production.contains("fn resolve_cost_micro_usd(") && production.contains("fn resolve_cost("),
+            "micro 口径和整分口径必须并存 —— 队列快照那一路存的仍是美元分"
+        );
+    }
+
+    /// **免费池的毫点和钱包的分是同一把尺子**,所以毫点折成钱包分只除 `MILLI`。
+    ///
+    /// 这条是「免费池部分覆盖时钱包被重复收费」那个修法的判据,而且是**真跑一遍**,
+    /// 不是读源码:两个换算函数各自独立算,结果必须落在同一个刻度上。
+    ///
+    ///   1 积分 = 1 人民币分 = 1 钱包分,  1 积分 = MILLI 毫点
+    ///   ⇒ milli_points_for_micro_usd(m) / MILLI  ==  usd_micro_to_wallet_cents(m)
+    ///
+    /// 原来那行除的是 `milli_points_per_cent`(一整**美分**等于多少毫点,≈7103),
+    /// 差的正好是汇率那 7.1 倍 —— 于是池子付掉的份额只被减掉 1/7.1,其余向钱包再收一次。
+    ///
+    /// 两边都有取整(一个向上取整到毫点、一个向上取整到分),所以允许 1 分的误差;
+    /// 真出了单位错的话差的是 7.1 **倍**,这个容差挡不住它。
+    #[test]
+    fn pool_milli_and_wallet_cents_are_the_same_scale() {
+        for micro in [1_408, 14_080, 140_800, 1_408_000, 10_000_000, 123_456_789] {
+            let via_pool = super::milli_points_for_micro_usd(micro) / super::MILLI;
+            let via_wallet = crate::settings::usd_micro_to_wallet_cents(micro);
+            assert!(
+                (via_pool - via_wallet).abs() <= 1,
+                "micro={micro}: 池子折出 {via_pool} 分,钱包折出 {via_wallet} 分 —— \
+                 两把尺子分家了,免费池部分覆盖时会重复收费",
+            );
+        }
+        // 反方向:错误的除数必须显著地错。它要是也能通过,上面那条就没有鉴别力。
+        let micro = 10_000_000; // $10
+        let milli_per_cent = super::milli_points_for_micro_usd(super::MICRO_USD_PER_CENT).max(1);
+        let wrong = super::milli_points_for_micro_usd(micro) / milli_per_cent;
+        let right = crate::settings::usd_micro_to_wallet_cents(micro);
+        assert!(
+            (right - wrong).abs() > right / 2,
+            "旧除数({milli_per_cent})折出 {wrong},正确是 {right} —— 两者差得不够远,\
+             说明这条测试证明不了什么",
+        );
+    }
+
+    /// 上面那条证明了刻度,这条钉住**它真的被用在那一行上**。
+    ///
+    /// 同一个 `spent` 在 `bill_inner` 里要折进两个不同口径的数,所以两处除数**必须不同**:
+    /// 入队快照是美元分(除 `milli_points_per_cent`),待收金额是人民币分(除 `MILLI`)。
+    /// 这是最容易被后来人「统一一下」改回去的一行。
+    #[test]
+    fn the_pool_share_is_subtracted_in_wallet_cents_not_usd_cents() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let production = &src[..src.find("mod billing_tests").expect("tests module")];
+        let i = production.find("async fn bill_inner(").expect("bill_inner 不见了");
+        let end = production[i..].find("\n}\n").map(|j| i + j).unwrap_or(production.len());
+        // **先剥注释**:上面那段说明里逐字写着旧写法长什么样,不剥就匹配到自己,恒真。
+        let body: String = production[i..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("let pool_paid_cents = pool_paid_milli / MILLI;"),
+            "池子付掉的份额又按美分折算了 —— 那会让钱包把池子已付的钱再收一次",
+        );
+        assert!(
+            !body.contains("pool_paid_milli / milli_points_per_cent"),
+            "旧除数回来了",
+        );
+        // 入队快照那一处**必须**继续用美元分的除数,别被一起改掉。
+        assert!(
+            body.contains("residual_usd_cents(queued_usd_cents, spent / milli_points_per_cent)"),
+            "入队快照那处的除数被顺手改了 —— 队列存的是美元分,改了会在补扣时折错",
+        );
+    }
+
+    /// 运营吸收 = 应收 − 实扣,而且**只可能发生在靠套餐额度放行的调用上**。
+    ///
+    /// 按量付费那一支把超支全额记成钱包债务(允许余额为负),所以实扣恒等于应收;
+    /// 订阅那一支不制造债务,配额窗口尾巴上那一段就由运营方吃掉。这两件事以前
+    /// 只有一条 `tracing::warn!`,现在落进 `absorbed_cents`,报表才看得见。
+    #[test]
+    fn absorbed_is_the_gap_and_only_subscriptions_can_have_one() {
+        // 按量付费:钱包只有 100,要收 500 → 全额记债务,一分不吸收。
+        let pay_go = split_fused_charge(500, false, 0, 0, 0, 0, 100);
+        assert_eq!(pay_go.quota_cents, 0);
+        assert_eq!(pay_go.wallet_cents, 500, "按量付费的超支必须全额记成债务");
+        assert_eq!(
+            (500 - pay_go.total_cents()).max(0),
+            0,
+            "按量付费不该产生吸收",
+        );
+
+        // 订阅:配额只剩 120,钱包 0,要收 500 → 收 120,其余 380 由运营方吃掉。
+        let sub = split_fused_charge(500, true, 120, 120, 0, 0, 0);
+        assert_eq!(sub.quota_cents, 120);
+        assert_eq!(sub.wallet_cents, 0, "订阅放行不许把钱包扣成负数");
+        assert_eq!((500 - sub.total_cents()).max(0), 380, "吸收额算错了");
+
+        // 订阅且配额与钱包同时为 0 → 整笔吸收,而这正是 cost_cents 记 0 的那一种。
+        let all_absorbed = split_fused_charge(500, true, 0, 0, 0, 0, 0);
+        assert_eq!(all_absorbed.total_cents(), 0);
+        assert_eq!((500 - all_absorbed.total_cents()).max(0), 500);
+
+        // 配额够付 → 没有吸收。
+        let covered = split_fused_charge(500, true, 10_000, 10_000, 0, 0, 0);
+        assert_eq!(covered.total_cents(), 500);
+        assert_eq!((500 - covered.total_cents()).max(0), 0);
+    }
+
+    /// 换算恒等式 + 向上取整,单独钉一遍。
+    ///
+    /// 美分 = micro ÷ 10000;人民币分 = 美分 × 10000 ÷ bps。约掉就是 **人民币分 = micro ÷ bps**。
+    /// `realtime.rs` 里那句 `cny_cents = micro / bps` 是同一式子的独立印证 —— 两处必须同解。
+    #[test]
+    fn wallet_cents_round_up_from_micro_usd() {
+        let _g = crate::settings::settings_test_guard();
+        use crate::settings::{usd_micro_to_wallet_cents, usd_per_cny_bps};
+        let bps = usd_per_cny_bps();
+        assert!(bps > 0, "汇率没设,下面的算术全没意义");
+
+        // 整除:不多收
+        assert_eq!(usd_micro_to_wallet_cents(bps * 3), 3);
+        // 差一 micro 也算一整分 —— 花了真钱就至少 ¥0.01
+        assert_eq!(usd_micro_to_wallet_cents(bps * 3 + 1), 4);
+        assert_eq!(usd_micro_to_wallet_cents(1), 1, "最小的一笔真实花费不许变成 0");
+        // 负数/零:不收
+        assert_eq!(usd_micro_to_wallet_cents(0), 0);
+        // 负数要挑**大**的:小负数在 `(x + bps - 1) / bps` 这个式子里本来就落到 0,
+        // 用 -5 去测等于没测(实测把那道早退删掉,断言照样绿)。
+        assert_eq!(usd_micro_to_wallet_cents(-5), 0);
+        assert_eq!(usd_micro_to_wallet_cents(-3 * bps), 0, "退款/负数被当成一笔负债记进钱包了");
+        assert_eq!(usd_micro_to_wallet_cents(i64::MIN / 2), 0);
+
+        // 和整美分那条老路的关系:**同一个商,一个向下取整一个向上**。
+        // 差值只许是 0 或 1 人民币分 —— 差更多就说明有一条把 bps 用反了(乘除颠倒会差
+        // 五万倍,一眼看不出来但钱是真的)。方向也钉死:新路只许 ≥ 老路,不许更便宜。
+        for cents in [1_i64, 7, 133, 5_000] {
+            let up = usd_micro_to_wallet_cents(cents * super::MICRO_USD_PER_CENT);
+            let down = crate::settings::usd_cents_to_wallet_cents(cents);
+            assert!(
+                up >= down && up - down <= 1,
+                "{cents} 美分:向上取整 {up} 对不上向下取整 {down} —— 两条换算路不是同一个商"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod cache_price_tests {
     use super::*;
     use serde_json::json;
+
+    /// 这个模块自己把要用的目录价种下去。
+    ///
+    /// 原来不种:`official_price` 只读实时目录,而目录是个进程级全局。整仓跑的时候
+    /// 恰好有别的模块先调了 `billing_tests::seed_catalog()`,于是这里"顺带"有价;
+    /// 单跑 `cargo test cache_price_tests::` 就查不到价 → 计价返回 0 → 断言当场红。
+    /// 属于「整份测试文件在空转」的近亲:绿不绿取决于跑了哪些别的测试。
+    fn seed() {
+        use crate::model_catalog::{priced, seed_for_test};
+        seed_for_test(&[("claude-opus-4-6", priced(5.0, 25.0, 128_000, vec![1_000_000]))]);
+    }
+
     #[test]
     fn explicit_cache_prices_used() {
+        seed();
         // Anthropic shape: 1000 plain input + 2000 cache_read + 500 cache_create + 300 output
         let u = json!({"input_tokens":1000,"output_tokens":300,"cache_read_input_tokens":2000,"cache_creation_input_tokens":500});
         // off_in=5, off_out=25 (official claude). explicit read=0.5, create=6.5. rate=1.
@@ -19043,6 +21956,67 @@ mod cache_price_tests {
         None,
             false,);
         assert_eq!(c2, 2, "factor fallback: got {}", c2);
+    }
+
+    /// **上游一打折,缓存那两条腿就跟着少收 —— 而锚定这个功能正是为了防这件事。**
+    ///
+    /// 官方价锚定(`official_price_window_days`)只抬 `input_price` / `output_price`,
+    /// `cache_read_price` / `cache_write_price` 两列**没有被一起抬**。而
+    /// `effective_cache_prices` 把缓存价当**倍率**用:挂牌缓存价 ÷ 挂牌输入价。
+    /// 分子是今天的活动价、分母是窗口内锚定过的旧高价 —— 两个年代的数拼在一起,
+    /// 倍率整体缩水,缓存读和缓存写按降幅线性少收,一声不吭。
+    ///
+    /// 缓存是这类模型**最大的计费项**(生产实测 claude-opus-5 单日 9500 万缓存读 +
+    /// 3200 万缓存写),所以这条腿的比例错多少,账单就直接错多少。
+    #[test]
+    fn cache_ratio_uses_the_same_vintage_on_both_sides() {
+        use crate::model_catalog::{seed_for_test, Entry};
+
+        // 上游把输入价从 $5 打折到 $4(八折),缓存价同比例跟着降到 0.4 / 5.0。
+        // 锚定把 input_price 抬回 5,spot_input_price 留下打折那一刻的 4。
+        let discounted = Entry {
+            input_price: Some(5.0),        // 锚定后的计费输入价
+            spot_input_price: Some(4.0),   // 今天真实挂牌
+            cache_read_price: Some(0.4),   // 挂牌缓存读 = 挂牌输入 × 0.1
+            cache_write_price: Some(5.0),  // 挂牌缓存写 = 挂牌输入 × 1.25
+            ..Default::default()
+        };
+        seed_for_test(&[("anchored-discount-probe", discounted)]);
+
+        let (read, write) = effective_cache_prices(
+            "anchored-discount-probe",
+            5.0,   // 计费输入价 = 锚定价
+            0.0, 0.0,
+            true,  // price_is_per_model:走目录倍率这一支
+            false,
+        );
+        // 上游公布的比例是 0.1× / 1.25×,和打不打折无关。乘上计费输入价 5:
+        assert!(
+            (read - 0.5).abs() < 1e-9,
+            "缓存读按打折后的比例收了:{read}(应当 0.5)—— 分母用了锚定价、分子用了活动价"
+        );
+        assert!(
+            (write - 6.25).abs() < 1e-9,
+            "缓存写按打折后的比例收了:{write}(应当 6.25)"
+        );
+
+        // 反方向:没有 spot(这个模型没进锚定窗口)时,分母退回 input_price,
+        // 行为必须逐字等同于加这段之前 —— 否则就是把一个 bug 换成另一个。
+        let plain = Entry {
+            input_price: Some(5.0),
+            spot_input_price: None,
+            cache_read_price: Some(0.6),   // 上游自己就把缓存读定得贵一点(0.12×)
+            cache_write_price: Some(5.0),
+            ..Default::default()
+        };
+        seed_for_test(&[("no-anchor-probe", plain)]);
+        let (r2, w2) = effective_cache_prices("no-anchor-probe", 10.0, 0.0, 0.0, true, false);
+        assert!((r2 - 1.2).abs() < 1e-9, "没锚定时倍率算错了:{r2}(0.6/5 × 10 = 1.2)");
+        assert!((w2 - 10.0).abs() < 1e-9, "没锚定时写入倍率算错了:{w2}");
+
+        // 连接级显式填了缓存价、且没有每模型覆盖时,倍率这一支根本不该被走到。
+        let (r3, w3) = effective_cache_prices("anchored-discount-probe", 5.0, 0.9, 9.9, false, false);
+        assert_eq!((r3, w3), (0.9, 9.9), "连接级显式缓存价被倍率覆盖了");
     }
 }
 
@@ -20072,10 +23046,16 @@ async fn compression_summarize(
             { "role": "user", "content": text },
         ],
     });
+    // 按线路自己的协议走。以前无条件拼 /chat/completions，于是 Anthropic 线路上的摘要
+    // 模型全程以 OpenAI 兼容形状跑 —— 线上实测同一个 Claude 模型走这条路缓存命中 0.7%，
+    // 走原生 /v1/messages 是 203%。摘要提示词逐字不变、正是最该命中缓存的那一段。
+    let key = model_key(&conn.api_key); // 落库密文 → 解密再发。
+    let (url, payload) = aux_wire_request(&conn.base_url, &conn.protocol, &payload).ok()?;
     let resp = GW_HTTP
-        .post(format!("{}/chat/completions", api_base(&conn.base_url)))
-        // 落库密文 → 解密再发。
-        .header("Authorization", format!("Bearer {}", model_key(&conn.api_key)))
+        .post(url)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("x-api-key", &key)
+        .header("anthropic-version", "2023-06-01")
         .json(&payload)
         .timeout(Duration::from_secs(120))
         .send()
@@ -20084,7 +23064,8 @@ async fn compression_summarize(
     if !resp.status().is_success() {
         return None;
     }
-    let data: serde_json::Value = resp.json().await.ok()?;
+    // 还原成 OpenAI 形状：下面读 choices 和 usage 的代码不用动，计费口径也不变。
+    let data = aux_wire_response(&conn.protocol, model_id, resp.json().await.ok()?);
     let out = data
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
@@ -20356,8 +23337,19 @@ fn compression_write_back(
     // 挪到尾部末条之前：文本一个字不改，模型照样读得到，而每步只作废最后一两条。
     // 留最后一条在最末尾是有意的——多家上游把「最后一条 user」当本轮请求来做门控。
     if let Some(text) = retrieved_history.filter(|text| !text.trim().is_empty()) {
-        let at = out.len().saturating_sub(1);
-        out.insert(at, json!({ "role": "system", "content": text }));
+        // **恒定排在最末尾**，不论尾部消息的 role 是什么。
+        //
+        // 旧版对 role=user 的尾部插在它之前、role=tool 的排末尾。两步之间 role 会变
+        // （第一步拿到用户消息、第二步拿到工具结果），于是检索块的**位置**在数组里跳来
+        // 跳去，把 OpenAI / xAI 的严格前缀缓存从插入点往后全部作废。线上实测的形状正是
+        // 「缓存量恒定、不随请求增长」——只有检索块之前那段能命中。
+        //
+        // 排到最末尾之后：
+        //   ① 两步之间，历史消息是纯追加，整段前缀都能命中。
+        //   ② 检索块内容每步都变，但它只占末尾几千 token，不影响前面的长前缀。
+        //   ③ 多家上游靠「最后一条 role=user」做门控——这里是 role=system，不会遮盖它。
+        //   ④ Anthropic 的滚动断点在最后一条 tool_result 上，检索块排在它后面不会作废断点。
+        out.push(json!({ "role": "system", "content": text }));
     }
     if let Some(slot) = body.get_mut("messages") {
         *slot = serde_json::Value::Array(out);
@@ -21479,7 +24471,10 @@ async fn bill_vision_call(
     // 单独打标，和聊天、压缩三者在用量表里分得开。
     let mut tokens = extract_bill_tokens(usage.filter(|_| reported), "michael-vision/gpt-5.5", !reported);
     tokens.request_id = None;
-    bill(state, uid, vconn.health_id(), vconn.id, cost, false, &tokens, false, 0).await;
+    // 网关自用：识图是网关自己发起的一次调用，不属于客户端的任何一次运行。
+    tokens.run_id = None;
+    bill(state, uid, vconn.health_id(), vconn.id, cost, false, &tokens, false, 0, vconn.rate,
+        cost.saturating_mul(MICRO_USD_PER_CENT)).await;
 }
 
 async fn bill_compression_call(
@@ -21519,6 +24514,8 @@ async fn bill_compression_call(
         !reported,
     );
     tokens.request_id = None;
+    // 网关自用：压缩是网关自己发起的，不属于客户端的任何一次运行。
+    tokens.run_id = None;
     // use_quota=true：压缩是**套餐内含的能力**（档位就是按套餐分的），所以走会员的
     // 时段额度，而不是钱包余额。
     //
@@ -21526,7 +24523,8 @@ async fn bill_compression_call(
     // 零余额的用户扣成负数 —— 他被自己套餐包含的功能扣出了债。压缩省下来的输入
     // token 远多于摘要本身的花费，走额度对用户是净赚；而"额度少了一截"这件事，
     // 正确的解法是在用量页面把压缩单独列出来，不是把账记到钱包上。
-    bill(state, uid, conn.health_id(), conn.id, cost, true, &tokens, false, 0).await;
+    bill(state, uid, conn.health_id(), conn.id, cost, true, &tokens, false, 0, conn.rate,
+        cost.saturating_mul(MICRO_USD_PER_CENT)).await;
 }
 
 #[cfg(test)]
@@ -21605,24 +24603,122 @@ mod route_cooldown_tests {
         let mut c = Model::blank();
         c.id = uuid::Uuid::new_v4();
         c.endpoint_id = Some(ep);
-        let wait = header_wait_for_candidate(Duration::from_secs(30), &c, Instant::now());
+        let wait = header_wait_for_candidate(Duration::from_secs(30), &c, Instant::now(), 0);
         assert!(
             wait < Duration::from_millis(13_300),
             "本该被拖到 13.3 秒以下（那样慢成功必被截断），实际 {wait:?}"
         );
     }
 
-    /// 收窄必须真的接在派单路径上 —— 函数写对了但没人调，等于没关跨线路。
+    /// **表头等待必须跟着请求大小走 —— 不然大请求会被自己的历史均值铡死。**
     ///
-    /// 这条守的是**调用点**：`narrow_to_one_route` 的单测只证明函数本身对，把那一行
-    /// 从主循环里删掉，那些单测照样全绿（我实测过）。所以在源码上钉住它被调用、
-    /// 且位置在 `expand()` 之后（收窄的输入必须是展开后的扁平表）。
+    /// EWMA 是这条出口所有请求混在一起的平均首字时间,它不知道这一笔有多大。
+    /// 一条平时跑小请求、均值 3.25 秒的出口算出来上限是 13 秒,而一轮 195k token 的
+    /// agent 请求光让上游把输入吃进去就不止 13 秒 —— 必然超时。
+    ///
+    /// 而且这个错**会自我强化**:超时发生在拿到表头之前,`record_route_header_ms`
+    /// 永远收不到这一笔的真实耗时,均值只会被小请求拉低、永远不会被大请求拉高。
+    /// 生产实拍 2026-09-03:deepseek 那条线路 5 个出口全部
+    /// 「upstream sent no response headers within 13s」,而用户上下文是 195k token。
     #[test]
-    fn the_dispatch_path_actually_narrows_to_one_route() {
+    fn a_big_request_is_not_guillotined_by_a_small_request_average() {
+        let ep = uuid::Uuid::new_v4();
+        // 平时都是 3.25 秒的小请求 → 速度档 = 3.25 × 4 = 13 秒
+        for _ in 0..12 {
+            record_route_header_ms(ep, 3_250);
+        }
+        let mut c = Model::blank();
+        c.id = uuid::Uuid::new_v4();
+        c.endpoint_id = Some(ep);
+        let base = Duration::from_secs(30);
+        let now = Instant::now();
+
+        // 小请求:档位一点没变（这是那道收紧本身的价值,不能顺手弄丢）
+        let small = header_wait_for_candidate(base, &c, now, 4 * 1024);
+        assert!(
+            small <= Duration::from_millis(13_500) && small >= Duration::from_millis(12_500),
+            "小请求的速度档被改动了:{small:?}(应当仍是 13 秒上下)"
+        );
+
+        // 大请求:必须显著更宽,并且被 base 兜住不越界
+        let big = header_wait_for_candidate(base, &c, now, 600 * 1024);
+        assert!(
+            big > small,
+            "大请求拿到的窗口没有比小请求宽 —— 195k 上下文会继续被 13 秒铡掉"
+        );
+        assert!(
+            big >= Duration::from_secs(25),
+            "大请求的窗口还是太短:{big:?}"
+        );
+        assert!(big <= base, "越过了 base 上限:{big:?} —— 慢线路会被无限等");
+
+        // 反方向:没有 EWMA 样本时不受影响,仍然是 base
+        let fresh_ep = uuid::Uuid::new_v4();
+        let mut f = Model::blank();
+        f.id = uuid::Uuid::new_v4();
+        f.endpoint_id = Some(fresh_ep);
+        assert_eq!(
+            header_wait_for_candidate(base, &f, now, 600 * 1024),
+            base,
+            "没有样本的出口不该因为请求大小而变"
+        );
+    }
+
+    /// **只留首选线路，备用线路从候选里整个删掉。**
+    ///
+    /// 线路由用户选，不许因为质量偷偷换。没配多路由的线路不该跨到同模型其它线路。
+    #[test]
+    fn only_the_chosen_route_survives() {
+        let chosen = uuid::Uuid::new_v4();
+        let backup = uuid::Uuid::new_v4();
+        let mk = |rid: uuid::Uuid, eid: Option<uuid::Uuid>| {
+            let mut m = Model::blank();
+            m.id = rid;
+            m.endpoint_id = eid;
+            m
+        };
+        let cands = vec![
+            mk(chosen, None),
+            mk(chosen, Some(uuid::Uuid::new_v4())),
+            mk(backup, None),
+            mk(backup, Some(uuid::Uuid::new_v4())),
+        ];
+        let (out, primary) = prefer_one_route(cands, |_| (10, 1), None);
+        assert_eq!(primary, Some(chosen));
+        assert_eq!(out.len(), 2, "备用线路没被丢掉 —— 那就是跨线路兜底");
+        assert!(
+            out.iter().all(|m| m.id == chosen),
+            "混进了不是首选线路的出口"
+        );
+        assert_eq!(super::CHAT_MAX_STALL_SWITCHES, 1);
+        assert_eq!(super::CHAT_MAX_CROSS_ROUTE_SWITCHES, 0);
+    }
+
+    /// 失败文案不许再承诺「重发就会换线」,也不许把出口说成线路。
+    ///
+    /// 老文案两处都假:`route_count` 取在收窄之后数的是**出口**,而跨线路兜底当时是关的。
+    /// 用户照着重发四次、四次回到同一条线路、四次空手(生产实拍 2026-09-03)。
+    #[test]
+    fn the_failure_text_promises_nothing_it_cannot_keep() {
+        for (rc, at) in [(2usize, 1u32), (5, 2), (24, 7)] {
+            let msg = chat_upstream_attempt_suffix(rc, at, 504, false);
+            assert!(!msg.contains("重发"), "又承诺重发会换线了:{msg}");
+            assert!(!msg.contains("自动改走"), "又承诺自动换线了:{msg}");
+            assert!(!msg.contains("条线路"), "又把出口说成线路了:{msg}");
+            assert!(!msg.contains("条没试过"), "同上:{msg}");
+        }
+        // 说的数字必须自洽:试了几个 + 还剩几个 = 总数
+        let msg = chat_upstream_attempt_suffix(5, 2, 504, false);
+        assert!(msg.contains("试了 2 个上游目标") && msg.contains("还有 3 个没试"), "{msg}");
+    }
+
+    /// 收窄必须真的接在派单路径上 —— 函数写对了但没人调，等于首选线路没被尊重。
+    #[test]
+    fn the_dispatch_path_filters_to_one_route() {
         let src = include_str!("models.rs");
-        const CALL: &str = "\n        candidates = narrow_to_one_route(candidates, rate_of);";
+        const CALL: &str = "\n        let (reordered, primary) = prefer_one_route(candidates, rate_of, explicit_route);";
         let at = src.find(CALL).expect(
-            "派单路径上没有调用 narrow_to_one_route —— 跨线路兜底其实没关掉，\
+            "派单路径上没有调用 prefer_one_route —— 首选线路不再被优先，\
              或者调用形状变了（那就更新这条断言的锚点）",
         );
         let expand_at = src
@@ -21632,12 +24728,17 @@ mod route_cooldown_tests {
             expand_at < at,
             "收窄跑到 expand 前面去了——那样它吃到的还不是「线路 × 门」的扁平表"
         );
-        assert_eq!(src.matches(CALL).count(), 1, "出现了第二个收窄点，逐一确认后再改这条");
+        assert_eq!(src.matches(CALL).count(), 1, "出现了第二个排序点，逐一确认后再改这条");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod ").unwrap_or(src.len())];
+        assert!(
+            prod.contains("candidates.into_iter().filter(|c| c.id == rid).collect()"),
+            "不是 filter 了 —— 备用线路会留在候选里，等于偷偷跨线路"
+        );
     }
 
-    /// 只留一条线路：跨线路兜底关掉之后，一个请求只在这条线路的出口之间切换。
+    /// 只留首选线路的出口，备用线路整个丢弃。
     #[test]
-    fn only_one_route_survives_narrowing() {
+    fn only_the_primary_routes_endpoints_survive() {
         let a = uuid::Uuid::new_v4();
         let b = uuid::Uuid::new_v4();
         let mk = |rid: uuid::Uuid, eid: Option<uuid::Uuid>| {
@@ -21646,7 +24747,6 @@ mod route_cooldown_tests {
             m.endpoint_id = eid;
             m
         };
-        // A 线路 3 个门（自带地址 + 2 个出口），B 线路 2 个。
         let cands = vec![
             mk(a, None),
             mk(a, Some(uuid::Uuid::new_v4())),
@@ -21654,17 +24754,13 @@ mod route_cooldown_tests {
             mk(b, None),
             mk(b, Some(uuid::Uuid::new_v4())),
         ];
-        // 都有成功记录 → 按顺序取第一条线路 A，且 A 的三个门**全部保留**（这就是多路由）。
-        let out = narrow_to_one_route(cands, |_| (10, 1));
-        assert_eq!(out.len(), 3, "线路内的多个出口被砍掉了，多路由就没了");
-        assert!(out.iter().all(|m| m.id == a), "混进了别的线路");
+        let (out, primary) = prefer_one_route(cands, |_| (10, 1), None);
+        assert_eq!(primary, Some(a), "首选线路认错了");
+        assert_eq!(out.len(), 3, "备用线路没被丢掉 —— 那就是跨线路兜底");
+        assert!(out.iter().all(|m| m.id == a), "混进了备用线路的出口");
     }
 
-    /// 「试过、从来没成过」的线路要跳过——这条防的是一次确定的停机。
-    ///
-    /// 线上 glm-5.3-flash：智普(sort 靠前) 对这个模型只有一个当天新建的出口
-    /// （0 成 2 败），而 670 成 62 败的那个在排后面那条线路上。今天靠跨线路兜底
-    /// 才没出事；按 sort 直接收窄会把每一发都钉死在 0 成 2 败上。
+    /// 「试过、从来没成过」的线路要跳过，选下一条有成功记录的。
     #[test]
     fn a_route_that_never_worked_is_skipped() {
         let dead = uuid::Uuid::new_v4();
@@ -21676,13 +24772,13 @@ mod route_cooldown_tests {
             m.endpoint_id = eid;
             m
         };
-        // 排在前面的是那条只有一个 0 成 2 败出口的线路。
         let cands = vec![mk(dead, Some(dead_ep)), mk(good, None)];
-        let out = narrow_to_one_route(cands, |m| {
+        let (out, primary) = prefer_one_route(cands, |m| {
             if m.endpoint_id == Some(dead_ep) { (0, 2) } else { (670, 62) }
-        });
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].id, good, "被钉死在那条从来没成过的线路上了");
+        }, None);
+        assert_eq!(primary, Some(good), "被钉死在那条从来没成过的线路上了");
+        assert_eq!(out.len(), 1, "选了 good 但 dead 没被丢掉");
+        assert_eq!(out[0].id, good);
     }
 
     /// 全新、还没有任何样本的线路不许被饿死：0 成 0 败照旧按顺序拿流量。
@@ -21695,10 +24791,12 @@ mod route_cooldown_tests {
             m.id = rid;
             m
         };
-        let out = narrow_to_one_route(vec![mk(fresh), mk(old)], |m| {
+        let (out, primary) = prefer_one_route(vec![mk(fresh), mk(old)], |m| {
             if m.id == fresh { (0, 0) } else { (999, 1) }
-        });
-        assert_eq!(out[0].id, fresh, "没有证据不构成降级理由——新线路被误跳过了");
+        }, None);
+        assert_eq!(primary, Some(fresh), "没有证据不构成降级理由——新线路被误跳过了");
+        assert_eq!(out.len(), 1, "只留选中的那条");
+        assert_eq!(out[0].id, fresh);
     }
 
     /// 全都从来没成过时照样发第一个：宁可试一发，也不把请求直接打死。
@@ -21711,9 +24809,30 @@ mod route_cooldown_tests {
             m.id = rid;
             m
         };
-        let out = narrow_to_one_route(vec![mk(a), mk(b)], |_| (0, 5));
-        assert_eq!(out.len(), 1);
+        let (out, primary) = prefer_one_route(vec![mk(a), mk(b)], |_| (0, 5), None);
+        assert_eq!(primary, Some(a));
+        assert_eq!(out.len(), 1, "只留选中的那条");
         assert_eq!(out[0].id, a);
+    }
+
+    /// 用户通过 x-ide-route 显式选的线路，即使它「从来没成过」也不跳过。
+    #[test]
+    fn pinned_route_is_never_skipped() {
+        let pinned_id = uuid::Uuid::new_v4();
+        let good = uuid::Uuid::new_v4();
+        let mk = |rid| {
+            let mut m = Model::blank();
+            m.id = rid;
+            m
+        };
+        let (out, primary) = prefer_one_route(
+            vec![mk(pinned_id), mk(good)],
+            |m| if m.id == pinned_id { (0, 2) } else { (100, 0) },
+            Some(pinned_id),
+        );
+        assert_eq!(primary, Some(pinned_id), "用户显式选的线路被跳过了");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, pinned_id);
     }
 
     /// 出口候选也必须吃到自适应收紧 —— 这条守的是一次真实的键错事故。
@@ -21724,7 +24843,7 @@ mod route_cooldown_tests {
     /// 3~6 个出口，等于绝大多数候选从来没被收紧过。
     ///
     /// 注意这条**必须打在 `header_wait_for_candidate` 上**：函数本身没错，错的是调用点
-    /// 传了哪个键，所以只测 `header_wait_for_route(base, id, now)` 是抓不到的。
+    /// 传了哪个键，所以只测 `header_wait_for_route(base, id, now, 0)` 是抓不到的。
     #[test]
     fn an_endpoint_candidate_gets_its_own_adaptive_header_budget() {
         let route_id = uuid::Uuid::new_v4();
@@ -21738,20 +24857,25 @@ mod route_cooldown_tests {
         // 这个出口实测 5 秒回表头（polly 的量级）——写入用的是它自己的 health_id。
         record_route_header_ms(candidate.health_id(), 5_000);
 
-        let got = header_wait_for_candidate(base, &candidate, Instant::now());
+        let got = header_wait_for_candidate(base, &candidate, Instant::now(), 0);
         assert!(
             got < base,
             "出口候选没吃到自适应收紧，仍然是满额 {base:?}（读写键又对不上了）"
         );
-        // 5s × 2.5 = 12.5s，但有 10 秒下限，所以是 12.5s。
-        assert_eq!(got, Duration::from_secs(12) + Duration::from_millis(500));
+        // 5s × 4 = 20s（系数 2026-09-02 从 2.5 抬到 4，理由见 header_wait_for_route：
+        // 均值表达不了尾巴，而 grok 的 p95/均值是 2.7，2.5 正好卡在它底下，
+        // 9% 的请求被自己的超时杀掉）。10 秒下限在这个量级上不再是约束。
+        //
+        // 这条等号守的是「算式没被悄悄换掉」；真正的不变量是上面那句 got < base
+        // （出口确实吃到了自适应收紧、读写键没有再对不上）。
+        assert_eq!(got, Duration::from_secs(20));
 
         // 反向：没有样本的出口照旧拿满额，不许因为这条修法把新出口误压。
         let mut fresh = Model::blank();
         fresh.id = uuid::Uuid::new_v4();
         fresh.endpoint_id = Some(uuid::Uuid::new_v4());
         assert_eq!(
-            header_wait_for_candidate(base, &fresh, Instant::now()),
+            header_wait_for_candidate(base, &fresh, Instant::now(), 0),
             base,
             "没有样本的新出口不该被收紧"
         );
@@ -21779,12 +24903,12 @@ mod route_cooldown_tests {
         let base = STANDARD_MAX_HEADER_WAIT;
 
         // 没有前科：完整预算。
-        assert_eq!(header_wait_for_route(base, id, Instant::now()), base);
+        assert_eq!(header_wait_for_route(base, id, Instant::now(), 0), base);
 
         // 卡满过一次之后：压到短探测预算——仍然会发，只是失败得起。
         mark_route_stall(id);
         assert_eq!(
-            header_wait_for_route(base, id, Instant::now()),
+            header_wait_for_route(base, id, Instant::now(), 0),
             CHAT_UPSTREAM_STALLED_PROBE_WAIT
         );
         // 上限：要显著更短，否则这条规则什么也没做。取一半以下，保证等待时间真的腰斩。
@@ -21805,7 +24929,7 @@ mod route_cooldown_tests {
         }
         mark_route_stall(slow);
         assert!(
-            header_wait_for_route(base, slow, Instant::now()) >= Duration::from_secs(24),
+            header_wait_for_route(base, slow, Instant::now(), 0) >= Duration::from_secs(24),
             "一条正常就要 24 秒的线路被短预算截断了 —— 它会一直被记成卡死，永远翻不了身"
         );
         // 而快线路必须真的被压下去，否则这条规则什么也没做。
@@ -21814,15 +24938,22 @@ mod route_cooldown_tests {
             record_route_header_ms(quick, 5_000); // polly 的实测均值
         }
         mark_route_stall(quick);
-        let quick_wait = header_wait_for_route(base, quick, Instant::now());
-        // 用 `<=` 不用 `==`：按速度那一档（5s × 2.5 = 12.5s）本来就比短预算 15s 更紧，
-        // 两道收紧取小者。写死等号会把「按速度切得更快」误判成回归。
+        let quick_wait = header_wait_for_route(base, quick, Instant::now(), 0);
+        // 用 `<=` 不用 `==`：两道收紧取小者，按速度那一档可能比短预算更紧。
         assert!(
             quick_wait <= CHAT_UPSTREAM_STALLED_PROBE_WAIT,
             "卡顿过的快线路没有被压到短预算（拿到 {quick_wait:?}）—— 挂了还要陪它等满预算"
         );
+        // 从 `<` 放宽成 `<=`，因为系数 2.5→4 之后按速度那一档（5s×4=20s）不再比短预算
+        // 15s 更紧，两者取小 = 正好 15s = base/2。
+        //
+        // **这是那次改动换来的真实代价，不是断言写松了**：卡顿过的快线路的故障切换
+        // 从 12.5 秒变成 15 秒，慢了 2.5 秒。换回来的是 grok 那 9% 被自己超时杀掉的请求
+        // （它均值 3.4 秒但尾巴超过 10 秒，而且分布是被截断的——成功样本最大值 9,897ms
+        // 紧贴着 10,000ms 的超时线，真实尾巴比看到的更长）。
+        // 上限仍是 base 的一半，这条规则本身没有失效。
         assert!(
-            quick_wait < base / 2,
+            quick_wait <= base / 2,
             "快线路的等待没有显著低于上限，这条规则等于没做"
         );
     }
@@ -21837,7 +24968,7 @@ mod route_cooldown_tests {
         clear_route_stall(id);
         assert!(!route_recently_stalled(id, Instant::now()));
         assert_eq!(
-            header_wait_for_route(STANDARD_MAX_HEADER_WAIT, id, Instant::now()),
+            header_wait_for_route(STANDARD_MAX_HEADER_WAIT, id, Instant::now(), 0),
             STANDARD_MAX_HEADER_WAIT
         );
     }
@@ -21880,8 +25011,8 @@ mod stall_routing_tests {
             super::record_route_header_ms(slow, 24_400);
         }
 
-        let fast_wait = super::header_wait_for_route(base, fast, now);
-        let slow_wait = super::header_wait_for_route(base, slow, now);
+        let fast_wait = super::header_wait_for_route(base, fast, now, 0);
+        let slow_wait = super::header_wait_for_route(base, slow, now, 0);
 
         // 快线路：不回应时必须**远早于** base 就放弃，否则用户干等一分钟。
         assert!(
@@ -21901,12 +25032,12 @@ mod stall_routing_tests {
         // **永远不放宽。** 上一版正是在这里放宽到了 base 之上。
         for id in [fast, slow, fresh] {
             assert!(
-                super::header_wait_for_route(base, id, now) <= base,
+                super::header_wait_for_route(base, id, now, 0) <= base,
                 "预算超过了请求本身的上限 —— 切换只会比不改更慢",
             );
         }
         // 没有样本（刚重启）→ 退回 base，不凭一个还不存在的均值砍线路。
-        assert_eq!(super::header_wait_for_route(base, fresh, now), base);
+        assert_eq!(super::header_wait_for_route(base, fresh, now, 0), base);
     }
 
     /// 上一条自己往表里塞样本。生产代码里那句 record 如果不存在，它**照样绿** ——
@@ -22166,7 +25297,60 @@ mod cache_key_tests {
 
 #[cfg(test)]
 mod step_kind_tests {
-    use super::{step_emitted_tool, step_is_tool_turn, step_mode};
+    use super::{scan_for_emitted_tool, step_emitted_tool, step_is_tool_turn, step_mode};
+
+    /// 工具名落在 1MB 之外时照样要认出来。
+    ///
+    /// 这是线上那道偏差的直接复现：`acc` 是响应缓存的载荷、封顶 1MB，而工具调用在流的
+    /// **末尾**。原来的做法（收完再从 acc 里找）在输出一长时就永远找不到 ——
+    /// completion_tokens >12k 的行只有 43.6% 记到了工具名，而那正是唯一想看的那批。
+    #[test]
+    fn a_tool_call_past_the_one_megabyte_cap_is_still_recorded() {
+        let filler = "data: {\"choices\":[{\"delta\":{\"content\":\"字\"}}]}\n\n".repeat(40_000);
+        let tail = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"read_file\"}}]}}]}\n\n";
+        assert!(filler.len() > 1_000_000, "填充没超过 1MB，这条测试就没在测它要测的东西");
+
+        // 老做法：整条流截到 1MB 再找 —— 找不到。
+        let capped: String = filler.chars().take(1_000_000).collect();
+        assert_eq!(step_emitted_tool(&capped), None, "前 1MB 里本来就不该有工具名");
+
+        // 新做法：边流边认，分块喂进去。
+        let mut seen = None;
+        let mut buf = Vec::new();
+        for chunk in filler.as_bytes().chunks(8_192) {
+            scan_for_emitted_tool(&mut seen, &mut buf, chunk);
+        }
+        assert_eq!(seen, None, "正文里没有工具调用却认出了一个");
+        scan_for_emitted_tool(&mut seen, &mut buf, tail.as_bytes());
+        assert_eq!(seen.as_deref(), Some("read_file"), "1MB 之外的工具调用又丢了");
+    }
+
+    /// 工具名被 SSE 分块**从中间切开**时也要认出来 —— 尾巴就是为这个留的。
+    #[test]
+    fn a_tool_name_split_across_chunks_is_still_recorded() {
+        let whole = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"run_cmd\"}}]}}]}\n\n";
+        // 逐个字节找一个真能把 `"function"…"name":"run_cmd"` 切断的位置。
+        let cut = whole.find("\"function\"").expect("样本形状变了") + 4;
+        let mut seen = None;
+        let mut buf = Vec::new();
+        scan_for_emitted_tool(&mut seen, &mut buf, whole[..cut].as_bytes());
+        assert_eq!(seen, None, "半截就认出来了？那认的不是完整的名字");
+        scan_for_emitted_tool(&mut seen, &mut buf, whole[cut..].as_bytes());
+        assert_eq!(seen.as_deref(), Some("run_cmd"), "跨块的工具名没拼回来");
+    }
+
+    /// 认到一个之后就不再改口：语义是「这一轮**第一个**工具」，和原来整份扫一致。
+    #[test]
+    fn the_streaming_scanner_keeps_the_first_tool_like_the_old_full_scan() {
+        let two = "\"function\":{\"name\":\"read_file\"} then \"function\":{\"name\":\"run_cmd\"}";
+        let mut seen = None;
+        let mut buf = Vec::new();
+        for chunk in two.as_bytes().chunks(7) {
+            scan_for_emitted_tool(&mut seen, &mut buf, chunk);
+        }
+        assert_eq!(seen.as_deref(), step_emitted_tool(two).as_deref());
+        assert_eq!(seen.as_deref(), Some("read_file"));
+    }
     use axum::http::HeaderMap;
     use serde_json::json;
 
@@ -23885,15 +27069,21 @@ mod audit_20260822_tests {
             "健康又按线路记了：后台自动探测靠「这个出口最近成功过没有」跳过探测，\
              记到线路头上会让它对所有出口一起跳过",
         );
+        // 思考**静音**那一套已按所有者要求整个删除（不降权，走用户选的线路），
+        // 所以这里只剩**钳位**要配对。钳位判的是「上游把思考后面的块整个丢了」，
+        // 那是一次真实的内容缺失，和「这一轮想没想」不是一回事。
         assert!(
-            body.contains("route_mutes_thinking(candidate.id, now)")
-                && body.contains("thinking_clip_active(candidate.id)"),
-            "思考静音/钳位的读取端改成出口了，而写入端是 cid（线路 id，因为它同时是计费归属）\
-             —— 读写不成对，这两个降权从此永远不生效",
+            body.contains("thinking_clip_active(candidate.id)"),
+            "思考钳位的读取端改成出口了，而写入端是 cid（线路 id，因为它同时是计费归属）\
+             —— 读写不成对，这个降权从此永远不生效",
         );
         assert!(
-            body.contains("mark_thinking_mute(cid)") && body.contains("mark_thinking_clip(cid)"),
+            body.contains("mark_thinking_clip(cid)"),
             "写入端不再是 cid 了，上面那条配对判断的前提没了",
+        );
+        assert!(
+            !body.contains(concat!("route_mutes", "_thinking")),
+            "思考静音又被接回派单了 —— 所有者定的是不降权：用户选哪条线路就走哪条",
         );
     }
 
@@ -24190,10 +27380,16 @@ mod code_corpus_leg_tests {
             "两处用量解析各要读两种位置（顶层 + prompt_tokens_details），共 4 处真实读取"
         );
         // 真实计费那一路，OpenAI 形状的写入位不许再硬写 0。
+        //
+        // 按**结构**取到这段的收尾（那个 `};`），不按字符数开窗口。原来是 `&src[at..at+900]`：
+        // 这一段里后来加了「1 小时 TTL 单独计价」的说明，窗口末端正好落进一个中文句号
+        // 中间 —— Rust 的 &str 切片在非字符边界上直接 panic，测试红了而代码是对的。
+        // 固定窗口切源码在这个仓库栽过很多次：函数一长它就不再守着尾部。
         let at = src
             .find("let (plain_input, read_tok, write_tok) =")
             .expect("计费拆分不见了");
-        let block = &src[at..at + 900];
+        let end = src[at..].find("\n    };").map(|d| at + d).unwrap_or(src.len());
+        let block = &src[at..end];
         assert!(
             block.contains("cached, cache_creation)"),
             "OpenAI 形状的缓存写入又被算成 0 了"
@@ -24215,3 +27411,293 @@ mod code_corpus_leg_tests {
     }
 }
 
+#[cfg(test)]
+mod aux_thinking_tests {
+    use super::*;
+
+    fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            let name = axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap();
+            h.insert(name, v.parse().unwrap());
+        }
+        h
+    }
+
+    /// 老版客户端不带 x-ide-aux：三条判据缺一不可。max_tokens 的界是 5000（见 is_ide_aux_request
+    /// 的预算表）：意图裁决在线路上是 900+4096=4996，认知腿最小是 2000+4096=6096。
+    #[test]
+    fn aux_is_recognised_only_when_all_three_signs_line_up() {
+        let small = json!({"model": "deepseek-v4-pro", "max_tokens": 900});
+        let intent = json!({"model": "deepseek-v4-pro", "max_tokens": 4996});
+        let critic = json!({"model": "deepseek-v4-pro", "max_tokens": 6096});
+        let big = json!({"model": "deepseek-v4-pro", "max_tokens": 8192});
+        assert!(is_ide_aux_request(&hdrs(&[("x-ide-run-id", "r1")]), &small));
+        assert!(is_ide_aux_request(&hdrs(&[("x-ide-run-id", "r1")]), &intent),
+            "带 4096 推理余量的裁决（900+4096）才是线上的真实形状——1024 那条界从来没命中过它");
+        assert!(!is_ide_aux_request(&hdrs(&[("x-ide-run-id", "r1")]), &critic),
+            "收尾评审 2000+4096 是认知腿，推理深度跟用户档位，不许被当成辅助调用关掉");
+        assert!(!is_ide_aux_request(&hdrs(&[("x-ide-run-id", "r1"), ("x-ide-mode", "agent")]), &small),
+            "带 x-ide-mode 的是主循环，哪怕 max_tokens 小也不是辅助调用");
+        assert!(!is_ide_aux_request(&hdrs(&[("x-ide-run-id", "r1")]), &big),
+            "max_tokens 大的不是辅助调用");
+        assert!(!is_ide_aux_request(&hdrs(&[]), &small),
+            "没有任何 IDE 头的是外部 API 调用，不许替人关推理");
+        assert!(is_ide_aux_request(&hdrs(&[("x-mide-client", "mide/0.14.6")]), &small),
+            "输入框预热那一发只有 x-mide-client、没有 run id，也得认出来");
+        assert!(is_ide_aux_request(&hdrs(&[("x-ide-aux", "intent")]), &big),
+            "新版客户端显式声明就认，不看其它判据");
+    }
+
+    /// 透传线路上最终出门的形状：第一步 + 第二步。
+    fn passthrough(mut b: serde_json::Value) -> serde_json::Value {
+        aux_thinking_common(&mut b);
+        openai_passthrough_aux_thinking(&mut b);
+        b
+    }
+
+    #[test]
+    fn deepseek_and_glm_get_the_thinking_switch_and_lose_the_effort_field() {
+        for m in ["deepseek-v4-pro", "glm-5.3-flash", "kimi-k3", "moonshot-v2"] {
+            let b = passthrough(json!({"model": m, "max_tokens": 900, "reasoning_effort": "low"}));
+            assert_eq!(b["thinking"], json!({"type": "disabled"}), "{m}");
+            assert!(b.get("reasoning_effort").is_none(), "{m}: 透传上游不认 off/low，留着只会 400 或触发钳位");
+        }
+    }
+
+    #[test]
+    fn qwen_gets_enable_thinking_false() {
+        let b = passthrough(json!({"model": "qwen3.8-max", "max_tokens": 900, "reasoning_effort": "low"}));
+        assert_eq!(b["enable_thinking"], json!(false));
+        assert!(b.get("reasoning_effort").is_none());
+        assert!(b.get("thinking").is_none(), "qwen 不认 thinking 对象，别乱发");
+    }
+
+    /// Anthropic 桥那一支只做第一步：off 是它唯一认的关闭写法。
+    #[test]
+    fn claude_five_gets_off_but_fable_keeps_the_lowest_dial() {
+        let mut opus = json!({"model": "claude-opus-5", "max_tokens": 900, "reasoning_effort": "low", "thinking": {"type": "adaptive"}});
+        aux_thinking_common(&mut opus);
+        assert_eq!(opus["reasoning_effort"], json!("off"));
+        assert!(opus.get("thinking").is_none(), "残留的 thinking 对象会让 thinking_effort_for 判成要推理");
+        // anthropic_thinking 把 off 翻成显式 disabled：Opus 5 省略 thinking 键时默认是 adaptive。
+        assert_eq!(anthropic_thinking("claude-opus-5", Some("off")), Some(json!({"type": "disabled"})));
+        let mut fable = json!({"model": "claude-fable-5-1", "max_tokens": 900, "reasoning_effort": "high"});
+        aux_thinking_common(&mut fable);
+        assert_eq!(fable["reasoning_effort"], json!("low"), "Fable 关不掉，只能封到最低档");
+    }
+
+    /// 同一个 claude 模型走 OpenAI 透传中转时，off 必须被剥掉——那是 ox-alpha 400 的形状。
+    #[test]
+    fn claude_over_an_openai_relay_never_sees_off() {
+        let b = passthrough(json!({"model": "claude-opus-5", "max_tokens": 900, "reasoning_effort": "low"}));
+        assert!(b.get("reasoning_effort").is_none());
+        assert!(b.get("thinking").is_none());
+    }
+
+    #[test]
+    fn gpt_five_gets_minimal_and_grok_keeps_low() {
+        let gpt = passthrough(json!({"model": "gpt-5.6-luna", "max_tokens": 900, "reasoning_effort": "low"}));
+        assert_eq!(gpt["reasoning_effort"], json!("minimal"));
+        let mut grok = json!({"model": "grok-4.6", "max_tokens": 900, "reasoning_effort": "high"});
+        aux_thinking_common(&mut grok);
+        assert_eq!(grok["reasoning_effort"], json!("low"), "xAI 桥按目录判要不要带 effort，这里只保证是最低档");
+        let unknown = passthrough(json!({"model": "stealth/ox-alpha", "max_tokens": 900, "reasoning_effort": "low"}));
+        assert!(unknown.get("reasoning_effort").is_none(), "没把握的家族什么开关都不发，留上游默认");
+        assert!(unknown.get("thinking").is_none());
+        assert!(unknown.get("enable_thinking").is_none());
+    }
+
+    /// 钳位对辅助调用和显式 disabled 都不许抬 max_tokens——否则关了推理也白关。
+    #[test]
+    fn guardrail_ignores_explicit_disabled_but_still_bumps_real_thinking() {
+        assert!(!thinking_needs_max_tokens_room(&json!({"thinking": {"type": "disabled"}})));
+        assert!(!thinking_needs_max_tokens_room(&json!({"reasoning_effort": "off"})));
+        assert!(!thinking_needs_max_tokens_room(&json!({"max_tokens": 900})));
+        assert!(thinking_needs_max_tokens_room(&json!({"reasoning_effort": "low"})));
+        assert!(thinking_needs_max_tokens_room(&json!({"thinking": {"type": "enabled", "budget_tokens": 4096}})));
+        assert!(thinking_needs_max_tokens_room(&json!({"thinking": {"type": "adaptive"}})));
+    }
+
+    /// 关掉推理之后，transport 也不再按「深思考」放宽表头等待。
+    #[test]
+    fn disabled_aux_is_not_deep_thinking_for_the_transport_budget() {
+        let mut b = json!({"model": "deepseek-v4-pro", "max_tokens": 900, "reasoning_effort": "low"});
+        assert!(request_is_deep_thinking(&b));
+        aux_thinking_common(&mut b);
+        assert!(!request_is_deep_thinking(&b));
+        assert!(!thinking_needs_max_tokens_room(&b), "off 不许再把 900 抬到 32K");
+    }
+}
+
+/// 工具调用 ↔ 工具结果配对修复。真往返：构造出线上那几种坏形状，跑一遍看修成什么样，
+/// 不查源码文本。判据和「为什么网关也要做一遍」写在 repair_tool_pairing 上面。
+#[cfg(test)]
+mod tool_pairing_tests {
+    use super::*;
+
+    fn asst(ids: &[&str]) -> serde_json::Value {
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": ids.iter().map(|id| json!({
+                "id": id, "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            })).collect::<Vec<_>>(),
+        })
+    }
+    fn tool(id: &str, body: &str) -> serde_json::Value {
+        json!({"role": "tool", "tool_call_id": id, "content": body})
+    }
+    fn wrap(msgs: Vec<serde_json::Value>) -> serde_json::Value {
+        json!({"model": "deepseek-v4-pro", "messages": msgs})
+    }
+    fn msgs_of(body: &serde_json::Value) -> Vec<serde_json::Value> {
+        body["messages"].as_array().cloned().unwrap_or_default()
+    }
+    /// 上游那条判据本身：每条带 tool_calls 的 assistant 后面，必须紧跟着数量相同、
+    /// id 一一对应的 tool 消息。测试拿它当断言，而不是逐条比对下标。
+    fn upstream_accepts(body: &serde_json::Value) -> bool {
+        let msgs = msgs_of(body);
+        for (i, m) in msgs.iter().enumerate() {
+            let Some(calls) = m.get("tool_calls").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            if m.get("role").and_then(|r| r.as_str()) != Some("assistant") || calls.is_empty() {
+                continue;
+            }
+            let mut want: Vec<&str> = calls
+                .iter()
+                .map(|c| c.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+                .collect();
+            if want.iter().any(|id| id.is_empty()) {
+                return false;
+            }
+            let mut seen = want.clone();
+            seen.sort_unstable();
+            seen.dedup();
+            if seen.len() != want.len() {
+                return false; // 重复 id：上游只认得出一条
+            }
+            let mut j = i + 1;
+            let mut got: Vec<&str> = Vec::new();
+            while j < msgs.len() && msgs[j].get("role").and_then(|r| r.as_str()) == Some("tool") {
+                got.push(msgs[j].get("tool_call_id").and_then(|v| v.as_str()).unwrap_or(""));
+                j += 1;
+            }
+            want.sort_unstable();
+            got.sort_unstable();
+            got.dedup();
+            if !want.iter().all(|id| got.contains(id)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn well_formed_transcripts_are_not_touched() {
+        let mut body = wrap(vec![
+            json!({"role": "user", "content": "hi"}),
+            asst(&["a", "b"]),
+            tool("a", "A"),
+            tool("b", "B"),
+        ]);
+        let before = body.clone();
+        assert_eq!(repair_tool_pairing(&mut body), 0);
+        assert_eq!(body, before, "本来就是好的却动了 body —— 这条跑在每一次请求上");
+    }
+
+    #[test]
+    fn a_missing_result_is_filled_in_right_after_its_assistant() {
+        // 线上那 4 次 400 的形状：两个并行调用只回来一条结果。
+        let mut body = wrap(vec![asst(&["a", "b"]), tool("a", "A")]);
+        assert!(!upstream_accepts(&body), "构造的样本本身就该是被上游拒的那种");
+        assert!(repair_tool_pairing(&mut body) > 0);
+        assert!(upstream_accepts(&body), "修完还是过不了上游那条判据");
+        let msgs = msgs_of(&body);
+        assert_eq!(msgs[2]["tool_call_id"], "b");
+        assert!(
+            msgs[2]["content"].as_str().unwrap().contains("[未执行]"),
+            "补进去的必须明说没执行，否则模型把它当成功"
+        );
+        assert_eq!(msgs[1]["content"], "A", "真实结果被覆盖了");
+    }
+
+    #[test]
+    fn results_separated_by_another_role_are_moved_back_next_to_the_call() {
+        // 中间夹一条 user（截图 / 运行事实 / 插话）就会被上游判成「结果不够」。
+        let mut body = wrap(vec![
+            asst(&["a", "b"]),
+            tool("a", "A"),
+            json!({"role": "user", "content": "一张截图"}),
+            tool("b", "B"),
+        ]);
+        assert!(!upstream_accepts(&body));
+        assert!(repair_tool_pairing(&mut body) > 0);
+        assert!(upstream_accepts(&body));
+        let msgs = msgs_of(&body);
+        assert_eq!(msgs[1]["content"], "A");
+        assert_eq!(msgs[2]["content"], "B");
+        assert_eq!(msgs[3]["role"], "user", "夹在中间那条被删了 —— 只许挪，不许删");
+    }
+
+    #[test]
+    fn duplicate_ids_are_renamed_and_their_results_follow_by_order() {
+        let mut body = wrap(vec![asst(&["dup", "dup"]), tool("dup", "第一条"), tool("dup", "第二条")]);
+        assert!(!upstream_accepts(&body), "重复 id 在上游眼里只算一条结果");
+        assert!(repair_tool_pairing(&mut body) > 0);
+        assert!(upstream_accepts(&body));
+        let msgs = msgs_of(&body);
+        let ids: Vec<&str> = msgs[0]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids[0], "dup");
+        assert_ne!(ids[1], "dup", "第二个调用还是同一个 id");
+        assert_eq!(msgs[1]["content"], "第一条");
+        assert_eq!(msgs[2]["content"], "第二条", "按次序配对，正文不许错位");
+        assert_eq!(msgs[2]["tool_call_id"], ids[1]);
+    }
+
+    #[test]
+    fn empty_ids_get_one_and_keep_their_real_result() {
+        let mut body = wrap(vec![asst(&[""]), tool("", "真实结果")]);
+        assert!(!upstream_accepts(&body));
+        assert!(repair_tool_pairing(&mut body) > 0);
+        assert!(upstream_accepts(&body));
+        let msgs = msgs_of(&body);
+        let id = msgs[0]["tool_calls"][0]["id"].as_str().unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(msgs[1]["tool_call_id"], id);
+        assert_eq!(msgs[1]["content"], "真实结果", "空 id 那条真实结果被丢了");
+    }
+
+    #[test]
+    fn orphan_results_stay_exactly_where_they_are() {
+        // 历史从前面被压缩掉：assistant 没了、结果还在。那是证据，不是协议噪声。
+        let mut body = wrap(vec![tool("gone", "这条结果里有真实证据"), asst(&["a"]), tool("a", "A")]);
+        let before = body.clone();
+        assert_eq!(repair_tool_pairing(&mut body), 0);
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn repair_is_idempotent_and_survives_dirty_input() {
+        let mut body = wrap(vec![asst(&["a", ""]), tool("a", "A")]);
+        assert!(repair_tool_pairing(&mut body) > 0);
+        let once = body.clone();
+        assert_eq!(repair_tool_pairing(&mut body), 0, "修过一遍还在改 —— 不幂等");
+        assert_eq!(body, once);
+
+        let mut no_messages = json!({"model": "x"});
+        assert_eq!(repair_tool_pairing(&mut no_messages), 0);
+        let mut empty = wrap(vec![]);
+        assert_eq!(repair_tool_pairing(&mut empty), 0);
+        let mut weird = json!({"messages": [json!(null), json!("字符串"), asst(&["z"])]});
+        assert!(repair_tool_pairing(&mut weird) > 0);
+        assert!(upstream_accepts(&weird));
+    }
+}

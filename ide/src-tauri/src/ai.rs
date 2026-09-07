@@ -88,6 +88,13 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .unwrap_or_else(|_| reqwest::Client::new())
 });
 
+/// 桌面端 MSE 加密客户端。网关地址是固定的，所以 pin 列表在编译时就定好。
+static MSE: LazyLock<crate::mse::MseClient> = LazyLock::new(|| {
+    crate::mse::MseClient::new(vec![])
+});
+
+const GATEWAY_BASE: &str = "https://code.mrday.one";
+
 async fn warm_gateway_transport_once(client: &reqwest::Client, url: &str) {
     let _ = client
         .head(url)
@@ -96,12 +103,23 @@ async fn warm_gateway_transport_once(client: &reqwest::Client, url: &str) {
         .await;
 }
 
+/// 判断一个 base_url 是不是指向我们自己的网关。
+fn is_our_gateway(base_url: &str) -> bool {
+    base_url.contains("code.mrday.one") || base_url.contains("mrday.one/v1")
+}
+
 /// Warm and retain the desktop AI client's own gateway connection. Frontend
 /// fetches use WebKit's separate pool, so they cannot prepay this TCP+TLS setup.
 pub(crate) fn start_gateway_transport_warmup() {
     tauri::async_runtime::spawn(async {
         loop {
             warm_gateway_transport_once(&HTTP, MICHAEL_GATEWAY_HEALTH_URL).await;
+            // 顺便建立/续期 MSE 会话。
+            if !MSE.is_active() {
+                if let Err(e) = MSE.establish(&HTTP, GATEWAY_BASE).await {
+                    tracing::warn!("MSE establish: {e}");
+                }
+            }
             tokio::time::sleep(GATEWAY_TRANSPORT_KEEPALIVE_INTERVAL).await;
         }
     });
@@ -234,6 +252,13 @@ pub struct AiConfig {
     /// byte-for-byte unchanged behavior.
     #[serde(default)]
     pub ide_mode: Option<String>,
+    /// 辅助调用（意图裁决 / 快通道这类只要几百 token JSON 的小请求）向网关报身份，这里转成
+    /// `x-ide-aux` 头；网关据此关掉推理、不抬 max_tokens。JS 那个请求头构建器只管网页端，
+    /// 桌面端每一个请求头都在 with_ide_headers 里造——漏了这一位，桌面端就只能靠网关按
+    /// max_tokens 猜（网关 is_ide_aux_request 的预算表），而输入框预热那一发没有 run id，
+    /// 猜不出来。
+    #[serde(default)]
+    pub ide_aux: Option<String>,
     /// 用户在模型卡片上选中的上下文窗口（token）。目录查不到窗口的模型在客户端和网关**两边**
     /// 都退回同一个猜测（128k），于是那个滑块拖了不算数。把选中的值原样带过去，网关的压缩
     /// 就按它切 —— 用户的原话是"我想调到用哪个就用哪个"。
@@ -286,6 +311,9 @@ pub struct AiConfig {
     pub ide_timezone: Option<String>,
     #[serde(default)]
     pub ide_utc_offset_minutes: Option<i16>,
+    /// 上一次失败的出口 ID。重试/续传时回发给网关，让它避开刚断掉的那个出口。
+    #[serde(default)]
+    pub avoid_endpoint: Option<String>,
 }
 
 /// Streamed back to the frontend over a Tauri channel as the model responds.
@@ -387,6 +415,10 @@ pub enum AiEvent {
     },
     Error {
         message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_elsewhere: Option<bool>,
     },
 }
 
@@ -580,6 +612,19 @@ async fn read_ai_error_body_cancellable(
 /// 是 8~40 秒，`first_upstream_chunk_after_headers_ms` 恒为 0，正是这个形状。改成 SSE 之后
 /// 首字节由上游边生成边发，同一批调用的等待肉眼可见地短。
 ///
+/// MSE 解密后的事件块里提取 data 载荷。解密出的内容是上游原始的 SSE 事件块
+/// （如 `data: {...}\n\n`），需要剥掉 `data:` 前缀拿到里面的 JSON。
+fn extract_mse_inner_data(plaintext: &[u8]) -> Result<String, String> {
+    let text =
+        std::str::from_utf8(plaintext).map_err(|_| "MSE: 解密后不是有效 UTF-8".to_string())?;
+    for line in text.lines() {
+        if let Some(inner) = line.trim().strip_prefix("data:") {
+            return Ok(inner.trim().to_string());
+        }
+    }
+    Ok(text.trim().to_string())
+}
+
 /// 两种帧都要认：走 OpenAI 形状的中转发 `choices[0].delta.content`，走原生 Anthropic 的
 /// 发 `content_block_delta` + `delta.text`（网关对 Claude 路由用的就是后者）。只认一种，
 /// 另一种就会拼出空字符串——而且不报错，表现成"模型什么都没回"。
@@ -590,9 +635,19 @@ async fn read_sse_text(
 ) -> Result<(String, String), String> {
     use futures_util::StreamExt;
     let deadline = Instant::now() + timeout;
+    let mse_stream = response.headers().get("x-mse-stream").is_some() && MSE.is_active();
+    let mse_req_seq: u64 = if mse_stream {
+        response
+            .headers()
+            .get("x-mse-seq")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mut mse_frame: u64 = 0;
     let mut stream = response.bytes_stream();
-    // 按**原始字节**攒，不按解码后的字符串：一个多字节 UTF-8 字符可能被切在两个网络包
-    // 之间，逐包解码会把它变成 �。SSE 以 '\n' 分行，而这个字节不会出现在多字节序列内部。
     let mut buf: Vec<u8> = Vec::new();
     let mut out = String::new();
     let mut saw_done = false;
@@ -636,12 +691,30 @@ async fn read_sse_text(
                 continue;
             };
             let data = data.trim();
+            // MSE: 外层 data 行是密文帧，先解开再拿到上游原本的 JSON。
+            let mse_inner;
+            let data = if mse_stream {
+                match MSE.open_sse_frame(data, mse_frame, mse_req_seq) {
+                    Ok(plaintext) => {
+                        mse_frame += 1;
+                        if crate::mse::MseClient::is_eos(&plaintext) {
+                            saw_done = true;
+                            break;
+                        }
+                        mse_inner = extract_mse_inner_data(&plaintext)?;
+                        mse_inner.as_str()
+                    }
+                    Err(e) => return Err(format!("MSE: 帧解密失败: {e}")),
+                }
+            } else {
+                data
+            };
             if data == "[DONE]" {
                 saw_done = true;
                 break;
             }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue; // 心跳/注释/半截帧：跳过，别把整轮判失败
+                continue;
             };
             if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
                 if !fr.is_empty() {
@@ -876,6 +949,16 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
     if let Some(m) = config.ide_mode.as_deref().filter(|s| !s.is_empty()) {
         rb = rb.header("x-ide-mode", m);
     }
+    // 辅助调用的身份标记。值是客户端自己定的短枚举（intent / fastroute …），按 run id 同一套
+    // 字符集过滤，别的形状一律不发——网关只看有没有这个头。
+    if let Some(aux) = config.ide_aux.as_deref().filter(|value| {
+        (1..=32).contains(&value.len())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }) {
+        rb = rb.header("x-ide-aux", aux);
+    }
     if let Some(t) = config.ide_tools.as_deref().filter(|s| !s.is_empty()) {
         rb = rb.header("x-ide-tools", t);
     }
@@ -919,6 +1002,14 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
         .filter(|offset| (-840..=840).contains(offset))
     {
         rb = rb.header("x-ide-utc-offset-minutes", offset.to_string());
+    }
+    if let Some(ep) = config
+        .avoid_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 64)
+    {
+        rb = rb.header("x-ide-avoid-endpoint", ep);
     }
     rb
 }
@@ -991,14 +1082,82 @@ async fn post_chat_once(
         return Err(CANCELLED_AI_REQUEST.to_string());
     }
     let deadline = ResponseHeadersDeadline::new(Instant::now(), response_headers_timeout);
+
+    // 走我们网关且 MSE 会话可用 → 密文请求。
+    if is_our_gateway(&config.base_url) && MSE.is_active() {
+        let path = url
+            .find("//")
+            .and_then(|i| url[i + 2..].find('/').map(|j| &url[i + 2 + j..]))
+            .unwrap_or("/v1/chat/completions");
+
+        match MSE.seal_request("POST", path, payload, None) {
+            Ok((mse_headers, sealed_body)) => {
+                let mut request = with_response_deadline_header(
+                    with_ide_headers(client.post(url).bearer_auth(&config.api_key), config),
+                    deadline,
+                );
+                for (name, value) in crate::protocol::extra_auth_headers(
+                    crate::protocol::Wire::of(config.protocol.as_deref()),
+                    &config.api_key,
+                ) {
+                    request = request.header(name, value);
+                }
+                for (name, value) in &mse_headers {
+                    request = request.header(name.as_str(), value.as_str());
+                }
+                request = request
+                    .header("content-type", "application/mse-sealed")
+                    .body(sealed_body);
+                match send_with_response_headers_deadline(request, deadline, cancel).await {
+                    Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                        tracing::warn!("MSE: 服务端返回 409 (rekey)，重新建立会话并加密重试");
+                        MSE.invalidate();
+                        if let Err(e) = MSE.establish(client, GATEWAY_BASE).await {
+                            return Err(format!("MSE re-establish failed after rekey: {e}"));
+                        }
+                        // 会话已刷新，重新走一遍加密发送
+                    }
+                    other => return other,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("MSE seal failed: {e}");
+                return Err(format!("MSE seal failed: {e}"));
+            }
+        }
+        // 409 rekey 之后走到这里：用新会话重新加密发送
+        let path2 = url
+            .find("//")
+            .and_then(|i| url[i + 2..].find('/').map(|j| &url[i + 2 + j..]))
+            .unwrap_or("/v1/chat/completions");
+        match MSE.seal_request("POST", path2, payload, None) {
+            Ok((mse_headers, sealed_body)) => {
+                let mut request = with_response_deadline_header(
+                    with_ide_headers(client.post(url).bearer_auth(&config.api_key), config),
+                    deadline,
+                );
+                for (name, value) in crate::protocol::extra_auth_headers(
+                    crate::protocol::Wire::of(config.protocol.as_deref()),
+                    &config.api_key,
+                ) {
+                    request = request.header(name, value);
+                }
+                for (name, value) in &mse_headers {
+                    request = request.header(name.as_str(), value.as_str());
+                }
+                request = request
+                    .header("content-type", "application/mse-sealed")
+                    .body(sealed_body);
+                return send_with_response_headers_deadline(request, deadline, cancel).await;
+            }
+            Err(e) => return Err(format!("MSE seal retry failed: {e}")),
+        }
+    }
+
     let mut request = with_response_deadline_header(
         with_ide_headers(client.post(url).bearer_auth(&config.api_key), config),
         deadline,
     );
-    // 协议要求的**附加**鉴权头。OpenAI（默认，含全部存量自定义模型）返回空表 ——
-    // 上面那行 `.bearer_auth()` 一个字节不动，请求逐字节和以前相同。
-    // Anthropic 要 x-api-key + anthropic-version：少了后者是硬 400，而只发
-    // Authorization 会让认 anthropic 口径的中转报「密钥被拒」，看着像密钥坏了。
     for (name, value) in crate::protocol::extra_auth_headers(
         crate::protocol::Wire::of(config.protocol.as_deref()),
         &config.api_key,
@@ -1350,6 +1509,47 @@ fn reasoning_text_from_delta(delta: &serde_json::Value) -> Option<String> {
 /// so the client has exactly one set of values to reason about. Anthropic's native
 /// stream reports `max_tokens` / `end_turn` / `tool_use` / `stop_sequence`; everything
 /// OpenAI-compatible already uses the target vocabulary and passes through unchanged.
+/// 传输层断流时给用户看的那句话 —— **带上真实原因**。
+///
+/// # 在这之前它是个常量
+///
+/// 原来这里写作 `Ok(Some(Err(_e))) => { ... "连接中断（网络波动）" ... }`：`_e` 绑定
+/// 之后一次都没有被使用，文案是写死的。于是三件完全不同的事在界面上同形：
+///
+/// · 上游把流掐了（网关侧会记 `流中途断掉，客户端还连着`，真实原因只进它自己的日志）；
+/// · 桌面端到网关这一跳自己断了（跨境链路上常见）；
+/// · 网关主动中止了响应体（协议校验没过时它就是这么做的）。
+///
+/// 用户报「老是断线」的时候，产品里**没有任何字段**能告诉他断在哪一段 —— 这正是
+/// 排查这类问题最费时间的地方。线上实测过：同一秒里网关日志写着
+/// `OpenAI upstream stream ended without terminal data: [DONE]`，而用户看到的是
+/// 「网络波动」。
+///
+/// # 两条约束
+///
+/// · **「连接中断」这几个字不能改。** 客户端的可重试判据和断点续传判据都按这几个词
+///   匹配（`ide/src/agent/ai-errors.js` 的正则、`main.js` 的分支）。改掉它们，续传
+///   会静默失效 —— 那正是这个仓库记过的一次事故。
+/// · **不回显地址和密钥。** reqwest 的错误里可能带完整 URL，而自定义端点允许把密钥
+///   写在查询串里。所以带 `://` 或 `key=`/`token=` 的词整个剥掉。
+fn stream_break_message(err: &dyn std::fmt::Display) -> String {
+    let raw = err.to_string();
+    let safe = raw
+        .split_whitespace()
+        .filter(|w| {
+            let l = w.to_ascii_lowercase();
+            !l.contains("://") && !l.contains("key=") && !l.contains("token=") && !l.contains("@")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let detail: String = safe.trim().chars().take(160).collect();
+    if detail.is_empty() {
+        "连接中断（网络波动），已保留生成的部分。".to_string()
+    } else {
+        format!("连接中断（网络波动），已保留生成的部分。原因：{detail}")
+    }
+}
+
 fn normalize_finish_reason(raw: &str) -> &str {
     match raw {
         "max_tokens" => "length",
@@ -1425,6 +1625,7 @@ mod ide_header_tests {
             ide_step_index: None,
             ide_step_kind: None,
             ide_mode: Some("agent".into()),
+            ide_aux: None,
             ide_tools: None,
             ide_semantic_profile: Some("2.5:engineering,design,existing_project".into()),
             ide_region: None,
@@ -1433,6 +1634,7 @@ mod ide_header_tests {
             mc_prefix_covered: None,
             ide_timezone: Some("America/Los_Angeles".into()),
             ide_utc_offset_minutes: Some(-420),
+            avoid_endpoint: None,
         }
     }
 
@@ -1813,6 +2015,7 @@ mod stream_timeout_tests {
             ide_step_index: None,
             ide_step_kind: None,
             ide_mode: None,
+            ide_aux: None,
             ide_tools: None,
             ide_semantic_profile: None,
             ide_region: None,
@@ -1821,6 +2024,7 @@ mod stream_timeout_tests {
             mc_prefix_covered: None,
             ide_timezone: None,
             ide_utc_offset_minutes: None,
+            avoid_endpoint: None,
         }
     }
 
@@ -2568,6 +2772,39 @@ mod stream_timeout_tests {
     }
 
     #[test]
+    /// 断流的真实原因必须跟到用户眼前，而且不能带出地址和密钥。
+    #[test]
+    fn a_stream_break_says_what_actually_broke() {
+        struct E(String);
+        impl std::fmt::Display for E {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        let msg = |t: &str| super::stream_break_message(&E(t.to_string()));
+
+        let m = msg("error decoding response body: unexpected EOF");
+        assert!(m.contains("unexpected EOF"), "真实原因又被丢掉了：{m}");
+        // 这几个字是客户端可重试/续传判据的匹配依据，改掉会让续传静默失效。
+        assert!(m.contains("连接中断"), "去掉「连接中断」会让断点续传认不出这一类：{m}");
+        assert!(m.contains("已保留生成的部分"), "少了这句用户会以为内容没了");
+
+        // 地址和密钥一个字都不许回显 —— 自定义端点允许把密钥写在查询串里。
+        let leaky = msg("error sending request for url https://relay.example/v1/messages?key=sk-abc123");
+        assert!(!leaky.contains("sk-abc123"), "密钥被回显了：{leaky}");
+        assert!(!leaky.contains("relay.example"), "上游地址被回显了：{leaky}");
+        assert!(leaky.contains("error sending request"), "剥得太狠，原因也没了：{leaky}");
+
+        // 空错误退回原来那句，不留一个孤零零的「原因：」。
+        let empty = msg("");
+        assert!(!empty.contains("原因"), "空错误不该拼出一个空的原因：{empty}");
+        assert!(empty.contains("连接中断"));
+
+        // 超长错误要截断，别把一整段上游报文塞进气泡。
+        let long = msg(&"x".repeat(4000));
+        assert!(long.chars().count() < 220, "没截断：{} 字", long.chars().count());
+    }
+
     fn finish_reasons_are_normalized_onto_one_vocabulary() {
         // Anthropic native -> OpenAI spelling
         assert_eq!(normalize_finish_reason("max_tokens"), "length");
@@ -3246,6 +3483,8 @@ async fn ai_chat_inner(
             // 也不要把一个残缺的请求发出去换回一句上游的通用 400。
             let _ = on_event.send(AiEvent::Error {
                 message: message.clone(),
+                endpoint: None,
+                retry_elsewhere: None,
             });
             return Err(message);
         }
@@ -3271,10 +3510,17 @@ async fn ai_chat_inner(
     };
     if !resp.status().is_success() {
         let status = resp.status();
+        let retry_elsewhere = resp
+            .headers()
+            .get("x-mide-retry-elsewhere")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "1");
         let text = read_ai_error_body(resp).await;
         let message = format_ai_http_error(status, &text);
         let _ = on_event.send(AiEvent::Error {
             message: message.clone(),
+            endpoint: None,
+            retry_elsewhere,
         });
         return Err(message);
     }
@@ -3306,6 +3552,25 @@ async fn ai_chat_inner(
             });
         }
     }
+
+    let gateway_endpoint: Option<String> = resp
+        .headers()
+        .get("x-mide-endpoint")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let mse_stream = resp.headers().get("x-mse-stream").is_some() && MSE.is_active();
+    let mse_req_seq: u64 = if mse_stream {
+        resp.headers()
+            .get("x-mse-seq")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mut mse_frame: u64 = 0;
 
     let mut stream = resp.bytes_stream();
     // Accumulate RAW BYTES, not lossily-decoded strings: a multibyte UTF-8 char
@@ -3347,6 +3612,8 @@ async fn ai_chat_inner(
         let Some(remaining) = progress.remaining(Instant::now()) else {
             let _ = on_event.send(AiEvent::Error {
                 message: progress.error_message(Instant::now()),
+                endpoint: gateway_endpoint.clone(),
+                retry_elsewhere: None,
             });
             let _ = on_event.send(AiEvent::Done);
             return Ok(());
@@ -3357,9 +3624,11 @@ async fn ai_chat_inner(
             // A mid-stream read error means the connection dropped partway (common
             // on cross-border / lossy links — "error decoding response body"). Keep
             // what we've already streamed and end the turn gracefully.
-            Ok(Some(Err(_e))) => {
+            Ok(Some(Err(e))) => {
                 let _ = on_event.send(AiEvent::Error {
-                    message: "连接中断（网络波动），已保留生成的部分。".to_string(),
+                    message: stream_break_message(&e),
+                    endpoint: gateway_endpoint.clone(),
+                    retry_elsewhere: None,
                 });
                 let _ = on_event.send(AiEvent::Done);
                 return Ok(());
@@ -3371,6 +3640,8 @@ async fn ai_chat_inner(
                 let message = INCOMPLETE_SSE_STREAM_ERROR.to_string();
                 let _ = on_event.send(AiEvent::Error {
                     message: message.clone(),
+                    endpoint: gateway_endpoint.clone(),
+                    retry_elsewhere: None,
                 });
                 return Err(message);
             }
@@ -3378,6 +3649,8 @@ async fn ai_chat_inner(
                 if progress.remaining(Instant::now()).is_none() {
                     let _ = on_event.send(AiEvent::Error {
                         message: progress.error_message(Instant::now()),
+                        endpoint: gateway_endpoint.clone(),
+                        retry_elsewhere: None,
                     });
                     let _ = on_event.send(AiEvent::Done);
                     return Ok(());
@@ -3428,6 +3701,8 @@ async fn ai_chat_inner(
                     let message = format!("AI stream contains invalid UTF-8 SSE data: {error}");
                     let _ = on_event.send(AiEvent::Error {
                         message: message.clone(),
+                        endpoint: gateway_endpoint.clone(),
+                        retry_elsewhere: None,
                     });
                     return Err(message);
                 }
@@ -3436,7 +3711,39 @@ async fn ai_chat_inner(
                 continue;
             };
             let data = data.trim();
-            progress.record_activity(Instant::now()); // 真正的 data 帧才算上游开始流式输出
+            progress.record_activity(Instant::now());
+            // MSE: 外层 data 行是密文帧，先解开再拿到上游原本的 JSON。
+            let mse_inner;
+            let data = if mse_stream {
+                match MSE.open_sse_frame(data, mse_frame, mse_req_seq) {
+                    Ok(plaintext) => {
+                        mse_frame += 1;
+                        if crate::mse::MseClient::is_eos(&plaintext) {
+                            send_stream_metric(
+                                &on_event,
+                                stream_started,
+                                "done",
+                                Some(raw_stream_bytes),
+                            );
+                            let _ = on_event.send(AiEvent::Done);
+                            return Ok(());
+                        }
+                        mse_inner = extract_mse_inner_data(&plaintext)?;
+                        mse_inner.as_str()
+                    }
+                    Err(e) => {
+                        let message = format!("MSE: 帧解密失败: {e}");
+                        let _ = on_event.send(AiEvent::Error {
+                            message: message.clone(),
+                            endpoint: gateway_endpoint.clone(),
+                            retry_elsewhere: None,
+                        });
+                        return Err(message);
+                    }
+                }
+            } else {
+                data
+            };
             if data == "[DONE]" {
                 send_stream_metric(&on_event, stream_started, "done", Some(raw_stream_bytes));
                 let _ = on_event.send(AiEvent::Done);
@@ -3448,11 +3755,14 @@ async fn ai_chat_inner(
             let v = match serde_json::from_str::<serde_json::Value>(data) {
                 Ok(value) => value,
                 Err(error) => {
-                    let message = format!("AI stream contains malformed SSE JSON: {error}");
-                    let _ = on_event.send(AiEvent::Error {
-                        message: message.clone(),
-                    });
-                    return Err(message);
+                    // 部分中转（尤其 DeepSeek 系列）偶尔夹杂非 JSON 帧（状态行、
+                    // 心跳、格式错误），在已经收到有效内容后不应打断整条流。
+                    // read_sse_text 那条路早就是 skip 的，这里对齐。
+                    tracing::warn!(
+                        data = data,
+                        "skipping malformed SSE frame: {error}"
+                    );
+                    continue;
                 }
             };
             // ── 上游线协议翻译 ───────────────────────────────────────────────
@@ -3476,6 +3786,8 @@ async fn ai_chat_inner(
                     Err(message) => {
                         let _ = on_event.send(AiEvent::Error {
                             message: message.clone(),
+                            endpoint: gateway_endpoint.clone(),
+                            retry_elsewhere: None,
                         });
                         return Err(message);
                     }
@@ -3632,6 +3944,29 @@ async fn ai_chat_inner(
                     }
                     _ => {}
                 }
+                // 网关在中止响应体**之前**会先发一帧带真实原因的 error 事件。
+                //
+                // 没有它的时候，客户端拿到的只是一个传输层错误，界面上一律显示成
+                // 「连接中断（网络波动）」—— 而真正的原因（上游的流没有终止标记就结束、
+                // 工具参数被掐断、协议校验没过）只留在网关自己的日志里。用户报「老是
+                // 断线」时，产品里没有任何字段能定位断在哪一段。
+                //
+                // 认得出它就直接把原因交出去。后面紧跟着的传输层错误照常到来，
+                // 那条路的兜底文案仍然在，这里只是把「有原因」的那一种提前说清楚。
+                if let Some(msg) = v
+                    .pointer("/error/message")
+                    .and_then(|m| m.as_str())
+                    .filter(|m| !m.trim().is_empty())
+                {
+                    let side = v["error"]["where"].as_str().unwrap_or("upstream");
+                    let side = if side == "gateway" { "网关" } else { "上游" };
+                    let _ = on_event.send(AiEvent::Error {
+                        message: format!("连接中断（{side}把这次响应截断了），已保留生成的部分。原因：{msg}"),
+                        endpoint: gateway_endpoint.clone(),
+                        retry_elsewhere: None,
+                    });
+                    continue;
+                }
                 let delta = &v["choices"][0]["delta"];
                 if progress.record_delta(delta, Instant::now()) && !sent_first_progress_metric {
                     sent_first_progress_metric = true;
@@ -3685,7 +4020,7 @@ async fn ai_chat_inner(
                         let index = match streamed_tool_call_index(tc) {
                             Ok(index) => index,
                             Err(message) => {
-                                let _ = on_event.send(AiEvent::Error { message });
+                                let _ = on_event.send(AiEvent::Error { message, endpoint: gateway_endpoint.clone(), retry_elsewhere: None });
                                 let _ = on_event.send(AiEvent::Done);
                                 return Ok(());
                             }
@@ -3739,6 +4074,8 @@ async fn ai_chat_inner(
         if progress.remaining(Instant::now()).is_none() {
             let _ = on_event.send(AiEvent::Error {
                 message: progress.error_message(Instant::now()),
+                endpoint: gateway_endpoint.clone(),
+                retry_elsewhere: None,
             });
             let _ = on_event.send(AiEvent::Done);
             return Ok(());

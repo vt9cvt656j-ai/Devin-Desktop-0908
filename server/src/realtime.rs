@@ -376,8 +376,10 @@ pub(crate) async fn free_pool_value_24h(state: &AppState) -> serde_json::Value {
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
-    // 一毫点 = 50 micro-USD（MICRO_USD_PER_MILLI_POINT）。两边同口径才能比。
-    const MICRO_USD_PER_MILLI_POINT: i64 = 50;
+    // 换算走 models.rs 那唯一一条（`milli_points_for_micro_usd`）。
+    // 原来这里手抄了一个 50 —— 那是 1 点 = ¥0.355 时代的数，而点值现在由后台汇率推导
+    // （100 积分 = ¥1）。手抄的那份不会跟着动，于是这块面板会一直按旧口径报「该扣多少」，
+    // 而它正是用来发现扣点口径漂了的面板。
     let total_micro: i64 = rows.iter().map(|r| r.3).sum();
     // micro-USD → 人民币分。推导：usd_cents = micro/10000，cny_cents = usd_cents*10000/bps，
     // 约掉就是 micro/bps。**别在前端写死 7.1023**：那个数是后台设置，改了之后前端不会跟。
@@ -391,7 +393,7 @@ pub(crate) async fn free_pool_value_24h(state: &AppState) -> serde_json::Value {
             .iter()
             .map(|(model, calls, milli, micro, unpriced)| {
                 // 「按参考成本该扣多少毫点」——同一把尺子换算过去。
-                let should = micro / MICRO_USD_PER_MILLI_POINT;
+                let should = crate::models::milli_points_for_micro_usd(*micro);
                 json!({
                     "model": model,
                     "calls": calls,

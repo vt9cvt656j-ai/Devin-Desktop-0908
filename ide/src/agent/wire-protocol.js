@@ -107,22 +107,31 @@ export function normalizeCustomModel(it) {
 export function cmModelsUrl(base, protocol) {
   const b = String(base || "").trim().replace(/\/+$/, "");
   if (!b) return "";
-  // Anthropic 的基址按约定**不带** /v1（占位符就是 https://api.anthropic.com），
-  // 所以这里补上；已经带了的不重复补。
-  if (cmProtocol(protocol) === "anthropic") return /\/v1$/.test(b) ? `${b}/models` : `${b}/v1/models`;
-  return `${b}/models`;
+  // 三种协议的列模型端点都在 /v1/models：
+  //   OpenAI:    GET /v1/models
+  //   Anthropic: GET /v1/models
+  //   xAI:       GET /v1/models
+  // 用户填的基址不一定带 /v1（尤其 Anthropic 和 xAI 的占位符就不带），
+  // 中转站也是：同一个站填成 https://relay.com 或 https://relay.com/v1 都有，
+  // 前者不补 /v1 会拼出 /models → 404。服务端的 api_base() 一直有这个归一化，
+  // 客户端之前只给 Anthropic 做了，现在统一。
+  const normalized = /\/v1$/.test(b) ? b : `${b}/v1`;
+  return `${normalized}/models`;
 }
 
 /** 列模型的鉴权头。空密钥不发头 —— 本机 Ollama / LM Studio 没有密钥。 */
 export function cmModelsHeaders(key, protocol) {
   const k = String(key || "").trim();
   const h = { Accept: "application/json" };
-  if (cmProtocol(protocol) === "anthropic") {
-    if (k) h["x-api-key"] = k;
-    h["anthropic-version"] = "2023-06-01";
-    return h;
+  // **两种认证头一起发。** 中转站只认 Authorization: Bearer，直连 Anthropic 只认
+  // x-api-key + anthropic-version。之前按协议切——选了 Anthropic 就只发 x-api-key，
+  // 导致中转站（用 Anthropic 协议转发 Claude 但自身是 OpenAI 兼容的）401「密钥被拒」。
+  // 服务端三处拉清单的函数一直是双头，客户端这里对齐。
+  if (k) {
+    h.Authorization = `Bearer ${k}`;
+    h["x-api-key"] = k;
   }
-  if (k) h.Authorization = `Bearer ${k}`;
+  h["anthropic-version"] = "2023-06-01";
   return h;
 }
 

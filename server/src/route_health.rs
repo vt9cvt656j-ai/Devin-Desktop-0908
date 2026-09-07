@@ -484,10 +484,70 @@ pub(crate) struct ProbeTokens {
     pub completion: i64,
 }
 
+/// 上游用这个码说的是「**这个模型**不在这」，不是「这个出口不在这」。
+///
+/// 400 = 请求里有它不认的东西（最常见就是模型名），404 = 找不到这个模型。
+/// 两者都只否定一个模型；401/403（密钥）、5xx、超时才是否定整个出口的。
+fn rejects_only_this_model(status: u16) -> bool {
+    matches!(status, 400 | 404)
+}
+
 async fn canary_once(m: &crate::models::Model) -> Option<(bool, u16, ProbeTokens, String)> {
-    let http = reqwest::Client::builder().timeout(CANARY_TIMEOUT).build().ok()?;
     let ids = crate::models::allowed_ids(m);
-    let model_id = ids.first()?;
+    // **一个下线的型号不该判死整个出口。**
+    //
+    // 这里原来是 `ids.first()?` —— 拿启用列表里的第一个去探，探不通就整个出口报红。
+    // 线上实测：`Claude` 线路的列表第一个是 `claude-fable-5`，那是 8/30 之后再没被
+    // 用过的旧型号（现在是 `claude-fable-5-1`）。polly 这个出口不提供它 → 400 →
+    // 整个出口被探成死的。而它 14 天里真实跑了 1171 次成功、95 次失败，是 Claude 上
+    // 量最大的出口之一。
+    //
+    // 后果是自我强化的：真实流量的保质期是 2 小时（`PROBE_FRESH_SECS`），一旦超过就
+    // 改按探测结论排序 → 这个出口掉到最差档 → 更拿不到流量 → 更没有新鲜的真实记录 →
+    // 一直压着。
+    //
+    // 所以：400/404 只否定**这一个模型**，换下一个接着探；把整个出口判死，必须是
+    // 所有允许的模型都被否定，或者遇到密钥/连接层的错（那些和模型无关）。
+    // 代价是最多几发 1-token 的探测，而且只在第一个模型就 400 的时候才会发生。
+    probe_until_decisive(&ids, |id| canary_once_with(m, id.clone()), |r| r.1).await
+}
+
+/// 逐个模型探，直到拿到一个**和模型无关**的结论。
+///
+/// · 探通了，或者失败的原因和模型无关（密钥、连接层、5xx）→ 就是这个出口的结论，立即返回，
+///   不再多发探测；
+/// · 「这个模型不在这」（400/404）→ 换下一个接着探；
+/// · 每一个允许的模型都被否掉了 → 采信最后一个，那才是出口真的不可用。
+///
+/// 抽成独立函数不是为了整洁，是为了**这条判据能在测试里真跑**：上面那个循环里唯一的
+/// 判断就是「什么时候停」，而它以前只能靠扫源码来守 —— 而源码断言守不住 `.take(1)`
+/// 这种改动（实测：加上 `.take(1)` 之后断言照样绿）。
+async fn probe_until_decisive<R, F, Fut>(
+    ids: &[String],
+    mut probe: F,
+    status_of: impl Fn(&R) -> u16,
+) -> Option<R>
+where
+    F: FnMut(&String) -> Fut,
+    Fut: std::future::Future<Output = Option<R>>,
+{
+    let mut last: Option<R> = None;
+    for id in ids.iter() {
+        let r = probe(id).await?;
+        if !rejects_only_this_model(status_of(&r)) {
+            return Some(r);
+        }
+        last = Some(r);
+    }
+    last
+}
+
+async fn canary_once_with(
+    m: &crate::models::Model,
+    model_id: String,
+) -> Option<(bool, u16, ProbeTokens, String)> {
+    let model_id = &model_id;
+    let http = reqwest::Client::builder().timeout(CANARY_TIMEOUT).build().ok()?;
     let key = crate::models::model_key(&m.api_key);
     let base = crate::models::api_base(&m.base_url);
     let wire = crate::models::Wire::of(&m.protocol);
@@ -1014,6 +1074,71 @@ pub fn spawn(state: AppState) {
 
 #[cfg(test)]
 mod real_outcome_tests {
+    /// 一个下线的型号不该判死整个出口。
+    ///
+    /// 线上实测：`Claude` 线路的启用列表第一个是 `claude-fable-5`（8/30 之后再没被
+    /// 用过的旧型号），polly 这个出口不提供它 → 400 → 整个出口被探成死的。而它 14 天里
+    /// 真实跑了 1171 次成功，是 Claude 上量最大的出口之一。而且这个错是自我强化的：
+    /// 真实流量的保质期只有 2 小时，一过就改按探测结论排序，出口掉到最差档、更拿不到
+    /// 流量、更没有新鲜记录。
+    #[test]
+    fn a_retired_model_must_not_condemn_the_whole_outlet() {
+        // 只否定这一个模型的：换下一个接着探。
+        assert!(super::rejects_only_this_model(400), "400 多半就是「不认识这个模型名」");
+        assert!(super::rejects_only_this_model(404), "404 就是「找不到这个模型」");
+        // 否定整个出口的：不用再换模型了，换了也一样。
+        for s in [200_u16, 401, 403, 429, 500, 502, 503, 504] {
+            assert!(
+                !super::rejects_only_this_model(s),
+                "{s} 被当成了「只是这个模型不在」—— 会白白多发几次探测"
+            );
+        }
+    }
+
+    /// 「什么时候换下一个模型、什么时候收手」—— 真跑，不扫源码。
+    ///
+    /// 这条最初写成源码断言（查循环里有没有 `for ... ids.iter()`），**变异测试当场
+    /// 证明它是恒真的**：把循环改成 `.take(1)`（也就是退回老行为）之后断言照样绿。
+    /// 这是这个仓库反复栽的那一类，判据一律改成能在进程里跑一遍的。
+    #[tokio::test]
+    async fn the_probe_walks_past_models_the_outlet_does_not_serve() {
+        let ids: Vec<String> = ["retired", "current", "third"].iter().map(|s| s.to_string()).collect();
+        // 记录实际探了哪几个，用来证明短路真的短路了。
+        async fn run(
+            ids: &[String],
+            plan: Vec<(bool, u16)>,
+        ) -> (Option<(bool, u16)>, Vec<String>) {
+            let seen = std::cell::RefCell::new(Vec::<String>::new());
+            let out = super::probe_until_decisive(
+                ids,
+                |id| {
+                    seen.borrow_mut().push(id.clone());
+                    let i = seen.borrow().len() - 1;
+                    let hit = plan[i];
+                    async move { Some(hit) }
+                },
+                |r: &(bool, u16)| r.1,
+            )
+            .await;
+            (out, seen.into_inner())
+        }
+
+        // ① 第一个模型 400（下线的型号）→ 换下一个，第二个通了就收手。
+        let (out, seen) = run(&ids, vec![(false, 400), (true, 200), (false, 500)]).await;
+        assert_eq!(out, Some((true, 200)), "第一个模型 400 就把整个出口判死了");
+        assert_eq!(seen, vec!["retired", "current"], "探通之后还在继续发探测（白烧钱）");
+
+        // ② 密钥被拒和模型无关 —— 立刻收手，别拿同一把坏钥匙再试三次。
+        let (out, seen) = run(&ids, vec![(false, 401), (true, 200), (true, 200)]).await;
+        assert_eq!(out, Some((false, 401)));
+        assert_eq!(seen, vec!["retired"], "401 之后还在换模型重试");
+
+        // ③ 每一个都说「没有这个模型」→ 这个出口确实不可用，采信最后一个。
+        let (out, seen) = run(&ids, vec![(false, 400), (false, 404), (false, 400)]).await;
+        assert_eq!(out, Some((false, 400)));
+        assert_eq!(seen.len(), 3, "没有把允许的模型走完就下结论");
+    }
+
     /// 真实结果必须**成功和失败都记**，否则成功率的分母永远缺一块。
     ///
     /// 在这之前：成功那一半有（model_usage 每次扣费写一行），失败只进 Redis 的一个
@@ -1200,12 +1325,15 @@ mod tests {
     /// 运维几次之后就把告警静音，下一次真事故照样没人看。
     #[test]
     fn the_canary_speaks_both_protocols() {
+        // 锚点是 `canary_once_with` 而不是 `canary_once`：协议分支住在前者里，
+        // 后者只是「逐个模型探到有结论为止」的分派。按 `canary_once` 切会切到分派那段，
+        // 于是下面每一条都找不到，断言变成恒红（改完这次分拆时当场撞到）。
         let src = include_str!("route_health.rs");
         let body = src
-            .split("async fn canary_once")
+            .split("async fn canary_once_with(")
             .nth(1)
             .and_then(|s| s.split("\n}").next())
-            .expect("canary_once 不见了");
+            .expect("canary_once_with 不见了");
         assert!(body.contains("anthropic"), "没有按协议分支");
         assert!(body.contains("x-api-key") && body.contains("anthropic-version"),
             "anthropic 分支缺鉴权头，那条路上的线路会被全部误判成坏的");

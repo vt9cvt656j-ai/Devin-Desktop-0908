@@ -155,3 +155,120 @@ test("怎么都压不下去时是明确失败，不是存一个半截的东西",
   const got = encode(fakeCanvas({ webp: true, bytesPerPx }), 8000, 8000);
   assert.equal(got, null, "压不下去却返回了东西");
 });
+
+// ── 皮肤覆盖面：谁跟着透、谁永远不透 ─────────────────────────────────────────
+//
+// 用户实拍两类毛病，根子是同一个：**皮肤有两套并行机制**，一套是改变量（覆盖面广、
+// 跟滑块走），一套是逐个元素写 `background: transparent`（绕开滑块）。第二套每多一条，
+// 滑块就多一块管不到的地方 —— 那就是"皮肤内容不全"。
+//
+// 这一组守的是收口之后的形状：**只留改变量那一套**。
+const CSS_ALL = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
+/** 切出皮肤那一节（到设置页样式为止），并剥掉注释——注释里逐字写着旧写法长什么样。 */
+function skinBlock() {
+  const from = CSS_ALL.indexOf("/* ═══ 自定义软件皮肤");
+  const to = CSS_ALL.indexOf(".settings-row--skin ");
+  assert.ok(from > 0 && to > from, "皮肤那一段没切出来，锚点漂了");
+  return CSS_ALL.slice(from, to)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+
+test("每个跟皮肤走的面色，都从自己那份 *-opaque 推导", () => {
+  // 皮肤要按浓度调一个面色，就必须有一份**没被调过的原值**可推导。缺了它只能一刀切成
+  // transparent（--bg 原来就是这样），于是所有消费者一起变成全透、滑块完全管不到。
+  const block = skinBlock();
+  const m = block.match(/:root\[data-skin="on"\]\s*\{([^}]*)\}/);
+  assert.ok(m, "皮肤的变量覆盖块不见了");
+  const decls = [...m[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)];
+  assert.ok(decls.length >= 5, `只覆盖了 ${decls.length} 个变量，覆盖面缩了`);
+  // 五个外框面一个都不能少：少一个，那一块就永远不跟着皮肤走。
+  // （`--skin-blur` 也在这个块里，但它是滤镜不是颜色，由下面那条单独的测试守。）
+  const SURFACES = ["--bg", "--panel", "--panel-solid", "--panel-2", "--editor-bg"];
+  for (const need of SURFACES) {
+    assert.ok(decls.some(([, n]) => n === need), `${need} 没被皮肤覆盖，这一块会漏`);
+  }
+  for (const [, name, value] of decls) {
+    if (!SURFACES.includes(name)) continue;
+    assert.match(
+      value,
+      /color-mix\(in srgb, var\(--[a-z0-9-]+-opaque\) var\(--skin-panel-a\), transparent\)/,
+      `${name} 没有按「原值 × 浓度」推导（值是 ${value.trim()}）——` +
+      "写死 transparent 或写死颜色都会让浓度滑块对它失效",
+    );
+  }
+});
+
+test("皮肤块里不许有 per-element 规则——只有底图那两条例外", () => {
+  // 两条例外都属于"铺底图"本身，不属于"让某个面透"：
+  //   body::before  底图层，图就画在它上面；
+  //   body          自己的底色必须让开，否则底图被它整块盖住。
+  // 除它俩之外，每一条 per-element 规则都是在绕开变量机制。删掉的四条各自的毛病：
+  //   .layout        空操作（那个元素本来就没有背景）；
+  //   .editorwrap    把滑块钉死成全透，浓度调到 0 也照样漏底图；
+  //   .welcome       重复，而且把颜色换成了另一个色阶；
+  //   .feature-panel 把设置页四个面色都调透 —— 而它是覆盖整窗的浮层，底下是**工作区**，
+  //                  于是欢迎页大标题、文件树、助手栏对话全从设置项文字底下透出来。
+  //
+  // **判据不能只看 `background`。** 上面 .feature-panel 那条改的是 `--feature-*` 自定义
+  // 属性，一个 background 字都没有 —— 旧版判据正是这么被绕过去的，而它是这一批里
+  // 最严重的一处。所以这里禁的是"出现 per-element 规则"本身，不是"规则里写了什么"。
+  const ALLOWED = new Set(["body", "body::before"]);
+  const block = skinBlock();
+  const bad = [];
+  for (const m of block.matchAll(/:root\[data-skin="on"\]\s+([^{,]+)\{/g)) {
+    const sel = m[1].trim();
+    if (ALLOWED.has(sel)) continue;
+    bad.push(sel);
+  }
+  assert.deepEqual(bad, [], `又出现了绕开变量机制的 per-element 规则：${bad.join(", ")}`);
+});
+
+test("皮肤要把底图糊掉，不是拿一层白纱压在清晰照片上", () => {
+  // 用户实拍否掉过没有模糊的版本：一层半透明veil压在一张清晰照片上，得到的是"脏"。
+  // 照片的高频细节直接顶在正文后面，对比度被打散。macOS vibrancy / Warp / Acrylic
+  // 做的都是"先糊掉背后，再上色veil"，所以底图退成柔和色场、文字始终压在纯色上。
+  const block = skinBlock();
+  const m = block.match(/:root\[data-skin="on"\]\s*\{([^}]*)\}/);
+  assert.ok(m, "皮肤的变量覆盖块不见了");
+  assert.match(m[1], /--skin-blur\s*:\s*[^;]*blur\(/, "皮肤开着时没有开启背景模糊");
+  assert.match(m[1], /--skin-blur\s*:\s*[^;]*saturate\(/,
+    "模糊会把颜色摊平，不补饱和度底图会灰得像蒙了层灰");
+
+  // 没有皮肤时必须是 none —— 否则等于给全窗口无条件加了一层昂贵的合成层。
+  assert.match(CSS_ALL, /(?<!\])\n:root \{[\s\S]*?--skin-blur:\s*none;/,
+    "--skin-blur 的默认值不是 none，没有皮肤时也会触发模糊");
+
+  // 消费方：外框面要真的吃到它，否则变量开了也没人用。
+  const nc = CSS_ALL.replace(/\/\*[\s\S]*?\*\//g, "");
+  const users = (nc.match(/backdrop-filter:\s*var\(--skin-blur\)/g) || []).length;
+  assert.ok(users >= 4, `只有 ${users} 处消费 --skin-blur，外框面没接全`);
+});
+
+test("浮层永远不透：它们浮在别的界面上，不是浮在壁纸上", () => {
+  // 实拍过：下拉菜单跟着半透之后，菜单文字和它盖住的输入框文字叠在一起。
+  // 这跟底图好不好看无关 —— 判据是"这个面底下是壁纸还是别的界面"。
+  const nc = CSS_ALL.replace(/\/\*[\s\S]*?\*\//g, "");
+  const FLOATING = [
+    ".settings-dropdown", ".assistant-capability__menu", ".ctp-card",
+    ".menu", ".git-branch-menu", ".palette__panel",
+  ];
+  const SKINNED = ["--panel-solid", "--panel-2", "--editor-bg", "--bg", "--panel"];
+  for (const sel of FLOATING) {
+    const re = new RegExp("(?:^|\\})\\s*" + sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\{([^}]*)\\}", "m");
+    const m = nc.match(re);
+    assert.ok(m, `${sel} 的规则找不到了`);
+    const bg = m[1].match(/(?:^|;)\s*background(?:-color)?\s*:\s*([^;]+)/);
+    assert.ok(bg, `${sel} 没有背景声明了`);
+    const v = bg[1];
+    assert.match(v, /var\(--popover-surface\)/, `${sel} 的底色不是 --popover-surface`);
+    for (const t of SKINNED) {
+      assert.ok(!v.includes(`var(${t})`), `${sel} 又吃上了会被皮肤调低的 ${t}`);
+    }
+  }
+  // 反方向：--popover-surface 必须**不**在皮肤的覆盖名单里，否则上面全白做。
+  assert.ok(
+    !/--popover-surface\s*:/.test(skinBlock()),
+    "--popover-surface 被皮肤覆盖了，浮层会重新变透",
+  );
+});

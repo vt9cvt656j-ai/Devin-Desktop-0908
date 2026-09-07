@@ -219,16 +219,22 @@ test("画像旗标 domain_<name>：目录名的 `-` 换成 `_`，只在 domain �
 
 test("领域旗标跟着会话级单调并集走，和其它旗标同一条路", () => {
   const stable = load("_sessionStableSemanticProfile");
+  // 裁决还没落定的会话，请求头最前面多一位 unjudged（不粘：模型判过就没了）——网关据此兜底挂工程块。
   const session = {};
   assert.equal(stable(session, semanticProfile({ applies: true, domain: "finance" })),
-    "2.5:engineering,domain_finance");
+    "2.5:unjudged,engineering,domain_finance");
   // 第二轮换了话题、旗标算不出来了，并集也不许把它丢掉——粘性是这套画像的既有设计
   // （丢了就等于每轮重写请求头的第 0 字节，把整条缓存前缀作废）。
   assert.equal(stable(session, semanticProfile({ applies: true })),
-    "2.5:engineering,domain_finance");
+    "2.5:unjudged,engineering,domain_finance");
   // 新领域是并进去，不是替换。
   assert.equal(stable(session, semanticProfile({ domain: "security" })),
+    "2.5:unjudged,engineering,domain_finance,domain_security");
+  // 模型裁决落定：unjudged 消失，且它从不进粘性并集。
+  session._semanticProfileFromModel = true;
+  assert.equal(stable(session, semanticProfile({ domain: "security" })),
     "2.5:engineering,domain_finance,domain_security");
+  assert.ok(!session._semanticProfileFlags.includes("unjudged"), "unjudged 不许粘进会话并集");
 });
 
 test("裁决提示词必须把 domain 讲清楚并出现在输出形状里，否则模型永远不会填它", () => {

@@ -1,0 +1,1 @@
+import{et as e,rt as t}from"./vendor-ZlW_aUeQ.js";t();export{e as WebviewWindow};

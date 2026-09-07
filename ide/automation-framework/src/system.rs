@@ -26,6 +26,150 @@ fn png_pixel_size(buf: &[u8]) -> Option<(u32, u32)> {
     if w == 0 || h == 0 { None } else { Some((w, h)) }
 }
 
+/// 抓屏成 PNG 字节（macOS，`screencapture` CLI）。**不碰 Agent**——截屏是只读能力，
+/// 不需要辅助功能权限，也不需要 enigo。抽成自由函数是为了让 `screen.capture` /
+/// `screen.marked` 能挂在 accept 线程之外跑，不再排在浏览器动作后面。
+/// `region` 是**点**坐标（`screencapture -R` 收的就是点）；出来的 PNG 在 Retina 上是 2× 像素。
+#[cfg(target_os = "macos")]
+pub fn capture_screen_png(region: Option<(i32, i32, i32, i32)>) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let dir = std::env::temp_dir().join("mrdayone-screen");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Error::System(format!("建临时目录失败：{e}")))?;
+    // 截图可能含密码、私信、密钥。0700：同机其他账户读不到。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir.join(format!(
+        "shot-{}.png",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut cmd = std::process::Command::new("screencapture");
+    cmd.arg("-x"); // 不发快门音
+    if let Some((x, y, w, h)) = region {
+        if w <= 0 || h <= 0 {
+            return Err(Error::System("截图区域的宽高必须为正".into()));
+        }
+        cmd.arg("-R").arg(format!("{x},{y},{w},{h}"));
+    }
+    let status = cmd
+        .arg(&path)
+        .status()
+        .map_err(|e| Error::System(format!("screencapture 起不来：{e}")))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        // 没授权"屏幕录制"时 screencapture 也会失败。这句必须说清是权限，否则模型会
+        // 反复重试一个永远不会成功的调用。
+        return Err(Error::System(
+            "截屏失败（退出码非 0）。最常见的原因是没给「屏幕录制」权限：                 系统设置 → 隐私与安全性 → 屏幕录制，勾上本应用后需要重启它。"
+                .into(),
+        ));
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(&path)
+        .and_then(|mut f| f.read_to_end(&mut buf))
+        .map_err(|e| Error::System(format!("读截图失败：{e}")))?;
+    let _ = std::fs::remove_file(&path); // 图已经在内存里，别把它留在盘上
+    if buf.is_empty() {
+        return Err(Error::System("截屏得到 0 字节——多半是屏幕录制权限没给".into()));
+    }
+    Ok(buf)
+}
+
+/// 主屏的**点**尺寸（不是像素）。鼠标坐标、AX 树坐标、`screencapture -R` 用的都是这一套。
+/// CGDisplay 那两个叫 pixels_wide/high 的方法在 Retina 上返回的其实是点（实测 1728×1117），
+/// 见 rpc.rs `screen.info` 那段说明。走 CoreGraphics 而不是 enigo，是为了不碰 Agent。
+#[cfg(target_os = "macos")]
+pub fn main_display_points() -> Option<(u32, u32)> {
+    let d = core_graphics::display::CGDisplay::main();
+    let (w, h) = (d.pixels_wide() as u32, d.pixels_high() as u32);
+    if w > 0 && h > 0 { Some((w, h)) } else { None }
+}
+
+/// 屏幕是不是锁着。锁屏时 screencapture 出来的是一张全黑图、CGWindowList 一扇窗口都没有，
+/// 而 AX 树照样读得到——不说出来，模型会把黑图当成「这个应用什么都没显示」。
+#[cfg(target_os = "macos")]
+pub fn screen_locked() -> bool {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+    }
+    unsafe {
+        let raw = CGSessionCopyCurrentDictionary();
+        if raw.is_null() {
+            return false;
+        }
+        let dict: CFDictionary<CFString, CFType> = CFDictionary::wrap_under_create_rule(raw);
+        dict.find(&CFString::new("CGSSessionScreenIsLocked"))
+            .and_then(|v| v.downcast::<CFBoolean>())
+            .map(|b| b.into())
+            .unwrap_or(false)
+    }
+}
+
+/// 屏幕上普通层的窗口，按 z 序**从前到后**（CGWindowList 就按这个顺序给），带所属进程。
+/// `screen.marked` 靠它判「这个元素在截图上看不看得见」；不碰 Agent，不需要辅助功能权限。
+#[cfg(target_os = "macos")]
+pub fn window_stack() -> Vec<crate::vision::WinRect> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowListExcludeDesktopElements,
+        kCGWindowListOptionOnScreenOnly,
+    };
+    let mut out = Vec::new();
+    let Some(list) = copy_window_info(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID,
+    ) else {
+        return out;
+    };
+    for item in list.iter() {
+        let dict: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_get_rule(*item as *const _) };
+        let n_of = |key: &str| -> f64 {
+            dict.find(&CFString::new(key))
+                .and_then(|v| v.downcast::<CFNumber>())
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0)
+        };
+        // layer != 0 是菜单栏 / Dock / 悬浮面板，不参与遮挡判断（菜单栏项照样要标）。
+        if n_of("kCGWindowLayer") != 0.0 {
+            continue;
+        }
+        let pid = n_of("kCGWindowOwnerPID") as i32;
+        let Some((x, y, w, h)) = dict.find(&CFString::new("kCGWindowBounds")).map(|v| unsafe {
+            let b: CFDictionary<CFString, CFType> =
+                CFDictionary::wrap_under_get_rule(v.as_CFTypeRef() as *const _);
+            let g = |k: &str| {
+                b.find(&CFString::new(k))
+                    .and_then(|n| n.downcast::<CFNumber>())
+                    .and_then(|n| n.to_f64())
+                    .unwrap_or(0.0)
+            };
+            (g("X"), g("Y"), g("Width"), g("Height"))
+        }) else {
+            continue;
+        };
+        if pid <= 0 || w < 2.0 || h < 2.0 {
+            continue;
+        }
+        out.push(crate::vision::WinRect { pid, x, y, w, h });
+    }
+    out
+}
+
 impl SystemAutomation {
     /// 屏幕的**点**尺寸（不是像素）。鼠标坐标用的就是这套单位。
     fn screen_size_points(&self) -> Option<(u32, u32)> {
@@ -75,48 +219,9 @@ impl SystemAutomation {
     /// 返回 (PNG data URL, 像素↔点的换算说明)。第二项在 Retina 上非空——
     /// 图是像素尺寸而鼠标收的是点，不说清楚模型就会拿图上量的坐标直接去点，点到屏幕外。
     pub fn screen_capture(&self, region: Option<(i32, i32, i32, i32)>) -> Result<(String, Option<String>)> {
-        use std::io::Read;
-        let dir = std::env::temp_dir().join("mrdayone-screen");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| Error::System(format!("建临时目录失败：{e}")))?;
-        // 截图可能含密码、私信、密钥。0700：同机其他账户读不到。
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
-        let path = dir.join(format!(
-            "shot-{}.png",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let mut cmd = std::process::Command::new("screencapture");
-        cmd.arg("-x"); // 不发快门音
-        if let Some((x, y, w, h)) = region {
-            if w <= 0 || h <= 0 {
-                return Err(Error::System("截图区域的宽高必须为正".into()));
-            }
-            cmd.arg("-R").arg(format!("{x},{y},{w},{h}"));
-        }
-        let status = cmd
-            .arg(&path)
-            .status()
-            .map_err(|e| Error::System(format!("screencapture 起不来：{e}")))?;
-        if !status.success() {
-            let _ = std::fs::remove_file(&path);
-            // 没授权"屏幕录制"时 screencapture 也会失败。这句必须说清是权限，否则模型会
-            // 反复重试一个永远不会成功的调用。
-            return Err(Error::System(
-                "截屏失败（退出码非 0）。最常见的原因是没给「屏幕录制」权限：                 系统设置 → 隐私与安全性 → 屏幕录制，勾上本应用后需要重启它。"
-                    .into(),
-            ));
-        }
-        let mut buf = Vec::new();
-        std::fs::File::open(&path)
-            .and_then(|mut f| f.read_to_end(&mut buf))
-            .map_err(|e| Error::System(format!("读截图失败：{e}")))?;
+        // 抓屏本身在自由函数里（不碰 Agent）；这个方法只负责老口径的回执：原图 + 换算提示。
+        // 新口径（缩图 + 精确换算）在 rpc.rs 的 screen.capture / screen.marked 里走 vision::prepare。
+        let buf = capture_screen_png(region)?;
         // Retina 上 screencapture 出的是**像素**尺寸（2x），而鼠标要的是**点**坐标。
         // 此前这个差别一个字都没告诉模型：它在图上量出按钮在 (1200, 800)，直接传给
         // mouse.move —— 实际点在 (2400, 1600)，屏幕外。「看一眼再动手」这条链从来没成立过。
@@ -137,10 +242,6 @@ impl SystemAutomation {
                 _ => None,
             }
         };
-        let _ = std::fs::remove_file(&path); // 图已经在内存里，别把它留在盘上
-        if buf.is_empty() {
-            return Err(Error::System("截屏得到 0 字节——多半是屏幕录制权限没给".into()));
-        }
         Ok((format!("data:image/png;base64,{}", base64_encode(&buf)), scale_note))
     }
 

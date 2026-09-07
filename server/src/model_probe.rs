@@ -73,19 +73,26 @@ async fn recalls_at(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
+    protocol: &str,
     model_id: &str,
     target_tokens: i64,
 ) -> anyhow::Result<bool> {
-    let url = format!("{}/chat/completions", crate::models::api_base(base_url));
     let body = serde_json::json!({
         "model": model_id,
         "messages": [{ "role": "user", "content": build_probe_prompt(target_tokens) }],
         "max_tokens": 40,
         "temperature": 0,
     });
+    // 按线路自己的协议打。以前无条件拼 /chat/completions —— Anthropic 线路上 404，
+    // 而下面那句「非 2xx 都算这个长度不行」会把 404 读成「装不下」，于是整条线路上的
+    // 模型被探成「一档都过不了」。这个错法尤其阴：它和「模型真的很小」返回同一个值。
+    let (url, body) = crate::models::aux_wire_request(base_url, protocol, &body)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let resp = http
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
         .json(&body)
         .send()
         .await?;
@@ -94,7 +101,7 @@ async fn recalls_at(
         // 误判为不行只是这一轮少测一档，下一轮还会再来。
         return Ok(false);
     }
-    let v: serde_json::Value = resp.json().await?;
+    let v = crate::models::aux_wire_response(protocol, model_id, resp.json().await?);
     let text = v
         .get("choices")
         .and_then(|c| c.get(0))
@@ -106,13 +113,18 @@ async fn recalls_at(
 }
 
 /// 探出这个模型真正能装下多少。`None` = 一档都没通过（线路不可用/模型名不对）。
-pub async fn probe_context(base_url: &str, api_key: &str, model_id: &str) -> Option<Entry> {
+pub async fn probe_context(
+    base_url: &str,
+    api_key: &str,
+    protocol: &str,
+    model_id: &str,
+) -> Option<Entry> {
     let http = reqwest::Client::builder()
         .timeout(PROBE_TIMEOUT)
         .build()
         .ok()?;
     for &tier in PROBE_TIERS {
-        match recalls_at(&http, base_url, api_key, model_id, tier).await {
+        match recalls_at(&http, base_url, api_key, protocol, model_id, tier).await {
             Ok(true) => {
                 tracing::info!(model = model_id, window = tier, "能力探测：召回成功，采信这一档");
                 return Some(Entry {

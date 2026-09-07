@@ -46,9 +46,19 @@ export function freshBuildFailure(run, implOps) {
     //
     // 判据用退出码 + 运行器级的「找不到」，不看代码里的报错文本：命令没找到是**执行事实**，
     // 而正文里出现 "not found" 完全可能是被测代码自己打印的。
+    //
+    // 字段名必须是 `stdout` / `stderr`。这里原来读的是 `e.output || e.tail`，而执行证据记录
+    // （`_executionEvidenceFromTool`）产出的字段只有 stdout/stderr —— **这两个名字一个都不存在**，
+    // 于是整条文本腿恒等于空串、恒不匹配，只剩退出码 127/126 那一半在工作。
+    // 后果正是这段注释上面描述的那一幕，只是换了个出口：一堆"验证器自己没起来"的失败走的是
+    // 退出码 1（`npm ERR! Missing script: "test"`、`pytest: 没装但被 sh -c 包了一层`、
+    // `Unknown command`），它们全部被判成红构建，把一个已经做完的任务推进两轮无意义的返修，
+    // 还盖上 build_failing。
+    const _runnerText = `${String(e.stderr || "")}\n${String(e.stdout || "")}`.slice(0, 400);
     const _cannotRun = e.exitCode === 127 || e.exitCode === 126
-      || /^(?:[^\n]{0,80}?:\s*)?(?:command not found|not found|no such file or directory)\b/im
-        .test(String(e.output || e.tail || "").slice(0, 400));
+      || /^(?:[^\n]{0,80}?:\s*)?(?:command not found|not found|no such file or directory)\b/im.test(_runnerText)
+      // 包管理器/运行器自己说"这个脚本我没有"——同样是执行事实，不是代码的证词。
+      || /\bnpm ERR! Missing script\b|\bno such (?:script|task|target)\b|\bUnknown command\b/i.test(_runnerText);
     if (_cannotRun) continue;
     // last-write-wins 是**按命令**算的，不是全局的。
     //

@@ -49,6 +49,28 @@ services:
       retries: 5
     logging: *default-logging
 
+  # PgBouncer：应用和 Postgres 之间的连接池。transaction 模式下事务结束立即归还 PG 后端，
+  # 50 个应用连接可以共用 20 个 PG 连接。横向扩展多个 backend 副本时尤其重要——
+  # 两个副本各开 50 连接就是 100，直连的话刚好撞到 PG 的 max_connections 上限。
+  pgbouncer:
+    # 标签必须带 v 前缀和 -pN 补丁号：Docker Hub 上不存在 `1.23.1`，只有 v1.23.1-p0…p3。
+    # 写成 1.23.1 时 compose 直接 "not found"，容器根本创建不出来。
+    image: edoburu/pgbouncer:v1.23.1-p3
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./pgbouncer-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+
   # 蓝绿部署：两种颜色共用这份定义，只有发布端口不同。
   #
   # 绿色挂在 profile 后面，平时**不启动**——`docker compose up -d` 不带 --profile 时
@@ -92,7 +114,7 @@ services:
     # 而测试目录里没有 `.env` → "env file not found" 直接失败。（和 ports 一个坑。）
     env_file: ${ENV_FILE_NAME:-.env}
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
       # 默认是 true —— 每个注册用户都会自动拿到往宿主机磁盘写文件、并占一个二级域名的
       # 权限。关掉，改成按名单发放（DEPLOY_ALLOWLIST）。
@@ -107,6 +129,8 @@ services:
       # MusicGen weights are downloaded once on first use and survive image rebuilds.
       - musiccache:/var/cache/michael/huggingface
     depends_on:
+      pgbouncer:
+        condition: service_started
       postgres:
         condition: service_healthy
       redis:

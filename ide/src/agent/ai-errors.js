@@ -42,6 +42,17 @@ function _aiStatusFromMessage(msg) {
  *   permanent  400 / 413 / 422 —— 请求本身有问题，原样重发必然再失败。
  */
 export function _aiFailureKind(msg, status = 0) {
+  // 网关自己那道并发闸的标记。**必须排在状态码判断之前**：它和上游限流同为 429，
+  // 而下面的分类只看状态码，于是这道闸会被当成真限流，白等 15 秒再等 30 秒。
+  //
+  // 两者性质相反：真限流是上游让我们慢下来，长退避是对的、也确实在省配额；这道闸的
+  // 请求**根本没发出去**，不烧任何配额，位子在用户自己那几个在跑的请求里任何一个
+  // 结束时就腾出来了。所以它走普通重试那条（2 秒起步的指数退避）。
+  //
+  // 字面量写在函数**里面**：test/logic.test.mjs 有自己的加载器（按函数名抠出源码再
+  // eval），模块级常量不在它的作用域里 —— 提出去会让那边 12 条测试一起
+  // `ReferenceError`（这次改动当场撞到）。
+  if (String(msg || "").includes("[gateway-inflight]")) return "gateway_busy";
   const code = Number(status) || _aiStatusFromMessage(msg);
   // 上游会把**容量**错误包在 400 + invalid_request_error 里发出来。实测原文：
   //   {"error":{"message":"请稍后重试，暂无可用渠道，或切换模型 (request id: …)",
@@ -107,7 +118,9 @@ export function _isRetryableAiError(msg, status = 0) {
   // 有状态码 → 分类说了算。没有状态码的失败（流中途断掉、停滞看门狗、fetch 抛错）
   // 本来就没有 HTTP 响应可依据，才轮到下面那些文案判据——续传（canResume）走的正是这条路。
   const kind = _aiFailureKind(msg, status);
-  if (kind) return kind === "transient";
+  // gateway_busy 和 transient 一样要重试 —— 区别只在**退避多长**：它走这条（2 秒起步），
+  // 不走限流那条（15 秒起步）。判成不可重试的话，一次自家排队会被当成整轮失败。
+  if (kind) return kind === "transient" || kind === "gateway_busy";
   if (_isUnrecoverableUpstreamError(msg)) return false;
   if (_isRateLimitedAiError(msg)) return false;
   if (_isProviderGatewayStatusError(msg)) return true;

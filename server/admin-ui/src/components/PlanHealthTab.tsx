@@ -31,7 +31,7 @@ type Burn = {
 };
 type Channel = {
   name: string; host: string; usd_per_cny: number;
-  requests: number; raw_cents: number; cny: number | null; share: number;
+  requests: number; sell_usd: number; cny: number | null; share: number;
 };
 type Plan = {
   plan: string; label: string | null;
@@ -46,7 +46,10 @@ type Health = {
   burn: Burn; channels: Channel[];
   blended_usd_per_cny: number | null;
   best_usd_per_cny: number | null; worst_usd_per_cny: number | null;
-  unpriced_raw_cents: number; zero_cost_share: number | null;
+  unpriced_sell_usd: number; zero_cost_share: number | null;
+  /** 这一屏的金额是拿多少行算的。usable < total 说明窗口里还有一批 2026-08-28
+   *  单位切换之前的旧行被排除在外 —— 那不是丢数据，是不混加。 */
+  usable_rows: number; total_rows: number; usable_since: string | null;
   /** 探针实测：这段时间中转账户真掉了多少上游美元、对应多少面值额度。没攒够样本时是 null。 */
   measured: {
     upstream_usd: number; visible_usd: number; requests: number;
@@ -165,10 +168,10 @@ export function PlanHealthTab() {
   if (!h) return <EmptyState title="读取中" hint="正在从真实用量和渠道构成里算。" />;
 
   const b = h.burn;
-  const unpricedShare = h.unpriced_raw_cents > 0 && h.channels.length
-    ? h.unpriced_raw_cents / h.channels.reduce((a, c) => a + c.raw_cents, 0)
+  const unpricedShare = h.unpriced_sell_usd > 0 && h.channels.length
+    ? h.unpriced_sell_usd / h.channels.reduce((a, c) => a + c.sell_usd, 0)
     : 0;
-  const placeholderish = h.channels.filter((c) => c.usd_per_cny === 1 && c.raw_cents > 0);
+  const placeholderish = h.channels.filter((c) => c.usd_per_cny === 1 && c.sell_usd > 0);
 
   return (
     <div className="flex flex-col gap-6">
@@ -353,6 +356,14 @@ export function PlanHealthTab() {
       </div>
 
       <Panel title={`真实流量落在哪些中转上（最近 ${h.window_days} 天）`}>
+        {h.total_rows > h.usable_rows && (
+          <div className="mb-3 text-xs text-muted-foreground">
+            窗口里 {num(h.total_rows)} 次调用，其中 {num(h.usable_rows)} 次的金额单位是可辨的，
+            上面的钱只按这一批算。其余是 2026-08-28 计费单位切换之前写下的行，
+            当时的「真实计费分」是美元分、之后是人民币分，混着相加会差 7.1 倍。
+            {h.usable_since ? ` 可用数据从 ${new Date(h.usable_since).toLocaleDateString()} 起。` : ""}
+          </div>
+        )}
         <Table className="min-w-[52rem]">
           <TableHeader>
             <TableRow>
@@ -360,7 +371,7 @@ export function PlanHealthTab() {
               <TableHead className="w-56">地址</TableHead>
               <TableHead numeric className="w-32">渠道购买价</TableHead>
               <TableHead numeric className="w-24">占消耗</TableHead>
-              <TableHead numeric className="w-28">真实分</TableHead>
+              <TableHead numeric className="w-28">售价</TableHead>
               <TableHead numeric className="w-28">人民币成本</TableHead>
             </TableRow>
           </TableHeader>
@@ -373,7 +384,7 @@ export function PlanHealthTab() {
                   {c.usd_per_cny > 0 ? `¥1 → $${c.usd_per_cny}` : <span className="text-muted-foreground">没填</span>}
                 </TableCell>
                 <TableCell numeric>{(c.share * 100).toFixed(1)}%</TableCell>
-                <TableCell numeric>{num(c.raw_cents)}</TableCell>
+                <TableCell numeric>{usd(c.sell_usd)}</TableCell>
                 <TableCell numeric>{c.cny == null ? "—" : cny(c.cny)}</TableCell>
               </TableRow>
             ))}

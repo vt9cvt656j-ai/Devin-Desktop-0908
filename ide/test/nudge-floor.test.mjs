@@ -38,7 +38,8 @@ function pushNudgeCalls(src) {
 // 一条没有理由的注入，就是下一次该被搬走的那条。
 const FLOOR = {
   // ── 控制流：要让循环再转一圈。提示词里写不出 continue，结构上搬不动。 ──
-  toolRepair: { n: 2, why: "control-flow" },   // 工具调用残缺 → 带着修复指令重来
+  // toolRepair 2026-09-05 拆了：参数不合规改成同轮 is_error 工具结果，不再重掷、不再劝。
+  refusalRetry: { n: 2, why: "control-flow" }, // 模型被自己的安全分类器拦了 → 自动重试
   turnRetry: { n: 1, why: "control-flow" },    // 这一轮模型没产出 → 重试
   buildFix: { n: 1, why: "control-flow" },     // 声明为验证的命令失败 → 不许收尾
   diagFinish: { n: 1, why: "control-flow" },   // 诊断没清零 → 不许收尾
@@ -49,8 +50,6 @@ const FLOOR = {
                                                // 挪到工具返回值上等于给每一轮加延迟
   stuck: { n: 1, why: "fact" },                // 近 8 次里失败 ≥4 —— 跨调用的聚合，
                                                // 没有任何单条工具结果看得见它
-  researchFirst: { n: 1, why: "fact" },        // 这次工程语义要求哪种真实参考、还差哪种
-  bugEvidence: { n: 1, why: "fact" },
   probeLoop: { n: 1, why: "fact" },
   directionCheck: { n: 1, why: "fact" },       // 评审给出的走向判断
   dynamicToolRoute: { n: 1, why: "fact" },     // 这一轮的工具窗口刚被改成什么样
@@ -84,8 +83,8 @@ test("循环里 harness 说的话已经收敛到地板，且不许悄悄涨回�
   assert.equal(dynamic, DYNAMIC_EXPECTED, "类名算出来的那两条：ask_user 边界 + churn:<路径>");
 
   // 总量闸：这一轮从 25 个降到 17 个。往回涨要先解释清楚。
-  assert.ok(calls.length <= 17,
-    `注入点 ${calls.length} 个，超过地板 17。`);
+  assert.ok(calls.length <= 15,
+    `注入点 ${calls.length} 个，超过地板 15。`);
 });
 
 test("已经搬走的那些，不许再回到循环里", () => {
@@ -102,6 +101,10 @@ test("已经搬走的那些，不许再回到循环里", () => {
     recovery: "_toolMsgForModel 生成失败工具结果时拼在正文末尾的 [RECOVERY:…]",
     cmdFail: "失败命令自己的工具结果",
     design: "design_components.txt（语义画像路由的条件层）",
+    // 2026-09-05 拆的两条：都是按画像**预测**模型会不会做，不是执行事实。
+    researchFirst: "agent_engineering.txt（先查真实版本/API 再写）+ 研究工具本来就在核心集",
+    bugEvidence: "agent_engineering.txt（bug 修复先建因果链）",
+    toolRepair: "参数不合规 → 同轮 [tool-args-invalid] 工具结果（is_error），不重掷、不劝",
     verifyNow: "[本轮交付事实] 块",
     writeFacts: "[本轮交付事实] 块",
   };

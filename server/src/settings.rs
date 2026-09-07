@@ -250,6 +250,32 @@ pub fn usd_per_cny_bps() -> i64 {
 ///
 /// 汇率取后台设置的 `usd_per_cny_bps`（1 人民币分折合多少美元分，万分比），
 /// 不写死：汇率变了改一个数字就行，不用改代码重新发版。
+/// **micro-USD → 用户钱包口径的人民币分。** 只取整一次。
+///
+/// `usd_cents_to_wallet_cents` 收的是**已经取整到整美分**的数，而 `compute_cost` 正是在那一步
+/// `(usd * 100 * rate).round()` 把精度扔了：人民币分比美分细 7.1 倍（bps=1408），于是
+/// **乘上线路倍率后不到半美分的调用全部被四舍五入成 0 —— 白送，而且没有任何日志**。
+/// 生产实测（2026-09-03，24 小时）：
+///   deepseek-v4-flash-vision-exp 235 次里 228 次收 0（平均 0.50 美分），1700 万 token
+///   claude-sonnet-5 收 0 那组平均 0.43 美分；deepseek-v4-pro 收 0 那组 0.14 美分
+///   而同一模型「收到钱」那组平均都在 1.2 美分以上 —— 分界线正好在半美分。
+///
+/// 换算恒等式：美分 = micro ÷ 10000，人民币分 = 美分 × 10000 ÷ bps，约掉就是 **micro ÷ bps**。
+/// （`realtime.rs` 里那句 `cny_cents = micro / bps` 是同一式子的独立印证。）
+///
+/// **向上取整**：花了真钱就至少收 1 人民币分（¥0.01）。和 `free_points_needed` 的地板同一条
+/// 纪律 —— 宁可多收一厘，也不能让一次真实调用变成静默免费。
+pub fn usd_micro_to_wallet_cents(usd_micro: i64) -> i64 {
+    if usd_micro <= 0 {
+        return 0;
+    }
+    let bps = usd_per_cny_bps();
+    if bps <= 0 {
+        return usd_micro / 10_000; // 夹过区间了，理论到不了；退回美分口径
+    }
+    ((usd_micro as i128 + bps as i128 - 1) / bps as i128) as i64
+}
+
 pub fn usd_cents_to_wallet_cents(usd_cents: i64) -> i64 {
     let bps = usd_per_cny_bps();
     if bps <= 0 {
@@ -277,6 +303,25 @@ pub fn wallet_cents_to_usd_cents(wallet_cents: i64) -> i64 {
     ((wallet_cents as i128 * bps as i128) / 10_000) as i64
 }
 
+/// **一个钱包分值多少美元。** [`wallet_cents_to_usd_cents`] 的浮点形式，同一个 bps。
+///
+/// 为什么要有它：损益那几处（`plan_health`、定价试算）算的是比值和毛利率，整数版本
+/// 会在小额上截断——一个 39780 分的套餐折过去还剩 5600 美分是够用的，但一条只跑了
+/// 几十分的线路折完就是 0，于是那条线路的成本凭空消失、毛利显示 100%。
+///
+/// **口径必须和整数版一模一样**：`wallet_cents_to_usd_cents` 是 `wallet × bps / 10000`
+/// （得美元分），再 ÷100 得美元，约掉就是 `wallet × bps / 1e6`。两处各写一遍的话，
+/// 「扣钱按哪把尺子」和「报表按哪把尺子」会不声不响地分家，而那正是 2026-08-28
+/// 之后 plan_health 一直在犯的错。
+pub fn usd_per_wallet_cent() -> f64 {
+    let bps = usd_per_cny_bps();
+    if bps <= 0 {
+        // 夹过区间了，理论到不了。退回「1 钱包分 = 1 美分」，也就是 08-28 之前的口径。
+        return 0.01;
+    }
+    bps as f64 / 1_000_000.0
+}
+
 /// 官方价锚定的窗口天数。默认 30，`0` = 关掉锚定（直接用当天目录价）。
 ///
 /// 30 天是这么定的：比任何一次常见促销都长，而比「厂商真降价了」的容忍期短。
@@ -285,9 +330,21 @@ pub fn official_price_window_days() -> i64 {
     current().official_price_window_days.unwrap_or(30).clamp(0, 365)
 }
 
-/// 同一个数的浮点形式，供利润测算用（`models.rs` 原先的 6.63）。
+/// **一个「面值美元」实际值多少美元。** 所有利润测算的换算锚点。
+///
+/// 原来写的是 `raw_cents_per_credit_usd() / 100.0`（= 6.63），那在 2026-08-28 之前是对的：
+/// 那时用户被扣的「真实计费分」就是美元分，663 分自然等于 $6.63。
+///
+/// c387e33 之后扣的是**人民币分**（`usd_micro_to_wallet_cents`），663 分变成 ¥6.63，
+/// 而这个函数仍然按美元下发给三处利润测算（`project_quota_package` 的 `quota_raw_usd`
+/// 与 `safe_visible_quota_usd`、`admin_model_estimate` 的 `visible_quota_usd`）——
+/// 供应商容量因此被高估 7.1 倍，反推出来的「安全额度」也跟着虚高。四个读者都在这一个
+/// 函数下面，所以**改这一处就够了**，不要去各个调用点各修一遍（那必然漂开）。
+///
+/// 现在的口径：面值 $1 = `raw_cents_per_credit_usd` 个钱包分，每个钱包分值
+/// `usd_per_wallet_cent()` 美元。汇率 1408 时 = 663 × 0.001408 ≈ $0.933。
 pub fn raw_usd_per_visible_usd() -> f64 {
-    raw_cents_per_credit_usd() as f64 / 100.0
+    raw_cents_per_credit_usd() as f64 * usd_per_wallet_cent()
 }
 
 /// 每日赠送点数（整点）。
@@ -501,8 +558,11 @@ pub async fn admin_get(claims: Claims) -> ApiResult<Json<serde_json::Value>> {
             "raw_cents_per_credit_usd": [MIN_RAW_CENTS_PER_CREDIT_USD, MAX_RAW_CENTS_PER_CREDIT_USD],
             "free_points_daily": [MIN_FREE_POINTS_DAILY, MAX_FREE_POINTS_DAILY],
         },
-        // 只读：由 663 与 ¥7.2/点价 ¥0.05 手工推导，是编译期常量，不在这一屏改。
-        "raw_cents_per_point": crate::models::RAW_CENTS_PER_POINT,
+        // 只读：由**后台设定**推导，不是编译期常量。100 积分 = ¥1，所以 1 点 = 1 人民币分，
+        // 折成真实计费分要过 usd_per_cny_bps —— 改那一格，这个数自动跟上。
+        "raw_cents_per_point": crate::models::raw_cents_per_point(),
+        "micro_usd_per_point": crate::models::micro_usd_per_point(),
+        "cny_cents_per_point": crate::models::CNY_CENTS_PER_POINT,
     })))
 }
 

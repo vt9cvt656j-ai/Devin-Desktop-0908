@@ -244,6 +244,14 @@ pub struct ModelPrice {
     /// 每百万「写入缓存的 token」多少美元。NULL = 没录，按输入价 × 1.25 推
     /// （上游普遍的倍数）—— **不按 0**。按 0 就是这个 bug 的原样重演。
     pub cache_write_per_mtok: Option<f64>,
+    /// 上游**按次**收的钱（美元/次）。new-api 形态的 `quota_type=1`、OpenRouter 的
+    /// `request` 价都落在这里。这一列 `relay_sync` 一直在写，但读的人一个都没有 ——
+    /// 于是「按次计费」的出口成本恒为 0，对账页上毛利 100%，且不进「待录单价」名单。
+    /// 线上实测:366 条自动价里 35 条有按次价,其中 **32 条 input/output 都是 0**
+    /// —— 对这 32 条,成本里除了按次价什么都没有,不读它就等于没有成本。
+    /// 后果不止对账好看:`check_margin_after_change` 用同一份价重算,一条按次计费
+    /// 的亏本线路永远算出 100% 毛利,自动止血那条链对这类出口**结构性哑掉**。
+    pub per_request: Option<f64>,
     pub note: String,
 }
 
@@ -425,6 +433,8 @@ fn derived_price(endpoint_id: uuid::Uuid, model_id: &str, ratio: f64) -> Option<
         output_per_mtok: out * ratio,
         cached_per_mtok: scale(live.as_ref().and_then(|e| e.cache_read_price)),
         cache_write_per_mtok: scale(live.as_ref().and_then(|e| e.cache_write_price)),
+        // 推算价来自 OpenRouter 官方**按量**价目，没有按次那一项。
+        per_request: None,
         note: format!("推算：OpenRouter 官方价 × 倍率 {}", (ratio * 10000.0).round() / 10000.0),
     })
 }
@@ -476,11 +486,16 @@ fn model_cost_usd(u: &ModelUsage, p: &ModelPrice) -> f64 {
     let write_price = p
         .cache_write_per_mtok
         .unwrap_or(p.input_per_mtok * CACHE_WRITE_FACTOR);
+    // 按次那一项**不除以一百万** —— 它的单位是美元/次，不是美元/百万 token。
+    // 上游同时按次又按量的（OpenRouter 有这种）两项都算，只按次的那 32 条出口
+    // 全部成本都在这一项里。
+    let per_call = u.calls.max(0) as f64 * p.per_request.unwrap_or(0.0);
     (fresh * p.input_per_mtok
         + cached as f64 * cached_price
         + u.cache_creation_tokens.max(0) as f64 * write_price
         + u.completion_tokens.max(0) as f64 * p.output_per_mtok)
         / 1_000_000.0
+        + per_call
 }
 
 /// `GET /api/admin/reconciliation?days=7`
@@ -548,6 +563,7 @@ pub async fn admin_reconciliation(
         output_per_mtok: f64,
         cached_per_mtok: Option<f64>,
         cache_write_per_mtok: Option<f64>,
+        per_request: Option<f64>,
         source: String,
     }
     for a in sqlx::query_as::<_, AutoPrice>(
@@ -559,7 +575,7 @@ pub async fn admin_reconciliation(
         // 覆盖率、推算成本、比价屏…），五份手写的天数必然会漂，而漂掉的那一处会
         // 安静地继续拿冻结的旧价算成本。清理放在**唯一的写入方**那里，读的人不用知道。
         "SELECT endpoint_id, model_id, input_per_mtok, output_per_mtok, cached_per_mtok, \
-                cache_write_per_mtok, source \
+                cache_write_per_mtok, per_request, source \
          FROM endpoint_auto_price",
     )
     .fetch_all(&state.db)
@@ -575,6 +591,7 @@ pub async fn admin_reconciliation(
                 output_per_mtok: a.output_per_mtok,
                 cached_per_mtok: a.cached_per_mtok,
                 cache_write_per_mtok: a.cache_write_per_mtok,
+                per_request: a.per_request,
                 note: format!("自动拉取（{}）", a.source),
             },
         );
@@ -1568,6 +1585,7 @@ mod tests {
             output_per_mtok: out,
             cached_per_mtok: cached,
             cache_write_per_mtok: None,
+            per_request: None,
             note: String::new(),
         }
     }
@@ -1973,6 +1991,7 @@ mod tests {
             output_per_mtok: 25.0,
             cached_per_mtok: None,
             cache_write_per_mtok: None, // 没录 → 按输入价 × 1.25 推
+            per_request: None,
             note: String::new(),
         };
         let got = model_cost_usd(&u, &p);
@@ -1997,6 +2016,63 @@ mod tests {
         // 任何一条没有缓存写入的历史账。
         let u0 = ModelUsage { cache_creation_tokens: 0, ..u.clone() };
         assert!((model_cost_usd(&u0, &p) - without_write).abs() < 1e-9);
+    }
+    /// **上游按次收的钱,成本这一侧一直读不到 —— 于是这类出口毛利恒 100%。**
+    ///
+    /// `endpoint_auto_price.per_request` 这一列 `relay_sync` 从抓价那天起就在写
+    /// (new-api 的 `quota_type=1`、OpenRouter 的 `request` 价都落在这里),但**读的人一个都没有**:
+    /// 五处 SELECT 全是显式列清单,没有一处带上它。
+    ///
+    /// 线上实测(2026-09-03):366 条自动价里 35 条有按次价,其中 **32 条 input/output 都是 0**
+    /// —— 对这 32 条出口,成本里除了按次价什么都没有,不读它就等于「这条出口不花钱」。
+    /// 连带后果比对账页难看更贵:`check_margin_after_change` 用同一份价重算,
+    /// 一条按次计费的亏本出口永远算出 100% 毛利,**自动止血那条链对它结构性哑掉**。
+    #[test]
+    fn per_request_upstream_pricing_is_part_of_the_cost() {
+        // 只按次计价的上游:按量单价全 0,每次 $0.10。
+        let u = ModelUsage {
+            endpoint_id: uuid::Uuid::nil(),
+            model_id: "some-per-call-model".into(),
+            calls: 10_000,
+            revenue_micro: 0,
+            prompt_tokens: 4_000_000,
+            completion_tokens: 600_000,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+            prompt_includes_cached: Some(true),
+        };
+        let per_call_only = ModelPrice {
+            endpoint_id: uuid::Uuid::nil(),
+            model_id: "some-per-call-model".into(),
+            input_per_mtok: 0.0,
+            output_per_mtok: 0.0,
+            cached_per_mtok: None,
+            cache_write_per_mtok: None,
+            per_request: Some(0.10),
+            note: String::new(),
+        };
+        let got = model_cost_usd(&u, &per_call_only);
+        assert!(
+            (got - 1_000.0).abs() < 1e-6,
+            "按次进价没算进成本:算出 ${got},应当是 10000 次 × $0.10 = $1000"
+        );
+
+        // 同时按量又按次的(OpenRouter 有这种):两项都要算,不是二选一。
+        let both = ModelPrice { input_per_mtok: 3.0, output_per_mtok: 15.0, ..per_call_only.clone() };
+        let want = (4_000_000.0 * 3.0 + 600_000.0 * 15.0) / 1_000_000.0 + 1_000.0;
+        let got2 = model_cost_usd(&u, &both);
+        assert!((got2 - want).abs() < 1e-6, "两种计价混用时算错了:{got2},应当 {want}");
+
+        // 反方向:没有按次价(绝大多数出口)时,结果必须**逐字**等同于加这一项之前。
+        let no_per_call = ModelPrice { per_request: None, ..both.clone() };
+        let got3 = model_cost_usd(&u, &no_per_call);
+        assert!(
+            (got3 - (want - 1_000.0)).abs() < 1e-6,
+            "没有按次价的出口被凭空加了钱:{got3}"
+        );
+        // Some(0.0) 和 None 必须同解 —— 上游明说「按次不收费」不该变成一笔账。
+        let zero = ModelPrice { per_request: Some(0.0), ..both.clone() };
+        assert_eq!(model_cost_usd(&u, &zero), got3, "显式按次 0 和没录不同解了");
     }
 
     /// 第一版这里只读手填的 `endpoint_model_price`，而适配器把 535 条真实进价写进了

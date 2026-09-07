@@ -1,10 +1,12 @@
 mod agent_trace;
 mod byo_upstream;
+mod cache_payoff;
 mod prefix_probe;
 mod api_key_store;
 mod auth;
 mod changelog;
 mod channel_rates;
+mod client_guard;
 mod codes;
 mod commission;
 mod compression;
@@ -44,6 +46,8 @@ mod pay;
 mod payout;
 mod procedural_3d;
 mod prompt_crypto;
+mod prompt_shield;
+mod rate_guard;
 mod prompt_modules;
 mod prompts;
 mod rankings;
@@ -57,6 +61,9 @@ mod settlement;
 mod skills;
 mod plan_health;
 mod stripe;
+mod thinking_replay;
+mod thinking_shape_probe;
+mod wire_shape;
 mod update;
 
 use std::sync::Arc;
@@ -99,9 +106,11 @@ async fn main() -> anyhow::Result<()> {
     // 第一条写入时才发现——那时候一半数据加密、一半没有，最难收拾。没配则 passthrough
     // （敏感字段以明文存库，会打一条 warn）。见 field_crypto.rs。
     field_crypto::init()?;
+    prompt_crypto::init()?;
 
     let db = PgPoolOptions::new()
         .max_connections(cfg.db_max_connections)
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .connect(&cfg.database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&db).await?;
@@ -225,6 +234,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/verify-code", post(auth::verify_code))
+        // 忘记密码：邮箱验证码 + 新密码，已有账号专用（新账号走 register）。公开路由，
+        // 和 send-code / verify-code 同一套发码与验码预算。见 auth.rs 的说明。
+        .route("/api/auth/reset-password", post(auth::reset_password))
         // Signing in with a provider. All three are public: they are reached before
         // anyone has a session, and the callback arrives as a bare browser redirect
         // from GitHub or Google with no header of ours on it (see oauth.rs).
@@ -254,6 +266,10 @@ async fn main() -> anyhow::Result<()> {
             get(changelog::admin_list).post(changelog::admin_create),
         )
         .route("/api/admin/changelog/:id", delete(changelog::admin_delete))
+        .route(
+            "/api/admin/thinking-shape-probe",
+            post(thinking_shape_probe::admin_thinking_probe),
+        )
         // 文档的写入口。全部 admin-only（handler 里再查一次 role，不只靠路由分组）。
         .route(
             "/api/admin/docs",
@@ -621,14 +637,23 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/events", get(realtime::recent_events))
         .route("/api/admin/stats", get(realtime::stats))
         .route("/ws", get(realtime::ws_handler))
-        // 层序（后加的在外）：CORS 最外，然后 Trace，然后 MSE，最里面才是路由。
+        // 层序（后加的在外）：
+        //   CORS → Trace → rate_guard → client_guard → MSE → 路由
         //
-        // MSE 在 Trace 之内：这样 access 日志记的是**外层**那个不带 query 的 URI，
-        // 而不是解密后的完整地址 —— 把 query 从中间人那里藏起来、却自己原样写进日志，
-        // 等于白做。Trace 在 CORS 之内没有影响，预检请求由 CORS 直接短路掉。
+        // rate_guard 在 Trace 之内：限速日志自带结构化字段，access 日志不需要重复。
+        // client_guard 在 rate_guard 之内：先限速再指纹——被限速的请求不值得做指纹校验。
+        // MSE 在 client_guard 之内：MSE 解密是最贵的操作，放最里面。
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             mse::middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            client_guard::middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rate_guard::middleware,
         ))
         .layer(
             TraceLayer::new_for_http()

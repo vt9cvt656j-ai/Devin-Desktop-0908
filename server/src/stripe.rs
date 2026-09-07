@@ -966,9 +966,9 @@ pub async fn webhook(
              *
              * 拒付（dispute）没有部分之说，对象上也没有 amount_refunded，按全额处理。
              */
+            let amount = obj.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
+            let refunded = obj.get("amount_refunded").and_then(|v| v.as_i64()).unwrap_or(0);
             let ratio_bps = if event_type == "charge.refunded" {
-                let amount = obj.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
-                let refunded = obj.get("amount_refunded").and_then(|v| v.as_i64()).unwrap_or(0);
                 if amount > 0 && refunded > 0 {
                     ((refunded.min(amount) * 10_000) / amount).clamp(0, 10_000)
                 } else {
@@ -977,6 +977,17 @@ pub async fn webhook(
             } else {
                 10_000
             };
+            // 退了多少钱，也要落库（20260876）。这个数上面已经解析出来了，此前算完比例
+            // 就扔掉，于是收入汇总永远不知道该扣多少，部分退款和全额退款在库里同形。
+            //
+            // 拒付走的是另一条：`charge.dispute.created` 的对象上没有 `amount_refunded`，
+            // 佣金按全额追回，金额这里取 `amount`（被拒付的那一整笔）。两条路都不写 0 ——
+            // 0 的意思是「确实一分没退」，而这两条路都退了钱。
+            let refunded_cents = if event_type == "charge.refunded" {
+                refunded.min(amount).max(0)
+            } else {
+                amount.max(0)
+            };
             if let Some(order_id) = order_for_reversal(&state, &mut tx, &obj).await? {
                 // 先把退款记在订单上。退过款的 Checkout Session 在 Stripe 那边仍然报
                 // payment_status: paid，所以没有这个标记，履约和计佣还能再跑一遍。
@@ -984,10 +995,23 @@ pub async fn webhook(
                 // COMMIT 是静默 ROLLBACK 且不报错 —— 于是 handler 照回 200，Stripe
                 // 认为投递成功不再重投，连上面那条幂等认领也一起回滚了。
                 // 用 `?` 才走得到本函数开头那段注释设计的路：500 → Stripe 重投 → 真的重跑。
+                // 金额用 GREATEST 累加式取大：同一单可以退好几次，Stripe 每次都把
+                // **累计**的 amount_refunded 发过来，而 webhook 不保证按顺序到达。
+                // 直接覆盖的话，一条迟到的「退了 $10」会把后来的「累计退了 $30」盖掉。
+                // 取大在乱序下也收敛到最终值，且永远不会把已记的退款额调小。
+                //
+                // `$2 <= 0` 时**不写**，让这一列留 NULL。NULL 的意思是「没记到金额」，
+                // 0 的意思是「确实一分没退」—— 收入汇总要能分开这两件事。回执里没有
+                // 金额（字段缺失、对象形状变了）却写个 0 进去，等于用一个确定的假事实
+                // 盖住「不知道」，而这一列存在的全部理由就是别再让退款额靠猜。
                 sqlx::query(
-                    "UPDATE orders SET refunded_at = COALESCE(refunded_at, now()) WHERE id = $1",
+                    "UPDATE orders SET refunded_at = COALESCE(refunded_at, now()), \
+                     refunded_cents = CASE WHEN $2 > 0 \
+                       THEN GREATEST(COALESCE(refunded_cents, 0), $2) \
+                       ELSE refunded_cents END WHERE id = $1",
                 )
                 .bind(order_id)
+                .bind(refunded_cents)
                 .execute(&mut *tx)
                 .await?;
                 crate::referral::reverse(&mut tx, order_id, event_type, ratio_bps).await;
@@ -1115,7 +1139,9 @@ pub async fn webhook(
             let won = obj.get("status").and_then(|v| v.as_str()) == Some("won");
             if won {
                 if let Some(order_id) = order_for_reversal(&state, &mut tx, &obj).await? {
-                    sqlx::query("UPDATE orders SET refunded_at = NULL WHERE id = $1")
+                    // 金额也要一起撤。只清时间戳的话，这一单在收入汇总里既算「没退款」
+                    // （refunded_at 为空）又留着一个退款额，两个字段自相矛盾。
+                    sqlx::query("UPDATE orders SET refunded_at = NULL, refunded_cents = NULL WHERE id = $1")
                         .bind(order_id)
                         .execute(&mut *tx)
                         .await?;

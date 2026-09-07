@@ -1,0 +1,1 @@
+import{At as e,Dt as t,Et as n,Ft as r,Mt as i,Nt as a,Ot as o,Pt as s,Tt as c,jt as l,kt as u,wt as d}from"./vendor-ZlW_aUeQ.js";l();export{d as Channel,c as PluginListener,n as Resource,t as SERIALIZE_TO_IPC_FN,o as addPluginListener,u as checkPermissions,e as convertFileSrc,i as invoke,a as isTauri,s as requestPermissions,r as transformCallback};

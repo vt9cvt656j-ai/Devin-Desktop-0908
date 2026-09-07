@@ -13,7 +13,7 @@ const dialog = () => {
   return CODE.slice(i, j);
 };
 
-test("列模型的地址：Anthropic 的基址不带 /v1，要自己补；末尾斜杠不能拼出 //", () => {
+test("列模型的地址：三种协议都归一化到 /v1/models，末尾斜杠不拼出 //", () => {
   assert.equal(cmModelsUrl("https://api.example.com/v1", "openai"), "https://api.example.com/v1/models");
   assert.equal(cmModelsUrl("https://api.example.com/v1/", "openai"), "https://api.example.com/v1/models");
   assert.equal(cmModelsUrl("https://api.anthropic.com", "anthropic"), "https://api.anthropic.com/v1/models");
@@ -21,18 +21,23 @@ test("列模型的地址：Anthropic 的基址不带 /v1，要自己补；末尾
   assert.equal(cmModelsUrl("https://relay.cc/v1", "anthropic"), "https://relay.cc/v1/models");
   assert.equal(cmModelsUrl("http://localhost:11434/v1", "openai"), "http://localhost:11434/v1/models");
   assert.equal(cmModelsUrl("", "openai"), "", "空地址不该拼出一个假 URL");
+  // 不带 /v1 的也要补——中转站 https://relay.com 拼 /models 是 404，要 /v1/models。
+  assert.equal(cmModelsUrl("https://relay.example.com", "openai"), "https://relay.example.com/v1/models");
+  assert.equal(cmModelsUrl("https://api.x.ai", "xai_responses"), "https://api.x.ai/v1/models");
 });
 
-test("鉴权头按协议分，空密钥不发头（本机 Ollama 没有密钥）", () => {
+test("鉴权头双发（Bearer + x-api-key + anthropic-version），空密钥不发头（本机 Ollama 没有密钥）", () => {
   const o = cmModelsHeaders("sk-1", "openai");
   assert.equal(o.Authorization, "Bearer sk-1");
-  assert.ok(!("x-api-key" in o));
+  assert.equal(o["x-api-key"], "sk-1");
+  assert.equal(o["anthropic-version"], "2023-06-01");
   const a = cmModelsHeaders("sk-2", "anthropic");
   assert.equal(a["x-api-key"], "sk-2");
+  assert.equal(a.Authorization, "Bearer sk-2");
   assert.equal(a["anthropic-version"], "2023-06-01");
-  assert.ok(!("Authorization" in a), "Anthropic 发 Bearer 会被当成没带密钥");
   const empty = cmModelsHeaders("  ", "openai");
   assert.ok(!("Authorization" in empty), "空密钥还发 Bearer，本机服务会 401");
+  assert.ok(!("x-api-key" in empty), "空密钥还发 x-api-key，本机服务会 401");
 });
 
 test("各家返回形状都认得，认不出时返回空而不是猜", () => {

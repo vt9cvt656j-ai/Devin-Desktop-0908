@@ -63,7 +63,14 @@ struct ChannelMix {
     /// 漏掉这一步，倍率 8 的连接成本会被算高 8 倍，倍率 0.2 的会被算低 5 倍。
     rate: f64,
     requests: i64,
-    raw_cents: i64,
+    /// 这条渠道这段时间的**售价合计，美元**（含线路倍率，不含汇率）。
+    ///
+    /// 原来叫 `raw_cents`、装的是「真实计费分」。那一列在 2026-08-28 从美元分变成了
+    /// 人民币分，跨那一天求和等于把两种差 7.1 倍的单位相加，所以数据源换成了
+    /// `model_usage.sell_micro_usd`。**名字必须跟着换**：留着 `raw_cents` 而里面装
+    /// 美元，前端那一列的表头会继续写「真实分」，屏幕上出现一个大一万倍的数而没有
+    /// 任何地方报错 —— 正是这轮审计要清掉的那种形状。
+    sell_usd: f64,
     cny: Option<f64>,
     /// 这条渠道占总真实消耗的比例。定价要看它：一条 usd_per_cny=1 的线只要占了
     /// 六成流量，整体成本就跟着它走，而不是跟着最便宜那条走。
@@ -103,6 +110,7 @@ pub async fn admin_plan_health(
            FROM model_usage m JOIN payer p ON p.id = m.user_id \
            WHERE m.created_at > now() - ($1 || ' days')::interval \
              AND m.free_milli_points_spent = 0 \
+             AND m.sell_micro_usd IS NOT NULL \
            GROUP BY 1, 2 \
          ), pu AS ( \
            SELECT user_id, count(*)::float8 AS active_days, avg(c)::float8 AS per_day, sum(reqs) AS reqs \
@@ -137,15 +145,27 @@ pub async fn admin_plan_health(
     //
     // 这一段是整个页面的关键。成本不该由「运营手选的那个渠道」决定，而该由
     // **流量实际落在哪** 决定。join 走 base_url 的 host —— 和 channel_rates.host 同一个键。
+    // **金额一律取 `sell_micro_usd`，不取 `cost_cents`。**
+    //
+    // `cost_cents` 的单位在 2026-08-28（c387e33）变过：那之前是美元分，那之后是
+    // `usd_micro_to_wallet_cents` 折出来的人民币分，两者差 7.1 倍，而库里没有任何一列
+    // 能把它们分开。这个页面的窗口是 60 天，横跨那一天 —— 直接 `sum(cost_cents)` 等于
+    // 把两种单位相加，然后再当美元解释一遍，成本因此整体偏 7 倍，毛利结论会反向。
+    //
+    // `sell_micro_usd`（20260875）记的是这一笔的售价，micro-USD，含线路倍率、不含汇率，
+    // **单位永不随汇率漂**。它只从本迁移上线之后才有值，所以旧行会被这条 WHERE 排除掉；
+    // 这不是丢数据，是把「口径不明的行」和「能算的行」分开 —— 下面 `usable_rows`
+    // 会把样本量如实报出去，页面照着说「统计了几行」，不假装窗口是满的 60 天。
     let mix = sqlx::query_as::<_, (String, Option<String>, Option<f64>, f64, i64, Option<i64>)>(
         "WITH u AS ( \
-           SELECT mu.cost_cents, m.label, m.rate, \
+           SELECT mu.sell_micro_usd, m.label, m.rate, \
                   substring(m.base_url from '://([^/]+)') AS host \
            FROM model_usage mu JOIN models m ON m.id::text = mu.model_id::text \
            WHERE mu.created_at > now() - ($1 || ' days')::interval \
+             AND mu.sell_micro_usd IS NOT NULL \
          ) \
          SELECT u.label, u.host, max(cr.usd_per_cny), u.rate, count(*)::bigint, \
-                sum(u.cost_cents)::bigint \
+                sum(u.sell_micro_usd)::bigint \
          FROM u LEFT JOIN channel_rates cr ON cr.host = u.host \
          GROUP BY 1, 2, 4 ORDER BY 6 DESC NULLS LAST",
     )
@@ -153,6 +173,8 @@ pub async fn admin_plan_health(
     .fetch_all(&state.db)
     .await?;
 
+    // 单位是 micro-USD（售价，含线路倍率）。局部变量名沿用 `raw` 只是懒得改一串，
+    // 下发出去的字段已经跟着单位改了名（`sell_usd` / `unpriced_sell_usd`）。
     let total_raw: i64 = mix.iter().map(|r| r.5.unwrap_or(0)).sum();
     // 折人民币时**只算得出价的那部分**：一条没填购买价的线，它的消耗不能当成 0 块钱，
     // 否则整体成本会被系统性低估。它单独计数，前端要把这个缺口说出来。
@@ -164,8 +186,11 @@ pub async fn admin_plan_health(
             let raw = raw.unwrap_or(0);
             // 先 ÷ 倍率还原成**我们真正付给中转的美元**，再 ÷ 购买价折人民币。
             // 这两步的顺序和 models.rs 的 project_quota_package 一致：
-            // provider_usd = quota_raw / multiplier; cny = provider_usd / usd_per_cny。
-            let upstream = if *mult > 0.0 { raw as f64 / 100.0 / mult } else { 0.0 };
+            // provider_usd = 售价美元 / multiplier; cny = provider_usd / usd_per_cny。
+            //
+            // 分子已经是 micro-USD 了（见上面那条 SQL 的注释），所以只除 1e6，
+            // **不再乘任何汇率** —— 汇率那一步早在 `sell_micro_usd` 之前就没有了。
+            let upstream = if *mult > 0.0 { raw as f64 / 1_000_000.0 / mult } else { 0.0 };
             let cny = buy
                 .filter(|r| *r > 0.0)
                 .filter(|_| *mult > 0.0)
@@ -180,7 +205,7 @@ pub async fn admin_plan_health(
                 usd_per_cny: buy.unwrap_or(0.0),
                 rate: *mult,
                 requests: *reqs,
-                raw_cents: raw,
+                sell_usd: raw as f64 / 1_000_000.0,
                 cny,
                 share: if total_raw > 0 { raw as f64 / total_raw as f64 } else { 0.0 },
             }
@@ -191,7 +216,8 @@ pub async fn admin_plan_health(
     // 综合购买价：**¥1 实际买到多少「用户额度美元」**。分子是扣用户的额度，分母是我们
     // 真花掉的人民币（已经过了倍率和各站购买价）。套餐额度是用「用户额度」计的，
     // 所以拿它去折算套餐成本，单位才对得上。
-    let blended = if priced_cny > 0.0 { Some(priced_raw as f64 / 100.0 / priced_cny) } else { None };
+    let blended =
+        if priced_cny > 0.0 { Some(priced_raw as f64 / 1_000_000.0 / priced_cny) } else { None };
     // 「最好 / 最差」也走同一个口径：¥1 买到多少用户额度美元 = 购买价 × 倍率。
     // 只比购买价是不够的 —— 倍率 8 的连接哪怕挂在最贵的站上，单位额度也很便宜。
     let effective = |c: &ChannelMix| {
@@ -217,7 +243,16 @@ pub async fn admin_plan_health(
     let rows: Vec<serde_json::Value> = plans
         .iter()
         .map(|(plan, total, window, days, price_fen, label)| {
-            let cost_at = |rate: f64| if rate > 0.0 { Some(*total as f64 / 100.0 / rate) } else { None };
+            // `total` 是 plan_quotas 的额度，单位和用户钱包一样（2026-08-28 起是人民币分）。
+            // `rate` 这里是「¥1 买到多少**用户额度美元**」，分子必须先折成美元 ——
+            // 直接 ÷100 当美元用，正是 08-28 之后这个页面成本偏 7 倍的那一步。
+            let cost_at = |rate: f64| {
+                if rate > 0.0 {
+                    Some(*total as f64 * crate::settings::usd_per_wallet_cent() / rate)
+                } else {
+                    None
+                }
+            };
             let cost_blended = blended.and_then(cost_at);
             let price_cny = price_fen.map(|f| f as f64 / 100.0);
             // 「能撑几个活跃日」：额度 ÷ 这一档用户的日耗。样本不够就不给数，
@@ -259,9 +294,29 @@ pub async fn admin_plan_health(
 
     let measured = measured_upstream_per_visible_usd(&state).await?;
 
+    // **样本量要如实报出去。** 上面每一处金额都加了 `sell_micro_usd IS NOT NULL`
+    // （单位可辨的那一批，见 mix 查询的注释），所以窗口写着 60 天、实际能算的可能只有
+    // 几天。不把这两个数一起给出去的话，页面会拿一个几百行的样本画出「60 天画像」，
+    // 而这正是控制台审计里反复出现的那种形状：一个确定的数，来源却是残缺的。
+    let (usable_rows, total_rows, usable_since): (i64, i64, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE sell_micro_usd IS NOT NULL), \
+                    count(*), \
+                    min(created_at) FILTER (WHERE sell_micro_usd IS NOT NULL) \
+             FROM model_usage WHERE created_at > now() - ($1 || ' days')::interval",
+        )
+        .bind(WINDOW_DAYS.to_string())
+        .fetch_one(&state.db)
+        .await?;
+
     Ok(Json(json!({
         "denominator": denominator,
         "zero_cost_share": zero_cost_share,
+        // 「这个页面的金额是拿多少行算出来的」。usable < total 说明窗口里还有一批
+        // 2026-08-28 单位切换之前的旧行被排除在外 —— 那不是丢数据，是不混加。
+        "usable_rows": usable_rows,
+        "total_rows": total_rows,
+        "usable_since": usable_since,
         "measured": measured,
         "window_days": WINDOW_DAYS,
         "enough_sample": enough,
@@ -271,7 +326,9 @@ pub async fn admin_plan_health(
         "blended_usd_per_cny": blended,
         "best_usd_per_cny": if best > 0.0 { Some(best) } else { None },
         "worst_usd_per_cny": if worst.is_finite() { Some(worst) } else { None },
-        "unpriced_raw_cents": total_raw - priced_raw,
+        // 跑在「没填购买价」的中转上的那部分消耗，**美元**（和 channels[].sell_usd 同单位）。
+        // 名字从 unpriced_raw_cents 改过来，理由见 ChannelMix.sell_usd 的注释。
+        "unpriced_sell_usd": (total_raw - priced_raw) as f64 / 1_000_000.0,
         "plans": rows,
     })))
 }
@@ -433,18 +490,47 @@ mod tests {
     #[test]
     fn cost_divides_by_the_purchase_rate_never_multiplies() {
         let src = prod_src();
+        // **先剥注释再断言。** 下面几条是「不许再出现旧写法」，而这个文件的注释里就在
+        // 讲那些旧写法长什么样 —— 不剥的话断言会匹配到自己的说明文字，恒绿。
+        let code: String = src
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 套餐额度是**钱包单位**（2026-08-28 起是人民币分），折成美元必须过汇率。
+        // ÷100 当美元用是 c387e33 之后一直在犯的错，成本整体偏 7.1 倍且方向是「更赚钱」。
         assert!(
-            src.contains("*total as f64 / 100.0 / rate"),
-            "套餐成本不再是「真实分 ÷ 100 ÷ 购买价」",
+            code.contains("*total as f64 * crate::settings::usd_per_wallet_cent() / rate"),
+            "套餐成本没过汇率——又回到「真实分 ÷ 100」了",
         );
+        assert!(
+            !code.contains("*total as f64 / 100.0 / rate"),
+            "旧的 ÷100 口径又回来了",
+        );
+
         // 渠道成本要走两步：先 ÷ 倍率还原成我们付给中转的美元，再 ÷ 购买价折人民币。
         // 漏掉倍率那一步，倍率 8 的连接成本会被算高 8 倍、倍率 0.2 的会被算低 5 倍，
         // 而两种都不会报错 —— 只是定价结论整个反过来。
+        //
+        // 分子现在取 sell_micro_usd（micro-USD，售价，不含汇率），所以是 ÷1e6 不是 ÷100。
         assert!(
-            src.contains("raw as f64 / 100.0 / mult"),
-            "渠道成本漏了「÷ 倍率」那一步",
+            code.contains("raw as f64 / 1_000_000.0 / mult"),
+            "渠道成本漏了「÷ 倍率」那一步，或者分子的单位换了没跟着改除数",
         );
-        assert!(src.contains(".map(|r| upstream / r)"), "还原成上游美元之后没有再 ÷ 购买价");
+        assert!(code.contains(".map(|r| upstream / r)"), "还原成上游美元之后没有再 ÷ 购买价");
+
+        // 金额一律取 sell_micro_usd，不取 cost_cents：后者跨 08-28 是两种单位，
+        // 而这个页面的窗口是 60 天，横跨那一天。
+        assert!(
+            code.contains("mu.sell_micro_usd IS NOT NULL"),
+            "金额又回去读 cost_cents 了——那一列跨 2026-08-28 是两种单位",
+        );
+        assert!(
+            code.contains("AND m.sell_micro_usd IS NOT NULL"),
+            "日耗画像没过滤单位可辨的那一批行",
+        );
+
         // 和 models.rs 那份权威实现同一个顺序，别让两处漂开。
         let authoritative = include_str!("models.rs");
         assert!(
@@ -454,9 +540,23 @@ mod tests {
         );
         // 综合购买价是「买到的美元额度 ÷ 花掉的人民币」，方向和上面一致。
         assert!(
-            src.contains("priced_raw as f64 / 100.0 / priced_cny"),
-            "综合购买价的方向变了",
+            code.contains("priced_raw as f64 / 1_000_000.0 / priced_cny"),
+            "综合购买价的方向或单位变了",
         );
+    }
+
+    /// 样本量必须和金额一起下发。
+    ///
+    /// 上面每一处金额都只统计 `sell_micro_usd IS NOT NULL` 的行（单位可辨的那一批），
+    /// 所以窗口写着 60 天、实际能算的可能只有几天。不把样本量一起给出去的话，页面会
+    /// 拿几百行画出一个「60 天画像」——一个确定的数，来源却是残缺的，而这正是控制台
+    /// 审计里反复出现的那种形状。
+    #[test]
+    fn the_sample_size_travels_with_the_money() {
+        let src = prod_src();
+        for key in ["usable_rows", "total_rows", "usable_since"] {
+            assert!(src.contains(key), "响应里少了 {key}，前端说不出这些数是拿多少行算的");
+        }
     }
 
     /// 样本不够就**不给百分位**，而不是给一个看着像数的噪声。
@@ -579,7 +679,7 @@ mod tests {
     fn traffic_without_a_price_is_reported_not_counted_as_free() {
         let src = prod_src();
         assert!(
-            src.contains("\"unpriced_raw_cents\": total_raw - priced_raw"),
+            src.contains("\"unpriced_sell_usd\": (total_raw - priced_raw)"),
             "没有把「没填价的那部分消耗」单独下发",
         );
         assert!(

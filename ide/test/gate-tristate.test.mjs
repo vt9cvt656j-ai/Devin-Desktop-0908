@@ -97,43 +97,18 @@ test("每一处「按画像否决」都要写明：裁决缺席时它倒向哪�
   }
 });
 
-test("工具编排的闸门必须区分「裁决未到」和「裁决说不适用」", () => {
-  // 这是那天那个 bug 的原位，单独钉一条：它是**唯一**一处倒向 capability 的否决，
-  // 也是「我让他干什么他什么都不知道」的直接成因。回退它不该只让上面那条泛化断言变红。
-  // 区间按 AST 取整条声明，不再是「从锚点起数 1400 个字」。
-  //
-  // 原来两行：`SRC.slice(RAW_SRC.indexOf("const _startInitialToolRoutingAfterFirstTurn"))`
-  // 再 `.slice(0, 1400)`。它当时还抓得住回归，但余量薄得只剩一次改动：
-  //   · 声明真身 1012 字，窗口 1400——余量 388 字；而这 1012 字里有 600 字是复盘那次事故的
-  //     注释（CODE 把注释置换成**等量空格**，长度不变、照样占偏移）。往这段注释里再补
-  //     623 字说明（实测：声明涨到 1635 字），末尾的代码就滑出窗口——两条 assert.match 仍
-  //     落在 1000/1162 偏移上、照样绿，而下面那条 assert.doesNotMatch（正是拦「旧的无条件
-  //     否决又长回来」的那条）从此恒真。实测过这个变异：把 `|| !run.engineering?.applies ||`
-  //     追加到声明末尾（偏移 1424，窗口外），整个文件 8/8 全绿，一声不吭。
-  //   · 反过来，那 388 字余量今天已经越过声明尾部，doesNotMatch 正管着声明**后面**一段
-  //     不相干的代码——那边写出这个形状会假红。
-  // fnSource 按 AST 节点边界切：声明长成什么样都盖得住，也一个字都不会盖到声明外面。
-  const gate = fnSource("_startInitialToolRoutingAfterFirstTurn", { code: true });
-  assert.match(gate, /const _verdictLanded = run\.engineering\?\.intentSource === "ai";/,
-    "工具编排闸门不再区分「裁决未到」——画像为空时整轮 128 个工具都进不来");
-  assert.match(gate, /\(_verdictLanded && !run\.engineering\.applies\)/,
-    "只有**裁决真的到了且说不适用**才拦；「还没到」必须放行");
-  assert.doesNotMatch(gate, /\|\|\s*!run\.engineering\?\.applies\s*\|\|/,
-    "旧的无条件否决又长回来了");
+test("循环里只剩一次编排调用：未知工具名的恢复；开局预装和插话再编排都已拆", () => {
+  // 2026-09-05：那两次 LLM 编排调用（每次 8–20 秒）连同「裁决未到 vs 说不适用」那道门一起拆了——
+  // 核心集整场静态，专用能力由模型用 search_tools 按需装载（只增不减）。这里守的是它们不回来。
+  assert.throws(() => fnSource("_startInitialToolRoutingAfterFirstTurn"), /找不到声明/, "开局预装编排回来了");
+  assert.doesNotMatch(SRC, /_routeAgentTools\(\s*"initial"|_routeAgentTools\("steering"/, "开局预装 / 插话再编排回来了");
+  assert.match(SRC, /_routeAgentTools\(\s*"unknown_tool"/, "未知工具名的恢复编排必须还在");
 });
 
-// ── 提醒的淘汰顺序 ───────────────────────────────────────────────────────
-//
-// 同轮挂太多提醒，模型会逐条表态，输出又长又自我横跳——所以要有上限。但"总数 ≤2"把病治过
-// 头了：一条 [BUILD_FAILED]、一条"你改了从没读过的文件"、一条子智能体带回来的结论，是三份
-// 互不替代的**现场**，丢哪一条模型都会照着错误的图景继续干活；而"逐条表态"的病根在建议类。
-// 所以建议只留 1 条、总额 4 条，超额时按重要性挑（先建议、再最旧的事实）。
-test("提醒按重要性淘汰，不是按先来后到", () => {
-  const factsSrc = /const _NUDGE_FACTS = new Set\(\[[\s\S]*?\]\);/.exec(SRC);
-  const onceSrc = /const _NUDGE_ONCE = new Set\(\[[\s\S]*?\]\);/.exec(SRC);
-  const rankSrc = /const _nudgeRank =\s*\n?\s*\(cat\) =>[\s\S]*?;/.exec(SRC);
-  assert.ok(factsSrc && onceSrc && rankSrc, "分级表或 _nudgeRank 被改名/挪走了——淘汰会退回按先来后到");
-  const rank = new Function(`${factsSrc[0]}\n${onceSrc[0]}\n${rankSrc[0]}\nreturn _nudgeRank;`)();
+test("提醒按重要性淘汰，不是按先来后到", async () => {
+  // 分级表和淘汰逻辑搬进了 agent/nudge-manager.js：这里 import 产品代码做真往返，不再从源码
+  // 切片 new Function——切片会随代码形状变化失去落点，而且验不到「真实调用链上还在不在」。
+  const { createNudgeManager, _nudgeRank: rank, _NUDGE_ONCE } = await import("../src/agent/nudge-manager.js");
 
   assert.equal(rank("steer"), 0, "用户实时插话必须永远最高优先级");
 
@@ -172,48 +147,39 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
   assert.equal(rank("someBrandNewNudge"), 3,
     "没登记的新提醒必须默认按建议类——要保命就得显式登记，不能靠默认捡到便宜");
   // 一次性档必须保持短：它挡在 ≤4 的名额前面，列进来的越多，上限越接近失效。
-  const onceCount = [...onceSrc[0].matchAll(/"[a-zA-Z]+"/g)].length;
+  const onceCount = _NUDGE_ONCE.size;
   assert.ok(onceCount <= 4,
     `一次性档有 ${onceCount} 条，已经吃掉 ≤4 名额的大半 —— 加之前先确认它真的被 run 级一次性标记守着`);
 
-  // 拿**源码里真实的那段淘汰循环**跑，不照抄一份：照抄的话我改了源码它照样绿。
-  // 拿**源码里真实的那段淘汰逻辑**跑，不照抄一份：照抄的话我改了源码它照样绿。
-  const loopSrc = /const _dropNudge = \(victim\) => \{[\s\S]*?\n    \}\n/.exec(SRC);
-  assert.ok(loopSrc, "淘汰逻辑的形状变了，这条断言失去落点");
-  assert.match(loopSrc[0], /_nudgeRank\(key\) > _nudgeRank\(worst\)/,
-    "超额淘汰没有按 _nudgeRank 挑——又回到了按先来后到");
-
-  // _nudgeTurnFloor = 0：这个测试台里全部消息就是那几条提醒本身，索引 0 起，
-  // 也就是「都在本轮尾部」。棘轮（只在尾部才真删）在这里恒真，被测的收敛行为一字不变。
-  const evict = new Function("_nudgeReg", "messages", "cat", "_nudgeRank", "_nudgeTurnFloor", `${loopSrc[0]}\nreturn [..._nudgeReg.keys()];`).bind(null);
-  const _evict0 = evict;
-  const evictWrap = (reg, msgs, c, rank) => _evict0(reg, msgs, c, rank, 0);
-  const mk = (names) => {
-    const reg = new Map(names.map((n) => [n, { c: n }]));
-    return { reg, msgs: names.map((n) => reg.get(n)) };
+  // 拿**真实的管理器**跑淘汰，不照抄一份：照抄的话我改了源码它照样绿。
+  // floor=0：这个测试台里全部消息就是那几条提醒本身，索引 0 起，也就是「都在本轮尾部」。
+  // 棘轮（只在尾部才真删）在这里恒真，被测的收敛行为一字不变。
+  const evictWrap = (names, incoming) => {
+    const messages = [];
+    const n = createNudgeManager({ messages, run: {}, orchNote: "", floor: () => 0, isEnabled: () => true, exempt: new Set() });
+    for (const c of names) n.push(c, c);
+    n.push(incoming, incoming);
+    return { keys: [...n.reg.keys()], msgs: messages.map((m) => m.content) };
   };
 
   // ① 事实不再被事实挤掉：三条事实 + 一条建议，第四条事实进来时该走的是建议。
-  const a = mk(["buildFix", "diag", "blindEdit", "askBudget"]);
-  assert.deepEqual(evictWrap(a.reg, a.msgs, "subagentResult", rank),
-    ["buildFix", "diag", "blindEdit"],
+  const a = evictWrap(["buildFix", "diag", "blindEdit", "askBudget"], "subagentResult");
+  assert.deepEqual(a.keys, ["buildFix", "diag", "blindEdit", "subagentResult"],
     "第四条事实到达时挤掉的必须是建议——构建失败、盲改警告、子智能体结论互不替代");
-  assert.equal(a.msgs.length, 3, "被淘汰的那条也要从消息列表里摘掉，不能只从注册表删");
+  assert.deepEqual(a.msgs, ["buildFix", "diag", "blindEdit", "subagentResult"],
+    "被淘汰的那条也要从消息列表里摘掉，不能只从注册表删");
 
   // ② 总额仍然有界：全是事实且已满额时，最旧的那条事实才让位。
-  const b = mk(["buildFix", "diag", "blindEdit", "turnRetry"]);  // cmdFail 已删（重复投递），换一条同为事实类的
-  assert.deepEqual(evictWrap(b.reg, b.msgs, "subagentResult", rank),
-    ["diag", "blindEdit", "turnRetry"], "满额时让位的是最旧的事实，且总数收敛");
+  const b = evictWrap(["buildFix", "diag", "blindEdit", "turnRetry"], "subagentResult");
+  assert.deepEqual(b.keys, ["diag", "blindEdit", "turnRetry", "subagentResult"], "满额时让位的是最旧的事实，且总数收敛");
 
   // ③ 建议同时只留 1 条（正在推入的那条就是这 1 条），事实不受牵连。
-  const c = mk(["buildFix", "askBudget"]);
-  assert.deepEqual(evictWrap(c.reg, c.msgs, "planNudge", rank), ["buildFix"],
-    "两条建议不能同时挂着，而事实要留下");
+  const c = evictWrap(["buildFix", "askBudget"], "planNudge");
+  assert.deepEqual(c.keys, ["buildFix", "planNudge"], "两条建议不能同时挂着，而事实要留下");
 
   // ④ steer 永远不被挤。
-  const d = mk(["steer", "buildFix", "diag", "blindEdit", "turnRetry"]);
-  assert.deepEqual(evictWrap(d.reg, d.msgs, "subagentResult", rank),
-    ["steer", "diag", "blindEdit", "turnRetry"], "用户实时插话被挤掉了");
+  const d = evictWrap(["steer", "buildFix", "diag", "blindEdit", "turnRetry"], "subagentResult");
+  assert.deepEqual(d.keys, ["steer", "diag", "blindEdit", "turnRetry", "subagentResult"], "用户实时插话被挤掉了");
 });
 
 test("默认完整交付、先读懂再动手、每一步先想", () => {
@@ -350,8 +316,10 @@ test("harness 注入的消息都要戴信封，否则会被当成用户说的话
   assert.doesNotMatch(SRC, /^  const _ORCH_NOTE = /m,
     "又变回局部常量了——那么 _agentModelTurn 里的注入会重新裸奔");
 
-  assert.match(SRC, /_argRepairMsg = \{ role: "user", content: `\$\{_ORCH_NOTE\}\[工具参数校验失败\]/,
-    "工具参数修复指令没戴信封——它会被模型当成用户发言，并把用户真正的请求顶走");
+  // 2026-09-05 起工具参数修复不再注入任何 role:"user" 消息：不合规调用在同一轮结算成
+  // [tool-args-invalid] 工具结果（is_error），信封问题在这条路上不复存在。守住「它真的没了」。
+  assert.doesNotMatch(SRC, /\[工具参数校验失败\]/, "参数修复又变回 role:\"user\" 注入了");
+  assert.match(SRC, /\[tool-args-invalid\] \$\{it\.tc\._argIssue\}/, "主循环没有把 _argIssue 结算成 is_error 工具结果");
 });
 
 test("schema 不许比实现更严——模型不填就整轮失败", () => {

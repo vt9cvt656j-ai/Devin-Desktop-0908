@@ -12,6 +12,7 @@
 // 拦不住它：那是一条规矩，而这是一份摆在眼前的模板。修机制不是加劝诫——说清用途就够了。
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { freshBuildFailure } from "../src/agent/verification-evidence.js";
 import { CODE as SRC, SRC as RAW_SRC, fnSource } from "./helpers/source.mjs";
 
 const at = SRC.indexOf('const _facts = run.mode === "agent"');
@@ -103,12 +104,22 @@ test("退出 126/127 不再被当成「构建没过、代码跑不起来」", ()
   // agent_engineering.txt:32 逐字写着 A verifier that cannot run is NOT evidence the code is
   // broken；而红构建门照单把 127 推成「代码现在跑不起来，先修根因」。用户现场就撞过：
   // `vhs demo.tape` 连着两次退出 127（工具没装），门却指示去修代码。
-  const fn = fnSource("freshBuildFailure", { code: true });
-  assert.match(fn, /e\.exitCode === 127 \|\| e\.exitCode === 126/,
-    "又把「命令没找到」当成代码坏了");
-  assert.match(fn, /if \(_cannotRun\) continue;/, "认出来了却没跳过");
+  // 这条原来第三句断言的是 `/e\.output \|\| e\.tail/` —— 用"源码里写没写这两个字段名"
+  // 来证明"看了运行器输出"。而执行证据记录（_executionEvidenceFromTool）产出的字段只有
+  // stdout/stderr，那两个名字**一个都不存在**：断言是真的，守的却是一段恒等于空串的死代码。
+  // 于是走退出码 1 的那一批"验证器自己没起来"（npm ERR! Missing script、被 sh 包一层的
+  // command not found）全部漏网，被判成红构建，把做完的任务推进两轮返修。
+  // 改成验行为：这个函数是纯的，直接喂记录跑真往返。
+  const red = (r) => !!freshBuildFailure({ _executionEvidence: [{
+    verifierRecognized: true, implementationVersion: 1, timedOut: false, cwd: "/w", command: "npm test", ...r }] }, 1);
+  assert.equal(red({ exitCode: 127, stderr: "vhs: not found" }), false, "又把「命令没找到」当成代码坏了");
+  assert.equal(red({ exitCode: 126, stderr: "permission denied" }), false);
+  assert.equal(red({ exitCode: 1, stderr: "pytest: command not found" }), false, "没看运行器级输出");
+  assert.equal(red({ exitCode: 1, stderr: 'npm ERR! Missing script: "test"' }), false, "没认出运行器缺脚本");
   // 判据必须是执行事实，不是正文里出现 not found（那可能是被测代码自己打印的）
-  assert.match(fn, /e\.output \|\| e\.tail/, "没看运行器级输出");
+  assert.equal(red({ exitCode: 1, stdout: "FAIL user.test.js\n  expected 404 not found" }), true,
+    "被测代码打印的 not found 被当成了「验证器没起来」——失败的测试从此免检");
+  assert.equal(red({ exitCode: 1, stderr: "AssertionError: expected 1 to equal 2" }), true, "真红的没判红");
 });
 
 // ── 诊断按新增算，不是按全工程 ───────────────────────────────────────

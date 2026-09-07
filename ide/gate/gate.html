@@ -139,6 +139,18 @@
       <label for="pw">Password</label>
       <input id="pw" type="password" required autocomplete="current-password" placeholder="••••••••" />
       <button class="primary" id="loginBtn" type="submit">Log in</button>
+      <p class="back"><button type="button" class="link" id="forgotBtn">Forgot your password?</button></p>
+    </form>
+
+    <!-- step 2c: forgot password — an emailed code plus a new password, then signed in -->
+    <form id="resetForm" autocomplete="on" hidden>
+      <p class="back"><button type="button" class="link" data-back>← <span id="resetEmail"></span></button></p>
+      <label for="resetCode">Verification code</label>
+      <input id="resetCode" type="text" inputmode="numeric" autocomplete="one-time-code" required placeholder="6-digit code" />
+      <p class="hint">We emailed you a code. It expires shortly.</p>
+      <label for="resetpw">New password</label>
+      <input id="resetpw" type="password" required autocomplete="new-password" placeholder="At least 8 characters" minlength="8" />
+      <button class="primary" id="resetBtn" type="submit">Set new password</button>
     </form>
 
     <!-- step 2b: new user — register needs an emailed code -->
@@ -237,7 +249,7 @@ function a0b(a,b){a=a-0x19c;const c=a0a();let d=c[a];if(a0b['SGwsDT']===undefine
 (function () {
   var $ = function (id) { return document.getElementById(id); };
   var msg = $("msg");
-  var forms = { email: $("emailForm"), login: $("loginForm"), signup: $("signupForm") };
+  var forms = { email: $("emailForm"), login: $("loginForm"), signup: $("signupForm"), reset: $("resetForm") };
   var state = { email: "" };
 
   // Only same-origin app paths may be redirected to, so ?next= can never become an
@@ -271,10 +283,12 @@ function a0b(a,b){a=a-0x19c;const c=a0a();let d=c[a];if(a0b['SGwsDT']===undefine
     $("title").textContent =
       which === "signup" ? "Create your account"
       : which === "login" ? "Welcome back"
+      : which === "reset" ? "Reset your password"
       : "Welcome to Mr. Day One";
     $("subtitle").textContent =
       which === "signup" ? "Confirm your email and pick a password"
       : which === "login" ? "Enter your password to continue"
+      : which === "reset" ? "Enter the code we emailed you and choose a new password"
       : "Create an account or sign in to continue";
     var foot = document.querySelector(".foot");
     if (foot) foot.hidden = which !== "email";
@@ -517,6 +531,45 @@ function a0b(a,b){a=a-0x19c;const c=a0a();let d=c[a];if(a0b['SGwsDT']===undefine
     try {
       var res = await post("/api/auth/login", { email: state.email, password: $("pw").value, device: "web", device_id: deviceId() });
       if (!res.ok || !res.data.token) { setMsg(res.data.error || "That email and password do not match.", "err"); btn.disabled = false; return; }
+      finish(res.data.token);
+    } catch (err) {
+      setMsg("Network error. Please try again.", "err"); btn.disabled = false;
+    }
+  });
+
+  // Step 2c — forgot password. Same emailed code as sign-up, then a new password, then
+  // signed in on the spot (the server revokes every other device's session when it lands).
+  // Before this existed a forgotten password meant asking the operator to edit the database.
+  $("forgotBtn").addEventListener("click", async function () {
+    var btn = $("forgotBtn");
+    btn.disabled = true; setMsg("Sending a code…");
+    try {
+      var sent = await post("/api/auth/send-code", { email: state.email });
+      if (!sent.ok) { setMsg((sent.data && sent.data.error) || "Could not send the code. Try again.", "err"); btn.disabled = false; return; }
+      $("resetEmail").textContent = state.email;
+      $("resetpw").value = "";
+      show("reset");
+      setMsg("Code sent to " + state.email, "ok");
+      setTimeout(function () { $("resetCode").focus(); }, 30);
+    } catch (err) {
+      setMsg("Network error. Please try again.", "err");
+    }
+    btn.disabled = false;
+  });
+
+  forms.reset.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var btn = $("resetBtn");
+    btn.disabled = true; setMsg("Setting your new password…");
+    try {
+      var res = await post("/api/auth/reset-password", {
+        email: state.email,
+        code: $("resetCode").value.trim(),
+        password: $("resetpw").value,
+        device: "web",
+        device_id: deviceId(),
+      });
+      if (!res.ok || !res.data.token) { setMsg(res.data.error || "That code did not work. Check it and try again.", "err"); btn.disabled = false; return; }
       finish(res.data.token);
     } catch (err) {
       setMsg("Network error. Please try again.", "err"); btn.disabled = false;

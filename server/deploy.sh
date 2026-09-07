@@ -36,11 +36,11 @@ case "$TARGET" in
     HEALTH_PORT="8081"
     ;;
   *)
-    echo "TARGET 只能是 prod 或 test（收到：$TARGET）" >&2
+    echo "TARGET 只能是 prod 或 test（收到：${TARGET}）" >&2
     exit 1
     ;;
 esac
-echo "部署目标：$TARGET（项目 $COMPOSE_PROJECT，端口 $HEALTH_PORT，目录 $REMOTE_DIR）"
+echo "部署目标：${TARGET}（项目 ${COMPOSE_PROJECT}，端口 ${HEALTH_PORT}，目录 ${REMOTE_DIR}）"
 REMOTE="${SERVER_USER}@${SERVER_HOST}"
 REMOTE_Q="$(printf '%q' "$REMOTE_DIR")"
 # 锁按目标分开：测试环境的一次构建不该把生产的发布挡在门外。

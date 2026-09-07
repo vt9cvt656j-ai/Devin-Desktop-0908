@@ -29,12 +29,14 @@ mod handoff;
 mod human_input;
 mod image_location;
 mod knowledge;
+mod local_crypto;
 mod local_discovery;
 mod location;
 mod lint;
 mod lsp;
 mod marketplace;
 mod mcp;
+mod mse;
 mod net;
 mod office_xlsx;
 mod process_util;
@@ -246,6 +248,15 @@ pub fn run() {
             // that pool in the background so the first model turn does not pay a cold
             // gateway TCP+TLS handshake, then retain it across idle agent/tool work.
             ai::start_gateway_transport_warmup();
+
+            {
+                use tauri::Manager;
+                if let Ok(data_dir) = app.path().app_data_dir() {
+                    if let Err(e) = local_crypto::init(&data_dir) {
+                        eprintln!("local_crypto init failed (conversations will be stored unencrypted): {e}");
+                    }
+                }
+            }
 
             // 这里原来 spawn 一个 auth::init_db()，在每台机器的 ~/.michael_ide/auth.db 里建
             // users（bcrypt 密码库）和 marketplace_extensions 两张表。两张都没人读：
@@ -464,6 +475,7 @@ pub fn run() {
             marketplace::marketplace_search,
             tasks::tasks_list,
             tasks::task_run_capture,
+            tasks::task_cancel_capture,
             watcher::fs_watch,
             watcher::fs_unwatch,
             handoff::handoff_set_session,
@@ -534,21 +546,47 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Mr. Day One")
         .run(|handle, event| {
-            // On app exit, kill every child process (shells / LSP servers / debug
-            // adapters) so nothing is left running after the window closes.
-            if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
-                use tauri::Manager;
-                handle.state::<terminal::TerminalState>().reset_all();
-                handle.state::<lsp::LspManager>().stop_all();
-                handle.state::<debug::DebugManager>().stop_all();
-                proxy::stop_all(&handle.state::<proxy::ProxyState>()); // reap the mitmdump proxy
-                mcp::stop_all(); // reap MCP servers on quit (global map, not Tauri State)
-                automation::stop(); // reap the desktop-automation server
-                // 浏览器一直不在这张单子上：退出 App 之后无头 Chrome 的整棵进程树还活着，
-                // 而它是这堆子进程里最重的一个。cleanup_stale（重载那条路）早就收它了，
-                // 只有退出这条漏了。必须用 blocking 版：close_all 把 drop 丢进后台线程，
-                // 而这时候进程马上就没了，那个线程根本来不及跑。
-                browser::close_all_blocking(std::time::Duration::from_secs(3));
+            match event {
+                // Cmd+Q (macOS) / Alt+F4 (Windows): the OS asked the app to quit.
+                // Prevent immediate exit so the WebView has time to flush session
+                // state (open tabs, chat history, unsaved buffers) to disk. Without
+                // this, the process dies before the async store.save() finishes and
+                // the user loses their workspace on reopen.
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static EXITING: AtomicBool = AtomicBool::new(false);
+                    if EXITING.swap(true, Ordering::SeqCst) {
+                        return; // already handling exit
+                    }
+                    api.prevent_exit();
+                    use tauri::Emitter;
+                    let _ = handle.emit("app-will-exit", ());
+                    let h = handle.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        use tauri::Manager;
+                        h.state::<terminal::TerminalState>().reset_all();
+                        h.state::<lsp::LspManager>().stop_all();
+                        h.state::<debug::DebugManager>().stop_all();
+                        proxy::stop_all(&h.state::<proxy::ProxyState>());
+                        mcp::stop_all();
+                        automation::stop();
+                        browser::close_all_blocking(std::time::Duration::from_secs(3));
+                        std::process::exit(0);
+                    });
+                }
+                // Normal exit (last window closed, or the safety timer above fired).
+                tauri::RunEvent::Exit => {
+                    use tauri::Manager;
+                    handle.state::<terminal::TerminalState>().reset_all();
+                    handle.state::<lsp::LspManager>().stop_all();
+                    handle.state::<debug::DebugManager>().stop_all();
+                    proxy::stop_all(&handle.state::<proxy::ProxyState>());
+                    mcp::stop_all();
+                    automation::stop();
+                    browser::close_all_blocking(std::time::Duration::from_secs(3));
+                }
+                _ => {}
             }
         });
 }

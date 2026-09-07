@@ -53,14 +53,16 @@ test("两端用的是同一个字段名，而且客户端四处都接上了", ()
 test("这一次响应作废时，它的签名不能带到下一次", () => {
   // 重试和续传都会重开一次响应。上一次的思考块属于上一次那个助手轮，混进新的一轮
   // 里就是「签名和文字对不上」——上游判 400，比不带还糟。
+  // 2026-09-05 起工具参数不合规不再整轮重掷（改成同轮 [tool-args-invalid] 工具结果：响应没作废，
+  // 签名照常跟着那条助手消息走），所以重置点只剩断流重来这一处。
   const resets = CODE.match(/(?<!let )reasoningBlocks = \[\];/g) || [];
-  assert.equal(resets.length, 2,
-    `重置点有 ${resets.length} 处，应该是 2 处（断流重来、工具参数修复重试）`);
+  assert.equal(resets.length, 1,
+    `重置点有 ${resets.length} 处，应该是 1 处（断流重来）`);
 
-  // 两处重置都必须和其它累加器的重置贴在一起 —— 分开写迟早漏掉一个。
+  // 重置必须和其它累加器的重置贴在一起 —— 分开写迟早漏掉一个。
   assert.equal(
     [...CODE.matchAll(/reasoningAll = "";[\s\S]{0,180}?(?<!let )reasoningBlocks = \[\];/g)].length,
-    2,
+    1,
     "有重置点没和 reasoningAll 的重置放在一起 —— 下次加累加器时必漏");
 });
 

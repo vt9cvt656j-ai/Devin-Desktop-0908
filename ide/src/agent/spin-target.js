@@ -12,7 +12,21 @@
 /** 这次调用冲着哪个东西去的。归一化到「去掉目录和通配符的名字」，跨工具才对得上。 */
 export function spinTargetOf(call) {
   const c = call || {};
-  const raw = String(c.path || c.pattern || c.query || c.name || "").trim();
+  let raw = String(c.path || c.pattern || c.query || c.name || "").trim();
+  // **run_cmd 的目标藏在命令行里。**
+  //
+  // 它没有 path/pattern/query，于是一次都进不了这本台账 —— 而它恰恰是打转量最大的
+  // 工具。用户实拍的那条路径里，第二次尝试往往就是一条命令：
+  //   view_image image.png 读不到 → `cat image.png` 也读不到 → 再换第三个工具。
+  // 不认这一支，「两个不同的工具都没找到」这条结论在最常见的形状上永远不成立。
+  //
+  // 取法：去掉命令本身和所有开关，取第一个**像路径/文件名**的参数（含 . 或 /），
+  // 拿不到就退回第一个普通参数。归一化之后和 path/pattern 那几路在同一个命名空间里，
+  // 跨工具才对得上。
+  if (!raw && c.command) {
+    const argv = String(c.command).trim().split(/\s+/).slice(1).filter((a) => a && !a.startsWith("-"));
+    raw = argv.find((a) => a.includes("/") || /\.[A-Za-z0-9]{1,8}$/.test(a)) || argv[0] || "";
+  }
   if (!raw) return "";
   const base = raw.split("/").filter(Boolean).pop() || raw;
   return base.replace(/[*?[\]]/g, "").toLowerCase().slice(0, 60);
