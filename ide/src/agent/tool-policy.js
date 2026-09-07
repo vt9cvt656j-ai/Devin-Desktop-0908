@@ -156,7 +156,7 @@ export function defineTool(type, policy = {}) {
  * 和 main.js `_toolMayProduceExternalEffect` 里那条正则**必须**逐字相同——那边是外部副作用
  * 判定，这边是审批 / 只读门，两处对同一件事说不同的话就是事故。tool-policy.test.mjs 对账。
  */
-export const AUTOMATION_OBSERVE_METHODS = /(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot|capture|position|info|wait)$/i;
+export const AUTOMATION_OBSERVE_METHODS = /(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot|capture|position|info|wait|ocr|resolve|probe|elements|marked|displays)$/i;
 
 /**
  * 能和别的只读调用并行的纯读类型。四个执行体都核过：无写盘、无建目录、无删除、

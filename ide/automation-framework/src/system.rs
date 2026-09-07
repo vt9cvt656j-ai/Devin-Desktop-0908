@@ -83,6 +83,135 @@ pub fn capture_screen_png(region: Option<(i32, i32, i32, i32)>) -> Result<Vec<u8
 
 /// 主屏的**点**尺寸（不是像素）。鼠标坐标、AX 树坐标、`screencapture -R` 用的都是这一套。
 /// CGDisplay 那两个叫 pixels_wide/high 的方法在 Retina 上返回的其实是点（实测 1728×1117），
+/// Windows：GDI 抓屏成 PNG 字节（物理像素）。`region` 不给就抓**整个虚拟桌面**（多显示器时
+/// 副屏在里面，坐标可能是负数）；给了就抓那块（全局坐标）。不碰 Agent。
+#[cfg(target_os = "windows")]
+pub fn capture_screen_png(region: Option<(i32, i32, i32, i32)>) -> Result<Vec<u8>> {
+    let (x, y, w, h) = match region {
+        Some((rx, ry, rw, rh)) => {
+            if rw <= 0 || rh <= 0 {
+                return Err(Error::System("截图区域的宽高必须为正".into()));
+            }
+            (rx, ry, rw, rh)
+        }
+        None => virtual_screen_rect().ok_or_else(|| Error::System("拿不到屏幕尺寸（虚拟桌面宽高为 0）".into()))?,
+    };
+    gdi_capture(x, y, w, h)
+}
+
+/// 虚拟桌面矩形（全部显示器的并集），物理像素、全局坐标。
+#[cfg(target_os = "windows")]
+pub fn virtual_screen_rect() -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+    let (x, y, w, h) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if w <= 0 || h <= 0 { None } else { Some((x, y, w, h)) }
+}
+
+/// 整屏截图实际覆盖的矩形：macOS 抓主屏、原点 (0,0)，用 None 让 vision::prepare 按主屏算；
+/// Windows 抓整个虚拟桌面，原点可能不是 (0,0)，必须把矩形交给 prepare，否则副屏上的坐标全错。
+#[cfg(target_os = "macos")]
+pub fn full_capture_rect() -> Option<(i32, i32, i32, i32)> {
+    None
+}
+#[cfg(target_os = "windows")]
+pub fn full_capture_rect() -> Option<(i32, i32, i32, i32)> {
+    virtual_screen_rect()
+}
+
+#[cfg(target_os = "windows")]
+fn gdi_capture(x: i32, y: i32, w: i32, h: i32) -> Result<Vec<u8>> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::*;
+    let pixels = unsafe {
+        let screen_dc = GetDC(HWND(std::ptr::null_mut()));
+        if screen_dc.is_invalid() {
+            return Err(Error::System("拿不到屏幕设备上下文（GetDC 失败）".into()));
+        }
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        if mem_dc.is_invalid() {
+            ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
+            return Err(Error::System("建内存设备上下文失败".into()));
+        }
+        let bitmap = CreateCompatibleBitmap(screen_dc, w, h);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
+            return Err(Error::System("建位图失败（截图区域可能过大）".into()));
+        }
+        let old = SelectObject(mem_dc, bitmap);
+        // CAPTUREBLT：不加的话分层窗口（输入法候选框、Electron 的阴影圆角、半透明浮层）整块缺失。
+        let blt_ok = BitBlt(mem_dc, 0, 0, w, h, screen_dc, x, y, SRCCOPY | CAPTUREBLT).is_ok();
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // 负高度 = 自上而下
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let got = if blt_ok {
+            GetDIBits(screen_dc, bitmap, 0, h as u32, Some(buf.as_mut_ptr() as *mut std::ffi::c_void), &mut info, DIB_RGB_COLORS)
+        } else {
+            0
+        };
+        SelectObject(mem_dc, old);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
+        if !blt_ok {
+            return Err(Error::System("BitBlt 抓屏失败。受保护内容（DRM 播放器、部分远程桌面会话）会拒绝被截。".into()));
+        }
+        if got == 0 {
+            return Err(Error::System("GetDIBits 读不出像素".into()));
+        }
+        buf
+    };
+    let mut rgba = pixels;
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 255;
+    }
+    let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+        .ok_or_else(|| Error::System("像素数据长度和图像尺寸对不上".into()))?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|e| Error::System(format!("PNG 编码失败：{e}")))?;
+    Ok(png.into_inner())
+}
+
+/// Windows：主显示器的物理像素尺寸（进程已声明 DPI 感知，不会被虚拟化）。
+#[cfg(target_os = "windows")]
+pub fn main_display_points() -> Option<(u32, u32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    if w > 0 && h > 0 { Some((w as u32, h as u32)) } else { None }
+}
+
+/// Windows 锁屏时桌面根本抓不到（安全桌面），BitBlt 会失败而不是回黑图，所以这里恒 false。
+#[cfg(target_os = "windows")]
+pub fn screen_locked() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub use crate::platform::windows_tree::{window_stack, window_titles};
+#[cfg(target_os = "windows")]
+pub use crate::platform::tree_types::WinTitle;
+
 /// 见 rpc.rs `screen.info` 那段说明。走 CoreGraphics 而不是 enigo，是为了不碰 Agent。
 #[cfg(target_os = "macos")]
 pub fn main_display_points() -> Option<(u32, u32)> {
@@ -197,10 +326,22 @@ impl SystemAutomation {
     /// 移动鼠标到指定位置
     pub fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
         debug!("移动鼠标到 ({}, {})", x, y);
-        self.enigo
-            .move_mouse(x, y, Coordinate::Abs)
-            .map_err(|e| Error::System(format!("移动鼠标失败: {:?}", e)))?;
-        Ok(())
+        // Windows：enigo 的绝对移动把坐标按**主屏**尺寸归一化成 0..65535，副屏上的点全部落错；
+        // SetCursorPos 收的是全局物理像素（进程已声明 DPI 感知），多显示器直接可用。
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+            unsafe { SetCursorPos(x, y) }
+                .map_err(|e| Error::System(format!("移动鼠标失败: {:?}", e)))?;
+            return Ok(());
+        }
+        #[allow(unreachable_code)]
+        {
+            self.enigo
+                .move_mouse(x, y, Coordinate::Abs)
+                .map_err(|e| Error::System(format!("移动鼠标失败: {:?}", e)))?;
+            Ok(())
+        }
     }
 
     /// 相对移动鼠标

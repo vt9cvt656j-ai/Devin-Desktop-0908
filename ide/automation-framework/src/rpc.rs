@@ -297,6 +297,10 @@ fn replay_steps(
 impl RpcServer {
     /// 创建新的 RPC 服务器
     pub fn new(port: u16) -> Result<Self> {
+        // Windows：坐标、截图、UIA 矩形、SetCursorPos 必须同一套物理像素——不声明 DPI 感知，
+        // 125% 缩放的屏上每一次点击都偏四分之一。
+        #[cfg(target_os = "windows")]
+        crate::platform::windows_tree::ensure_dpi_aware();
         let agent = Agent::new()?;
 
         Ok(Self {
@@ -434,10 +438,10 @@ impl RpcServer {
     /// `recorder.replay` 会把录制里的每一步 re-dispatch 回 `execute_method`。走那条路时
     /// 请求本来就在持锁线程上，分流让它至少不必再等一次锁，也躲开 mutex 中毒
     /// （`lock().unwrap()` 在中毒时 panic，而中毒会连环杀掉整个 sidecar）。
-    #[cfg(all(feature = "system", target_os = "macos"))]
+    #[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
     fn screen_method(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         match method {
-            #[cfg(all(feature = "system", target_os = "macos"))]
+            #[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
             "screen.elements" | "screen.probe" => {
                 let cap = params.get("cap").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
                 // probe = 只看一眼，**不换句柄表**。轮询式的屏幕检查（background_monitor
@@ -449,9 +453,9 @@ impl RpcServer {
                 let pid = Self::resolve_ax_pid(&params)?;
                 let t0 = std::time::Instant::now();
                 let (nodes, page) = if probe {
-                    crate::platform::macos_tree::snapshot_probe(pid, cap)
+                    crate::platform::tree::snapshot_probe(pid, cap)
                 } else {
-                    crate::platform::macos_tree::snapshot(pid, cap)
+                    crate::platform::tree::snapshot(pid, cap)
                 };
                 // pid 和应用名要一起回：调用方（read_screen）拿它装 ref 表，
                 // 没有身份就没法在动作时校验「读的还是不是同一个 app」。
@@ -460,7 +464,7 @@ impl RpcServer {
                 // enumerate_windows() 里 is_frontmost 那一条的标题——只读前台时碰巧
                 // 总是对的，一旦支持指定目标就成了系统性的假话：读的是 A，回执说是 B，
                 // 而下游正是拿这个名字当身份去做「还是不是同一个 app」的校验。
-                let app_name = crate::platform::macos_tree::name_of(pid).unwrap_or_default();
+                let app_name = crate::platform::tree::name_of(pid).unwrap_or_default();
                 Ok(serde_json::json!({
                     "elements": nodes,
                     "count": nodes.len(),
@@ -468,6 +472,8 @@ impl RpcServer {
                     "took_ms": t0.elapsed().as_millis() as u64,
                     "pid": pid,
                     "app": app_name,
+                    // 可执行路径：调用方拿它判「这是不是用户正在开发的应用」（落在工作区里）。
+                    "exe": crate::platform::tree::exe_path_of(pid),
                     // 明说这次读有没有动过句柄表，调用方不用靠方法名去猜。
                     "refs_installed": !probe,
                     // 前台是浏览器时才有。没有它，一个加载了一半的页面和一个加载完的
@@ -478,7 +484,7 @@ impl RpcServer {
             }
             // 对上一次 screen.elements 里的某个 ref 执行 AX 动作。用的是**留下来的句柄**，
             // 不重跑枚举——老路那种「点的时候再枚举一遍按下标取第 N 个」既慢又会下标错位。
-            #[cfg(all(feature = "system", target_os = "macos"))]
+            #[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
             "screen.act" => {
                 let r = params.get("ref").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("press");
@@ -491,7 +497,7 @@ impl RpcServer {
                 // pid 是调用方（read_screen 时记下的身份）传下来的，可选：不给就不校验，
                 // 给了就必须对得上。见 macos_tree::act 里那段说明。
                 let want_pid = params.get("pid").and_then(|v| v.as_i64()).map(|v| v as i32);
-                crate::platform::macos_tree::act(r, action, value, want_pid)
+                crate::platform::tree::act(r, action, value, want_pid)
                     .map_err(|e| Error::Other(anyhow::anyhow!(e)))
             }
             // 截屏（新口径）：在壳里缩到模型建议的尺寸并回传精确换算关系。
@@ -510,7 +516,10 @@ impl RpcServer {
                 let png = crate::system::capture_screen_png(region)?;
                 let screen = crate::system::main_display_points()
                     .ok_or_else(|| Error::System("读不到主屏尺寸".into()))?;
-                let prepared = crate::vision::prepare(&png, max_side, region, screen).map_err(Error::System)?;
+                // 整屏时 macOS 抓主屏（原点 0,0，按主屏算）；Windows 抓整个虚拟桌面，原点可能是负数，
+                // 必须把实际覆盖的矩形交给 prepare，否则副屏上量到的坐标全错。
+                let covered = region.or_else(crate::system::full_capture_rect);
+                let prepared = crate::vision::prepare(&png, max_side, covered, screen).map_err(Error::System)?;
                 let out = crate::vision::encode_png(&prepared.image).map_err(Error::System)?;
                 Ok(capture_json(&prepared.geometry, &out, region, None))
             }
@@ -524,8 +533,8 @@ impl RpcServer {
                 let max_side = capture_max_side(&params);
                 let pid = Self::resolve_ax_pid(&params)?;
                 let t0 = std::time::Instant::now();
-                let (nodes, page) = crate::platform::macos_tree::snapshot(pid, cap);
-                let app_name = crate::platform::macos_tree::name_of(pid).unwrap_or_default();
+                let (nodes, page) = crate::platform::tree::snapshot(pid, cap);
+                let app_name = crate::platform::tree::name_of(pid).unwrap_or_default();
                 let base = |v: &mut serde_json::Value| {
                     v["elements"] = serde_json::json!(nodes);
                     v["count"] = serde_json::json!(nodes.len());
@@ -533,6 +542,7 @@ impl RpcServer {
                     v["took_ms"] = serde_json::json!(t0.elapsed().as_millis() as u64);
                     v["pid"] = serde_json::json!(pid);
                     v["app"] = serde_json::json!(app_name);
+                    v["exe"] = serde_json::json!(crate::platform::tree::exe_path_of(pid));
                     v["refs_installed"] = serde_json::json!(true);
                     v["page"] = serde_json::json!(page);
                     if crate::system::screen_locked() {
@@ -545,13 +555,13 @@ impl RpcServer {
                 // 话由调用方拼。窗口在但被部分盖住的情况在下面逐元素判。
                 let stack = crate::system::window_stack();
                 if !stack.iter().any(|w| w.pid == pid) {
-                    let front = crate::platform::macos_tree::frontmost_pid();
+                    let front = crate::platform::tree::frontmost_pid();
                     let mut v = serde_json::json!({
                         "image": serde_json::Value::Null,
                         "occluded": {
                             "target_pid": pid,
                             "front_pid": front,
-                            "front_app": front.and_then(crate::platform::macos_tree::name_of),
+                            "front_app": front.and_then(crate::platform::tree::name_of),
                             "reason": "no_onscreen_window",
                         },
                     });
@@ -561,7 +571,7 @@ impl RpcServer {
                 let png = crate::system::capture_screen_png(None)?;
                 let screen = crate::system::main_display_points()
                     .ok_or_else(|| Error::System("读不到主屏尺寸".into()))?;
-                let mut prepared = crate::vision::prepare(&png, max_side, None, screen).map_err(Error::System)?;
+                let mut prepared = crate::vision::prepare(&png, max_side, crate::system::full_capture_rect(), screen).map_err(Error::System)?;
                 // 只给**可交互的叶子控件**画框。容器（Window / SplitGroup / ScrollArea / Outline /
                 // Table / Toolbar…）和静态文本一律不画：它们不是点击目标，画上只会盖住真正的控件；
                 // 单元格（Cell）也不画——它总在一个 Row 里，Row 才是被选中的那一级。
@@ -612,10 +622,21 @@ impl RpcServer {
                     .find_map(|k| params.get(*k).and_then(|v| v.as_str()))
                     .map(str::trim)
                     .unwrap_or("");
-                if name.is_empty() {
-                    return Err(Error::Other(anyhow::anyhow!("Missing 'name' parameter")));
+                // 直接给 pid 就不用认名字（read_screen 回来的就是 pid）。
+                let by_pid = params.get("pid").and_then(|v| v.as_i64()).filter(|p| *p > 0).map(|p| {
+                    let pid = p as i32;
+                    crate::platform::tree_types::AppMatch {
+                        pid,
+                        name: crate::platform::tree::name_of(pid).unwrap_or_else(|| pid.to_string()),
+                        bundle: String::new(),
+                        exe: crate::platform::tree::exe_path_of(pid).unwrap_or_default(),
+                        via: "pid",
+                    }
+                });
+                if name.is_empty() && by_pid.is_none() {
+                    return Err(Error::Other(anyhow::anyhow!("Missing 'name' parameter (or 'pid')")));
                 }
-                match crate::platform::macos_tree::resolve_app(name) {
+                match by_pid.map(Ok).unwrap_or_else(|| crate::platform::tree::resolve_app(name)) {
                     Ok(m) => {
                         let titles: Vec<String> = crate::system::window_titles()
                             .into_iter()
@@ -623,13 +644,105 @@ impl RpcServer {
                             .map(|w| w.title)
                             .take(8)
                             .collect();
+                        // 它是什么：可执行路径（调用方据此判「这是不是用户正在开发的应用」）、是不是
+                        // Chromium 内核、开着的监听端口，以及其中哪个是 Chromium 调试接口——有的话
+                        // browser 工具可以直接按 CDP 接管，不必走可访问性树。
+                        let details = crate::platform::tree::app_details(m.pid);
+                        let cdp = details.ports.iter().find_map(|p| crate::cdp_probe::probe(p.port));
                         Ok(serde_json::json!({
                             "pid": m.pid, "name": m.name, "bundle": m.bundle, "via": m.via,
+                            "exe": if m.exe.is_empty() { details.exe.clone() } else { m.exe.clone() },
+                            "bundle_path": details.bundle_path,
+                            "chromium": details.chromium,
+                            "ports": details.ports,
+                            "cdp": cdp,
                             "windows": titles,
-                            "frontmost": crate::platform::macos_tree::frontmost_pid() == Some(m.pid),
+                            "frontmost": crate::platform::tree::frontmost_pid() == Some(m.pid),
                         }))
                     }
-                    Err(c) => Err(Error::ElementNotFound(crate::platform::macos_tree::no_such_app(name, &c))),
+                    Err(c) => Err(Error::ElementNotFound(crate::platform::tree::no_such_app(name, &c))),
+                }
+            }
+            // 等界面出现（或消失）某个元素：多步自动化最常见的失败就是「动作发完立刻读屏 / 点下一步」，
+            // 而对话框还没弹出来、页面还没渲染完。轮询走 probe（不动句柄表），所以模型手里的 ref 不受影响。
+            // 不是错误：等不到也正常返回 ok:false，由模型决定接下来是继续等还是换路。
+            "screen.wait" => {
+                let pid = Self::resolve_ax_pid(&params)?;
+                let want = |k: &str| params.get(k).and_then(|v| v.as_str()).map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+                let (text, role, id) = (want("text"), want("role"), want("id"));
+                let gone = params.get("gone").and_then(|v| v.as_bool()).unwrap_or(false);
+                if text.is_none() && role.is_none() && id.is_none() {
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "screen.wait 需要 text / role / id 至少一个（等它出现；gone:true 等它消失）"
+                    )));
+                }
+                let timeout = params.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(8000).min(30_000);
+                let interval = params.get("interval_ms").and_then(|v| v.as_u64()).unwrap_or(300).clamp(100, 2000);
+                let cap = params.get("cap").and_then(|v| v.as_u64()).unwrap_or(600) as usize;
+                let t0 = std::time::Instant::now();
+                let mut checks = 0u32;
+                loop {
+                    let (nodes, _) = crate::platform::tree::snapshot_probe(pid, cap);
+                    checks += 1;
+                    let hit = nodes.iter().find(|n| {
+                        role.as_ref().map(|r| n.role.to_lowercase() == *r).unwrap_or(true)
+                            && id.as_ref().map(|i| n.id.to_lowercase() == *i).unwrap_or(true)
+                            && text.as_ref().map(|t| n.text.to_lowercase().contains(t.as_str()) || n.value.to_lowercase().contains(t.as_str())).unwrap_or(true)
+                    });
+                    let satisfied = if gone { hit.is_none() } else { hit.is_some() };
+                    let elapsed = t0.elapsed().as_millis() as u64;
+                    if satisfied {
+                        return Ok(serde_json::json!({
+                            "ok": true, "elapsed_ms": elapsed, "checks": checks, "elements_seen": nodes.len(),
+                            "match": if gone { serde_json::Value::Null } else { serde_json::json!(hit) },
+                            "waited_for": { "text": text, "role": role, "id": id, "gone": gone },
+                        }));
+                    }
+                    if elapsed >= timeout {
+                        return Ok(serde_json::json!({
+                            "ok": false, "elapsed_ms": elapsed, "checks": checks, "elements_seen": nodes.len(),
+                            "waited_for": { "text": text, "role": role, "id": id, "gone": gone },
+                        }));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(interval));
+                }
+            }
+            // 系统 OCR（Windows：Windows.Media.Ocr，按已装语言包）。自绘界面（微信 / QQ 桌面版、游戏、
+            // DirectUI 的企业软件）在 UI Automation 里几乎什么都不交，文字只能从像素里认。
+            // macOS 走 read_screen ocr=true（Apple Vision），这条不重复实现。
+            "screen.ocr" => {
+                #[cfg(target_os = "windows")]
+                {
+                    let num = |k: &str| params.get(k).and_then(|v| v.as_f64()).map(|n| n as i32);
+                    let region = match (num("x"), num("y"), num("width"), num("height")) {
+                        (Some(x), Some(y), Some(w), Some(h)) => Some((x, y, w, h)),
+                        (None, None, None, None) => None,
+                        _ => return Err(Error::System("区域要同时给 x/y/width/height 四个参数".into())),
+                    };
+                    let (region, scope) = match region {
+                        Some(r) => (r, "region"),
+                        None => match Self::resolve_ax_pid(&params).ok().and_then(crate::platform::tree::main_window_rect) {
+                            Some(r) => (r, "window"),
+                            None => (
+                                crate::system::full_capture_rect().ok_or_else(|| Error::System("读不到屏幕尺寸".into()))?,
+                                "screen",
+                            ),
+                        },
+                    };
+                    let t0 = std::time::Instant::now();
+                    let png = crate::system::capture_screen_png(Some(region))?;
+                    let boxes = crate::platform::tree::ocr_png(&png, (region.0, region.1)).map_err(Error::System)?;
+                    return Ok(serde_json::json!({
+                        "boxes": boxes, "count": boxes.len(), "scope": scope,
+                        "region": { "x": region.0, "y": region.1, "width": region.2, "height": region.3 },
+                        "coordinate_space": "screen_points_top_left",
+                        "took_ms": t0.elapsed().as_millis() as u64,
+                        "note": "These are text observations, not accessibility refs: click them through computer coordinates (mouse.click at the box centre).",
+                    }));
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Err(Error::Other(anyhow::anyhow!("screen.ocr 只在 Windows 上实现；macOS 用 read_screen ocr=true（Apple Vision）")))
                 }
             }
             _ => unreachable!("screen_method 只处理 needs_no_agent 里列出的方法"),
@@ -639,16 +752,16 @@ impl RpcServer {
     /// 读屏类方法的目标进程：pid > app 名（精确优先于子串）> 前台。三个方法共用这一份，
     /// 不然「同一个 app 参数在 elements 找得到、在 marked 找不到」这种事迟早发生。
     /// 名字对不上就**报错**，绝不"退回读前台"：那会让模型以为自己读的是 A，实际读的是别的应用。
-    #[cfg(all(feature = "system", target_os = "macos"))]
+    #[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
     fn resolve_ax_pid(params: &serde_json::Value) -> Result<i32> {
         Ok(match params.get("pid").and_then(|v| v.as_i64()) {
             Some(p) if p > 0 => p as i32,
             _ => match params.get("app").and_then(|v| v.as_str()).map(str::trim) {
                 // 显示名 / 可执行名 / bundle id / 窗口标题一次全认；找不到把屏幕上有窗口的应用列给它。
-                Some(a) if !a.is_empty() => crate::platform::macos_tree::resolve_app(a)
+                Some(a) if !a.is_empty() => crate::platform::tree::resolve_app(a)
                     .map(|m| m.pid)
-                    .map_err(|c| Error::ElementNotFound(crate::platform::macos_tree::no_such_app(a, &c)))?,
-                _ => crate::platform::macos_tree::frontmost_pid().ok_or_else(|| {
+                    .map_err(|c| Error::ElementNotFound(crate::platform::tree::no_such_app(a, &c)))?,
+                _ => crate::platform::tree::frontmost_pid().ok_or_else(|| {
                     Error::Other(anyhow::anyhow!("读不到当前前台应用；给 app 或 pid 参数指定目标"))
                 })?,
             },
@@ -658,8 +771,8 @@ impl RpcServer {
     fn execute_method(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         // 分流放在拿锁之前。走到这里的 screen.* 只可能来自 recorder.replay 的
         // re-dispatch（正常路径在 accept 那一层就被挪走了）。详见 screen_method 上面那段。
-        #[cfg(all(feature = "system", target_os = "macos"))]
-        if matches!(method, "screen.elements" | "screen.probe" | "screen.act" | "screen.capture" | "screen.marked" | "app.resolve") {
+        #[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
+        if matches!(method, "screen.elements" | "screen.probe" | "screen.act" | "screen.capture" | "screen.marked" | "app.resolve" | "screen.wait" | "screen.ocr") {
             return Self::screen_method(method, params);
         }
         let mut agent = self.agent.lock().unwrap();
@@ -777,10 +890,10 @@ impl RpcServer {
             //
             // 区域截图那条链早就支持副屏（screencapture -R 收的是全局坐标），
             // 缺的只是"告诉它副屏在哪"。
-            #[cfg(all(feature = "system", target_os = "macos"))]
+            #[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
             "screen.displays" => {
                 drop(agent);
-                let list: Vec<serde_json::Value> = crate::platform::macos::list_displays()
+                let list: Vec<serde_json::Value> = crate::platform::tree::list_displays()
                     .into_iter()
                     .map(|(id, x, y, w, h, is_main)| {
                         serde_json::json!({
@@ -1419,9 +1532,9 @@ impl RpcServer {
         } else {
             match serde_json::from_slice::<RpcRequest>(&job.body) {
                 Ok(req) => {
-                    #[cfg(all(feature = "system", target_os = "macos"))]
+                    #[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
                     let result = Self::screen_method(&req.method, req.params);
-                    #[cfg(not(all(feature = "system", target_os = "macos")))]
+                    #[cfg(not(all(feature = "system", any(target_os = "macos", target_os = "windows"))))]
                     let result: Result<serde_json::Value> = Err(Error::Other(anyhow::anyhow!(
                         "screen.* 只在 macOS 上可用"
                     )));
@@ -1479,12 +1592,13 @@ impl Job {
         if self.health_probe {
             return true;
         }
-        #[cfg(all(feature = "system", target_os = "macos"))]
+        #[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
         {
             if matches!(
                 self.rpc_method.as_deref(),
                 Some("screen.elements") | Some("screen.probe") | Some("screen.act")
                     | Some("screen.capture") | Some("screen.marked") | Some("app.resolve")
+                    | Some("screen.wait") | Some("screen.ocr")
             ) {
                 return true;
             }
@@ -1495,7 +1609,7 @@ impl Job {
 
 /// 截图最长边。`raw:true` 或 `max_side:0` = 原图（要真实像素做 OCR/取证时用）；默认 1280。
 /// 上限 4096：再大既超各家视觉 API 的预算，也没有任何模型在那个尺寸上更准。
-#[cfg(all(feature = "system", target_os = "macos"))]
+#[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
 fn capture_max_side(params: &serde_json::Value) -> u32 {
     if params.get("raw").and_then(|v| v.as_bool()).unwrap_or(false) {
         return 0;
@@ -1507,7 +1621,7 @@ fn capture_max_side(params: &serde_json::Value) -> u32 {
 }
 
 /// 截图回执。**坐标空间是图上像素**，换算关系一并给出，壳按它换算，模型不换算。
-#[cfg(all(feature = "system", target_os = "macos"))]
+#[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
 fn capture_json(
     g: &crate::vision::Geometry,
     png: &[u8],
@@ -1591,7 +1705,7 @@ mod tests {
             );
         }
 
-        #[cfg(all(feature = "system", target_os = "macos"))]
+        #[cfg(all(feature = "system", any(target_os = "macos", target_os = "windows")))]
         for m in ["screen.elements", "screen.probe", "screen.act", "screen.capture", "screen.marked"] {
             assert!(
                 job(Some(m), false).offloadable(),

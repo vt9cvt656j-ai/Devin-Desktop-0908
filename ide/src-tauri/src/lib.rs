@@ -409,6 +409,7 @@ pub fn run() {
             capture::capture_url,
             capture::capture_url_frames,
             browser::browser_navigate,
+            browser::browser_attach,
             browser::browser_click,
             browser::browser_type,
             files::read_document,

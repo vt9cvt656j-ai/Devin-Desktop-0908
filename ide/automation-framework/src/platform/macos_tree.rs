@@ -24,6 +24,11 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use std::ptr;
 
+/// 两个平台共用的数据形状和纯逻辑（见 tree_types.rs）。
+pub use super::tree_types::{
+    no_such_app, signature_drift, AppDetails, AppMatch, AxNode, ListenPort, PageState, WinTitle,
+};
+
 #[repr(C)]
 struct __AXUIElement(std::ffi::c_void);
 type AXUIElementRef = *const __AXUIElement;
@@ -55,31 +60,7 @@ extern "C" {
     fn AXValueGetValue(value: CFTypeRef, the_type: u32, out: *mut std::ffi::c_void) -> bool;
 }
 
-/// 一个可访问性元素。字段名和 JXA 那版保持一致，下游不用改。
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AxNode {
-    pub role: String,
-    pub text: String,
-    pub value: String,
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
-    pub enabled: bool,
-}
 
-/// 网页加载状态。**只有前台是浏览器（树里有 WebArea）时才有。**
-///
-/// 可访问性树只反映**此刻**渲染出来的东西。页面还在加载时读到的就是半个页面，而
-/// 一个加载了一半的页面和一个加载完的短页面在结果里长得一模一样——模型会把
-/// 「还没渲染出来」当成「这页没有这个按钮」，然后基于这句假话往下决策。
-/// JXA 那条老路一直在顺路读它；快路上线时漏了，而快路现在是 macOS 的默认路。
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct PageState {
-    pub title: String,
-    pub loaded: bool,
-    pub progress: f64,
-}
 
 unsafe fn attr_f64(el: AXUIElementRef, name: &str) -> Option<f64> {
     let v = copy_attr(el, name)?;
@@ -147,6 +128,13 @@ unsafe fn node_text(el: AXUIElementRef) -> String {
     String::new()
 }
 
+/// 开发者起的稳定标识（accessibilityIdentifier）。自研应用靠它按名字点，不靠文案和坐标。
+unsafe fn node_id(el: AXUIElementRef) -> String {
+    attr_string(el, "AXIdentifier")
+        .map(|s| s.trim().chars().take(80).collect())
+        .unwrap_or_default()
+}
+
 unsafe fn node_value(el: AXUIElementRef) -> String {
     match copy_attr(el, "AXValue") {
         Some(v) => {
@@ -204,6 +192,7 @@ unsafe fn walk(
             w,
             h,
             enabled: attr_bool(el, "AXEnabled").unwrap_or(true),
+            id: node_id(el),
         };
         // ref 就是它在这一份结果里的序号。句柄一起留下来，点的时候直接用，
         // 不必重跑一遍枚举——那正是老路又慢又会下标错位的原因。
@@ -265,13 +254,6 @@ pub fn front_app() -> Option<WinTitle> {
     window_titles().into_iter().next()
 }
 
-/// 屏幕上的一扇窗口：主人进程、主人名、标题。按 z 序从前到后。
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct WinTitle {
-    pub pid: i32,
-    pub owner: String,
-    pub title: String,
-}
 
 /// 屏幕上正在显示的普通窗口（层级 0、至少 40×40），z 序从前到后。
 /// 标题（kCGWindowName）在没有屏幕录制权限时对别家应用读不到，会是空串——主人和 pid 照样有。
@@ -553,19 +535,6 @@ fn store_handles(pid: i32, items: Vec<(u32, AXUIElementRef, AxNode)>) {
     }
 }
 
-/// 签名变了就说它变了，不要闷头去点。
-fn signature_drift(a: &AxNode, b: &AxNode) -> Option<String> {
-    if a.role != b.role {
-        return Some(format!("role {} → {}", a.role, b.role));
-    }
-    if a.text != b.text {
-        return Some("文案变了".into());
-    }
-    if (a.x - b.x).abs() > 4 || (a.y - b.y).abs() > 4 {
-        return Some(format!("位置从 {},{} 移到 {},{}", a.x, a.y, b.x, b.y));
-    }
-    None
-}
 
 /// 发一个 AX 动作；AXError 0 才算成功。
 ///
@@ -737,7 +706,110 @@ unsafe fn walk_one(el: AXUIElementRef, out: &mut Vec<AxNode>) {
         w,
         h,
         enabled: attr_bool(el, "AXEnabled").unwrap_or(true),
+        id: node_id(el),
     });
+}
+
+/// 一个进程「是什么」：可执行文件、.app 包、是不是 Chromium 内核、开着哪些监听端口。
+///
+/// Chromium 判据是包里有没有 Electron / Chrome / Edge / CEF 的 Framework——这些应用带
+/// `--remote-debugging-port` 启动就能被 browser 工具按 CDP 接管，比走可访问性树省得多。
+/// 端口用 lsof 查本进程和它的直接子进程（只在 app.resolve 时查一次，几十毫秒）。
+pub fn app_details(pid: i32) -> AppDetails {
+    use cocoa::base::{id, nil};
+    use objc::{class, msg_send, sel, sel_impl};
+    let mut d = AppDetails::default();
+    unsafe {
+        let app: id = msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if app != nil {
+            let read = |obj: id| -> String {
+                if obj == nil {
+                    return String::new();
+                }
+                let ptr: *const i8 = msg_send![obj, UTF8String];
+                if ptr.is_null() { String::new() } else { std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+            };
+            let exe: id = msg_send![app, executableURL];
+            d.exe = if exe == nil { String::new() } else { read(msg_send![exe, path]) };
+            let bundle: id = msg_send![app, bundleURL];
+            d.bundle_path = if bundle == nil { String::new() } else { read(msg_send![bundle, path]) };
+        }
+    }
+    if !d.bundle_path.is_empty() {
+        let frameworks = std::path::Path::new(&d.bundle_path).join("Contents").join("Frameworks");
+        if let Ok(rd) = std::fs::read_dir(&frameworks) {
+            d.chromium = rd.flatten().any(|e| {
+                let n = e.file_name().to_string_lossy().to_lowercase();
+                n.contains("electron framework") || n.contains("chromium embedded") || n.contains("chrome framework")
+                    || n.contains("edge framework") || n.contains("brave browser framework") || n.contains("chromium framework")
+            });
+        }
+    }
+    if !d.chromium {
+        let lower = d.exe.to_lowercase();
+        d.chromium = ["google chrome", "microsoft edge", "chromium", "brave browser", "electron"].iter().any(|k| lower.contains(k));
+    }
+    d.ports = listen_ports(pid);
+    d
+}
+
+/// 本进程及其直接子进程正在监听的 TCP 端口（lsof）。查不到就是空，不猜。
+fn listen_ports(pid: i32) -> Vec<ListenPort> {
+    let mut pids = vec![pid];
+    if let Ok(out) = std::process::Command::new("/usr/bin/pgrep").arg("-P").arg(pid.to_string()).output() {
+        pids.extend(String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse::<i32>().ok()));
+    }
+    let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    let Ok(out) = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", &list, "-Fpn"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    let mut cur_pid = pid;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            cur_pid = p.trim().parse().unwrap_or(pid);
+        } else if let Some(n) = line.strip_prefix('n') {
+            if let Some(port) = n.rsplit(':').next().and_then(|s| s.trim().parse::<u16>().ok()) {
+                if !ports.iter().any(|p: &ListenPort| p.port == port) {
+                    ports.push(ListenPort { port, pid: cur_pid });
+                }
+            }
+        }
+    }
+    ports
+}
+
+/// 全部显示器：(id, x, y, w, h, is_main)。实现在 platform::macos，这里转发一下让两个平台同名。
+pub fn list_displays() -> Vec<(u32, i32, i32, u32, u32, bool)> {
+    super::macos::list_displays()
+}
+
+/// 可执行文件完整路径（NSRunningApplication.executableURL）。
+pub fn exe_path_of(pid: i32) -> Option<String> {
+    use cocoa::base::{id, nil};
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let app: id = msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if app == nil {
+            return None;
+        }
+        let url: id = msg_send![app, executableURL];
+        if url == nil {
+            return None;
+        }
+        let path: id = msg_send![url, path];
+        if path == nil {
+            return None;
+        }
+        let ptr: *const i8 = msg_send![path, UTF8String];
+        if ptr.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    }
 }
 
 /// 按进程号反查应用名。
@@ -775,14 +847,6 @@ pub fn wake_ax(pid: i32) -> bool {
     }
 }
 
-/// 按名字找应用的结果：pid 之外把「凭什么认定的」也交回去，模型看得懂自己是按标题还是按名字命中的。
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AppMatch {
-    pub pid: i32,
-    pub name: String,
-    pub bundle: String,
-    pub via: &'static str,
-}
 
 /// 按名字找运行中的应用：显示名 / 可执行名 / bundle id（整个或最后一段）/ **窗口标题**，一次全认。
 ///
@@ -799,7 +863,7 @@ pub fn resolve_app(query: &str) -> Result<AppMatch, Vec<String>> {
         return Err(Vec::new());
     }
     let lw = want.to_lowercase();
-    struct App { pid: i32, name: String, bundle: String, exe: String, regular: bool }
+    struct App { pid: i32, name: String, bundle: String, exe: String, exe_path: String, regular: bool }
     let mut apps: Vec<App> = Vec::new();
     unsafe {
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
@@ -823,12 +887,14 @@ pub fn resolve_app(query: &str) -> Result<AppMatch, Vec<String>> {
             }
             let url: id = msg_send![app, executableURL];
             let exe = if url == nil { String::new() } else { read(msg_send![url, lastPathComponent]) };
+            let exe_path = if url == nil { String::new() } else { read(msg_send![url, path]) };
             let policy: isize = msg_send![app, activationPolicy];
             apps.push(App {
                 pid,
                 name: read(msg_send![app, localizedName]),
                 bundle: read(msg_send![app, bundleIdentifier]),
                 exe,
+                exe_path,
                 regular: policy == 0,
             });
         }
@@ -836,7 +902,7 @@ pub fn resolve_app(query: &str) -> Result<AppMatch, Vec<String>> {
     // 带界面的排前面：同名时（比如 Electron 的辅助进程）优先命中真正开着窗口的那个。
     apps.sort_by_key(|a| !a.regular);
     let eq = |s: &str| !s.is_empty() && s.to_lowercase() == lw;
-    let found = |a: &App, via: &'static str| AppMatch { pid: a.pid, name: a.name.clone(), bundle: a.bundle.clone(), via };
+    let found = |a: &App, via: &'static str| AppMatch { pid: a.pid, name: a.name.clone(), bundle: a.bundle.clone(), exe: a.exe_path.clone(), via };
     if let Some(a) = apps.iter().find(|a| {
         eq(&a.name) || eq(&a.bundle) || eq(a.bundle.rsplit('.').next().unwrap_or("")) || eq(&a.exe)
     }) {
@@ -851,7 +917,7 @@ pub fn resolve_app(query: &str) -> Result<AppMatch, Vec<String>> {
             if let Some(a) = apps.iter().find(|a| a.pid == w.pid) {
                 return Ok(found(a, "window_title"));
             }
-            return Ok(AppMatch { pid: w.pid, name: w.owner.clone(), bundle: String::new(), via: "window_title" });
+            return Ok(AppMatch { pid: w.pid, name: w.owner.clone(), bundle: String::new(), exe: String::new(), via: "window_title" });
         }
     }
     if let Some(a) = apps.iter().find(|a| {
@@ -877,17 +943,6 @@ pub fn resolve_app(query: &str) -> Result<AppMatch, Vec<String>> {
     Err(candidates)
 }
 
-/// 找不到时给模型的一句话：候选列表就是下一步该填的名字。
-pub fn no_such_app(query: &str, candidates: &[String]) -> String {
-    if candidates.is_empty() {
-        format!("没有找到名字里含「{query}」的运行中应用（显示名 / 可执行名 / bundle id / 窗口标题都试过了）；用 window.list 看，或直接给 pid")
-    } else {
-        format!(
-            "没有找到名字里含「{query}」的运行中应用（显示名 / 可执行名 / bundle id / 窗口标题都试过了）。屏幕上有窗口的是：{}。挑一个重发，或直接给 pid",
-            candidates.join("、")
-        )
-    }
-}
 
 pub fn name_of(pid: i32) -> Option<String> {
     use cocoa::base::{id, nil};

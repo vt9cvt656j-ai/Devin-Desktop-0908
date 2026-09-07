@@ -19,6 +19,7 @@ export const _AUTOMATION_METHODS = [
   "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.down", "keyboard.up",
   "keyboard.hold", "keyboard.paste",
   "screen.info", "screen.displays", "screen.capture", "screen.elements", "screen.probe", "screen.act",
+  "screen.marked", "screen.wait", "screen.ocr", "app.resolve",
   "clipboard.get", "clipboard.set",
   "window.list", "window.activate", "window.minimize", "window.restore",
   "recorder.save", "recorder.list", "recorder.replay",
@@ -35,5 +36,8 @@ export const _COMPUTER_METHODS = [
   // 游戏、Canvas、视频、PDF 都是全盲的：动完手没法看一眼确认自己做成没有。
   // 不给 x/y/width/height 就是整屏；四个要么都给要么都不给。
   "screen.info", "screen.displays", "screen.capture", "clipboard.get", "clipboard.set",
+  // screen.wait：等界面出现 / 消失某段文字（wait_for 动作的底层）；screen.ocr：Windows 系统 OCR；
+  // app.resolve：按名字找应用（可执行路径、是不是 Chromium 内核、调试端口）。
+  "screen.wait", "screen.ocr", "app.resolve",
   "window.list", "window.activate", "window.minimize", "window.restore",
 ];

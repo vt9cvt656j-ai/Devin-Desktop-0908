@@ -50,6 +50,9 @@ pub mod human_input;
 /// 截图缩放、坐标换算与 Set-of-Marks 编号框。纯函数，不碰 Agent。
 pub mod vision;
 
+/// 探本机端口上的 Chromium 调试接口（自研 Electron / WebView2 应用的接管入口）。
+pub mod cdp_probe;
+
 #[cfg(feature = "system")]
 pub mod system;
 

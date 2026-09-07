@@ -1,6 +1,8 @@
 //! 平台特定功能模块
 
 pub mod desktop_element;
+/// 读屏族两个平台共用的数据形状与纯逻辑（role 词汇、按名字找应用的排序、签名比对）。
+pub mod tree_types;
 
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -15,6 +17,17 @@ pub mod macos_accessibility;
 /// 往返，实测真实窗口下 500 个元素要 95 秒，而读屏上限是 6 秒——必然超时。
 #[cfg(target_os = "macos")]
 pub mod macos_tree;
+/// Windows 的孪生实现：UI Automation 读树 / 按 ref 操作 / 按名字找应用 / 前台判定 / OCR。
+/// 和 macos_tree 暴露**同一组函数名和类型**，rpc.rs 只认 `platform::tree`，不认平台。
+#[cfg(target_os = "windows")]
+pub mod windows_tree;
+
+/// 读屏那一族方法的平台入口：rpc.rs 里一律写 `crate::platform::tree::…`。
+/// 两边函数签名必须一致——少一个，Windows 上那条 RPC 就编不过（这正是要的：静默缺功能比编译错糟）。
+#[cfg(target_os = "macos")]
+pub use macos_tree as tree;
+#[cfg(target_os = "windows")]
+pub use windows_tree as tree;
 
 use crate::error::Result;
 use crate::types::{ScreenInfo, WindowInfo};

@@ -27,7 +27,7 @@ test("每个动作都映射到 sidecar 真正实现的方法名，审批策略�
     "mouse.position", "mouse.drag", "mouse.scroll", "keyboard.type", "keyboard.press", "keyboard.combo",
     "keyboard.hold", "keyboard.paste", "screen.info", "screen.capture", "clipboard.get", "clipboard.set",
     "window.list", "window.activate", "window.minimize", "window.restore",
-    "recorder.save", "recorder.replay", "recorder.list",
+    "recorder.save", "recorder.replay", "recorder.list", "screen.wait",
   ]);
   const sample = {
     screenshot: {}, zoom: { region: [0, 0, 10, 10] },
@@ -38,6 +38,7 @@ test("每个动作都映射到 sidecar 真正实现的方法名，审批策略�
     hold_key: { text: "shift", duration: 1 }, paste: { text: "x" }, screen_info: {}, window_list: {},
     window_activate: { title: "Finder" }, window_minimize: { title: "Finder" }, window_restore: { title: "Finder" },
     clipboard_get: {}, clipboard_set: { text: "x" }, recorder_save: { name: "a" }, recorder_replay: { name: "a" }, recorder_list: {},
+    wait_for: { text: "保存成功" },
   };
   for (const action of COMPUTER_ACTIONS) {
     if (action === "wait") continue;
@@ -178,4 +179,14 @@ test("window_activate 认窗口标题、应用名、pid 三种写法；一个都
   assert.match(bad.error, /title/);
   assert.match(bad.error, /应用名/);
   assert.deepEqual(mapComputerAction({ action: "window_minimize", app: "Finder" }).method, "window.minimize");
+});
+
+test("wait_for：text 必填，秒数封顶 30，title/app 指目标，gone 等消失", () => {
+  const m = mapComputerAction({ action: "wait_for", text: "保存成功", duration: 5, title: "记事本" });
+  assert.equal(m.method, "screen.wait");
+  assert.deepEqual(m.params, { text: "保存成功", timeout_ms: 5000, app: "记事本" });
+  assert.equal(mapComputerAction({ action: "wait_for", text: "x", duration: 999 }).params.timeout_ms, 30000, "要封顶");
+  assert.equal(mapComputerAction({ action: "wait_for", text: "x" }).params.timeout_ms, 8000, "默认 8 秒");
+  assert.equal(mapComputerAction({ action: "wait_for", text: "正在加载", gone: true }).params.gone, true);
+  assert.match(mapComputerAction({ action: "wait_for" }).error, /text/);
 });

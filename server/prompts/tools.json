@@ -1761,7 +1761,7 @@
     "type": "function",
     "function": {
       "name": "system",
-      "description": "Application-level control through system APIs — faster than screenshots and pixel clicks. Actions: open switches to an app or launches it (name, e.g. Finder/Safari/Mail); menu triggers a menu item by path, e.g. [\"File\",\"New Window\"] or [\"Format\",\"Font\",\"Bold\"] (omit app for the frontmost); menu_items lists the real item names at one level (path [] = the top level); apps lists running apps and the frontmost; windows lists an app's window titles; focus raises the window whose title contains title; frontmost reports the current app and window. Typical flow: open → menu_items → menu; for what is not in a menu, read_screen + ui_click (or computer's screen.capture for real pixels). Menu names must match the interface exactly, including any ellipsis. macOS: full support (Accessibility permission). Windows: launching, listing and activating work; menus go through UI Automation, which Electron, UWP and custom-drawn apps often do not expose — 「找不到菜单项」 there means no menu bar is exposed, so switch to read_screen + ui_click or computer coordinates. Linux: open/windows/focus need wmctrl + xdotool; menus go through computer coordinates.",
+      "description": "Application-level control through system APIs — faster than screenshots and pixel clicks. Actions: open switches to an app or launches it (name, e.g. Finder/Safari/Mail); menu triggers a menu item by path, e.g. [\"File\",\"New Window\"] or [\"Format\",\"Font\",\"Bold\"] (omit app for the frontmost); menu_items lists the real item names at one level (path [] = the top level); apps lists running apps and the frontmost; windows lists an app's window titles; focus raises the window whose title contains title; frontmost reports the current app and window. Typical flow: open → menu_items → menu; for what is not in a menu, read_screen + ui_click (or computer's screen.capture for real pixels). Menu names must match the interface exactly, including any ellipsis. macOS: full support (Accessibility permission). Windows: launching, listing and activating work; menus go through UI Automation — Electron and Chromium apps expose their menus once read, custom-drawn apps (DirectUI, games) do not, and 「找不到菜单项」 there means no menu bar is exposed, so switch to read_screen + ui_click, read_screen ocr=true, or computer coordinates. Linux: open/windows/focus need wmctrl + xdotool; menus go through computer coordinates.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1782,6 +1782,10 @@
             "type": "string",
             "description": "For open/windows/focus: the app name exactly as shown in Applications or the menu bar."
           },
+          "background": {
+            "type": "boolean",
+            "description": "For open (optional): launch in the background without stealing focus (macOS)."
+          },
           "path": {
             "type": "array",
             "description": "For menu/menu_items: the menu path, e.g. [\"File\",\"New\"]; pass [] to menu_items for the top-level menus.",
@@ -1796,10 +1800,6 @@
           "app": {
             "type": "string",
             "description": "For menu/menu_items (optional): the target app; omit for the current frontmost app."
-          },
-          "background": {
-            "type": "boolean",
-            "description": "For open (optional): launch in the background without stealing focus (macOS)."
           }
         },
         "required": [
@@ -1812,7 +1812,7 @@
     "type": "function",
     "function": {
       "name": "browser",
-      "description": "Drive a real Chromium browser (Chrome / Edge / Brave, configurable) on a persistent automation profile: whatever you sign into here stays signed in; sessions are sticky and reused by default (close only releases this task's hold, force:true really quits). Every action returns the page after it: a screenshot with red numbers on interactive elements, the numbered node list ([n] role \"name\" state; off = outside the viewport), what changed since the previous step (URL / title / nodes / focus / dialogs / new tabs), where the viewport sits on the page, and a text excerpt. One numbering everywhere: red digit = node = the [n] inside read output; act with node=n and use fresh numbers after every step. Workflow: navigate → read (the page as a document, paged by offset) or find (text / pattern / role → matching nodes plus text hits with context, first hit scrolled into view) → act by node (click / type / select / toggle / press / hover / drag / upload / scroll to a node) → verify with assert / check / find. Many steps at once → batch: real pointer/mouse events, drag / slide / swipe / wheel, targeting through Shadow DOM and same-origin iframes, occlusion detection, and expect* checks that stop on failure. Unknown number of steps → task with a goal: the tool observes, acts, notes findings and re-observes by itself up to max_steps rounds and returns a summary. Forms → autofill with fields by meaning, then read back missing / invalid. Several pages → tab (list / new / switch / close); back / forward / reload move through history. JS dialogs are accepted automatically and reported; a link that opens a new tab is followed automatically; a click blocked by a cookie banner or modal dismisses it first and says so; a captcha or login wall stops with the reason instead of retrying. Target lives INSIDE a web page (DOM nodes, forms, text, page screenshots, network / console, cookies / storage, design / inspect for styling) → this tool, which addresses elements by node number. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → computer (automation is an alias), which synthesises real OS mouse and keyboard events. Both drive the same browser brand (one setting decides for both). Do not reach for computer just because a click failed in browser — re-read the nodes first; and do not drive a web page through computer coordinates when browser can address it by node. The user's OWN everyday browser is unreachable (a debugging port is a launch flag): use system open → read_screen → ui_click for it. Just showing the user a page → open (hands the URL to their default browser; you see nothing). Before delivering a public-facing UI, check desktop and phone via viewport.",
+      "description": "Drive a real Chromium browser (Chrome / Edge / Brave, configurable) on a persistent automation profile: whatever you sign into here stays signed in; sessions are sticky and reused by default (close only releases this task's hold, force:true really quits). Every action returns the page after it: a screenshot with red numbers on interactive elements, the numbered node list ([n] role \"name\" state; off = outside the viewport), what changed since the previous step (URL / title / nodes / focus / dialogs / new tabs), where the viewport sits on the page, and a text excerpt. One numbering everywhere: red digit = node = the [n] inside read output; act with node=n and use fresh numbers after every step. Workflow: navigate → read (the page as a document, paged by offset) or find (text / pattern / role → matching nodes plus text hits with context, first hit scrolled into view) → act by node (click / type / select / toggle / press / hover / drag / upload / scroll to a node) → verify with assert / check / find. Many steps at once → batch: real pointer/mouse events, drag / slide / swipe / wheel, targeting through Shadow DOM and same-origin iframes, occlusion detection, and expect* checks that stop on failure. Unknown number of steps → task with a goal: the tool observes, acts, notes findings and re-observes by itself up to max_steps rounds and returns a summary. Forms → autofill with fields by meaning, then read back missing / invalid. Several pages → tab (list / new / switch / close); back / forward / reload move through history. JS dialogs are accepted automatically and reported; a link that opens a new tab is followed automatically; a click blocked by a cookie banner or modal dismisses it first and says so; a captcha or login wall stops with the reason instead of retrying. Target lives INSIDE a web page (DOM nodes, forms, text, page screenshots, network / console, cookies / storage, design / inspect for styling) → this tool, which addresses elements by node number. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → computer (automation is an alias), which synthesises real OS mouse and keyboard events. Both drive the same browser brand (one setting decides for both). Do not reach for computer just because a click failed in browser — re-read the nodes first; and do not drive a web page through computer coordinates when browser can address it by node. The user's OWN everyday browser is unreachable (a debugging port is a launch flag): use system open → read_screen → ui_click for it. An app the user is BUILDING (Electron, Tauri on Windows / WebView2, CEF, any Chromium shell) is reachable: start it with --remote-debugging-port=<port> (Electron: pass the flag on its command line; WebView2: env WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<port>), then attach (port, or app / pid — read_screen and app resolution report the port) — every later action drives that app's own window by node, and close only disconnects, it never quits the app. Just showing the user a page → open (hands the URL to their default browser; you see nothing). Before delivering a public-facing UI, check desktop and phone via viewport.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1821,6 +1821,7 @@
             "enum": [
               "mytabs",
               "open",
+              "attach",
               "navigate",
               "observe",
               "viewport",
@@ -1867,7 +1868,7 @@
               "reload",
               "tab"
             ],
-            "description": "The browser action to perform. read = the page as a document (offset / max_chars / selector or node). find = locate by text / pattern / role: node hits plus text hits with context, scrolls to the first. nodes / observe = structured node list. scroll = by amount, or to a node / target text. mytabs = look at what the user already has open in their OWN browser (titles and URLs only, macOS, no automation window) — check it first when the task touches a page they may already be on. open = hand the URL to the USER'S OWN default browser for them to look at; you do not see the page. task = goal + optional url + max_steps: observe → act → note → re-observe by itself, returns a summary. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. check only performs a page health check; checkboxes and switches use toggle with checked. upload sends a file to an <input type=file>: selector picks the input, path / paths the absolute local file path. back / forward / reload move through history."
+            "description": "The browser action to perform. read = the page as a document (offset / max_chars / selector or node). find = locate by text / pattern / role: node hits plus text hits with context, scrolls to the first. nodes / observe = structured node list. scroll = by amount, or to a node / target text. mytabs = look at what the user already has open in their OWN browser (titles and URLs only, macOS, no automation window) — check it first when the task touches a page they may already be on. open = hand the URL to the USER'S OWN default browser for them to look at; you do not see the page. task = goal + optional url + max_steps: observe → act → note → re-observe by itself, returns a summary. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. check only performs a page health check; checkboxes and switches use toggle with checked. upload sends a file to an <input type=file>: selector picks the input, path / paths the absolute local file path. back / forward / reload move through history. attach = take over an already-running Chromium-based app of the user's own (Electron / WebView2 / CEF started with a debugging port): port, or app / pid; the app's current window becomes the page you act on, and close only disconnects."
           },
           "url": {
             "type": "string",
@@ -2124,6 +2125,18 @@
           "tab": {
             "type": "integer",
             "description": "For tab switch/close: the tab number from tab op list."
+          },
+          "port": {
+            "type": "integer",
+            "description": "For attach: the app's --remote-debugging-port."
+          },
+          "app": {
+            "type": "string",
+            "description": "For attach: the app's name or window title (its debugging port is discovered); pid also works."
+          },
+          "pid": {
+            "type": "integer",
+            "description": "For attach: the app's process id."
           }
         },
         "required": []
@@ -3471,13 +3484,13 @@
     "type": "function",
     "function": {
       "name": "read_screen",
-      "description": "Read the accessibility tree of an application: role, name, value, enabled state and screen coordinates of each element. A browser exposes its rendered page too (links, buttons, fields, text), which is how you operate the user's own already-running browser: read here, then act by ref with ui_click — nothing with an AX action needs coordinates. By default it reads the frontmost app; pass app or pid to read one that is not in front (for instance when the front window is Mr. Day One) without stealing focus. An empty result names its cause (permission missing / read incomplete / windows minimized / the app exposes nothing); only the last means a retry is pointless. By default the result also carries a screenshot in which each element's ref is drawn as a numbered box (only elements actually visible on screen are boxed), and that image is the coordinate reference for computer.",
+      "description": "Read the accessibility tree of an application: role, name, value, enabled state and screen coordinates of each element. A browser exposes its rendered page too (links, buttons, fields, text), which is how you operate the user's own already-running browser: read here, then act by ref with ui_click — nothing with an AX action needs coordinates. By default it reads the frontmost app; pass app or pid to read one that is not in front (for instance when the front window is Mr. Day One) without stealing focus. An empty result names its cause (permission missing / read incomplete / windows minimized / the app exposes nothing); only the last means a retry is pointless. By default the result also carries a screenshot in which each element's ref is drawn as a numbered box (only elements actually visible on screen are boxed), and that image is the coordinate reference for computer. Works the same on macOS (accessibility tree, Electron/Chromium apps woken up automatically) and Windows (UI Automation). Elements carry id when the developer gave them one (accessibilityIdentifier / AutomationId / HTML id); target carries the process's executable path, and when it lies inside the workspace the app is the user's own — its source is at hand.",
       "parameters": {
         "type": "object",
         "properties": {
           "ocr": {
             "type": "boolean",
-            "description": "true = macOS on-screen text recognition for an app with no accessibility tree (may need Screen Recording permission); an OCR ref is not an actionable AX node, and it covers only the frontmost window, so it cannot combine with app/pid."
+            "description": "true = on-screen text recognition for an app that exposes no accessibility tree (macOS: Apple Vision, frontmost window only, cannot combine with app/pid; Windows: the system OCR of the target app's window, app/pid allowed). An OCR ref is text with coordinates, not an actionable AX node — click it through computer at the box centre."
           },
           "app": {
             "type": "string",
@@ -3500,7 +3513,7 @@
     "type": "function",
     "function": {
       "name": "ui_click",
-      "description": "Perform press, set_value or focus on a real accessibility ref returned by read_screen. **This works on web page elements too** — a browser exposes its links, buttons, text fields and dropdowns as AX nodes that support a real press, so this is how you operate the user's own already-running browser (the one CDP cannot attach to) without touching a single coordinate. **The ref carries its own target**: if read_screen was pointed at a specific app, ui_click acts on that same app — it does NOT need to be in front, and pressing does not bring it forward. A ref carries the pid it was read from and is refused if the action would land on a different process, so it never operates the wrong app's window. Only direct manipulation of macOS AX nodes is supported; re-run read_screen after the interface changes, and OCR refs may not be passed in.",
+      "description": "Perform press, set_value or focus on a real accessibility ref returned by read_screen. **This works on web page elements too** — a browser exposes its links, buttons, text fields and dropdowns as AX nodes that support a real press, so this is how you operate the user's own already-running browser (the one CDP cannot attach to) without touching a single coordinate. **The ref carries its own target**: if read_screen was pointed at a specific app, ui_click acts on that same app — it does NOT need to be in front, and pressing does not bring it forward. A ref carries the pid it was read from and is refused if the action would land on a different process, so it never operates the wrong app's window. Refs come from the accessibility tree on macOS and from UI Automation on Windows (press = Invoke / Toggle / Select / default action, falling back to a real click at the element's centre; set_value = the value pattern, falling back to focus + typing); re-run read_screen after the interface changes, and OCR refs may not be passed in.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -4130,7 +4143,7 @@
     "type": "function",
     "function": {
       "name": "computer",
-      "description": "Drive the desktop the way a person at the screen would: look, act, look again. screenshot returns a scaled image of the whole screen; every coordinate you pass is a pixel of the LAST screenshot or read_screen image you received (origin top-left) — the host converts it to screen points, so never scale or guess coordinates, and take a screenshot before the first click. Prefer read_screen + ui_click for anything that has an accessibility ref (the numbered boxes in the read_screen image ARE those refs); use coordinates for what has none: canvas, games, custom-drawn controls, drag-and-drop, native dialogs. Use it as a state machine: confirm the precondition first (window in front, element visible, sign-in state), act, then verify the postcondition with screenshot or read_screen — issuing a click or some typing is not the same as succeeding. When an element moved or a ref went stale, re-read the screen instead of retrying blind; when sign-in, a captcha or a system permission blocks you, name the blocker and hand that step to the user. Target lives INSIDE a web page (DOM nodes, forms, buttons, text) → the browser tool, which addresses elements by node number and is cheaper and more reliable than pixels. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → this tool; the user's own already-running browser is reached with read_screen → ui_click. Both drive the same browser brand (one setting decides for both). Do not reach for computer just because a click failed in browser — re-read the nodes first; and do not drive a web page through computer coordinates when browser can address it by node.",
+      "description": "Drive the desktop the way a person at the screen would: look, act, look again. screenshot returns a scaled image of the whole screen; every coordinate you pass is a pixel of the LAST screenshot or read_screen image you received (origin top-left) — the host converts it to screen points, so never scale or guess coordinates, and take a screenshot before the first click. Prefer read_screen + ui_click for anything that has an accessibility ref (the numbered boxes in the read_screen image ARE those refs); use coordinates for what has none: canvas, games, custom-drawn controls, drag-and-drop, native dialogs. Use it as a state machine: confirm the precondition first (window in front, element visible, sign-in state), act, then verify the postcondition with screenshot or read_screen — issuing a click or some typing is not the same as succeeding. When an element moved or a ref went stale, re-read the screen instead of retrying blind; when sign-in, a captcha or a system permission blocks you, name the blocker and hand that step to the user. Target lives INSIDE a web page (DOM nodes, forms, buttons, text) → the browser tool, which addresses elements by node number and is cheaper and more reliable than pixels. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → this tool; the user's own already-running browser is reached with read_screen → ui_click. Both drive the same browser brand (one setting decides for both). Do not reach for computer just because a click failed in browser — re-read the nodes first; and do not drive a web page through computer coordinates when browser can address it by node. Same tool on macOS and Windows (accessibility tree on macOS, UI Automation on Windows; coordinates are always pixels of the last image). An app you are building yourself is the easiest target of all: its source is in the workspace, so give controls stable ids when they lack names, and if it is Electron / Tauri-on-Windows / any Chromium shell, start it with --remote-debugging-port and drive it through browser attach.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -4164,9 +4177,10 @@
               "clipboard_set",
               "recorder_save",
               "recorder_replay",
-              "recorder_list"
+              "recorder_list",
+              "wait_for"
             ],
-            "description": "screenshot: the screen (max_side to change its size). zoom: region [x0,y0,x1,y1] of the last screenshot at full resolution, for reading small text; coordinates stay in the full-screenshot space. Clicks take coordinate (omit to click where the pointer is) and text as held modifiers (\"cmd\", \"shift+alt\"). left_click_drag: start_coordinate → coordinate. scroll: scroll_direction + scroll_amount at coordinate. type: text verbatim. key: one key or a combo (\"Return\", \"cmd+s\", \"ctrl+shift+p\"), repeat to press it n times. hold_key: text + duration seconds. wait: duration seconds (max 60). paste: put text on the clipboard and paste it (fast for long text). window_activate / window_minimize / window_restore: title — a window title or an app name, either works (pid also accepted); when nothing matches the error lists what is on screen. clipboard_get / clipboard_set {text}. recorder_save / recorder_replay {name}, recorder_list."
+            "description": "screenshot: the screen (max_side to change its size). zoom: region [x0,y0,x1,y1] of the last screenshot at full resolution, for reading small text; coordinates stay in the full-screenshot space. Clicks take coordinate (omit to click where the pointer is) and text as held modifiers (\"cmd\", \"shift+alt\"). left_click_drag: start_coordinate → coordinate. scroll: scroll_direction + scroll_amount at coordinate. type: text verbatim. key: one key or a combo (\"Return\", \"cmd+s\", \"ctrl+shift+p\"), repeat to press it n times. hold_key: text + duration seconds. wait: duration seconds (max 60). paste: put text on the clipboard and paste it (fast for long text). window_activate / window_minimize / window_restore: title — a window title or an app name, either works (pid also accepted); when nothing matches the error lists what is on screen. clipboard_get / clipboard_set {text}. recorder_save / recorder_replay {name}, recorder_list. wait_for: text — poll the accessibility tree until an element whose name or value contains it appears (gone:true = until it disappears), duration = max seconds (default 8, max 30), title = the app to watch (default frontmost); returns ok:false when it never showed up — use it after every click that opens a dialog, a page or a save, instead of a fixed wait."
           },
           "coordinate": {
             "type": "array",
@@ -4222,7 +4236,11 @@
           },
           "title": {
             "type": "string",
-            "description": "window_activate / window_minimize / window_restore: a window title or an app name"
+            "description": "window_activate / window_minimize / window_restore / wait_for: a window title or an app name"
+          },
+          "gone": {
+            "type": "boolean",
+            "description": "wait_for: true = wait until the text is gone (a spinner, a 'loading' label) instead of until it appears"
           },
           "name": {
             "type": "string",
