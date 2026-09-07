@@ -17898,11 +17898,14 @@ async function _renderMsgRange(session, from, to, options = {}) {
     }
     const m = page[index];
     if (m && m.content != null) {
+      const _notice = m.role !== "assistant" && m._ideMeta?.notice ? m._ideMeta.notice : null;
       const displayContent = m.role === "assistant"
         ? _withoutLegacyReasoningSummary(m.content, m.reasoning)
+        : _notice ? _notice.display // IDE 后台通知：画一行系统说明，不画用户气泡
         : (m._ideMeta?.slashDisplay || m.content); // /技能 调用：气泡画用户敲的那行，不画展开的正文
       const body = addMessage(m.role === "assistant" ? "assistant" : "user", displayContent, session, m.attachments || [], {
         ...options,
+        ...(_notice ? { notice: _notice } : {}),
         transcriptSequence: from + index,
         // 这条当初是哪个模型答的。**这个键必须一直传**（哪怕值是空串）：它是
         // addMessage 区分「历史重画」和「实时那一轮」的唯一判据，漏了就退回
@@ -18759,11 +18762,17 @@ function _pendingSendsForStorage(pendingSends, mediaBudget, textBudget) {
     return {
       content: String(pending?.text || ""),
       attachments: Array.isArray(pending?.attachments) ? pending.attachments : [],
+      // 两个标记跟着走：notice（IDE 后台通知，重启后照样不能画成用户气泡）、
+      // alreadyInTranscript（气泡和记忆早就落过，重启后再发就是同一句话出现两遍）。
+      ...(pending?.notice ? { notice: pending.notice } : {}),
+      ...(pending?.alreadyInTranscript ? { alreadyInTranscript: true } : {}),
     };
   }).filter((pending) => pending.content.trim() || pending.attachments.length);
   return serializeMessagesForPersistence(normalized, mediaBudget, { textBudget }).map((pending) => ({
     text: pending.content,
     attachments: Array.isArray(pending.attachments) ? pending.attachments : [],
+    ...(pending.notice ? { notice: pending.notice } : {}),
+    ...(pending.alreadyInTranscript ? { alreadyInTranscript: true } : {}),
   }));
 }
 
@@ -19530,7 +19539,7 @@ async function restoreChatHistory() {
       const session = _newChatSession("Chat 1");
       for (const m of saved) {
         session.memory.push(m);
-        addMessage(m.role === "assistant" ? "assistant" : "user", m._ideMeta?.slashDisplay || m.content);
+        addMessage(m.role === "assistant" ? "assistant" : "user", m._ideMeta?.notice?.display || m._ideMeta?.slashDisplay || m.content, undefined, [], m._ideMeta?.notice ? { notice: m._ideMeta.notice } : {});
       }
     }
   } catch (e) { console.warn("[chat] restore failed:", e); }
@@ -21812,6 +21821,19 @@ function addMessage(role, text, forSession, attachments = [], options = {}) {
   const target = session ? session.container : chatEl;
   if (!options.skipPrune && session?._historyAtLatest === false) void _renderLatestHistoryWindow(session);
   try { target.querySelector(":scope > .chat-empty")?.remove(); } catch {} // first message → drop the starter hint
+  // IDE 自己续上的一轮（后台监控等到了…）：画成一行淡淡的系统通知，不画用户气泡——它不是用户
+  // 说的话。图标复用工具卡那套 Lucide 几何。所有者：「不要让他给我 IDE 直接用用户视角发消息」。
+  if (options.notice) {
+    wrap.className = "msg notice";
+    const _nIcon = options.notice.source === "background_monitor" ? "background_monitor" : "think";
+    wrap.innerHTML = `<span class="notice__ic" aria-hidden="true">${_toolIconSvg(_nIcon)}</span><span class="notice__t"></span>`;
+    const _nText = wrap.querySelector(".notice__t");
+    _nText.textContent = String(text || "");
+    wrap.title = String(text || "");
+    if (options.before && options.before.parentNode === target) target.insertBefore(wrap, options.before);
+    else target.appendChild(wrap);
+    return _nText;
+  }
   // 复用 sendPrompt 预先上屏的助手消息壳（头像+消息框+思考卡）：发送瞬间显示的那张
   // 就是本回合真正的回复卡，不再出现「先一个裸转圈、1-2 秒后又冒出第二张思考中」。
   // 只在壳仍是最后一条消息时复用；否则视为残留，丢弃重建。
@@ -28871,6 +28893,39 @@ function _queueFollowup(sess, text, attachments = []) {
   // 每排一条再糊一层浮层，发得多的时候就一直在闪。
   _renderQueueBar(sess);
 }
+/**
+ * IDE 自己续上的一轮——后台监控等到了 / 没等到。**不是用户说的话**，所以和 _queueFollowup 处处相反：
+ *   · 不画用户气泡，画一行淡淡的系统通知（addMessage 的 notice 分支）；
+ *   · 不进排队小卡片（那是给用户自己排的话用的，通知没有「插入」「删除」可言）；
+ *   · 发给模型的正文套一层「这不是用户发的」，免得它把"继续执行"读成用户的新指令、再复述一遍；
+ *   · 这一轮还在跑就**并进当前这一轮**（steer 队列，打 notice 标记，循环里不按用户插话处理）——
+ *     一边干活一边收到后台结果，这才是异步；没在跑才另起一轮。
+ * 所有者 2026-09-07：「不要让他给我 IDE 直接用用户视角发消息……都后台了，你可以实现多线程和异步的」。
+ */
+function _queueNotice(sess, text, meta = {}) {
+  const t = String(text || "").trim();
+  if (!sess || !t) return;
+  const notice = {
+    source: String(meta.source || "ide"),
+    display: String(meta.display || "").trim() || t.split("\n")[0].slice(0, 160),
+  };
+  // 形状照 Claude Code 的 task-notification：先两行结构化的「任务 / 状态」，再是正文。
+  const head = [meta.task ? `任务：${String(meta.task)}` : "", meta.status ? `状态：${String(meta.status)}` : ""].filter(Boolean).join("\n");
+  const body = "〔IDE 后台通知 · 不是用户发的消息〕\n" + (head ? head + "\n" : "") + t
+    + "\n（用户没有说话，这是 IDE 在后台等到结果后自动续上的。接着做你之前在做的事；别向用户转述这条通知，也别问他接下来做什么。）";
+  // 戴编排信封：和循环里其它 harness 注入同一个形状（test/logic.test.mjs 有一条按结构扫的断言）。
+  // steer 项另带 body：循环里那句 push 要自己拼 _ORCH_NOTE，才过得了那条结构扫描。
+  const content = _ORCH_NOTE + body;
+  if (sess.streaming && sess._runIsLoop) {
+    (sess._steerQueue = sess._steerQueue || []).push({ text: content, body, attachments: [], notice });
+    sess.memory.push({ role: "user", content, attachments: [], _ideMeta: { notice } });
+    try { addMessage("user", notice.display, sess, [], { notice }); } catch {}
+    saveChatHistory({ immediate: true });
+    return;
+  }
+  (sess._pendingSends = sess._pendingSends || []).push({ text: content, attachments: [], notice });
+  saveChatHistory();
+}
 // 排队消息小卡片：挂在底部输入框上方，超长省略号，末尾「插入」按钮——
 // 点插入把这条立即并入当前任务（agent 跑动中→实时引导；普通对话→阻断当前回答，
 // 结合两次输入重新作答）。不点则维持原排队行为：当前回答完成后自动发送。
@@ -28880,7 +28935,8 @@ function _renderQueueBar(sess) {
     const composer = document.getElementById("composer");
     if (!composer) return;
     let bar = composer.querySelector(":scope > .queue-bar");
-    const items = Array.isArray(sess._pendingSends) ? sess._pendingSends : [];
+    // 后台通知不进这张卡片：那是给用户自己排的话用的（能「插入」能「删除」），通知既不是他说的，也没有可插可删。
+    const items = (Array.isArray(sess._pendingSends) ? sess._pendingSends : []).filter((item) => !(item && typeof item === "object" && item.notice));
     if (!items.length) { if (bar) bar.remove(); return; }
     if (!bar) {
       bar = document.createElement("div");
@@ -28978,7 +29034,7 @@ async function _drainFollowups(sess) {
     saveChatHistory();
     const sent = typeof next === "string"
       ? sendPrompt(next, [], config)
-      : sendPrompt(next.text, next.attachments || [], config, { alreadyInTranscript: !!next.alreadyInTranscript });
+      : sendPrompt(next.text, next.attachments || [], config, { alreadyInTranscript: !!next.alreadyInTranscript, notice: next.notice || null });
     Promise.resolve(sent).catch(() => {});
     _renderQueueBar(sess);
   } catch {}
@@ -29265,7 +29321,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
    */
   try {
     if (sess && !sess._titled && _isDefaultChatName(sess.name)) {
-      const _autoTitle = _chatTitleFrom(_slashDisplay || text);
+      // IDE 后台通知续上的一轮不起名：标题得来自用户自己的第一句话。
+      const _autoTitle = opts.notice ? "" : _chatTitleFrom(_slashDisplay || text);
       if (_autoTitle) { sess.name = _autoTitle; sess._titled = true; _renderChatTabs(); saveChatHistory(); }
     }
   } catch { /* 起不出名字就留着原来的，绝不能让标签变空 */ }
@@ -29354,7 +29411,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     _turnIntentContext.sessionId || sess?.id,
     _aiIntentContextFingerprint(_turnIntentContext),
   );
-  const _aiIntentPromise = effectiveMode === "chat"
+  // opts.notice（IDE 后台通知续上的一轮）也不裁：它的意思恒是「接着做刚才那件事」，
+  // 会话上已有的语义画像照用，再花一次付费裁决只会把「端口已监听」这种话裁成别的东西。
+  const _aiIntentPromise = effectiveMode === "chat" || opts.notice
     ? Promise.resolve(null)
     : _aiIntentProfile(text, config, sess, _turnIntentContext).catch(() => null);
   const _turnIntentExactPromise = effectiveMode === "chat"
@@ -29419,10 +29478,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 记下发出去的原话：预测不能再推一遍用户刚做完的事。上下文预测器（打开的文件 /
   // 诊断 / git）是无状态的，它不知道刚才发生过什么——"解释 database.py" 发完、模型
   // 答完，它照样把同一句再推一次，看着就像预测从来不更新。
-  try { sess._recentSent = [_slashDisplay || text, ...(sess._recentSent || [])].slice(0, 5); } catch {}
+  if (!opts.notice) { try { sess._recentSent = [_slashDisplay || text, ...(sess._recentSent || [])].slice(0, 5); } catch {} }
   // opts.alreadyInTranscript：气泡和记忆在别处已经落过了——收尾时被搁下的插话走这条路
   // 重发一轮，再画一次就是同一句话在对话里出现两遍。
-  if (!opts.alreadyInTranscript) addMessage("user", _slashDisplay || text, sess, attachments);
+  // opts.notice：IDE 自己续上的一轮（后台监控等到了…），画成一行系统通知，不画用户气泡。
+  if (opts.notice) { if (!opts.alreadyInTranscript) addMessage("user", opts.notice.display || text, sess, [], { notice: opts.notice }); }
+  else if (!opts.alreadyInTranscript) addMessage("user", _slashDisplay || text, sess, attachments);
   // 直接把「真正的助手消息壳」（头像+消息框+思考卡）提前上屏——和流式开始时那张是同一张，
   // 而不是先塞一个裸转圈占位（没有消息框结构、跟上文挤在一起，1-2 秒后又被真卡替换）。
   // 下游所有 addMessage("assistant", …) 通过 sess._preTurnAssistant 复用这个壳。
@@ -30152,11 +30213,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   } catch {}
   // 展开后的技能正文进记忆（模型每一轮都要看见它）；用户敲的那一行挂在 _ideMeta 上给重画用，
   // 出线口 _sanitizeProviderMessages 会把 _ideMeta 摘掉，不会发给上游。
-  if (!opts.alreadyInTranscript) sess.memory.push({ role: "user", content: text, attachments, ...(_slashDisplay ? { _ideMeta: { slashDisplay: _slashDisplay } } : {}) });
+  if (!opts.alreadyInTranscript) sess.memory.push({ role: "user", content: text, attachments, ...(opts.notice ? { _ideMeta: { notice: opts.notice } } : _slashDisplay ? { _ideMeta: { slashDisplay: _slashDisplay } } : {}) });
   // 会话需求账本：用户每条实质要求入账（接续词/纯寒暄不записыв入），每轮开工整本
   // 注入——治"项目多轮对话失忆，不知道我具体需求"：老要求在几百条工具结果里被
   // 稀释/折叠后，模型注意力捞不回来；账本把历次要求压缩成清单常驻眼前。
-  {
+  if (!opts.notice) { // 后台通知不是用户的要求：不进账本、不沉淀记忆
     const _lt = text.trim();
     // 语义那一半抽走了（`_isFillerUtterance`），**长度那一半留在这里** ——
     // 账本要的是「值不值得记成一条要求」，六个字以下的先不记；
@@ -49274,7 +49335,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     lines.push("写入单件律：每轮回复只发 1 个 write_file 或 edit_file——写一个、落一个，看到工具结果确认落盘后再写下一个。同一个文件的多处修改用 multi_edit 一次交付（那是单文件内的真批量，不算多文件打包）。禁止一轮打包多个文件：传输中断时整轮作废全部重写，磁盘迟迟没产出；写入之外的只读工具同轮照常发。");
   }
   // 并行开工律：耗时任务先跑着，同时干别的——用户痛点“哪些任务可以先跑着，先做其他的”。
-  lines.push("并行开工律：耗时操作（依赖安装、构建、下载、爬取、长命令）用 run_in_terminal 挂后台先跑着，同轮/下一轮继续做不依赖它的工作（写代码、读文件、写文档），到真需要其结果时再 read_terminal 收割；不要坐着干等。需要用户人工动作（扫码/验证码/授权）时：先把环境全备好→一句话说清用户要做的唯一动作→立刻 background_monitor 盯条件满足自动继续，绝不反复追问“好了吗”。");
+  lines.push("并行开工律：耗时操作（依赖安装、构建、下载、爬取、长命令）用 run_in_terminal 挂后台先跑着，同轮/下一轮继续做不依赖它的工作（写代码、读文件、写文档），命令退出时会自动收到后台通知，要看输出再 read_terminal，别反复去问跑完没有；不要坐着干等。需要用户人工动作（扫码/验证码/授权）时：先把环境全备好→一句话说清用户要做的唯一动作→立刻 background_monitor 盯条件满足自动继续，绝不反复追问“好了吗”。");
   if (p.bug || p.debugProject) {
     lines.push("Bug 修复律：先复现/读取真实报错、日志、截图、诊断或失败命令；沿入口、数据流、状态机、异步时序、边界值和调用方契约定位根因；补最小补丁后重跑同一失败路径或最接近回归。");
     const ladder = (typeof _agentBugEvidenceLadderBlock === "function") ? _agentBugEvidenceLadderBlock(t, p) : "";
@@ -49317,7 +49378,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     lines.push("网站生产交付律：网站不是只摆好看页面；必须覆盖真实内容/文案/素材、路由/404/SEO metadata、表单提交/API 错误、加载/空/失败状态、性能基础、无障碍、桌面+手机浏览器验收和主要转化路径。");
   }
   if (p.longRunningRuntime || p.interactiveWait) {
-    lines.push("持续任务律：会长期运行的 dev server/watch/守护进程用 run_in_terminal；随后 read_logs/read_terminal 看 URL/日志/退出状态；等待端口/URL/文件/命令/人工操作用 background_monitor，timeout 后先查真实状态再决定。run_cmd 只跑会结束的短命令。");
+    lines.push("持续任务律：会长期运行的 dev server/watch/守护进程用 run_in_terminal；随后 read_logs/read_terminal 看 URL/日志（命令退出会自动通知你，不用轮询退出状态）；等待端口/URL/文件/命令/界面文字用 background_monitor，timeout 后先查真实状态再决定。run_cmd 只跑会结束的短命令。");
   }
   if (p.browserAutomation || p.capture) {
     lines.push("浏览器/抓包律：登录、点击、填表、E2E 用有头 browser；先 check/nodes，连续动作必须用 batch，一次跑完后用 assert/check 验证，别每步 screenshot；截图只做最终视觉验收或定位肉眼排版问题。找真实网页接口先 capture_start(mode:\"isolated_browser\") → browser navigate(fresh:true) → 真实操作 → capture_flows。任意桌面 App 才用 system，手动代理/后台监听用 background。301/302 先看 Location/cookie/最终 URL，不乱拼。");
@@ -52358,6 +52419,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // the round and redoing it. This is what makes long runs steerable.
       if (Array.isArray(session._steerQueue) && session._steerQueue.length) {
         for (const queued of session._steerQueue.splice(0)) {
+          // IDE 自己的后台通知（后台监控等到了…）：只把文字并进这一轮，不走下面那套「用户插话」
+          // 的处理——不进需求账本、不沉淀记忆、不再花一次意图裁决，也不套 [MICHAEL_USER_STEERING]。
+          // 它不是用户说的话（见 _queueNotice）。
+          if (queued && typeof queued === "object" && queued.notice) {
+            messages.push({ role: "user", content: _ORCH_NOTE + String(queued.body || queued.text || "") });
+            continue;
+          }
           const steerText = typeof queued === "string" ? queued : String(queued?.text || "");
           const steerAttachments = typeof queued === "string" ? [] : (queued?.attachments || []);
           // Loop-body scope deliberately: this is read again AFTER the block below closes, by
@@ -56176,7 +56244,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       (session._pendingSends = session._pendingSends || []).push({
         text: _t,
         attachments: (typeof stranded === "string" ? [] : stranded?.attachments) || [],
-        alreadyInTranscript: true, // 气泡和记忆在 _steerRunningAgent 里已经落过
+        alreadyInTranscript: true, // 气泡和记忆在 _steerRunningAgent / _queueNotice 里已经落过
+        ...(stranded && typeof stranded === "object" && stranded.notice ? { notice: stranded.notice } : {}),
       });
     }
     _drainFollowups(session); // safety net: any queued follow-up (if this wasn't steered) fires now
@@ -62814,10 +62883,21 @@ async function _executeToolStepInner(step, call, root, run) {
       if (run) {
         r.entry.agentRunId = run._reqId || "";
         r.entry.agentRoot = root || "";
+        // Claude Code 的 run_in_background 语义：命令**退出时通知**模型，而不是让它反复 read_terminal
+        // 去问"跑完没有"。记下发起它的会话和代际；结束由 _pollTermRunning 那边「跑过 → 停了」的跃迁
+        // 触发（_notifyTerminalCommandEnded）。每次（重）起命令都把"已通知"清零。
+        r.entry.agentSession = run.session || null;
+        r.entry.agentRunGen = run.session?._runGen || 0;
+        r.entry.agentLabel = label;
+        r.entry.exitNotified = false;
         if (devServerUrl) run._devServer = { url: devServerUrl, root: root || "", requestId: run._reqId || "", entry: r.entry };
       }
       // 这次的终端已经记录在案，顺手回收之前那些跑完的，别让它们无限堆下去。
       _reapExitedAgentTerminals();
+      // 退出通知只在能探到前台进程组的平台上有（Windows 的 term_running_ids 回 null，见
+      // terminal-liveness.js）；探不到就别承诺，模型照旧自己 read_terminal。
+      const _exitNoticeNote = _detectOS() === "Windows" ? ""
+        : "\n\n它退出时你会收到一条后台通知（这一轮还在跑就随下一批工具结果一起来；你已经收尾就会把你唤醒），所以**不用反复 read_terminal 问它跑完没有**——起了就接着干别的。";
       res.className = exited ? "atc-result atc-result--err" : "atc-result atc-result--ok";
       res.textContent = exited ? "已退出" : "运行中";
       if (vp) vp.innerHTML = `<pre>${_escHtml(out || "(暂无输出)")}</pre>`;
@@ -62834,7 +62914,7 @@ async function _executeToolStepInner(step, call, root, run) {
         stderr: "",
         content: (r.reused ? "（已复用现有终端 tab 原地重跑，未新开）\n" : "") + (exited
         ? `[ERROR] 命令在 IDE 终端「${label}」启动后很快退出，未形成持续运行任务。一次性命令应改用 run_cmd 取得真实退出码；持续服务请根据下面输出修复后重启：\n$ ${cmd}\n输出:\n${out || "(无)"}${_readyNote}`
-        : `${_startupFailed ? "[启动失败] 输出里检测到明确的启动错误（见下方 ⚠️），这条服务没有正常起来——先按输出修，别当成已启动。\n" : ""}已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。**注意：running 只表示这个终端标签页还开着（PTY 存活），不等于你这条命令本身还在跑**——命令自己退出了（编译失败、端口被占、进程崩溃），shell 仍然活着，这里照样显示运行中。要确认它真的在服务，读一次 read_terminal 看输出，或直接访问它应该提供的地址。${devServerUrl ? `本 run 检测到的 dev server：${devServerUrl}` : "尚未从该终端识别出本地 URL；用 read_logs/read_terminal 读取后续日志。"}${_readyNote}`),
+        : `${_startupFailed ? "[启动失败] 输出里检测到明确的启动错误（见下方 ⚠️），这条服务没有正常起来——先按输出修，别当成已启动。\n" : ""}已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。**注意：running 只表示这个终端标签页还开着（PTY 存活），不等于你这条命令本身还在跑**——命令自己退出了（编译失败、端口被占、进程崩溃），shell 仍然活着，这里照样显示运行中。要确认它真的在服务，读一次 read_terminal 看输出，或直接访问它应该提供的地址。${_exitNoticeNote}${devServerUrl ? `本 run 检测到的 dev server：${devServerUrl}` : "尚未从该终端识别出本地 URL；用 read_logs/read_terminal 读取后续日志。"}${_readyNote}`),
       };
 
     } else if (call.type === "termread") {
@@ -63592,7 +63672,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       let _bmRelease = () => {};
       // 代际快照：这个监视器只属于**发起它的那一轮**。
       //
-      // `_bmFinish` 会 _queueFollowup + _drainFollowups，也就是**自动开一整轮新的计费
+      // `_bmFinish` 会 _queueNotice + _drainFollowups，也就是**自动开一整轮新的计费
       // agent run**。而轮询自续、没有存活判据，所以：用户点 Stop 杀不掉它；关掉标签页它
       // 还在跑；用户发了新消息开了新一轮，它超时后照样再塞一轮进去 —— 跨轮复活且无上限。
       // `session` is not in scope here — _executeToolStepInner takes (step, call, root, run).
@@ -63644,7 +63724,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           // 第一次检查就命中 = 极可能「开始等之前就已经成立」，不是「等到了」。不改控制流，
           // 只说清区别——否则旧进程占的端口/上次留下的文件会被当成"这一步刚做完"的证据。
           const _pre = dotClass === "done" ? preexistingConditionNote(_bmChecks, bmType) : "";
-          _queueFollowup(_bmSess, followupText + _pre);
+          _queueNotice(_bmSess, followupText + _pre, { source: "background_monitor", task: "后台监控 — " + bmMsg, status: statusText, display: (dotClass === "done" ? "后台等到了：" : "后台没等到：") + bmMsg });
           _drainFollowups(_bmSess);
         }
       };
@@ -78875,7 +78955,10 @@ async function _pollTermRunning() {
     // src/agent/terminal-liveness.js（那里写着为什么必须拆）。
     // 传 ids 原值而不是 next：null = 平台报不了（Windows 无前台进程组）或这次没采到，
     // 压成空集就等于告诉它"全都结束了"——Windows 上每条命令都会被误判。
-    applyRunningPoll(termTabs, ids, { graceMs: _CMD_START_GRACE_MS });
+    // 「跑过 → 停了」的跃迁：智能体起的命令结束了就通知它（Claude Code 的 run_in_background 语义）。
+    for (const t of applyRunningPoll(termTabs, ids, { graceMs: _CMD_START_GRACE_MS }) || []) {
+      try { _notifyTerminalCommandEnded(t); } catch {}
+    }
     // 只有集合真的变了才动 DOM——每秒无谓地改 class 会让 CSS 动画不停重启。
     let changed = next.size !== _termRunningIds.size;
     if (!changed) for (const id of next) if (!_termRunningIds.has(id)) { changed = true; break; }
@@ -78885,6 +78968,41 @@ async function _pollTermRunning() {
 }
 
 const _terminalCommandEnded = commandEnded;
+
+/**
+ * 智能体起的终端命令结束了 → 给它一条后台通知。这是 Claude Code 里 run_in_background 的语义
+ * （"keeps running across turns and re-invokes you when it exits"）：模型起了命令就能接着干别的，
+ * 不用反复 read_terminal 去问"跑完没有"。所有者 2026-09-07：「主要后台这一块你一定要学些 claude code」。
+ *
+ * 去向按这个会话此刻在干什么定：
+ *   · 正在跑智能体循环 → 并进当前这一轮（随下一批工具结果一起进来，不另起一轮、不多计费）；
+ *   · 闲着、从起命令到现在没开过新一轮、且是一次性命令（装依赖/构建/测试/下载）→ 唤醒一轮，
+ *     它说过"跑完我接着做"；
+ *   · 闲着但用户已经开过新一轮 → 不唤醒，他已经转去别的事了（终端 tab 上照样看得到）；
+ *   · 闲着时服务型命令（dev server / watch）退出 → 也不唤醒：那多半是用户自己 Ctrl+C 了，
+ *     为此开一轮计费只会说一句"看到它停了"。
+ * 交互式 shell 里拿不到退出码，只给最后的输出让模型判；每条命令只决定一次（通知或放过）。
+ */
+function _notifyTerminalCommandEnded(entry) {
+  const sess = entry?.agentSession;
+  if (!sess || entry.exitNotified || sess._disposed) return;
+  entry.exitNotified = true;
+  const cmd = String(entry.lastCommand || entry.taskCommand || "").trim();
+  const label = String(entry.agentLabel || _terminalDisplayLabel(entry) || "").trim();
+  const live = !!sess.streaming && !!sess._runIsLoop;
+  if (!live) {
+    if ((sess._runGen || 0) !== (entry.agentRunGen || 0)) return;
+    if (_looksLikeServiceCommand(cmd)) return;
+  }
+  const tail = _terminalPlainText(String(entry.recentOut || "")).trim().split("\n").slice(-25).join("\n").slice(-2400);
+  const hit = _detectTerminalReady(tail);
+  const failed = !!(hit && hit.failed);
+  const verdict = failed ? `输出里有失败特征（${hit.pattern}）` : "交互式终端里拿不到退出码，按输出判断";
+  _queueNotice(sess,
+    `[run_in_terminal 结束] 终端「${label}」里的命令已经退出：\n$ ${cmd}\n${verdict}。最后的输出：\n${tail || "(无)"}\n如果你在等它的结果，现在接着做；要看更早的输出用 read_terminal（name=「${label}」）。`,
+    { source: "terminal", task: `终端「${label}」`, status: failed ? "已退出（输出里有失败特征）" : "已退出", display: `终端「${label}」的命令已退出` });
+  _drainFollowups(sess);
+}
 
 /// 一条命令刚写进这个终端。顺带叫醒轮询：面板收着时它是停的，而智能体发命令时
 /// 用户完全可能没开终端面板 —— 那样这条命令的死活就没人看了。

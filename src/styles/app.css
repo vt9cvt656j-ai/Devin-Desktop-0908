@@ -6426,6 +6426,17 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* 系统通知行：IDE 自己续上的一轮（后台监控等到了…）。不是用户说的话，所以不画成用户气泡，
+   画成一行淡淡的、带图标的说明——像 Slack 里「xx 加入了频道」那种。所有者 2026-09-07：
+   「不要让他给我 IDE 直接用用户视角发消息」。 */
+.msg.notice {
+  flex-direction: row; align-items: center; gap: 7px;
+  padding: 1px 2px; margin: 4px 0;
+  font-size: 12px; line-height: 1.5; color: var(--text-dim);
+}
+.msg.notice .notice__ic { flex: none; display: inline-flex; width: 13px; height: 13px; opacity: .8; }
+.msg.notice .notice__ic svg { width: 13px; height: 13px; }
+.msg.notice .notice__t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg.user {
   align-items: flex-end;
 }
