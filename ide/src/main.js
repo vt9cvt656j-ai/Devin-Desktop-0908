@@ -1227,6 +1227,14 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     // michael-compression：网关按会员套餐钳位并回传实际生效档位。
     if (config.michaelCompression) _h["x-michael-compression"] = String(config.michaelCompression);
     if (Number.isInteger(config.ideUtcOffsetMinutes)) _h["x-ide-utc-offset-minutes"] = String(config.ideUtcOffsetMinutes);
+    // 自定义端点走网关代发：和桌面端 ai.rs 发的是同一组头。没有它们，网关 from_headers 回 None，
+    // 拿着用户的模型名去查我们自己的 models 表 → 走我们的线路、按我们的价钱计费，而卡片上写着
+    // 「用你自己的密钥计费」。base 不在就一个都不发：只发 key 或只发 proto 会让网关进半配置状态。
+    if (config.byoBase) {
+      _h["x-ide-byo-base"] = String(config.byoBase);
+      if (config.byoKey) _h["x-ide-byo-key"] = String(config.byoKey);
+      if (config.byoProto) _h["x-ide-byo-proto"] = String(config.byoProto);
+    }
     const endpoint = _chatCompletionsUrl(config.baseUrl);
     // 和桌面端同一个头。网页端不经过 Tauri，所以在这儿直接加。
     const _routeId = String(config.ideRouteId || config.gatewayRouteId || "").trim();
@@ -13701,9 +13709,8 @@ function _formatAiHttpError(status, statusText, body) {
  * 所以两边都要有，各司其职。
  */
 function _byoViaGateway(custom) {
-  // **只有桌面端走得通**：x-ide-byo-* 只有 Rust 在发，网页版走 _realAiFetch 的装配、一个都没有；
-  // 少了头网关 from_headers 返回 None → 拿上游真名查我们自己的 models 表 → 按我们的价钱计费。
-  if (!inTauri) return false;
+  // 桌面端由 Rust（ai.rs）发 x-ide-byo-*，网页版由 _realAiFetch 发同一组头——两边都走得通，
+  // 所以这里不再按 inTauri 分岔。网页版走代发比直连还多一层好处：不再撞第三方端点的 CORS 预检。
   const raw = String(custom?.baseUrl || "").trim();
   if (!raw) return false;
   let u;
@@ -43331,6 +43338,12 @@ function _recoverFromAiFailure(kind, { custom = false } = {}) {
       showToast("你自己那个端点说额度不足（402）。这是那个中转站的余额，不是 Mr. Day One 的额度。", { duration: 9000 });
       return true;
     }
+    if (kind === "upstream") {
+      // 424 = 网关替他试过他的端点，没走通（连不上 / key 被拒 / 那边余额不足）。原因在对话里
+      // 那条红字里已经点名；这里只提醒别去动本产品的账号。
+      showToast("你自己那个端点这次没走通（424）。看对话里那条红字：多半是地址连不上、密钥被拒或那边余额不足，和你在 Mr. Day One 的账号无关。", { duration: 9000 });
+      return true;
+    }
     return false;
   }
   if (kind === "auth") {
@@ -43388,6 +43401,12 @@ function _formatAgentFinalError(err, { custom = false } = {}) {
     return `额度用完了：会员额度、钱包余额、今日免费点数三样都是空的。免费点数每天 UTC 0 点（北京时间 8:00）重置；也可以开通会员或充值后继续。已经为你打开账户页。${upstreamWords ? `\n服务端原话：${upstreamWords}` : ""}`;
   }
   if (kind === "upstream") {
+    // 走自己端点的那一轮：424 是网关替他试过**他的端点**之后说的话，里面已经点名了是连不上、
+    // key 被拒还是那边余额不足（server 的 upstream_friendly_message 按 byo 分了口径）。
+    // 别再套「服务端配置问题、换一个模型」——那是给我们自己的线路说的，对他既不对也没用。
+    if (custom) {
+      return `你自己那个端点这次没走通，原样重发不会变好。${upstreamWords ? `\n${upstreamWords}` : "到「模型 → 自定义模型」里检查地址和密钥。"}`;
+    }
     return `上游供应商那边的账号出了问题（密钥失效 / 没有可用账号 / 供应商欠费）。这是服务端的配置问题，重试不会变好——换一个模型通常立刻就能用。${upstreamWords ? `\n服务端原话：${upstreamWords}` : ""}`;
   }
   if (kind === "permanent") {

@@ -1984,6 +1984,16 @@ fn upstream_friendly_message(status: u16, low: &str, byo: bool) -> String {
         || low.contains("quota exceeded")
     {
         let detail = safe_upstream_error_excerpt(low);
+        if byo {
+            // 自带端点：这是**他在那家中转/供应商的账户**，不是本产品的余额，也没有「后台」「线路」
+            // 可言。说错对象的后果是用户跑来给本产品充值，然后发现还是不能用（2026-09-07 实测
+            // teamorouter 余额为零时，返回的正是下面那句给运维看的话）。
+            return if detail.is_empty() {
+                "你的自定义端点余额不足（这是你在那家中转/供应商的账户，不是本产品的余额）。到那边充值后再试。".into()
+            } else {
+                format!("你的自定义端点余额不足（这是你在那家中转/供应商的账户，不是本产品的余额）。上游原话：{detail}")
+            };
+        }
         if detail.is_empty() {
             "上游供应商账户余额不足。请在后台为该模型线路充值，或切换到其他可用线路。".into()
         } else {
@@ -2019,6 +2029,22 @@ fn upstream_friendly_message(status: u16, low: &str, byo: bool) -> String {
             "上游密钥无效（这条线路的 key 不对，重发多少次都一样）。换个模型可以继续用；管理员请到控制台「模型线路 → 线路」更新该连接的 API Key。"
                 .into()
         }
+    } else if byo
+        && (low.contains("error sending request")
+            || low.contains("connect")
+            || low.contains("dns")
+            || low.contains("timed out")
+            || low.contains("timeout"))
+    {
+        // 自带端点连不上：点名那个主机。普通线路的同一种错走下面的兜底（运维看日志就够了），
+        // 而自带端点的用户只有这句话——他得知道是地址错、那家挂了，还是填了个本机地址。
+        let host = byo_host_from_error(low);
+        let where_ = if host.is_empty() { String::new() } else { format!("（{host}）") };
+        let detail = safe_upstream_error_excerpt(low);
+        format!(
+            "连不上你的自定义端点{where_}{}。先确认地址填对、那家服务还活着；本机地址（localhost / 127.0.0.1 / 内网）走不了这条路。",
+            if detail.is_empty() { String::new() } else { format!("：{detail}") }
+        )
     } else if status == 400 {
         let detail = safe_upstream_error_excerpt(low);
         if detail.is_empty() {
@@ -2042,6 +2068,32 @@ fn upstream_friendly_message(status: u16, low: &str, byo: bool) -> String {
         } else {
             format!("上游暂时不可用（HTTP {status}）：{detail}")
         }
+    }
+}
+
+/// 从 reqwest 那句 `error sending request for url (https://host/path)` 里抠主机名，
+/// 给自带端点的报错点名。抠不到就回空串，调用方不点名。
+fn byo_host_from_error(low: &str) -> String {
+    let Some(i) = low.find("for url (") else { return String::new() };
+    let rest = &low[i + "for url (".len()..];
+    let url = rest.split(')').next().unwrap_or("");
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_default()
+}
+
+/// 自带上游的失败一律以 4xx 回给客户端。
+///
+/// 域名前面是 Cloudflare：源站的 502/503/504 **正文会被它换成自己那句 `error code: 502`**，
+/// 客户端拿不到 upstream_friendly_message 写的那句话。对普通线路这只是难看（客户端还会自己
+/// 重试、换线）；对自带端点这句话就是**全部**——没有线路可换、没有后台可查，用户必须知道是
+/// 地址连不上、key 被拒还是余额不足。424 在客户端归类为 upstream：不重试、不登出、原样显示。
+fn byo_downstream_status(status: StatusCode, byo: bool) -> StatusCode {
+    if byo && status.is_server_error() {
+        StatusCode::FAILED_DEPENDENCY
+    } else {
+        status
     }
 }
 
@@ -13299,7 +13351,10 @@ pub async fn chat_completions(
         match (success, selected_conn) {
             (Some(r), Some(c)) => (r, c),
             (None, _) => {
-                let downstream_status = upstream_failure_status(err_status, &err_low);
+                let downstream_status = byo_downstream_status(
+                    upstream_failure_status(err_status, &err_low),
+                    byo.is_some(),
+                );
                 tracing::warn!(
                     model = %model_name,
                     upstream_status = err_status,
@@ -13313,12 +13368,18 @@ pub async fn chat_completions(
                 let msg = format!(
                     "【{model_name}】{}{}{}",
                     friendly_upstream(err_status, &err_low, byo.is_some()),
-                    chat_upstream_attempt_suffix(
-                        route_count,
-                        attempted_sends,
-                        err_status,
-                        want_power
-                    ),
+                    if byo.is_some() {
+                        // 自带端点只有一个目标：「只有 1 个可用上游目标 / 还有 N 个没试」是线路的话，
+                        // 对他没有意义，反而像在说我们这边配少了。
+                        format!("（自定义端点；最后状态 {err_status}）")
+                    } else {
+                        chat_upstream_attempt_suffix(
+                            route_count,
+                            attempted_sends,
+                            err_status,
+                            want_power
+                        )
+                    },
                     rate_limit_exhausted_note(err_status, rate_limit_waited)
                 );
                 if headers.contains_key("x-ide-mode") {
@@ -16335,6 +16396,41 @@ mod billing_tests {
                        super::friendly_upstream_for_test(st, "boom"),
                        "状态 {st} 上两条路不该有区别");
         }
+    }
+
+    /// 自带端点的余额不足说的是**他那家中转的账户**，不是本产品的余额——说错对象用户会来这边充值。
+    #[test]
+    fn a_byo_balance_failure_names_the_users_own_account() {
+        let byo = super::friendly_upstream_byo_for_test(
+            400,
+            r#"{"error":{"message":"teamorouter 钱包余额不足，请前往充值","type":"insufficient_balance"}}"#,
+        );
+        assert!(byo.contains("自定义端点") && byo.contains("不是本产品"), "{byo}");
+        assert!(!byo.contains("后台") && !byo.contains("线路"), "自带端点没有后台和线路可言：{byo}");
+        let ours = super::friendly_upstream_for_test(400, "insufficient_balance");
+        assert!(ours.contains("线路"), "普通线路那句不许变：{ours}");
+    }
+
+    /// 连不上自带端点要点名那个主机，并说清本机地址走不了这条路。
+    #[test]
+    fn a_byo_connect_failure_names_the_host() {
+        let raw = "error sending request for url (https://polly.modelbridge.cc/v1/messages)";
+        let byo = super::friendly_upstream_byo_for_test(502, raw);
+        assert!(byo.contains("polly.modelbridge.cc"), "{byo}");
+        assert!(byo.contains("连不上"), "{byo}");
+        let ours = super::friendly_upstream_for_test(502, raw);
+        assert_ne!(byo, ours, "普通线路的同一种错该走兜底，不该被改口");
+        assert_eq!(super::byo_host_from_error("boom"), "", "抠不到主机名就回空，调用方不点名");
+    }
+
+    /// Cloudflare 会把源站 5xx 的正文换掉；自带端点的失败一律降成 424，客户端才看得到那句话。
+    #[test]
+    fn byo_failures_never_leave_as_5xx() {
+        use axum::http::StatusCode;
+        assert_eq!(super::byo_downstream_status(StatusCode::BAD_GATEWAY, true), StatusCode::FAILED_DEPENDENCY);
+        assert_eq!(super::byo_downstream_status(StatusCode::GATEWAY_TIMEOUT, true), StatusCode::FAILED_DEPENDENCY);
+        assert_eq!(super::byo_downstream_status(StatusCode::TOO_MANY_REQUESTS, true), StatusCode::TOO_MANY_REQUESTS, "429 照旧，客户端会退避重试");
+        assert_eq!(super::byo_downstream_status(StatusCode::BAD_GATEWAY, false), StatusCode::BAD_GATEWAY, "普通线路不动");
     }
 
     /// 这句文案**不许对「重发会怎样」做承诺**，也不许把出口说成线路。

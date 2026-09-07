@@ -278,14 +278,31 @@ pub async fn from_headers_async(
 pub fn pinned_client(byo: &ByoUpstream) -> reqwest::Client {
     let host = byo.base.host_str().unwrap_or_default().to_string();
     let port = byo.base.port_or_known_default().unwrap_or(443);
-    let mut b = reqwest::Client::builder()
+    // **一次钉全部地址，IPv4 排前。** 原来是逐个 `.resolve()`——那个接口是「覆盖」不是「追加」
+    // （reqwest 里它就是 `resolve_to_addrs(domain, &[addr])`），后一个把前一个顶掉，最后只剩
+    // 解析结果里的**最后一个**。Cloudflare 后面的中转（polly.modelbridge.cc 实测：2 个 A +
+    // 2 个 AAAA）最后一个是 IPv6，而这台服务器没有 IPv6 出口 → 连接秒失败 → 用户看到 502，
+    // 日志里只有一句 error sending request。teamorouter 那种只有 A 记录的站就通，所以这个坑
+    // 只在双栈站上现形，也只在代发这条路上有（普通线路走的是 reqwest 自己的解析）。
+    // 顺序：连接器按顺序尝试，v4 放前面就不会先在一个必然失败的 v6 上耗时间。
+    let b = reqwest::Client::builder()
         .http1_only()
         .connect_timeout(std::time::Duration::from_secs(5))
-        .tcp_nodelay(true);
-    for ip in &byo.resolved {
-        b = b.resolve(&host, std::net::SocketAddr::new(*ip, port));
-    }
+        .tcp_nodelay(true)
+        .resolve_to_addrs(&host, &pinned_addrs(&byo.resolved, port));
     b.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// 校验过的地址 → 连接顺序：IPv4 在前、IPv6 在后，各自保持解析器给的顺序，一个都不丢。
+pub fn pinned_addrs(resolved: &[IpAddr], port: u16) -> Vec<std::net::SocketAddr> {
+    let mut v4: Vec<std::net::SocketAddr> = Vec::new();
+    let mut v6: Vec<std::net::SocketAddr> = Vec::new();
+    for ip in resolved {
+        let sa = std::net::SocketAddr::new(*ip, port);
+        if ip.is_ipv4() { v4.push(sa) } else { v6.push(sa) }
+    }
+    v4.extend(v6);
+    v4
 }
 
 #[cfg(test)]
@@ -422,10 +439,33 @@ mod tests {
             protocol: "openai".into(),
             resolved: vec!["93.184.216.34".parse().unwrap()],
         };
-        // 建得出来即可：reqwest 不暴露 resolve 表，真正的行为由 pinned_client 的实现保证，
-        // 而实现里那个 for 循环是唯一的写法。这里守的是「有这一步」。
+        // 建得出来即可：reqwest 不暴露 resolve 表，真正的行为由 pinned_client 的实现保证
+        // （它把 pinned_addrs 的结果整份交给 resolve_to_addrs）。这里守的是「有这一步」。
         let _ = pinned_client(&byo);
         assert!(!byo.resolved.is_empty(), "没有解析结果就等于没钉");
+    }
+
+    /// 双栈站：一个地址都不丢，IPv4 在前。
+    ///
+    /// 逐个 `.resolve()` 会只剩解析结果里的最后一个（polly.modelbridge.cc 实测是 IPv6），
+    /// 而服务器没有 IPv6 出口 —— 那就是代发到它「秒 502」的全部原因。
+    #[test]
+    fn dual_stack_addresses_are_all_pinned_with_ipv4_first() {
+        let resolved: Vec<IpAddr> = [
+            "2606:4700:3030::6815:4abf",
+            "104.21.74.191",
+            "2606:4700:3035::ac43:a25f",
+            "172.67.162.95",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let addrs = pinned_addrs(&resolved, 443);
+        assert_eq!(addrs.len(), 4, "一个地址都不能丢");
+        assert!(addrs[0].is_ipv4() && addrs[1].is_ipv4(), "IPv4 必须排前");
+        assert!(addrs[2].is_ipv6() && addrs[3].is_ipv6());
+        assert_eq!(addrs[0].to_string(), "104.21.74.191:443");
+        assert_eq!(addrs[1].to_string(), "172.67.162.95:443");
     }
 
 

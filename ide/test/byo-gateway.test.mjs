@@ -39,19 +39,23 @@ test("远程 https 端点走代发；本机和明文一律不走", () => {
   }
 });
 
-test("**网页版一律不走代发**——那三个 byo 头只有 Rust 那侧在发", () => {
-  // 网页版走 main.js 的 _realAiFetch 装配请求头，里面一个 x-ide-byo-* 都没有。
-  // 少了头，网关 byo_upstream::from_headers 直接 return Ok(None)，于是拿着已被改写成
-  // 上游真名的 model 去查**我们自己的** models 表 → 走我们的线路、按我们的价钱计费，
-  // 而卡片上写着「用你自己的密钥计费」。这道门把网页版挡在代发之外，恢复浏览器直连。
+test("网页版也走代发——三个 byo 头由 _realAiFetch 发，和桌面端 Rust 那侧同一组", () => {
+  // 2026-09-07 之前这里是反过来的：网页版一律不走，因为 _realAiFetch 里一个 x-ide-byo-* 都
+  // 没有，少了头网关会把用户的模型名当成我们自己的模型、按我们的价钱计费。现在头补上了，
+  // 门就该拆：网页版直连第三方还要撞 CORS 预检，代发反而是更好走的那条。
   const web = byoViaGateway(false);
   for (const good of ["https://api.teamorouter.cn/v1", "https://polly.modelbridge.cc/v1"]) {
-    assert.equal(web({ baseUrl: good }), false,
-      `${good} 在网页版上不该走代发 —— 头发不出去，网关会把它当成我们自己的模型`);
+    assert.equal(web({ baseUrl: good }), true, `${good} 在网页版上也该走代发`);
   }
-  // 桌面端同一个地址必须仍然走：这条反向断言防止有人把门加宽成"谁都不走"。
-  assert.equal(byoViaGateway(true)({ baseUrl: "https://api.teamorouter.cn/v1" }), true,
-    "桌面端也被挡住了 —— 那等于把整个代发功能关掉");
+  assert.equal(byoViaGateway(true)({ baseUrl: "https://api.teamorouter.cn/v1" }), true);
+  // 头必须真的在装配函数里，而且 base 不在就一个都不发（只发 key/proto 会让网关进半配置状态）。
+  const fetchFn = fnSource("_realAiFetch", { code: true });
+  assert.match(fetchFn, /if \(config\.byoBase\) \{\s*\n\s*_h\["x-ide-byo-base"\] = String\(config\.byoBase\);/, "网页版没发 x-ide-byo-base");
+  assert.match(fetchFn, /if \(config\.byoKey\) _h\["x-ide-byo-key"\]/, "key 的发送不在 base 的条件里");
+  assert.match(fetchFn, /if \(config\.byoProto\) _h\["x-ide-byo-proto"\]/, "proto 的发送不在 base 的条件里");
+  // 这几个头必须排在「直连时清掉 x-ide-*」那道门之前——代发线路 _isGatewayConfig 为真，门不会清它们；
+  // 排在门之后的话直连线路也会带着它们发给第三方。
+  assert.ok(fetchFn.indexOf('_h["x-ide-byo-base"]') < fetchFn.indexOf('startsWith("x-ide-")'), "byo 头写在了清理门之后");
 });
 
 test("要放开网页版，必须先把三个 byo 头补进 _realAiFetch", () => {
