@@ -97,9 +97,14 @@ test("内置命令指向的动作必须真的存在", () => {
   assert.notStrictEqual(at, -1, "_SLASH 找不到了");
   const block = CODE.slice(at, CODE.indexOf("];", at));
   const cmds = [...block.matchAll(/cmd:\s*"([^"]+)"/g)].map((m) => m[1]);
-  assert.ok(cmds.length >= 10, `内置命令只剩 ${cmds.length} 条，之前补齐的那批被删了`);
-  for (const must of ["new", "sessions", "memory", "remote", "agent", "chat", "plan", "settings", "skills", "mcp"]) {
+  assert.ok(cmds.length >= 8, `内置命令只剩 ${cmds.length} 条，之前补齐的那批被删了`);
+  for (const must of ["new", "sessions", "memory", "terminal", "skills", "mcp", "shortcuts", "settings", "cost"]) {
     assert.ok(cmds.includes(must), `内置命令少了 /${must}`);
+  }
+  // 这几条是**刻意不收**的，别再顺手加回来：模式切换在输入条上已经有选择器（同一件事两个
+  // 入口只是把列表撑长），appearance / remote 在设置里点得到（所有者 2026-09-07：没啥用）。
+  for (const never of ["agent", "chat", "plan", "appearance", "remote"]) {
+    assert.ok(!cmds.includes(never), `/${never} 又回到命令表里了 —— 它是被明确删掉的，不是漏了`);
   }
   assert.equal(new Set(cmds).size, cmds.length, "有重名的内置命令，后一条永远选不到");
   // action 里调到的每个函数，main.js 里都得真的定义过。**一个打不开任何东西的命令比没有
@@ -109,14 +114,6 @@ test("内置命令指向的动作必须真的存在", () => {
   assert.deepEqual(missing, [], `这些命令调的函数在 main.js 里不存在：${missing.join(", ")}`);
 });
 
-test("三个模式命令和模式选择器走同一份实现", () => {
-  // 两个入口各写一遍必然漂：漏 session.mode 就是「切了模式，下一条消息又变回去」，
-  // 漏 _renderChatTabs 就是标签栏还标着旧模式。两种都在这个文件里真的发生过。
-  const setter = CODE.slice(CODE.indexOf("function _setAiMode("), CODE.indexOf("function _updateModeUI"));
-  assert.ok(setter.length > 100, "_setAiMode 没切出来");
-  for (const must of ["_currentAiMode = mode.id", "_updateModeUI()", "session.mode = mode.id", "_renderChatTabs()", "saveChatHistory()"]) {
-    assert.ok(setter.includes(must), `_setAiMode 少了 ${must}`);
-  }
-  assert.match(CODE, /item\.addEventListener\("click", \(\) => \{ _setAiMode\(mode\.id\); _closeModeMenu\(\); \}\)/,
-    "模式选择器没走 _setAiMode —— 两个入口又各写了一遍");
-});
+// 模式切换的那条守卫连同 `/agent` `/chat` `/plan` 一起撤了：命令删掉之后模式只剩**一个**
+// 入口（输入条上的选择器），当初把它抽成 _setAiMode 的理由（两个入口会漂）不再成立，
+// 抽取也一并还原了。留一段理由已经不成立的抽象，比不抽更容易误导下一个人。
