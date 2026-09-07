@@ -273,7 +273,7 @@ import { translateHoverMarkdown as _translateHoverMarkdown } from "./agent/hover
 import { chatTitleFrom as _chatTitleFrom, isDefaultChatName as _isDefaultChatName } from "./agent/chat-title.js";
 import { contextUsageView as _contextUsageView } from "./agent/context-usage.js";
 import { contextPartsView as _contextPartsView } from "./agent/context-parts.js";
-import { countCjk as _countCjk, sumContextParts as _sumContextParts, pendingTurnUsage as _pendingTurnUsage, costCalibration as _costCalibration } from "./agent/turn-pending.js";
+import { countCjk as _countCjk, pendingTurnUsage as _pendingTurnUsage } from "./agent/turn-pending.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { pointInTermSelection as _pointInTermSelection, termChipLabel as _termChipLabel, termSnippetText as _termSnippetText } from "./agent/term-drag.js";
@@ -20352,12 +20352,13 @@ function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, liv
         : turns.length > 1 ? `第 ${Number(openTurn.stepIndex) || turns.length} 轮 · ` : "";
       const attempts = Array.isArray(openTurn.attempts) ? openTurn.attempts.length : 0;
       const retry = attempts > 1 ? `重试 #${attempts} · ` : "";
-      if (openTurn.firstProgressAt == null) bits.push(`${tag}${retry}等待上游首字节`);
+      // 「等待上游首字节」那句 2026-09-07 按所有者要求撤掉：等首字节时只留轮次/重试信息
+      // （「第 3 轮 · 重试 #2」），没有这些信息就什么都不加——思考卡本身已经在说明还在等。
+      if (openTurn.firstProgressAt == null) { const _wait = `${tag}${retry}`.replace(/\s*·\s*$/, ""); if (_wait) bits.push(_wait); }
       else if (openTurn.firstVisibleAt == null) bits.push(`${tag}接收中`);
     } else if (!turns.length) {
-      // 一轮都还没开过（timeline 刚建）：这时任务级判据就是当前判据。
-      if (firstProgressMs == null) bits.push("等待上游首字节");
-      else if (firstVisibleMs == null) bits.push("接收中");
+      // 一轮都还没开过（timeline 刚建）：这时任务级判据就是当前判据。等首字节同样不加标签。
+      if (firstProgressMs != null && firstVisibleMs == null) bits.push("接收中");
     }
     // 有轮次但都已结束 = 正在跑工具，工具卡自己在转，不用加标签。
     //
@@ -20406,30 +20407,23 @@ function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, liv
     }
     if (Number.isInteger(settlement.costCents)) costCents = settlement.costCents;
   }
-  // 「任何时刻都有数」（2026-09-07 所有者点名：第一轮还在思考时只有秒表，结算前用户看不到自己
-  // 在花钱；结算失败或按停之后干脆一个字没有）。三格永远都在：秒表 / 输入·输出 / 金额。
-  // 数从三层来——网关已结算的 + 上游已报用量但网关还没结算的 + 正在流的这一轮按本地估算的
-  //（`pending`，见 agent/turn-pending.js）；只要含估算就在数前挂 ≈，结算齐了 ≈ 自动消失。
-  // 什么都还没有时印 —，不印 0：0 读起来是「免费」，— 才是「不知道」。
+  // 三格永远都在：秒表 / 输入·输出 / 金额。但数**只来自真实来源**（2026-09-07 所有者：「不要估算，
+  // 都要走真实的，接入真实的那条路」）：网关已结算的，加上上游流里已报了用量、网关还没结算的
+  // （token 是上游报的准数）。正在流的这一轮不再按本地估算补数——估出来的数前面挂 ≈ 也是假的；
+  // 它的真数在上游报出用量那一刻就到（Anthropic 线路首帧就报输入 token，网关会立刻转出来），
+  // 收尾由结算兜底。什么都还没有时印 —，不印 0：0 读起来是「免费」，— 才是「不知道」。
   const pendIn = Math.max(0, Math.round(Number(pending?.in) || 0));
   const pendOut = Math.max(0, Math.round(Number(pending?.out) || 0));
-  // null = 单价未知（按次计费 / 免费模型 / 网关没下发），和 0 元是两回事：Number(null) 会变 0，所以先判空。
-  const pendCost = pending?.costCents == null ? null : Math.max(0, Number(pending.costCents) || 0);
-  const hasPending = !!pending && (pendIn > 0 || pendOut > 0 || pendCost != null);
+  const hasPending = !!pending && (pendIn > 0 || pendOut > 0);
   if (inTok != null || hasPending) {
-    const approxTok = hasPending && pending.estimated ? "≈" : "";
-    bits.push(`${_icTokens}${approxTok}${_tokenShort((inTok || 0) + pendIn)}/${_tokenShort((outTok || 0) + pendOut)}`);
+    bits.push(`${_icTokens}${_tokenShort((inTok || 0) + pendIn)}/${_tokenShort((outTok || 0) + pendOut)}`);
   } else if (settlement) {
     bits.push(`${_icTokens}Usage unavailable`);
   } else {
     bits.push(`${_icTokens}—/—`);
   }
-  if (costCents != null || pendCost != null) {
-    // 在途那一份永远是估算（标价 × 本次 run 的校准系数），所以只要它在，金额就带 ≈。
-    bits.push(`${hasPending ? "≈" : ""}${_dispUsd((costCents || 0) + (pendCost || 0))}`);
-  } else {
-    bits.push("$—");
-  }
+  // 金额只认网关结算：按标价折算那份不是真扣的数，不印。
+  bits.push(costCents != null ? _dispUsd(costCents) : "$—");
   const html = bits.map((b) => `<span class="turn-stats__item">${b}</span>`).join("");
   return { html };
 }
@@ -20501,17 +20495,13 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timel
     ? `Credit cost: ${_dispUsd(settlement.costCents)} (${_MICHAEL_RAW_CENTS_PER_CREDIT_USD} raw cents = $1.00 credit; includes model, cache, and route pricing)${costBreakdown}`
     : "Cost: waiting for server settlement";
   const settledTitle = live && settlement?.settledTurns
-    ? `\nSettled: ${settlement.settledTurns} model requests; unsettled ones are shown as ≈ estimates`
+    ? `\nSettled: ${settlement.settledTurns} model requests; unsettled ones are not counted until the gateway settles them`
     : "";
-  // 在途那一层：上游已报用量但网关还没结算的（token 准、钱按标价折）+ 正在流的这一轮（本地估算）。
+  // 在途那一层：上游已报用量但网关还没结算的。token 是上游报的准数；金额不折算，等结算。
   const pendIn = Math.max(0, Math.round(Number(pending?.in) || 0));
   const pendOut = Math.max(0, Math.round(Number(pending?.out) || 0));
-  // null = 单价未知（按次计费 / 免费模型 / 网关没下发），和 0 元是两回事：Number(null) 会变 0，所以先判空。
-  const pendCost = pending?.costCents == null ? null : Math.max(0, Number(pending.costCents) || 0);
-  const pendingTitle = pending && (pendIn > 0 || pendOut > 0 || pendCost != null)
-    ? `\n在途（网关还没结算）: 输入 ${_tokenShort(pendIn)} · 输出 ${_tokenShort(pendOut)}${pendCost != null ? ` → ≈${_dispUsd(pendCost)}` : " → 单价未知，金额待结算"}`
-      + `（${pending.real ? "上游已报用量，金额按目录单价 × 本次校准折算" : "正在流：提示词按上一轮实测估、输出按已收到的字数估"}`
-      + `${pending.real && pending.estimated ? "；正在流的这一轮按本地估算" : ""}；结算落地后以网关为准，≈ 随之消失）`
+  const pendingTitle = pending && (pendIn > 0 || pendOut > 0)
+    ? `\n在途（上游已报用量、网关还没结算）: 输入 ${_tokenShort(pendIn)} · 输出 ${_tokenShort(pendOut)}（token 是上游报的准数；金额等网关结算，不折算）`
     : "";
   const timelineElapsed = (target, field) => {
     const startedAt = Number(target?.startedAt);
@@ -20555,7 +20545,7 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timel
       + `\n模型轮数: ${Array.isArray(timeline.turns) ? timeline.turns.length : 0}`
       + (turnLines ? `\n${turnLines}` : "")
     : "";
-  return `${live ? "Live stats (settled + pending ≈)" : "Reply stats"}\nTime: ${_fmtElapsed(elapsedMs)}${timelineTitle}\n${tokenTitle}\n${costTitle}${settledTitle}${pendingTitle}`;
+  return `${live ? "Live stats (settled + reported)" : "Reply stats"}\nTime: ${_fmtElapsed(elapsedMs)}${timelineTitle}\n${tokenTitle}\n${costTitle}${settledTitle}${pendingTitle}`;
 }
 
 // Token 与金额以服务端已落库的 settlement 为准；在途请求只以带 ≈ 的估算出现，结算落地即被替换。
@@ -20871,25 +20861,14 @@ function _noteTurnStreamUsage(turn, ev) {
   turn.usage = { prompt, completion, cacheRead: read == null ? 0 : n(read), cacheWrite: n(ev.cacheCreationTokens ?? ev.cache_creation_tokens) };
 }
 function _liveTurnPending({ session, timeline, prices = null, runUsage = null } = {}) {
+  // 参数里的 session / prices / runUsage 现在都用不上了——它们是当初给本地估算算提示词、
+  // 缓存比例和校准系数用的。所有者 2026-09-07 定调「不要估算」，在途只剩上游报过的准数；
+  // 调用点的形状不动（两条路四处都在传），免得为一个不再读的参数改四处接线。
+  void session; void prices; void runUsage;
   try {
     const turns = Array.isArray(timeline?.turns) ? timeline.turns : [];
     if (!turns.length) return null;
-    // 正在流的这一轮的提示词估算：上一轮实测（含缓存的整个窗口）和本地拼装量取大者。
-    const floor = session?._ctxRealFloor || null;
-    const promptEstimate = Math.max(Number(floor?.total) || 0, _sumContextParts(session?._ctxParts));
-    // 缓存命中比例：优先本次 run 已结算的口径，其次上一轮实测；都没有就按全部未命中估（偏高，带 ≈）。
-    let cacheRatio = 0;
-    if (runUsage && (Number(runUsage.reportedTurns) || 0) > 0) {
-      const inAll = (Number(runUsage.in) || 0)
-        + (runUsage.promptIncludesCached === false ? (Number(runUsage.cacheRead) || 0) + (Number(runUsage.cacheCreation) || 0) : 0);
-      if (inAll > 0) cacheRatio = (Number(runUsage.cacheRead) || 0) / inAll;
-    } else if (floor && floor.cacheRead != null && (Number(floor.input) || 0) > 0) {
-      cacheRatio = (Number(floor.cacheRead) || 0) / Number(floor.input);
-    }
-    return _pendingTurnUsage({
-      turns, prices, rawCentsPerUsd: _MICHAEL_RAW_CENTS_PER_CREDIT_USD, promptEstimate, cacheRatio,
-      calibration: _costCalibration(runUsage, prices, _MICHAEL_RAW_CENTS_PER_CREDIT_USD),
-    });
+    return _pendingTurnUsage({ turns });
   } catch { return null; }
 }
 
@@ -49367,7 +49346,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     // licence to build for imagined futures，抽象层要等到第三处真的需要时才抽。两条同时到场时
     // 这句是「默认就要可扩展」，正相反——实测形状是给一个只有单一调用点的 CLI 导出功能
     // 抽出接口 + 注册表 + 配置项。配置集中与禁止硬编码那半句保留，它和 :6 是一致的。
-    lines.push("可维护升级律：任何项目默认要好维护、好升级：清晰目录/模块边界、配置/env 集中、类型/schema/接口明确、测试与 README/用法说明齐全；禁止把业务规则、颜色、端口、密钥、路径和魔法值散落硬编码。注释按「为什么」写：每个不平凡的函数/类/模块给一句文档注释说明它是干什么的、调用方必须知道而签名说不出的（单位、不变量、空值与错误返回的含义）；函数体里只写读代码推不出来的那部分——非显然的约束、绕开某个 bug 的原因、看着像错其实是有意的、做过的取舍。不要复述下一行在干什么，不要写「这一段做 X」式的标题注释。新文件没有既有风格可跟，风格由你定。");
+    lines.push("可维护升级律：任何项目默认要好维护、好升级：清晰目录/模块边界、配置/env 集中、类型/schema/接口明确；禁止把业务规则、颜色、端口、密钥、路径和魔法值散落硬编码。测试和说明文档按需要写，不按配额：值得测的写够测试（可以多个文件、多个层次），没必要的不硬凑；README 或其它 markdown 不是必写、也不限一份，需要什么说明就写什么。注释要写足，且注释按「为什么」写：每个文件开头一段说明它是干什么的、在项目里处于什么位置；每个函数/类/模块给一段文档注释（做什么、参数和返回值的含义、单位、不变量、空值与错误返回、调用方必须知道而签名说不出的）；函数体里每一段有逻辑的地方都写注释——非显然的约束、绕开某个 bug 的原因、看着像错其实是有意的、做过的取舍、和别处的关系。只做一件显而易见的事的一行不用注释，不要复述下一行在干什么，不要写「这一段做 X」式的标题注释。标准是：不熟悉这个项目的人只靠注释就能读懂每个文件，宁多勿少；注释用用户跟你说话的语言。新文件没有既有风格可跟，就按这个标准写。");
   }
   if (p.promptRescue || p.vagueProjectRequest) {
     lines.push("烂提示词救援律：用户说不清、提示词垃圾或触发词缺失时，不要卡住也不要乱写；先从上下文/项目现状归纳真实目标，列少量默认假设和可反悔选择，按常识补齐业务、UI、数据、权限、错误态和验收清单，只在关键方向会完全改变结果时才问。");

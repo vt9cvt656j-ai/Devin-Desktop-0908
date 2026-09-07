@@ -10976,6 +10976,20 @@ impl AnthSse {
                 // type; the per-type arms below only deal with content and control flow.
                 Some("message_start") => {
                     self.ensure_role(&mut out);
+                    // 上游首帧就报了输入 token（Anthropic message_start.usage.input_tokens 是准数）：
+                    // 立刻按 OpenAI 形状转一块 usage 出去，客户端统计行第一秒就能显示真实的输入
+                    // token，不用再靠本地估算（所有者 2026-09-07：「不要估算，都要走真实的」）。
+                    // 空 choices 的 usage 块和收尾那块同一个形状，两边客户端早就认；输出那半在
+                    // 尾块补上，尾块的数取 max 覆盖，计费仍以 finish 时的 usage() 为准。
+                    if self.input_usage_reported && self.input_tokens > 0 {
+                        out.extend(
+                            format!(
+                                "data: {}\n\n",
+                                json!({"object":"chat.completion.chunk","model":self.model,"choices":[],"usage":self.usage()})
+                            )
+                            .into_bytes(),
+                        );
+                    }
                 }
                 Some("content_block_start") => {
                     let idx = ev.get("index").and_then(|v| v.as_i64()).ok_or_else(|| {
@@ -21220,7 +21234,12 @@ mod billing_tests {
         // Event shapes copied verbatim from a real zyz streaming response (tool call).
         let mut c = AnthSse::new("claude-opus-4-8");
         let mut out: Vec<u8> = Vec::new();
-        out.extend(c.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":15,\"cache_read_input_tokens\":46,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n\n").unwrap());
+        // 首帧就报了输入 token：那一块 usage 必须**当场**转出去，客户端才不用估算。
+        let head = c.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":15,\"cache_read_input_tokens\":46,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n\n").unwrap();
+        assert!(String::from_utf8_lossy(&head).contains("\"prompt_tokens\":15"),
+            "message_start 带来的输入 token 没有立刻转成 usage 块");
+        assert!(String::from_utf8_lossy(&head).contains("\"cache_read_input_tokens\":46"));
+        out.extend(head);
         out.extend(
             c.push(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
                 .unwrap(),

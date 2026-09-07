@@ -18069,7 +18069,9 @@ test("reply stats footer uses exact server settlements on both chat paths", () =
   const statsSource = SRC.slice(RAW_SRC.indexOf("function _turnStatsText"), RAW_SRC.indexOf("function _liveTurnStats"));
   assert.match(statsSource, /settlement\.usageReported/);
   assert.match(statsSource, /Usage unavailable/);
-  assert.match(statsSource, /_dispUsd\(\(costCents \|\| 0\) \+ \(pendCost \|\| 0\)\)/, "金额 = 已结算 + 在途估算");
+  // 2026-09-07 下午所有者再点名「不要估算，都要走真实的」：金额只认网关结算，在途不折算、不挂 ≈。
+  assert.match(statsSource, /bits\.push\(costCents != null \? _dispUsd\(costCents\) : "\$—"\)/, "金额只认网关结算");
+  assert.doesNotMatch(statsSource, /pendCost/, "在途折算金额又回来了——所有者要的是真实的");
   // 这里原来钉的是模块级注释里那句 "663 raw cents ($6.63) = $1.00 of visible quota/credits"。
   // 注释不是代码：把常量改掉、注释留着，断言照样绿。契约（663:1 这个分母写死在源码里可查证）
   // 由下面那条常量断言完整承担，注释这条去掉。
