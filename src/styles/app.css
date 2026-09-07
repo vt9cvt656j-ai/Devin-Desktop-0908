@@ -7782,25 +7782,27 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 }
 
 /* ── background_monitor card ──
-   形状对齐链接预览卡那一版定稿的样子：中性描边 + 12px 圆角 + 面板底。**没有强调色竖条、
-   没有彩色底**——那两样所有者明确否过（"蓝色线条…太丑"）。整张卡唯一的颜色是那个状态
-   指示点，它是信息不是装饰。
+   工具卡（.agent-tool-step）已经是一张带边框的白卡，这里**不再套一层框**：正文就是两行——
+     第一行：呼吸着的指示点 + 模型那句「在等什么」；
+     第二行：类型图标 + 等宽的「具体在探什么」+ 右侧状态。
+   原来是「等 URL 可达」胶囊 + 状态 + 单独一行灰底地址，三样东西说同一件事（所有者：太丑）。
 
-   刻意**不放倒计时**：这张卡此前有过「Xs / Ys」和进度条，所有者要的是「还在听」而不是
-   一个滴答的表。活性全部由指示点的呼吸环表达，那一条不要再加回来。 */
-.bm-card {
-  padding: 12px 14px;
-  border-radius: 12px;
-  background: var(--atc-bg, var(--panel));
-  border: 1px solid var(--line);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, .04);
+   **没有按钮**：这个工具是 AI 全自动的，等到就自己继续，「已完成，继续」「取消等待」都撤了。
+   **没有倒计时**：所有者要的是「还在听」而不是一个滴答的表，活性全由指示点的呼吸环表达。
+   **不染色**：整块唯一的颜色是指示点和状态字，它们是信息不是装饰；没有强调色竖条、
+   没有彩色底（所有者否过）。 */
+.bm-card { padding: 10px 14px 11px 13px; display: flex; flex-direction: column; gap: 6px; }
+
+.bm-msg {
+  display: flex; align-items: flex-start; gap: 9px;
+  font-size: 13px; font-weight: 500; line-height: 1.5;
+  color: var(--atc-text, var(--text));
 }
-.bm-head { display: flex; align-items: flex-start; gap: 10px; }
-.bm-head__body { flex: 1; min-width: 0; }
+.bm-msg__t { min-width: 0; overflow-wrap: anywhere; }
 
-/* 指示点 + 呼吸环。环是 box-shadow 撑出来的：它不占布局，所以不会把第一行顶开，
-   也不会在收尾停止动画时让整张卡跳一下。 */
-.bm-ind { position: relative; flex: none; width: 8px; height: 8px; margin-top: 5px; }
+/* 指示点 + 呼吸环。环是 box-shadow 撑出来的：它不占布局，不会把第一行顶开，
+   收尾停掉动画时整块也不会跳一下。margin-top 把点对到第一行文字的中线（19.5px 行高）。 */
+.bm-ind { position: relative; flex: none; width: 8px; height: 8px; margin-top: 6px; }
 .bm-ind__dot {
   position: absolute; inset: 0; border-radius: 50%;
   background: var(--accent);
@@ -7814,47 +7816,41 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 /* 系统里关了动效就别呼吸：一个持续跳动的点在这类设置下是明确不该出现的。 */
 @media (prefers-reduced-motion: reduce) { .bm-ind__dot { animation: none; } }
 
-.bm-msg {
-  font-size: 13.5px; font-weight: 600; line-height: 1.45;
-  color: var(--atc-text, var(--text)); overflow-wrap: anywhere;
+/* 条件行：缩进到和第一行文字对齐（8px 点 + 9px 间距）。 */
+.bm-cond {
+  display: flex; align-items: center; gap: 7px; min-width: 0;
+  padding-left: 17px;
+  font-size: 11.5px; line-height: 1.5; color: var(--atc-dim, var(--text-dim));
 }
-.bm-meta { display: flex; align-items: center; gap: 7px; margin-top: 5px; font-size: 11.5px; color: var(--atc-dim, var(--text-dim)); }
-/* 条件类型做成一枚很轻的胶囊：它是**分类**，和后面那句状态不是一回事，挤在一行纯文字里
-   两者会读成同一句话。 */
-.bm-tag {
-  flex: none; padding: 1px 7px; border-radius: 999px; font-weight: 500;
-  background: color-mix(in srgb, var(--atc-text, var(--text)) 8%, transparent);
+.bm-cond__ic { flex: none; display: inline-flex; width: 13px; height: 13px; opacity: .85; }
+.bm-cond__ic svg { width: 13px; height: 13px; }
+.bm-cond__app { flex: none; }
+/* 值：等宽、一行、省略号，全文在 title 里。写成 .atc-viewport 下的复合选择器是为了压过
+   聊天正文那条 .msg__body code（工具卡渲染在消息体里，那条规则会漏进来）。 */
+.atc-viewport .bm-cond__v {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  color: var(--atc-dim, var(--text-dim)); background: none; padding: 0; border: 0;
 }
-.bm-state { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 空状态整个收掉：flex 的 gap 对空元素照样生效，留着就是标签后面挂一段说不清的空白。 */
+.atc-viewport .bm-cond__v--plain { font-family: var(--font); }
+.bm-state {
+  flex: none; margin-left: auto; padding-left: 12px;
+  font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+/* 监听中这里是空的（步骤头已经写着「监听中」），整个收掉，别留一段 padding 撑出来的空白。 */
 .bm-state:empty { display: none; }
 
-/* 在等什么：等宽一行。原来这张卡只说「等命令成功」，而"哪条命令"只有终端里才看得到。 */
-.bm-cond {
-  margin-top: 9px; padding: 6px 8px; border-radius: 7px;
-  background: color-mix(in srgb, var(--atc-text, var(--text)) 4%, transparent);
-  font: 11.5px/1.5 var(--mono); color: var(--atc-dim, var(--text-dim));
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-
-.bm-actions { display: flex; gap: 8px; margin-top: 11px; }
-.bm-btn {
-  padding: 5px 13px; border-radius: 7px; border: 1px solid var(--line);
-  background: transparent; color: var(--atc-text, var(--text)); cursor: pointer;
-  font-size: 12px; font-weight: 500; line-height: 1.5;
-  transition: background .13s ease, border-color .13s ease, color .13s ease;
-}
-.bm-btn:hover { border-color: var(--line-strong, var(--text-dim)); background: color-mix(in srgb, var(--atc-text, var(--text)) 5%, transparent); }
-.bm-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.bm-btn--primary { background: var(--accent); color: #fff; border-color: transparent; }
-.bm-btn--primary:hover { background: var(--accent-hover, var(--accent)); color: #fff; border-color: transparent; }
-.bm-btn:disabled { opacity: .5; cursor: default; }
-
-/* 四种收尾状态：只换指示点的颜色并停掉呼吸。**整张卡不染色**——把卡片刷成绿的/黄的会
-   盖过正文，而正文（在等什么、等到没有）才是用户要读的东西。 */
-.bm-card[data-state="done"] .bm-ind__dot { background: #34a853; animation: none; box-shadow: none; }
-.bm-card[data-state="timeout"] .bm-ind__dot { background: #f0a030; animation: none; box-shadow: none; }
-.bm-card[data-state="cancelled"] .bm-ind__dot { background: var(--text-dim); animation: none; box-shadow: none; }
+/* 三种收尾：指示点换色、停掉呼吸；状态字跟着表态（成功绿 / 告警橙 / 停止灰）。
+   颜色令牌和步骤头 .atc-result 同一套，两处永远一致。 */
+.bm-card[data-state="done"] .bm-ind__dot,
+.bm-card[data-state="timeout"] .bm-ind__dot,
+.bm-card[data-state="cancelled"] .bm-ind__dot { animation: none; box-shadow: none; }
+.bm-card[data-state="done"] .bm-ind__dot { background: var(--atc-success); }
+.bm-card[data-state="timeout"] .bm-ind__dot { background: var(--atc-warning); }
+.bm-card[data-state="cancelled"] .bm-ind__dot { background: var(--atc-dim, var(--text-dim)); }
+.bm-card[data-state="done"] .bm-state { color: var(--atc-success); }
+.bm-card[data-state="timeout"] .bm-state { color: var(--atc-warning); }
 
 /* Task plan card — 就是一份清单，不是一张卡片。
    所有者定的方向（2026-09-05）：完全照 Claude Code 桌面端那份任务计划来。它的做法是

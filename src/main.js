@@ -37151,7 +37151,9 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       return {
         type: "background_monitor",
         message: String(args.message || args.msg || "等待中..."),
-        checkType: String(args.check_type || args.checkType || args.check || "manual"),
+        // 没给 check_type 就留空，让执行器那道可检查性守卫当场说清该怎么改。原来这里默认成
+        // "manual"（挂一张卡等用户点按钮）——那一档 2026-09-07 撤了：后台监控只做自动探测。
+        checkType: String(args.check_type || args.checkType || args.check || ""),
         pattern: String(args.pattern || ""),
         filePattern: String(args.file_pattern || args.filePattern || ""),
         app: String(args.app || args.app_name || args.appName || args.application || "").trim(),
@@ -63524,7 +63526,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
     } else if (call.type === "background_monitor") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "background_monitor", path: "", content: "[不可用] background_monitor 只能在桌面 App 里用。" }; }
       const bmMsg = call.message || "等待中...";
-      const bmType = call.checkType || "manual";
+      const bmType = String(call.checkType || "");
       const bmPat = call.pattern || "";
       const bmFilePat = call.filePattern || "";
       const bmApp = call.app || "";
@@ -63537,9 +63539,12 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       //     恰恰是模型最容易塞一整句自然语言的字段（condition:"dev server listening on 3000"）。
       //  ② 类型认识但 pattern 是空的——file/command/url/port 四条分支都带 `&& bmPat`。
       // 不猜：把事实回给模型让它重发一次，别用 300 秒换一个假答案。
-      // capture 和 manual 有意豁免：manual 不轮询；capture 空 pattern 匹配下一条新流量，
-      // 是抓包恢复路径明说的用法（logic.test.mjs 那条 CONFIGURE_BACKGROUND_PROXY 钉着）。
-      const _BM_CHECKS = new Set(["manual", "capture", "file", "command", "url", "port", "screen"]);
+      // capture 有意豁免：空 pattern 匹配下一条新流量，是抓包恢复路径明说的用法
+      // （logic.test.mjs 那条 CONFIGURE_BACKGROUND_PROXY 钉着）。
+      // **没有 manual**：那一档是「挂一张卡、等用户回来点『已完成』」。所有者 2026-09-07 定调
+      // 这个工具是 AI 全自动的，不让用户手动点按钮——模型还发 manual（网关那份目录没更新之前
+      // 它仍可能发）就在下面当场拦下，并告诉它改走哪条路。
+      const _BM_CHECKS = new Set(["capture", "file", "command", "url", "port", "screen"]);
       const _BM_NEEDS_PATTERN = new Set(["file", "command", "url", "port", "screen"]);
       // 光判「空不空」不够。轮询里还有第二道**隐形**闸门：
       //   port  → `const port = bmPat.replace(/[^0-9]/g,""); if (port) { …lsof… }`
@@ -63561,6 +63566,11 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         // 这里还没走到 _registerRunInteraction，没有东西要释放；_bmRelease 也还在 TDZ 里。
         res.className = "atc-result atc-result--err"; res.textContent = "条件没法检查";
         const _why = _bmPatternIssue ? `${_bmPatternIssue}。把条件本身写进 pattern，别写成一句话。`
+          : bmType === "manual" || !bmType
+          ? `${bmType ? 'check_type="manual" 已经不存在' : "没给 check_type"}：后台监控只做自动探测，不再让用户手动点「已完成」。`
+            + `要等用户做一件事：会留下痕迹的用 port / url / file / command / capture；`
+            + `只在界面上发生的（登录、关弹窗、打开开关）用 screen 盯那个应用的界面文字；`
+            + `什么都探测不到的，把要做的步骤直接告诉用户并结束这一轮——用户做完回来发消息，对话自然继续。`
           : !_BM_CHECKS.has(bmType)
           ? `check_type 收到的是「${String(bmType).slice(0, 120)}」，不是可检查的类型。`
             + `注意入参归一会把 condition / check / condition_type 都并进 check_type——`
@@ -63571,11 +63581,13 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           path: bmType,
           failure: { code: "monitor_uncheckable", attempted: false },
           content: `[BLOCKED_MONITOR_UNCHECKABLE] ${_why}\n`
-            + `没有开始等待（等下去这 ${bmTimeout} 秒里一次检查都不会发生）。check_type 可选：port(pattern=端口)、url(pattern=URL)、command(pattern=命令，exit 0 即满足)、file(pattern=路径，可加 file_pattern)、capture(pattern=流量关键词，可空)、manual(等用户确认)。改好 pattern 和类型后重发。`,
+            + `没有开始等待（等下去这 ${bmTimeout} 秒里一次检查都不会发生）。check_type 可选：port(pattern=端口)、url(pattern=URL)、command(pattern=命令，exit 0 即满足)、file(pattern=路径，可加 file_pattern)、capture(pattern=流量关键词，可空)、screen(pattern=界面上会原样出现的文字，配 app)。改好 pattern 和类型后重发。`,
         };
       }
-      const _bmTypeLabels = { manual: "等用户确认", capture: "监控抓包", file: bmFilePat ? "等文件内容匹配" : "等文件出现", command: "等命令成功", url: "等 URL 可达", port: "等端口监听", screen: bmApp ? `盯着 ${bmApp} 的界面` : "盯着前台界面" };
-      res.className = "atc-result atc-result--ok"; res.textContent = `⏳ ${bmMsg}`;
+      const _bmTypeLabels = { capture: "监控抓包", file: bmFilePat ? "等文件内容匹配" : "等文件出现", command: "等命令成功", url: "等 URL 可达", port: "等端口监听", screen: bmApp ? `盯着 ${bmApp} 的界面` : "盯着前台界面" };
+      // 步骤头只放**结论**（监听中 / 已等到 / 没等到 / 已停止），用会呼吸的 pending 色。
+      // 「在等什么」那句话在卡片正文里，头上再抄一遍就是同一句话出现两次。
+      res.className = "atc-result atc-result--pending"; res.textContent = "监听中";
       let _bmIv = null, _bmDone = false, _bmChecks = 0;
       let _bmRelease = () => {};
       // 代际快照：这个监视器只属于**发起它的那一轮**。
@@ -63620,10 +63632,13 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         // 已经不是这一轮了：安静退场，绝不再排一轮新的计费 run。
         if (_bmRetired() && !suppressFollowup) return;
         if (dotClass === "done") _bmNotify(statusText + " — " + bmMsg);
+        // 头上给结论、卡片里给证据：头是「已等到 / 没等到 / 已停止」三个词之一，
+        // 卡片条件行右侧才是具体怎么等到的（HTTP 200 / exit 0 / 已监听…）。
+        res.className = "atc-result " + (dotClass === "done" ? "atc-result--ok" : dotClass === "timeout" ? "atc-result--timeout" : "atc-result--interrupted");
+        res.textContent = dotClass === "done" ? "已等到" : dotClass === "timeout" ? "没等到" : "已停止";
         if (vp) {
           const bmCard = vp.querySelector(".bm-card"); if (bmCard) bmCard.dataset.state = dotClass;
           const st = vp.querySelector(".bm-state"); if (st) st.textContent = statusText;
-          const acts = vp.querySelector(".bm-actions"); if (acts) acts.remove();
         }
         if (!suppressFollowup) {
           // 第一次检查就命中 = 极可能「开始等之前就已经成立」，不是「等到了」。不改控制流，
@@ -63636,43 +63651,54 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // durable：这一轮自然结束时**不要**杀它 —— 熬过这一轮正是它存在的理由。
       // 按停 / 开新一轮 / 关会话仍然会收（见 _registerRunInteraction 的注释）。
       _bmRelease = _registerRunInteraction(run, () => {
-        _bmFinish("cancelled", "已因任务停止而取消", "", true);
+        _bmFinish("cancelled", "已停止", "", true);
       }, { durable: true });
       if (!_runInteractionLive(run)) {
-        _bmFinish("cancelled", "已因任务停止而取消", "", true);
+        _bmFinish("cancelled", "已停止", "", true);
         return { type: "background_monitor", path: bmType, content: "[已取消] 当前等待所属任务已停止或被替换。" };
       }
       if (vp) {
         vp.innerHTML = "";
-        const card = document.createElement("div"); card.className = "bm-card";
+        // 正文两行，**没有外框**：它已经在工具卡（.agent-tool-step）里面，再套一圈边框就是框里套框。
+        //   第一行：呼吸着的指示点 + 模型那句「在等什么」；
+        //   第二行：**具体在探什么**——类型用一个图标说（球=URL、终端=命令、文件、服务器=端口、
+        //           靶心=抓包、显示器=界面），值用等宽字原样摆出来，右侧挂状态。
+        // 原来是「等 URL 可达」胶囊 + 状态 + 单独一行灰底地址，三样东西说同一件事（所有者：太丑）。
+        //
+        // **没有按钮。**「已完成，继续」「取消等待」都撤了：这个工具是 AI 全自动的，等到就自己继续；
+        // 要中止就按停、或者直接发下一条消息——这两条路本来就都会把它收掉（见 _registerRunInteraction）。
+        //
+        // 图标复用工具卡那套 Lucide 几何（src/agent/tool-icons.js），不另画。
+        const _bmGlyph = _toolIconSvg({ url: "web", command: "cmd", file: "read", port: "remote", capture: "capture_start", screen: "readscreen" }[bmType] || "background_monitor");
+        // 值是给用户看的那份：port 写成浏览器里真会敲的 localhost:3000；command 带 $；
+        // file 配了内容匹配就「路径 › 模式」；screen 带引号（它是要在界面上原样出现的字）。
+        const _bmValue = bmType === "port" ? `localhost:${bmPat.replace(/[^0-9]/g, "")}`
+          : bmType === "command" ? `$ ${bmPat}`
+          : bmType === "file" ? (bmFilePat ? `${bmPat} › ${bmFilePat}` : bmPat)
+          : bmType === "screen" ? `\u201c${bmPat}\u201d`
+          : bmPat;
+        const card = document.createElement("div"); card.className = "bm-card"; card.dataset.state = "live";
         card.innerHTML =
-          // 头一行：呼吸指示点 + 在等什么（一句话）+ 一行灰的元信息（条件类型小标签 + 当前状态）。
-          // 状态文字单独占一个 span，收尾时只换它：整行重写会把条件类型那个标签一起抹掉。
-          `<div class="bm-head">` +
+          `<div class="bm-msg">` +
             `<span class="bm-ind" aria-hidden="true"><span class="bm-ind__dot"></span></span>` +
-            `<div class="bm-head__body">` +
-              `<div class="bm-msg">${_escHtml(bmMsg)}</div>` +
-              `<div class="bm-meta">` +
-                `<span class="bm-tag">${_escHtml(_bmTypeLabels[bmType] || bmType)}</span>` +
-                // manual 那一档的状态留空：它的标签已经是「等用户确认」，再写一遍「等你确认」是同一句话
-                // 说两遍。空的时候 CSS 把它整个收掉，不留一个 gap。收尾时这里会被填上最终状态。
-                `<span class="bm-state">${bmType === "manual" ? "" : "监听中"}</span>` +
-              `</div>` +
-            `</div>` +
+            `<span class="bm-msg__t">${_escHtml(bmMsg)}</span>` +
           `</div>` +
-          // **在等什么**要摆在卡片上。原来只说「等命令成功」，而"哪条命令"只有终端里才看得到——
-          // 用户看着这张卡，唯一想知道的就是它到底在等什么。太长省略，全文进 title。
-          (bmPat ? `<div class="bm-cond" title="${_escAttr(bmPat)}">${_escHtml(bmPat)}</div>` : "") +
-          `<div class="bm-actions">` +
-            (bmType === "manual" ? `<button class="bm-btn bm-btn--primary _bmContinue">已完成，继续</button>` : "") +
-            `<button class="bm-btn _bmCancel">取消等待</button>` +
+          `<div class="bm-cond">` +
+            `<span class="bm-cond__ic" title="${_escAttr(_bmTypeLabels[bmType] || bmType)}">${_bmGlyph}</span>` +
+            (bmType === "screen" && bmApp ? `<span class="bm-cond__app">${_escHtml(bmApp)} ·</span>` : "") +
+            // <code>：自动本地化会跳过它——URL、命令、路径是要**原样**认的字面量，不是文案。
+            (_bmValue
+              ? `<code class="bm-cond__v" title="${_escAttr(_bmValue)}">${_escHtml(_bmValue)}</code>`
+              : `<span class="bm-cond__v bm-cond__v--plain">任意新请求</span>`) +
+            // 监听时这里空着：活性由呼吸点表达，步骤头已经写着「监听中」，再写一遍是同一个词
+            // 出现两次。收尾时 _bmFinish 往这里填证据（HTTP 200 / exit 0 / 已监听…）。
+            `<span class="bm-state"></span>` +
           `</div>`;
         vp.appendChild(card); step.classList.add("is-open");
-        const contBtn = card.querySelector("._bmContinue");
-        if (contBtn) contBtn.addEventListener("click", () => _bmFinish("done", "已恢复", `[background_monitor 结果] 用户已手动确认完成「${bmMsg}」，继续执行。`), { once: true });
-        card.querySelector("._bmCancel").addEventListener("click", () => _bmFinish("cancelled", "已取消", `[background_monitor 取消] 用户取消了等待「${bmMsg}」。请跳过这个等待步骤继续。`), { once: true });
       }
-      if (bmType !== "manual") {
+      // 所有类型都轮询。原来这里是 `if (bmType !== "manual")`——manual（挂一张卡等用户点按钮）
+      // 2026-09-07 撤了，见上面的可检查性守卫；留一个恒真的条件只会让下一个人以为还有那一档。
+      {
         const _bmSnapTotal = _captureTotal;   // 见 _onCaptureFlow：下标当基线会被环形缓冲吃掉
         const _bmStart = Date.now();
         // 生产者快照：这个条件多半靠刚才那条终端命令去促成（cursor login 的 CLI、npm run dev）。
@@ -63696,7 +63722,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           if (_bmWatchEnt) {
             const _ps = monitorProducerStopped({ wasExited: _bmWatchWasExited, nowExited: _bmStopped(_bmWatchEnt), recentOut: _terminalPlainText(_bmWatchEnt.recentOut || "") });
             if (_ps.stopped && _ps.failed) {
-              _bmFinish("timeout", "所等命令已失败退出", `[background_monitor 生产者已停] 你在等「${bmMsg}」，但促成它的那条终端命令已经退出、且输出里有失败信号（${_ps.pattern}）——这**不是**「用户没做」，是它在等一件已经失败了的事。终端临终输出：\n${_ps.tail || "(空)"}\n先按这段报错定位根因（凭据/授权/端口/依赖），修好再重试那一步；别继续空等，也别问用户"你想做什么"。`);
+              _bmFinish("timeout", "命令已失败退出", `[background_monitor 生产者已停] 你在等「${bmMsg}」，但促成它的那条终端命令已经退出、且输出里有失败信号（${_ps.pattern}）——这**不是**「用户没做」，是它在等一件已经失败了的事。终端临终输出：\n${_ps.tail || "(空)"}\n先按这段报错定位根因（凭据/授权/端口/依赖），修好再重试那一步；别继续空等，也别问用户"你想做什么"。`);
               return;
             }
           }
@@ -63705,7 +63731,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           // 不再显示「Xs / Ys」倒计时和进度条——用户要的是「监听中」而不是一个滴答的表。
           // 卡片头上的 .bm-ind__dot 一直在呼吸，那就是「还在听」的活性指示；这里什么都不刷。
           if (elapsed > bmTimeout) {
-            _bmFinish("timeout", "监听结束（未捕捉到）", `[background_monitor 超时] 一直在监听「${bmMsg}」但没等到条件（检查 ${_bmChecks} 次）。${_bmCmdTimedOut
+            _bmFinish("timeout", "超时，没等到", `[background_monitor 超时] 一直在监听「${bmMsg}」但没等到条件（检查 ${_bmChecks} 次）。${_bmCmdTimedOut
               ? `\n\n⚠️ **注意：你这条检查命令每次都被自己的超时杀掉了**（每次最多给它几十秒）。也就是说条件在结构上就不可能成立，不是"用户没做完"。换一条跑得快的判据（探端口/探 URL/看文件），或者把这条慢命令交给 run_in_terminal 起起来再监听它的产物。`
               : ""}注意：用户可能已经完成了操作但检测没捕捉到——先用工具检查当前实际状态（读文件/跑命令/看浏览器），确认条件是否其实已满足，然后继续你的原始任务。不要问用户"你想做什么"——回顾上文你知道自己在做什么。`);
             return;
@@ -63718,7 +63744,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
               const f = _captureFlows[i];
               const hay = `${f.url||""} ${f.host||""} ${f.path||""} ${f.method||""} ${f.status||""} ${f.respBody||""} ${f.reqBody||""}`;
               if (re ? re.test(hay) : hay.toLowerCase().includes(bmPat.toLowerCase())) {
-                _bmFinish("done", "条件满足", `[background_monitor 结果] 匹配到抓包流量: [${f.status||"?"}] ${f.method} ${f.url}`.slice(0, 300) + `，继续执行。`);
+                _bmFinish("done", "已捕获到", `[background_monitor 结果] 匹配到抓包流量: [${f.status||"?"}] ${f.method} ${f.url}`.slice(0, 300) + `，继续执行。`);
                 return;
               }
             }
@@ -63731,10 +63757,10 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
                 const hay = typeof content === "string" ? content : String(content || "");
                 const fre = (() => { try { return new RegExp(bmFilePat, "i"); } catch { return null; } })();
                 if (fre ? fre.test(hay) : hay.includes(bmFilePat)) {
-                  _bmFinish("done", "文件内容匹配", `[background_monitor 结果] 文件「${bmPat}」中匹配到「${bmFilePat}」，继续执行。`);
+                  _bmFinish("done", "内容已匹配", `[background_monitor 结果] 文件「${bmPat}」中匹配到「${bmFilePat}」，继续执行。`);
                 }
               } else {
-                _bmFinish("done", "文件已出现", `[background_monitor 结果] 文件「${bmPat}」已出现，继续执行。`);
+                _bmFinish("done", "已出现", `[background_monitor 结果] 文件「${bmPat}」已出现，继续执行。`);
               }
             } catch {} finally { _bmFileChecking = false; }
           } else if (bmType === "command" && bmPat) {
@@ -63747,18 +63773,18 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
               const r = await backend.taskRunCapture(bmCwd, bmPat, { timeoutSecs: _cmdTimeout });
               // 被自己的超时杀掉 ≠ 条件没满足。记一笔，超时回执里要说出来。
               if (r && r.timedOut) _bmCmdTimedOut = true;
-              if (r && r.code === 0) _bmFinish("done", "命令成功（exit 0）", `[background_monitor 结果] 命令「${bmPat}」返回 exit 0，输出：${(r.stdout || "").slice(0, 500)}。继续执行。`);
+              if (r && r.code === 0) _bmFinish("done", "exit 0", `[background_monitor 结果] 命令「${bmPat}」返回 exit 0，输出：${(r.stdout || "").slice(0, 500)}。继续执行。`);
             } catch {}
           } else if (bmType === "url" && bmPat) {
             try {
               const r = await backend.invoke("http_request", { url: bmPat, method: "GET", timeoutSecs: 5 });
               const status = typeof r === "string" ? (r.match(/^(\d{3})\s/) || [])[1] : (r?.status || r?.statusCode);
-              if (status && +status >= 200 && +status < 400) _bmFinish("done", `URL 可达 (${status})`, `[background_monitor 结果] URL「${bmPat}」返回 HTTP ${status}，可达。继续执行。`);
+              if (status && +status >= 200 && +status < 400) _bmFinish("done", `HTTP ${status}`, `[background_monitor 结果] URL「${bmPat}」返回 HTTP ${status}，可达。继续执行。`);
             } catch {}
           } else if (bmType === "screen" && bmPat) {
             // 盯屏幕：用户要做的那件事常常**没有文件、没有端口、没有请求**——
             // 关掉一个弹窗、在网页上登完、把某个开关打开。这条之前不存在，
-            // 于是那类任务只能退回 manual（等用户回来点"已完成"），也就是用户说的
+            // 没有它的话那类任务只能让用户回来说一声（当年是 manual 那个按钮，2026-09-07 撤了），也就是用户说的
             // 「明明完成了他也不知道」。
             //
             // 走的是 probe_screen，**不是** read_screen：后者每次都会清空 ref 表，
@@ -63779,7 +63805,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
               _bmScreenOk = true; _bmScreenFails = 0;
               if (hit) {
                 const _which = lines.find((l) => (sre ? sre.test(l) : l.toLowerCase().includes(bmPat.toLowerCase()))) || "";
-                _bmFinish("done", "界面已出现", `[background_monitor 结果] 「${r?.app || bmApp || "前台应用"}」的界面上出现了「${bmPat}」（命中：${String(_which).slice(0, 160)}），说明那一步已经做完了。继续执行。`);
+                _bmFinish("done", "已出现", `[background_monitor 结果] 「${r?.app || bmApp || "前台应用"}」的界面上出现了「${bmPat}」（命中：${String(_which).slice(0, 160)}），说明那一步已经做完了。继续执行。`);
               }
             } catch (e) {
               // 探查不可用（自动化子进程没起来 / 没给辅助功能权限）就**立刻退场**，
@@ -63789,7 +63815,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
               if (_bmScreenFails >= 3) {
                 _bmFinish("timeout", "屏幕探查不可用", `[background_monitor 失败] 盯屏幕这条走不通：${String(e?.message || e).slice(0, 200)}。这**不是**「条件没满足」。${_bmScreenOk
                   ? `前面成功探查过，是中途开始连续失败的——多半是目标应用退出了或切走了，别去查权限。`
-                  : `一次都没成功过，多半是没给辅助功能权限，或者目标应用名「${bmApp || "(未指定)"}」找不到；可以先用 system 的 window.list 确认应用名。`} 也可以换 manual 让用户点确认。`);
+                  : `一次都没成功过，多半是没给辅助功能权限，或者目标应用名「${bmApp || "(未指定)"}」找不到；可以先用 system 的 window.list 确认应用名。`} 盯不了就把要做的步骤直接告诉用户并结束这一轮——用户做完回来发消息，对话自然继续。`);
                 return;
               }
             } finally { _bmScreenChecking = false; }
@@ -63801,7 +63827,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
                   ? `netstat -ano | findstr /R /C:":${port} .*LISTENING"`
                   : `lsof -nP -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null`;
                 const r = await backend.taskRunCapture(bmCwd, cmd, { timeoutSecs: 5 });
-                if (r && r.code === 0 && (r.stdout || "").trim()) _bmFinish("done", `端口 ${bmPat} 已监听`, `[background_monitor 结果] 端口 ${bmPat} 已被监听（PID: ${(r.stdout || "").trim().split("\n")[0]}），继续执行。`);
+                if (r && r.code === 0 && (r.stdout || "").trim()) _bmFinish("done", "已监听", `[background_monitor 结果] 端口 ${bmPat} 已被监听（PID: ${(r.stdout || "").trim().split("\n")[0]}），继续执行。`);
               }
             } catch {}
           }
