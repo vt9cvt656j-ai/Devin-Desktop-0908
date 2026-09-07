@@ -61909,7 +61909,7 @@ async function _executeToolStepInner(step, call, root, run) {
       // 原来 alt 用 _escHtml：文件名带一个双引号就能闭合 alt="…"，后面的字符变成 <img> 的
       // 真实属性——含 onerror，等于在带 backend 桥的面板里执行任意 JS。src 同理（data:image/
       // svg+xml 正文可带引号）。5138 行的兄弟预览早就用 _escAttr，这里对齐。
-      if (vp) vp.innerHTML = `<img src="${_escAttr(_viUrl)}" alt="${_escAttr(_viRel)}" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">`;
+      if (vp) vp.innerHTML = `<img class="atc-shot atc-shot--full" src="${_escAttr(_viUrl)}" alt="${_escAttr(_viRel)}">`;
       step.classList.add("is-open");
       _chatFollow(run && run.session);
       // `image` 会被主循环挑走，作为图片块喂回模型（文本模型走视觉转写那条路）。
@@ -61938,7 +61938,7 @@ async function _executeToolStepInner(step, call, root, run) {
         return { type: "screenshot", path: url, content: "[失败] 没拿到截图——多半是桌面 App 没用最新代码重新构建，或本机没装 Chrome/Chromium/Edge。请排查，别当成功继续。" };
       }
       res.className = "atc-result atc-result--ok"; res.textContent = _filmstrip ? "已抓胶片" : "已截图";
-      if (vp) vp.innerHTML = `<img src="${dataUrl}" alt="screenshot" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">`;
+      if (vp) vp.innerHTML = `<img class="atc-shot atc-shot--full" src="${dataUrl}" alt="screenshot">`;
       step.classList.add("is-open");
       _chatFollow(run && run.session);
       // `image` is picked up by the agent loop and fed back to the model multimodally.
@@ -62008,7 +62008,7 @@ async function _executeToolStepInner(step, call, root, run) {
       }
       res.className = "atc-result atc-result--ok";
       res.textContent = _vcMetric ? `相似度 ${_vcMetric.similarity.toFixed(1)}%` : "已并排对比";
-      if (vp) vp.innerHTML = `<img src="${_vcImg}" alt="compare" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">`;
+      if (vp) vp.innerHTML = `<img class="atc-shot atc-shot--full" src="${_vcImg}" alt="compare">`;
       step.classList.add("is-open"); _chatFollow(run && run.session);
       return { type: "vizcompare", path: _vcUrl, image: _vcImg, content: `已并排对比【左=目标设计 DESIGN，右=你当前实现 LIVE】，图已回传给你看。**逐项比对、改代码到像素级吻合**：① 整体布局/分区结构；② 间距/留白/对齐；③ 配色 hex/渐变/背景；④ 字体族/字重/字号/行高；⑤ 圆角/阴影/边框；⑥ 组件细节(按钮/卡片/导航/图标)；⑦ 图片/插画位置与比例。把每处差异列出来 → 改 → 再 visual_compare，直到右边和左边几乎一模一样。**别停在"差不多"**。${_vcNumbers}` };
 
@@ -63659,7 +63659,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           vp.innerHTML = "";
           const media = document.createElement(isVideoFile(call.dest) ? "video" : "img");
           media.src = backend.assetUrl(downloadedPath);
-          media.style.cssText = "display:block;max-width:100%;max-height:360px;border-radius:8px;background:#000";
+          media.className = "atc-shot atc-shot--capped atc-shot--media";
           if (media.tagName === "VIDEO") { media.controls = true; media.preload = "metadata"; media.playsInline = true; }
           else media.addEventListener("click", () => showImageLightbox(media.src));
           media.addEventListener("error", async () => { try { const dataUrl = await backend.readFileDataUrl(downloadedPath); if (dataUrl) media.src = dataUrl; } catch {} }, { once: true });
@@ -64132,7 +64132,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           _gimg.src = out.data_url;
           _gimg.alt = "generated";
           _gimg.title = "点击查看 4K 原图";
-          _gimg.style.cssText = "max-width:100%;max-height:320px;border-radius:8px;display:block;margin:8px auto;cursor:zoom-in;transition:transform .15s ease";
+          _gimg.className = "atc-shot atc-shot--capped";
+          _gimg.style.cssText = "cursor:zoom-in;transition:transform .15s ease";
           _gimg.addEventListener("click", () => showImageLightbox(_gimg.src));
           _gimg.addEventListener("mouseenter", () => { _gimg.style.transform = "scale(1.01)"; });
           _gimg.addEventListener("mouseleave", () => { _gimg.style.transform = "scale(1)"; });
@@ -64229,7 +64230,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           for (const item of media) {
             const element = document.createElement(item.kind === "image" ? "img" : item.kind);
             element.src = item.dataUrl;
-            element.style.cssText = "display:block;max-width:100%;max-height:360px;margin-top:8px;border-radius:8px;background:#000";
+            element.className = "atc-shot atc-shot--capped atc-shot--media";
             if (item.kind !== "image") { element.controls = true; element.preload = "metadata"; }
             else element.addEventListener("click", () => showImageLightbox(item.dataUrl));
             host.appendChild(element);
