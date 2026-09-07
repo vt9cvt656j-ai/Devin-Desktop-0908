@@ -26,7 +26,10 @@ mod shutdown;
 mod calibrate;
 mod failover;
 mod route_endpoints;
+mod route_credentials;
 mod route_health;
+mod model_groups;
+mod usage_log;
 mod integrations;
 mod code_corpus;
 mod knowledge;
@@ -482,9 +485,33 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/models/:id/available",
             get(models::admin_available),
         )
+        .route(
+            "/api/admin/models/:id/credentials",
+            get(route_credentials::admin_list).post(route_credentials::admin_create),
+        )
+        .route(
+            "/api/admin/models/:id/credentials/:cid",
+            post(route_credentials::admin_update).delete(route_credentials::admin_delete),
+        )
         // Display grouping: show one route's models under another's name. Changes only
         // the picker's heading — never where a request goes (see models.rs).
         .route("/api/admin/models/:id/group", post(models::admin_group))
+        .route(
+            "/api/admin/model-groups",
+            get(model_groups::admin_list).post(model_groups::admin_create),
+        )
+        .route(
+            "/api/admin/model-groups/reorder",
+            post(model_groups::admin_reorder),
+        )
+        .route(
+            "/api/admin/model-groups/:id",
+            post(model_groups::admin_update).delete(model_groups::admin_delete),
+        )
+        .route(
+            "/api/admin/model-groups/:id/move",
+            post(model_groups::admin_move),
+        )
         // 多路由：一条线路挂多个上游出口。出口只带地址/密钥/进价，
         // 价格和用量归属留在线路上 —— 换出口换不动账单。见 route_endpoints.rs。
         .route(

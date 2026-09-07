@@ -3449,21 +3449,57 @@ pub async fn admin_create(
     Ok(Json(json!({ "ok": true, "id": id })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeleteConfirm {
+    /// 前端弹窗确认后带 `?confirm=true` 再删。
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 /// DELETE /api/admin/models/:id (admin).
+///
+/// 删除护栏（计划 §3.1）：被引用时先返 `{ affected, total }`；
+/// `confirm=true` 后同一事务内删掉引用该线路的全部 `route_endpoints`。
 pub async fn admin_delete(
     State(state): State<AppState>,
     claims: Claims,
     Path(id): Path<uuid::Uuid>,
+    axum::extract::Query(q): axum::extract::Query<DeleteConfirm>,
 ) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
+    let exists: i64 = sqlx::query_scalar("SELECT count(*) FROM models WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+    if exists == 0 {
+        return Err(AppError::bad("模型不存在"));
+    }
+    let impact = crate::route_credentials::line_impact(&state.db, id).await?;
+    if impact.total > 0 && !q.confirm {
+        return Ok(Json(json!({
+            "ok": false,
+            "needs_confirm": true,
+            "affected": impact.affected,
+            "total": impact.total,
+        })));
+    }
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM route_endpoints WHERE route_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     let res = sqlx::query("DELETE FROM models WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     if res.rows_affected() == 0 {
         return Err(AppError::bad("模型不存在"));
     }
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({
+        "ok": true,
+        "deleted_routes": impact.total,
+    })))
 }
 
 /// GET /api/admin/models/:id/available — proxy the provider's model catalogue
