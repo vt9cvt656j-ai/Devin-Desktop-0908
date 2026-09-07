@@ -216,6 +216,8 @@ test("三条认知腿在非 OpenAI 协议上必须走协议分叉，而不是打
   const _cognitiveLegComplete = load("_cognitiveLegComplete", {
     _ipSafeRoute: () => true,
     cmProtocol,
+    _legBareCap: (_m, n) => n,
+    _ideAuxValue: (k, n) => `${k}-c${n}`,
     _fetchCompletionText: (url) => { calls.push(["openai直发", url]); return Promise.resolve("{}"); },
     _chatCompletionsUrl: (b) => String(b).replace(/\/+$/, "") + "/chat/completions",
     _billableAiComplete: (cfg) => { calls.push(["走Rust协议分叉", cfg.protocol]); return Promise.resolve("{}"); },

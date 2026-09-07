@@ -480,7 +480,17 @@ fn request_is_deep_thinking(body: &serde_json::Value) -> bool {
 /// 全部落进判据：对一个按声明不推理的模型，关推理是空操作。新版客户端显式带 x-ide-aux，
 /// 老版按三条认。
 fn is_ide_aux_request(headers: &HeaderMap, body: &serde_json::Value) -> bool {
-    if headers.contains_key("x-ide-aux") {
+    if let Some(aux) = headers.get("x-ide-aux").and_then(|v| v.to_str().ok()) {
+        // 认知腿（值以 leg 开头：收尾评审 / 工具编排 / 离线蒸馏）的推理深度跟用户档位走，
+        // 只有在思考「只有开/关」的家族上才按辅助调用处理——那里没有 low 这一档，"开"就是
+        // 不封顶的推理：2026-09-07 线上一条腿 6~13k 个输出 token（41 行，全是 deepseek）。
+        // Claude / Fable / grok / gpt 这些有档位的家族，腿照旧带着客户端给的 low 出门。
+        if aux.starts_with("leg") {
+            return body
+                .get("model")
+                .and_then(|m| m.as_str())
+                .is_some_and(toggle_thinking_family);
+        }
         return true;
     }
     let ide = headers.contains_key("x-mide-client") || headers.contains_key("x-ide-run-id");
@@ -494,6 +504,62 @@ fn is_ide_aux_request(headers: &HeaderMap, body: &serde_json::Value) -> bool {
 
 /// 见 is_ide_aux_request 的预算表：辅助调用带余量后最大 4996，认知腿最小 6096。
 const IDE_AUX_MAX_TOKENS_CEILING: i64 = 5000;
+
+/// 客户端给辅助调用加的推理余量（镜像 main.js 的 `_AUX_REASONING_HEADROOM_TOKENS`）。老客户端
+/// （≤ 0.14.6）不报裸上限，它们的辅助调用只有一种形状会超过这个数：裸上限（≤ 2000）+ 这份余量。
+const IDE_AUX_REASONING_HEADROOM: i64 = 4096;
+
+/// 思考只有开/关两档的家族：`openai_passthrough_aux_thinking` 对它们发的是硬关闭。
+fn toggle_thinking_family(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    ["deepseek", "glm", "kimi", "moonshot", "qwen", "qwq"]
+        .iter()
+        .any(|family| m.contains(family))
+}
+
+/// `aux_thinking_common` 写下的 off 在这些家族上是真的关掉了：开/关家族靠透传那一步的硬开关，
+/// Claude 靠 Anthropic 桥（off = 不带 thinking）。Fable / Mythos / grok 关不掉、只封到 low，
+/// gpt-5 / o 系是 minimal 而不是零，没把握的家族留着上游默认——这三类的推理余量都得留着。
+fn aux_thinking_hard_off(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    if m.contains("fable") || m.contains("mythos") || m.contains("grok") {
+        return false;
+    }
+    toggle_thinking_family(&m) || m.contains("claude")
+}
+
+/// 客户端在 `x-ide-aux` 里报的裸上限：值形如 `intent-c900` / `leg-c2000`，`-c` 后面是它给正文留的
+/// 预算（不含推理余量）。解析从严：没有后缀、不是正整数，都当没报。
+fn aux_declared_cap(headers: &HeaderMap) -> Option<i64> {
+    let value = headers.get("x-ide-aux")?.to_str().ok()?;
+    let (_, cap) = value.rsplit_once("-c")?;
+    let cap: i64 = cap.parse().ok()?;
+    (cap > 0).then_some(cap)
+}
+
+/// 推理关掉之后，推理余量就没有主人了——收回到裸上限。回 `Some((原值, 新值))` 供日志用。
+///
+/// 为什么必须收：余量是给推理内容的；推理没了，它只剩一个用处——让跑飞的正文多烧 4096 个
+/// token。2026-09-07 线上 152 行辅助调用在关了推理的 deepseek 上仍封顶在 4996/4256，每行 9~10 点，
+/// 一个用户一天 2000 点的免费池就是这样被吃空的。报了裸上限按报的收；老客户端按余量常数推：
+/// 辅助调用的裸上限没有超过 2000 的，超过 4096 的 max_tokens 只可能是「裸上限 + 余量」。
+fn reclaim_aux_headroom(headers: &HeaderMap, body: &mut serde_json::Value) -> Option<(i64, i64)> {
+    let model = body.get("model")?.as_str()?.to_string();
+    if !aux_thinking_hard_off(&model) {
+        return None;
+    }
+    let current = body.get("max_tokens")?.as_i64()?;
+    let target = match aux_declared_cap(headers) {
+        Some(cap) => cap.min(current),
+        None if current > IDE_AUX_REASONING_HEADROOM => current - IDE_AUX_REASONING_HEADROOM,
+        None => return None,
+    };
+    if target >= current {
+        return None;
+    }
+    body.as_object_mut()?.insert("max_tokens".into(), json!(target));
+    Some((current, target))
+}
 
 /// 辅助调用「不推理」的第一步（协议无关，在选出口之前做）：去掉一切思考对象，把档位写成
 /// Anthropic 桥认的 `off`。
@@ -11691,6 +11757,7 @@ pub async fn chat_completions(
         max_tokens = body.get("max_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
         ide_mode = headers.contains_key("x-ide-mode"),
         aux_header = headers.contains_key("x-ide-aux"),
+        aux_cap = aux_declared_cap(&headers).unwrap_or(0),
         ide_aux = is_ide_aux_request(&headers, &body),
         "thinking telemetry: inbound chat request"
     );
@@ -12256,6 +12323,16 @@ pub async fn chat_completions(
     let ide_aux = is_ide_aux_request(&headers, &body);
     if ide_aux {
         aux_thinking_common(&mut body);
+        // 推理关了，余量随之收回（见 reclaim_aux_headroom）。放在这里而不是透传分支里：
+        // Anthropic 桥那条路的 off 同样是真关，余量同样该收。
+        if let Some((from, to)) = reclaim_aux_headroom(&headers, &mut body) {
+            tracing::info!(
+                model = %model_id,
+                max_tokens_from = from,
+                max_tokens_to = to,
+                "aux headroom reclaimed: thinking is off for this call"
+            );
+        }
     }
     // ── max_tokens guardrail for thinking (all protocols) ───────────────────
     // Chinese aggregators (zyz etc.) convert reasoning_effort / thinking to Anthropic thinking
@@ -27562,6 +27639,70 @@ mod aux_thinking_tests {
             "输入框预热那一发只有 x-mide-client、没有 run id，也得认出来");
         assert!(is_ide_aux_request(&hdrs(&[("x-ide-aux", "intent")]), &big),
             "新版客户端显式声明就认，不看其它判据");
+    }
+
+    #[test]
+    fn a_leg_is_aux_only_where_thinking_is_a_switch() {
+        let leg = hdrs(&[("x-ide-aux", "leg-c2000")]);
+        let critic = json!({"model": "deepseek-v4-flash", "max_tokens": 6096, "reasoning_effort": "low"});
+        assert!(is_ide_aux_request(&leg, &critic), "deepseek 上 low 不存在，腿要按辅助调用关推理");
+        for m in ["glm-5.3-flash", "kimi-k3", "qwen3.8-max"] {
+            assert!(is_ide_aux_request(&leg, &json!({"model": m, "max_tokens": 6096})), "{m}");
+        }
+        for m in ["claude-opus-5", "claude-fable-5-1", "grok-4.6", "gpt-5.6"] {
+            assert!(!is_ide_aux_request(&leg, &json!({"model": m, "max_tokens": 6096, "reasoning_effort": "low"})),
+                "{m}: 有档位的家族，腿跟用户档位走");
+        }
+        assert!(is_ide_aux_request(&hdrs(&[("x-ide-aux", "intent-c900")]), &json!({"model": "claude-opus-5", "max_tokens": 4996})),
+            "带裸上限后缀的辅助调用照旧认");
+    }
+
+    #[test]
+    fn declared_cap_parsing_is_strict() {
+        assert_eq!(aux_declared_cap(&hdrs(&[("x-ide-aux", "intent-c900")])), Some(900));
+        assert_eq!(aux_declared_cap(&hdrs(&[("x-ide-aux", "fastroute-c200")])), Some(200));
+        assert_eq!(aux_declared_cap(&hdrs(&[("x-ide-aux", "leg-c2000")])), Some(2000));
+        for bad in ["intent", "intent-c0", "intent-c-5", "intent-cabc", "intent-c"] {
+            assert_eq!(aux_declared_cap(&hdrs(&[("x-ide-aux", bad)])), None, "{bad}");
+        }
+        assert_eq!(aux_declared_cap(&hdrs(&[])), None);
+    }
+
+    #[test]
+    fn headroom_comes_back_once_thinking_is_off() {
+        let declared = hdrs(&[("x-ide-aux", "intent-c900")]);
+        let mut b = json!({"model": "deepseek-v4-flash", "max_tokens": 4996});
+        aux_thinking_common(&mut b);
+        assert_eq!(reclaim_aux_headroom(&declared, &mut b), Some((4996, 900)));
+        assert_eq!(b["max_tokens"], 900);
+        // Anthropic 桥的 off 是真关：Claude 同样收
+        let mut c = json!({"model": "claude-opus-5", "max_tokens": 4996});
+        aux_thinking_common(&mut c);
+        assert_eq!(reclaim_aux_headroom(&declared, &mut c), Some((4996, 900)));
+        // 关不掉的家族余量留着
+        for m in ["grok-4.6", "claude-fable-5-1", "gpt-5.6", "omen-alpha"] {
+            let mut g = json!({"model": m, "max_tokens": 4996});
+            aux_thinking_common(&mut g);
+            assert_eq!(reclaim_aux_headroom(&declared, &mut g), None, "{m}");
+            assert_eq!(g["max_tokens"], 4996, "{m}");
+        }
+        // 裸上限不比现值小：不动（也绝不往上抬）
+        let mut small = json!({"model": "deepseek-v4-flash", "max_tokens": 300});
+        assert_eq!(reclaim_aux_headroom(&declared, &mut small), None);
+        assert_eq!(small["max_tokens"], 300);
+    }
+
+    #[test]
+    fn old_clients_get_the_headroom_inferred() {
+        let old = hdrs(&[("x-ide-run-id", "r1")]);
+        let mut intent = json!({"model": "deepseek-v4-flash", "max_tokens": 4996});
+        assert_eq!(reclaim_aux_headroom(&old, &mut intent), Some((4996, 900)), "900 + 4096 的裁决");
+        let mut predict = json!({"model": "deepseek-v4-pro", "max_tokens": 4256});
+        assert_eq!(reclaim_aux_headroom(&old, &mut predict), Some((4256, 160)), "160 + 4096 的预测");
+        let mut bare = json!({"model": "deepseek-v4-flash", "max_tokens": 2000});
+        assert_eq!(reclaim_aux_headroom(&old, &mut bare), None, "没带余量的裸上限不动");
+        let mut no_cap = json!({"model": "deepseek-v4-flash"});
+        assert_eq!(reclaim_aux_headroom(&old, &mut no_cap), None, "没有 max_tokens 不发明一个");
     }
 
     /// 透传线路上最终出门的形状：第一步 + 第二步。

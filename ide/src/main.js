@@ -13810,6 +13810,30 @@ function _markModelNeedsAuxHeadroom(model) {
     localStorage.setItem(_AUX_HEADROOM_KEY, JSON.stringify([...set]));
   } catch {}
 }
+/**
+ * `x-ide-aux` 头的值：`<种类>-c<裸上限>`，例如 intent-c900 / fastroute-c200 / leg-c2000。
+ * 裸上限 = 给正文留的预算，不含 _AUX_REASONING_HEADROOM_TOKENS 那 4096 推理余量。网关替这次
+ * 调用关掉推理之后（deepseek / glm / kimi / qwen 这类只有开关的家族，以及 Claude），就把
+ * max_tokens 收回到这个数——余量是给推理的，推理没了它只剩一个用处：让跑飞的正文多烧 4096
+ * 个 token（2026-09-07 线上 152 行辅助调用封顶在 4996，每行 9~10 点，免费池一天 2000 点）。
+ * 字符集跟 ai.rs 的过滤一致：字母数字和 _ -，整体 ≤ 32 字；种类缺省 aux，已带 -c 的先剥掉再盖。
+ */
+function _ideAuxValue(kind, cap) {
+  const k = String(kind || "aux").replace(/-c\d+$/, "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 20) || "aux";
+  const n = Math.floor(Number(cap) || 0);
+  return n > 0 ? `${k}-c${n}` : k;
+}
+
+/**
+ * 认知腿的裸上限。调用方传的是「裸上限 + 推理余量」（_criticMaxTokens 的形状：普通 2000、
+ * 声明了推理档位的 +4096），这里按**同一判据**减回去——判据是模型自己的能力声明，不是名单。
+ */
+function _legBareCap(model, maxTokens) {
+  const declares = String(_thinkingProfileFor(model)?.kind || "none") !== "none";
+  const total = Math.floor(Number(maxTokens) || 0);
+  return declares && total > _AUX_REASONING_HEADROOM_TOKENS ? total - _AUX_REASONING_HEADROOM_TOKENS : total;
+}
+
 function _billableAiComplete(config, messages, maxTokens) {
   const requestConfig = { ...(config || {}) };
   if (!/^[-_A-Za-z0-9]{8,128}$/.test(String(requestConfig.requestId || ""))) {
@@ -13819,6 +13843,9 @@ function _billableAiComplete(config, messages, maxTokens) {
   const model = String(requestConfig.model || "");
   const cap = Number(maxTokens) || 0;
   const headroomCap = cap + _AUX_REASONING_HEADROOM_TOKENS;
+  // 向网关报裸上限（值形如 intent-c900，见 _ideAuxValue）：网关替这次调用关掉推理时，把 4096
+  // 推理余量收回到这个数。老客户端不报，网关按余量常数推——报了就不用它猜。
+  if (cap > 0) requestConfig.ideAux = _ideAuxValue(requestConfig.ideAux, cap);
   // 余量必须**第一次就给**，不能靠"先空一次再重试"。
   //
   // 重试那种写法在正确性上说得通，在延迟上是错的：首轮等待窗口只有
@@ -28491,6 +28518,9 @@ async function _predictNextAsk(sess) {
         // 只对网关发：这是我们自己的计费关联头，第三方端点既不认它，也没道理收到它。
         const rid = String(sess._reqId || "");
         if (_predictCfg.viaGateway && /^[-_A-Za-z0-9]{8,128}$/.test(rid)) h["x-ide-request-id"] = rid;
+        // 同样只对网关：报「输入框预测、裸上限 160」。网关关掉推理后把 _predictMaxTokens 里那 4096
+        // 余量收回——否则关了推理的 flash 系模型会把 4256 全烧在正文上（2026-09-07 实测 4 行）。
+        if (_predictCfg.viaGateway) h["x-ide-aux"] = _ideAuxValue("predict", _PREDICT_CAP_TOKENS);
         return h;
       })(), {
         model: _predictCfg.model,
@@ -50495,6 +50525,11 @@ function _cognitiveLegComplete(config, body, maxTokens, signal) {
   // 完整的内置提示词，走用户自己的端点等于把它们抄送给他。调用方三处都已经能接住 null
   // （各自有 catch/兜底分支），所以这里直接不发。
   if (!_ipSafeRoute(config)) return Promise.resolve(null);
+  // 向网关报身份和裸上限（leg-c2000 这种形状，见 _legBareCap）。调用方给的 maxTokens 是
+  // 「裸上限 + 推理余量」；网关在 deepseek / glm / kimi / qwen 这类只有开关的家族上会替腿
+  // 关掉推理并把余量收回到裸上限，有档位的家族（Claude / Fable / grok / gpt）照旧跟用户档位。
+  const _legModel = String(body?.model || config?.model || "");
+  const _bare = _legBareCap(_legModel, maxTokens);
   if (cmProtocol(config?.protocol) === "openai") {
     return _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
       "Content-Type": "application/json",
@@ -50502,10 +50537,13 @@ function _cognitiveLegComplete(config, body, maxTokens, signal) {
       "x-ide-request-id": String(config.requestId || "").slice(0, 128),
       "x-mide-client": "mide/" + (typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "0.0.0"),
       "x-req-ts": String(Date.now()),
+      "x-ide-aux": _ideAuxValue("leg", _bare),
     }, body, signal);
   }
-  const cfg = { ...config, model: String(body?.model || config.model || ""), temperature: 0 };
-  return Promise.resolve(_billableAiComplete(cfg, body?.messages || [], maxTokens)).catch(() => null);
+  // Rust 那条路由 _billableAiComplete 自己按能力声明补余量：这里递裸上限，不再把已经含余量的
+  // 数再加一次余量（原来是 6096 + 4096 = 10192）；它同时会把 ideAux 盖成 leg-c<裸上限>。
+  const cfg = { ...config, model: _legModel, temperature: 0, ideAux: "leg" };
+  return Promise.resolve(_billableAiComplete(cfg, body?.messages || [], _bare)).catch(() => null);
 }
 
 // 认知腿的期限跟着**同一份 config 的思考档位**走，而不是写死一个数。
@@ -50557,9 +50595,11 @@ function _cognitiveLegDeadlineMs(config) {
  * 推理档位，不看模型名单。余量共用 `_AUX_REASONING_HEADROOM_TOKENS`，不散新魔数。
  * 抬预算不花钱：max_tokens 是**上限不是消费**，没生成的 token 不计费也不耗时。
  */
+// 输入框预测给正文留的裸上限；预测请求头里报给网关的也是它（见 _predictNextAsk）。
+const _PREDICT_CAP_TOKENS = 160;
 function _predictMaxTokens(model) {
   const declaresReasoning = String(_thinkingProfileFor(model)?.kind || "none") !== "none";
-  return 160 + (declaresReasoning ? _AUX_REASONING_HEADROOM_TOKENS : 0);
+  return _PREDICT_CAP_TOKENS + (declaresReasoning ? _AUX_REASONING_HEADROOM_TOKENS : 0);
 }
 
 function _criticMaxTokens(model) {

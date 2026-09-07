@@ -31,6 +31,8 @@ test("三条认知腿在自定义端点上一个字都不发", async () => {
   const f = load("_cognitiveLegComplete", {
     _ipSafeRoute: load("_ipSafeRoute", {}),
     cmProtocol: (p) => String(p || "openai"),
+    _legBareCap: (_m, n) => n,
+    _ideAuxValue: (k, n) => `${k}-c${n}`,
     _fetchCompletionText: (...a) => { calls.push(["直发", a[0]]); return Promise.resolve("{}"); },
     _chatCompletionsUrl: (b) => b + "/chat/completions",
     _billableAiComplete: (c) => { calls.push(["走Rust", c.protocol]); return Promise.resolve("{}"); },
