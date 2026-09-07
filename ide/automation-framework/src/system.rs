@@ -116,6 +116,10 @@ pub fn screen_locked() -> bool {
     }
 }
 
+/// 屏幕上的窗口标题清单：实现在 platform::macos_tree（那边不受 `system` 特性门控，按名字找应用要用它）。
+#[cfg(target_os = "macos")]
+pub use crate::platform::macos_tree::{window_titles, WinTitle};
+
 /// 屏幕上普通层的窗口，按 z 序**从前到后**（CGWindowList 就按这个顺序给），带所属进程。
 /// `screen.marked` 靠它判「这个元素在截图上看不看得见」；不碰 Agent，不需要辅助功能权限。
 #[cfg(target_os = "macos")]

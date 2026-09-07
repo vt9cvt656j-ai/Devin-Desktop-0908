@@ -52,8 +52,14 @@ pub trait WindowControl {
     /// 查找窗口（根据标题）
     fn find_window(&self, title: &str) -> Result<Option<WindowInfo>>;
     
-    /// 激活窗口
+    /// 激活窗口（按窗口标题或应用名，平台层自己认）
     fn activate_window(&self, title: &str) -> Result<()>;
+
+    /// 按进程号激活。read_screen / app.resolve 回来的就是 pid，不必再翻译成名字。
+    /// 默认不支持（Windows 那边还是按标题走），macOS 覆盖。
+    fn activate_pid(&self, pid: i32) -> Result<()> {
+        Err(crate::error::Error::Other(anyhow::anyhow!("activate by pid is not supported on this platform (pid {pid}); use title")))
+    }
     
     /// 最小化窗口
     fn minimize_window(&self, title: &str) -> Result<()>;

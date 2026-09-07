@@ -603,6 +603,35 @@ impl RpcServer {
                 base(&mut v);
                 Ok(v)
             }
+            // 按名字找应用：读屏 / 激活 / 点击前的那一跳。Tauri 那边原来用 JXA 枚举 System Events
+            // 的全部进程来解析名字，4 秒必超时（300 个进程 × 每个 4 次 Apple Event）；这里是进程内
+            // 的 NSWorkspace，毫秒级，而且连窗口标题一起认。
+            "app.resolve" => {
+                let name = ["name", "app", "title"]
+                    .iter()
+                    .find_map(|k| params.get(*k).and_then(|v| v.as_str()))
+                    .map(str::trim)
+                    .unwrap_or("");
+                if name.is_empty() {
+                    return Err(Error::Other(anyhow::anyhow!("Missing 'name' parameter")));
+                }
+                match crate::platform::macos_tree::resolve_app(name) {
+                    Ok(m) => {
+                        let titles: Vec<String> = crate::system::window_titles()
+                            .into_iter()
+                            .filter(|w| w.pid == m.pid && !w.title.is_empty())
+                            .map(|w| w.title)
+                            .take(8)
+                            .collect();
+                        Ok(serde_json::json!({
+                            "pid": m.pid, "name": m.name, "bundle": m.bundle, "via": m.via,
+                            "windows": titles,
+                            "frontmost": crate::platform::macos_tree::frontmost_pid() == Some(m.pid),
+                        }))
+                    }
+                    Err(c) => Err(Error::ElementNotFound(crate::platform::macos_tree::no_such_app(name, &c))),
+                }
+            }
             _ => unreachable!("screen_method 只处理 needs_no_agent 里列出的方法"),
         }
     }
@@ -615,12 +644,10 @@ impl RpcServer {
         Ok(match params.get("pid").and_then(|v| v.as_i64()) {
             Some(p) if p > 0 => p as i32,
             _ => match params.get("app").and_then(|v| v.as_str()).map(str::trim) {
-                Some(a) if !a.is_empty() => crate::platform::macos_tree::pid_of(a)
-                    .ok_or_else(|| {
-                        Error::Other(anyhow::anyhow!(
-                            "没有找到名字里含「{a}」的运行中应用；用 window.list 看准确名字，或直接给 pid"
-                        ))
-                    })?,
+                // 显示名 / 可执行名 / bundle id / 窗口标题一次全认；找不到把屏幕上有窗口的应用列给它。
+                Some(a) if !a.is_empty() => crate::platform::macos_tree::resolve_app(a)
+                    .map(|m| m.pid)
+                    .map_err(|c| Error::ElementNotFound(crate::platform::macos_tree::no_such_app(a, &c)))?,
                 _ => crate::platform::macos_tree::frontmost_pid().ok_or_else(|| {
                     Error::Other(anyhow::anyhow!("读不到当前前台应用；给 app 或 pid 参数指定目标"))
                 })?,
@@ -632,7 +659,7 @@ impl RpcServer {
         // 分流放在拿锁之前。走到这里的 screen.* 只可能来自 recorder.replay 的
         // re-dispatch（正常路径在 accept 那一层就被挪走了）。详见 screen_method 上面那段。
         #[cfg(all(feature = "system", target_os = "macos"))]
-        if matches!(method, "screen.elements" | "screen.probe" | "screen.act" | "screen.capture" | "screen.marked") {
+        if matches!(method, "screen.elements" | "screen.probe" | "screen.act" | "screen.capture" | "screen.marked" | "app.resolve") {
             return Self::screen_method(method, params);
         }
         let mut agent = self.agent.lock().unwrap();
@@ -1079,10 +1106,22 @@ impl RpcServer {
             }
             #[cfg(feature = "system")]
             "window.activate" => {
-                let title = params.get("title").and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'title' parameter")))?;
+                // title / app / name 三个键都收，值是窗口标题或应用名都行（平台层一次全认）；
+                // 给了 pid 就按 pid 直接激活——read_screen / app.resolve 回来的 pid 不必再翻译成名字。
+                let pid = params.get("pid").and_then(|v| v.as_i64()).filter(|p| *p > 0);
+                let title = ["title", "app", "name"]
+                    .iter()
+                    .find_map(|k| params.get(*k).and_then(|v| v.as_str()))
+                    .map(str::trim)
+                    .unwrap_or("");
+                if pid.is_none() && title.is_empty() {
+                    return Err(Error::Other(anyhow::anyhow!("Missing 'title' parameter (a window title or an app name; 'pid' also works)")));
+                }
                 drop(agent);
-                crate::platform::get_window_controller().activate_window(title)?;
+                match pid {
+                    Some(p) => crate::platform::get_window_controller().activate_pid(p as i32)?,
+                    None => crate::platform::get_window_controller().activate_window(title)?,
+                }
                 // 到这里才代表**回读确认过**目标真在前台了（见 platform 层的轮询）。
                 // 把实际前台一并回出去，调用方不必再信一个光秃秃的 ok。
                 Ok(serde_json::json!({ "status": "ok", "frontmost": frontmost_now() }))
@@ -1445,7 +1484,7 @@ impl Job {
             if matches!(
                 self.rpc_method.as_deref(),
                 Some("screen.elements") | Some("screen.probe") | Some("screen.act")
-                    | Some("screen.capture") | Some("screen.marked")
+                    | Some("screen.capture") | Some("screen.marked") | Some("app.resolve")
             ) {
                 return true;
             }

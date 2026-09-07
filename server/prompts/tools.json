@@ -4166,7 +4166,7 @@
               "recorder_replay",
               "recorder_list"
             ],
-            "description": "screenshot: the screen (max_side to change its size). zoom: region [x0,y0,x1,y1] of the last screenshot at full resolution, for reading small text; coordinates stay in the full-screenshot space. Clicks take coordinate (omit to click where the pointer is) and text as held modifiers (\"cmd\", \"shift+alt\"). left_click_drag: start_coordinate → coordinate. scroll: scroll_direction + scroll_amount at coordinate. type: text verbatim. key: one key or a combo (\"Return\", \"cmd+s\", \"ctrl+shift+p\"), repeat to press it n times. hold_key: text + duration seconds. wait: duration seconds (max 60). paste: put text on the clipboard and paste it (fast for long text). window_activate / window_minimize / window_restore: title from window_list. clipboard_get / clipboard_set {text}. recorder_save / recorder_replay {name}, recorder_list."
+            "description": "screenshot: the screen (max_side to change its size). zoom: region [x0,y0,x1,y1] of the last screenshot at full resolution, for reading small text; coordinates stay in the full-screenshot space. Clicks take coordinate (omit to click where the pointer is) and text as held modifiers (\"cmd\", \"shift+alt\"). left_click_drag: start_coordinate → coordinate. scroll: scroll_direction + scroll_amount at coordinate. type: text verbatim. key: one key or a combo (\"Return\", \"cmd+s\", \"ctrl+shift+p\"), repeat to press it n times. hold_key: text + duration seconds. wait: duration seconds (max 60). paste: put text on the clipboard and paste it (fast for long text). window_activate / window_minimize / window_restore: title — a window title or an app name, either works (pid also accepted); when nothing matches the error lists what is on screen. clipboard_get / clipboard_set {text}. recorder_save / recorder_replay {name}, recorder_list."
           },
           "coordinate": {
             "type": "array",
@@ -4222,7 +4222,7 @@
           },
           "title": {
             "type": "string",
-            "description": "window_activate / window_minimize / window_restore: the window title"
+            "description": "window_activate / window_minimize / window_restore: a window title or an app name"
           },
           "name": {
             "type": "string",
