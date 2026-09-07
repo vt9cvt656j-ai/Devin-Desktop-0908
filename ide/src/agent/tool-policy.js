@@ -453,14 +453,15 @@ function seed() {
   //   从来没看过它们——Plan 模式里 POST / DELETE 打到任意地址畅通无阻，而隔壁 userhttp
   //   早就按方法判了。这里让声明和特判说同一句话。
   const httpWrites = (call) => !["GET", "HEAD", "OPTIONS"].includes(String(call?.method || "GET").toUpperCase());
-  for (const t of ["http"]) {
-    defineTool(t, {
-      needsApproval: httpWrites,
-      readOnlyModeBlocked: httpWrites,
-      parallelSafe: (call) => /^(get|head)$/i.test(String(call?.method || "GET").trim()),
-      readOnlyBlockedVerb: "发出会改变服务端状态的 HTTP 请求（POST / PUT / DELETE …）",
-    });
-  }
+  // 直接按名字登记，不套在 for 循环里：服务端 prompts.rs 的只读注入测试按源码读这张表，
+  // 把每条登记里第一个字符串字面量当类型名——套循环时它读到的是下面正则里的 "GET"，
+  // http 就从「按调用判」名单里消失，服务端会把 http_request 整个当改动类拒掉。
+  defineTool("http", {
+    needsApproval: httpWrites,
+    readOnlyModeBlocked: httpWrites,
+    parallelSafe: (call) => /^(get|head)$/i.test(String(call?.method || "GET").trim()),
+    readOnlyBlockedVerb: "发出会改变服务端状态的 HTTP 请求（POST / PUT / DELETE …）",
+  });
   // mcp 的并行判据：服务自己声明了 readOnlyHint 的才并行（和只读门同一个信号）。
   // 声明本身在上面 defineTool("mcp") 里，这里只补 parallelSafe 一位。
   defineTool("mcp", { ...toolPolicy("mcp"), parallelSafe: (call) => !!call?.mcpReadOnly });
