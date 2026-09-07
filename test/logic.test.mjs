@@ -39218,3 +39218,37 @@ test("终端命令退出即通知（Claude Code 的 run_in_background 语义）�
   qn(s, "正文", { source: "terminal", task: "终端「x」", status: "已退出" });
   assert.match(s._pendingSends[0].text, /任务：终端「x」\n状态：已退出\n正文/);
 });
+
+test("辅助调用向网关报裸上限：x-ide-aux 的值形如 intent-c900，腿按同一判据把余量减回去", () => {
+  // 2026-09-07 线上：网关对 deepseek 这类家族真把推理关了，可 max_tokens 还留着 900+4096 的余量，
+  // 没有推理的 flash 把整份预算烧在正文上——152 行封顶在 4996，每行 9~10 点，免费池一天 2000 点。
+  // 裸上限报过去，网关关掉推理时就能把余量收回来；老客户端不报，网关按余量常数推。
+  const v = load("_ideAuxValue", {});
+  assert.equal(v("intent", 900), "intent-c900");
+  assert.equal(v(undefined, 1300), "aux-c1300", "没报种类的有界辅助调用缺省 aux");
+  assert.equal(v("intent-c900", 200), "intent-c200", "已带后缀的要盖掉，不是叠上去");
+  assert.equal(v("fastroute", 0), "fastroute", "没有裸上限就只报种类");
+  assert.equal(v("a b/c", 5), "abc-c5", "字符集和 ai.rs 的过滤一致，否则桌面端整头不发");
+  assert.ok(v("x".repeat(40), 999999).length <= 32, "超过 32 字桌面端不发");
+  const bare = load("_legBareCap", { _thinkingProfileFor: (m) => ({ kind: m === "r" ? "effort" : "none" }), _AUX_REASONING_HEADROOM_TOKENS: 4096 });
+  assert.equal(bare("r", 6096), 2000, "收尾评审 2000+4096 → 2000");
+  assert.equal(bare("r", 4496), 400, "核心半 400+4096 → 400");
+  assert.equal(bare("r", 3000), 3000, "工具编排 3000 没加过余量，原样");
+  assert.equal(bare("n", 6096), 6096, "不声明推理的模型没加过余量，原样");
+  // 三个发送口都报
+  const bill = extractFn("_billableAiComplete", { code: true });
+  assert.match(bill, /if \(cap > 0\) requestConfig\.ideAux = _ideAuxValue\(requestConfig\.ideAux, cap\);/, "有界辅助调用没报裸上限");
+  const leg = extractFn("_cognitiveLegComplete", { code: true });
+  assert.match(leg, /"x-ide-aux": _ideAuxValue\("leg", _bare\),/, "认知腿 openai 直发没报身份");
+  assert.match(leg, /_billableAiComplete\(cfg, body\?\.messages \|\| \[\], _bare\)/, "Rust 那条路又把含余量的数再加一次余量");
+  assert.match(leg, /ideAux: "leg"/, "Rust 那条路没报腿的身份");
+  const predict = extractFn("_predictNextAsk", { code: true });
+  assert.match(predict, /if \(_predictCfg\.viaGateway\) h\["x-ide-aux"\] = _ideAuxValue\("predict", _PREDICT_CAP_TOKENS\);/, "预测没报裸上限");
+  assert.match(extractFn("_predictMaxTokens", { code: true }), /_PREDICT_CAP_TOKENS \+/, "预测预算和报出去的裸上限不是同一个数");
+  // 网关那半：家族判据、余量常数、收回函数都在，常数和这边同一个数
+  const gw = _rfs(new URL("../../server/src/models.rs", import.meta.url), "utf8");
+  assert.match(gw, /const IDE_AUX_REASONING_HEADROOM: i64 = 4096;/, "网关的余量常数和客户端不一致");
+  assert.match(SRC, /const _AUX_REASONING_HEADROOM_TOKENS = 4096;/, "客户端余量常数变了，网关那份要跟着改");
+  assert.match(gw, /fn reclaim_aux_headroom\(/, "网关没有收回余量");
+  assert.match(gw, /if aux\.starts_with\("leg"\)/, "网关不认腿的身份");
+});
