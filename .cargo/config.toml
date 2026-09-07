@@ -1,0 +1,7 @@
+# 开发版主程序链接完自动用本机固定证书签名，让辅助功能 / 屏幕录制授权在重编之后还在。
+# 细节和关闭方法见 scripts/dev-linker.sh。只作用于 mac 目标；Windows 交叉编译不经过它。
+[target.aarch64-apple-darwin]
+linker = "scripts/dev-linker.sh"
+
+[target.x86_64-apple-darwin]
+linker = "scripts/dev-linker.sh"

@@ -223,9 +223,12 @@ export function mapComputerAction(args) {
     case "screen_info": return { method: "screen.info", params: {}, coordSpace: "points" };
     case "window_list": return { method: "window.list", params: {}, coordSpace: "points" };
     case "window_activate": case "window_minimize": case "window_restore": {
-      const title = String(a.title || a.text || "").trim();
-      if (!title) return { error: `${action} 需要 title（window_list 里的窗口标题）` };
-      return { method: `window.${action.slice("window_".length)}`, params: { title }, coordSpace: "points" };
+      // title / app / name 都收：值是窗口标题还是应用名，sidecar 那边一次全认；pid 直接透传。
+      const title = String(a.title || a.app || a.name || a.text || "").trim();
+      const pid = Number(a.pid);
+      if (!title && !(pid > 0)) return { error: `${action} 需要 title（窗口标题或应用名，window_list / read_screen 里都能看到；也可以直接给 pid）` };
+      const params = pid > 0 ? { pid: Math.floor(pid) } : { title };
+      return { method: `window.${action.slice("window_".length)}`, params, coordSpace: "points" };
     }
     case "clipboard_get": return { method: "clipboard.get", params: {}, coordSpace: "points" };
     case "clipboard_set": {

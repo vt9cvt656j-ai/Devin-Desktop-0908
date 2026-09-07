@@ -231,7 +231,7 @@ impl AxTarget {
 /// 点中的却是另一个应用的同名按钮。所以这里统一在 Tauri 层解析一次，
 /// 往下一律只传 pid。
 #[cfg(target_os = "macos")]
-fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
+async fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
     if let Some(p) = target.pid {
         if p > 0 {
             return Ok(Some(p));
@@ -240,6 +240,25 @@ fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
     let Some(name) = target.app.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
         return Ok(None); // 前台
     };
+    // 快路：sidecar 的 app.resolve —— 进程内 NSWorkspace，毫秒级，显示名 / 可执行名 / bundle id /
+    // **窗口标题**一次全认，找不到时把屏幕上有窗口的应用列回来。下面那条 JXA 老路要枚举 System
+    // Events 的全部进程（每个 4 次 Apple Event），本机 300 个进程时 4 秒必超时——所有者今天那次
+    // 「解析应用名「Electron」超时」就是它。老路只在 sidecar 起不来时兜底。
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        crate::automation::automation_call("app.resolve".into(), serde_json::json!({ "name": name })),
+    )
+    .await
+    {
+        Ok(Ok(v)) => {
+            if let Some(pid) = v.get("pid").and_then(|p| p.as_i64()).filter(|p| *p > 0) {
+                return Ok(Some(pid));
+            }
+        }
+        // sidecar 真找过了（回的是「没有找到…」这种业务错误）：原话交回去，里面带候选名单。
+        Ok(Err(e)) if e.contains("没有找到") => return Err(e),
+        _ => {}
+    }
     // 三种名字都要认，因为它们**互不相同**而且模型只知道其中一种：
     //   · System Events 的 name() 给的是可执行名（Finder / WeChat）
     //   · 用户屏幕上看到的是 localizedName（访达 / 微信）——中文系统上和上面完全不同
@@ -308,7 +327,7 @@ fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
+async fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
     // **给了 app 却按名字找不到，必须硬报错，不能静默忽略。**
     // 上一版直接 `Ok(target.pid.filter(...))` —— app 参数整个被丢掉，然后底层无条件读
     // **前台窗口**（很可能就是 IDE 自己）。macOS 那一支同样的调用是硬报错，
@@ -441,7 +460,7 @@ pub async fn read_screen(
             target.describe()
         ));
     }
-    let target_pid = resolve_target_pid(&target)?;
+    let target_pid = resolve_target_pid(&target).await?;
     // Invalidate old refs before starting a new read. A failed or concurrent read
     // must never leave a ref from an older foreground process actionable.
     clear_latest_ax_refs()?;
@@ -635,7 +654,7 @@ pub async fn probe_screen(
     pid: Option<i64>,
 ) -> Result<serde_json::Value, String> {
     let target = AxTarget { pid, app };
-    let target_pid = resolve_target_pid(&target)?;
+    let target_pid = resolve_target_pid(&target).await?;
     let mut args = serde_json::json!({ "cap": 400 });
     if let Some(p) = target_pid.filter(|p| *p > 0) {
         args["pid"] = serde_json::json!(p);

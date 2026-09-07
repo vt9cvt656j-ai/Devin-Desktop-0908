@@ -175,7 +175,9 @@ unsafe fn walk(
     handles: &mut Vec<(u32, AXUIElementRef, AxNode)>,
     page: &mut Option<PageState>,
 ) {
-    if out.len() >= cap || depth > 24 {
+    // 深度上限只防病态树，不能拦住正常网页：React 应用的 DOM 三四十层是常态（Claude 桌面端实测
+    // 最深 39 层、613 个节点，上限 24 时只读出 86 个，看起来像「这应用没内容」）。节点总数另有 cap 兜底。
+    if out.len() >= cap || depth > 80 {
         return;
     }
     let role = attr_string(el, "AXRole").unwrap_or_default();
@@ -235,7 +237,16 @@ unsafe fn walk(
 
 /// 当前前台应用的进程号。调用方不必先跑一次 window.list 再把 pid 传回来——
 /// 少一次往返，而「读前台」正是这个方法九成的用法。
+///
+/// **不能**只问 NSWorkspace.frontmostApplication / NSRunningApplication.isActive：这两个值靠本进程的
+/// 主事件循环收 LaunchServices 通知来刷新，而 sidecar 主线程一直阻塞在 accept() 上，没有事件循环，
+/// 于是它们永远停在进程启动那一刻的快照。实测：`open -b com.apple.finder` 之后 lsappinfo 说访达在前，
+/// sidecar 还咬定 Claude 在前——激活明明成功，却回「2.5 秒后它仍不在前台」。窗口服务器的 z 序
+/// （CGWindowList 前到后）是活的，第一扇普通层级的窗口归谁，谁就在前台。
 pub fn frontmost_pid() -> Option<i32> {
+    if let Some(w) = front_app() {
+        return Some(w.pid);
+    }
     use cocoa::base::{id, nil};
     use objc::{class, msg_send, sel, sel_impl};
     unsafe {
@@ -249,11 +260,126 @@ pub fn frontmost_pid() -> Option<i32> {
     }
 }
 
+/// 屏幕上最前面那扇普通窗口（z 序第一）：它的主人就是前台应用。读的是窗口服务器，不经 NSWorkspace。
+pub fn front_app() -> Option<WinTitle> {
+    window_titles().into_iter().next()
+}
+
+/// 屏幕上的一扇窗口：主人进程、主人名、标题。按 z 序从前到后。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WinTitle {
+    pub pid: i32,
+    pub owner: String,
+    pub title: String,
+}
+
+/// 屏幕上正在显示的普通窗口（层级 0、至少 40×40），z 序从前到后。
+/// 标题（kCGWindowName）在没有屏幕录制权限时对别家应用读不到，会是空串——主人和 pid 照样有。
+pub fn window_titles() -> Vec<WinTitle> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowListExcludeDesktopElements,
+        kCGWindowListOptionOnScreenOnly,
+    };
+    let mut out = Vec::new();
+    let Some(list) = copy_window_info(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID,
+    ) else {
+        return out;
+    };
+    for item in list.iter() {
+        let dict: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_get_rule(*item as *const _) };
+        let n_of = |key: &str| -> f64 {
+            dict.find(&CFString::new(key))
+                .and_then(|v| v.downcast::<CFNumber>())
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0)
+        };
+        let s_of = |key: &str| -> String {
+            dict.find(&CFString::new(key))
+                .and_then(|v| v.downcast::<CFString>())
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+        };
+        if n_of("kCGWindowLayer") != 0.0 {
+            continue;
+        }
+        let pid = n_of("kCGWindowOwnerPID") as i32;
+        if pid <= 0 {
+            continue;
+        }
+        let (w, h) = dict
+            .find(&CFString::new("kCGWindowBounds"))
+            .map(|v| unsafe {
+                let b: CFDictionary<CFString, CFType> =
+                    CFDictionary::wrap_under_get_rule(v.as_CFTypeRef() as *const _);
+                let g = |k: &str| {
+                    b.find(&CFString::new(k))
+                        .and_then(|n| n.downcast::<CFNumber>())
+                        .and_then(|n| n.to_f64())
+                        .unwrap_or(0.0)
+                };
+                (g("Width"), g("Height"))
+            })
+            .unwrap_or((0.0, 0.0));
+        // 40×40 以下是阴影 / 输入法 / 状态条这类附属层，既不是窗口也没有像样的标题。
+        if w < 40.0 || h < 40.0 {
+            continue;
+        }
+        out.push(WinTitle { pid, owner: s_of("kCGWindowOwnerName"), title: s_of("kCGWindowName") });
+    }
+    out
+}
+
+/// 问目标应用自己「你在前台吗」（AXFrontmost，由它进程内的 AX 服务回答，活的）。
+/// 读不到（没权限 / 应用卡死 / 不是 GUI 进程）回 None——「没查成」不能说成「不在」。
+pub fn is_frontmost(pid: i32) -> Option<bool> {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.8);
+        let v = attr_bool(app, "AXFrontmost");
+        CFRelease(app as CFTypeRef);
+        v
+    }
+}
+
+/// 通过 AX 让目标应用自己切到前台（AXFrontmost = true）。NSRunningApplication 的激活请求在
+/// macOS 14+ 的「协作式激活」下可能被静默拒绝，而 AX 这条路是应用在自己进程里执行 activate，
+/// 没有这层限制；它和读屏用的是同一份辅助功能授权，不会多弹一个权限框。
+pub fn set_frontmost(pid: i32) -> bool {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        AXUIElementSetMessagingTimeout(app, 1.0);
+        let key = CFString::new("AXFrontmost");
+        let v = CFBoolean::true_value();
+        let ok = AXUIElementSetAttributeValue(app, key.as_concrete_TypeRef(), v.as_CFTypeRef()) == 0;
+        CFRelease(app as CFTypeRef);
+        ok
+    }
+}
+
 /// 拍一份前台应用的可访问性树。
 ///
 /// 只走用户真看得见、真点得到的窗口：跳过最小化的和尺寸退化的（浏览器会挂 1x1 的
 /// 隐藏工具窗），主窗口排最前——被 cap 截断时先留它。
 pub fn snapshot(pid: i32, cap: usize) -> (Vec<AxNode>, Option<PageState>) {
+    // 刚被叫醒的 Chromium / Electron / WebKit 要一小会儿才把树建出来，而且是**渐进**的：第一遍
+    // 读到的往往是半棵（不只是「壳」），拿节点数当判据会把半棵当整棵。所以只要这次真叫醒了它，
+    // 就等一拍再读；只在叫醒的那一次多等，之后每次读都不多花一毫秒。
+    if wake_ax(pid) {
+        std::thread::sleep(std::time::Duration::from_millis(350));
+    }
     snapshot_inner(pid, cap, true)
 }
 
@@ -267,6 +393,7 @@ pub fn snapshot(pid: i32, cap: usize) -> (Vec<AxNode>, Option<PageState>) {
 /// 这条路走同一套遍历，末尾把 walk 里 retain 过的句柄逐个放掉（不放就是泄漏），
 /// 只交出可读文本。**它不产生 ref，也不销毁 ref。**
 pub fn snapshot_probe(pid: i32, cap: usize) -> (Vec<AxNode>, Option<PageState>) {
+    wake_ax(pid);
     snapshot_inner(pid, cap, false)
 }
 
@@ -620,6 +747,148 @@ unsafe fn walk_one(el: AXUIElementRef, out: &mut Vec<AxNode>) {
 /// 这个名字就成了系统性的假话：读的是 A，回执说是 B。而 read_screen 正是拿这个名字
 /// 装进 ref 表当身份，ui_click 再用它校验「读的还是不是同一个 app」——错的身份会让
 /// 这道校验形同虚设。按 pid 反查是唯一诚实的读法。
+/// 叫醒 Chromium / Electron / WebKit 的可访问性树。
+///
+/// 这几家默认**不建**树：没有辅助工具在问的时候，Chrome、Electron 应用（所有者自己做的那些）、
+/// 甚至 WKWebView 只交出 Window + 几个空 Group，看起来就像「这个应用不暴露可访问性」——实测
+/// Claude 桌面端只读出 13 个节点。VoiceOver 的做法是给应用元素写 AXEnhancedUserInterface = true，
+/// Electron 另认 AXManualAccessibility = true；写上以后它们才开始把网页内容翻成 AX 树。
+/// 返回「这次是不是真把它叫醒的」：之前就是 true 的不算，调用方据此决定要不要多等一拍。
+pub fn wake_ax(pid: i32) -> bool {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        AXUIElementSetMessagingTimeout(app, 1.0);
+        let already = attr_bool(app, "AXEnhancedUserInterface").unwrap_or(false);
+        let mut set_any = false;
+        for name in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
+            let key = CFString::new(name);
+            let v = CFBoolean::true_value();
+            if AXUIElementSetAttributeValue(app, key.as_concrete_TypeRef(), v.as_CFTypeRef()) == 0 {
+                set_any = true;
+            }
+        }
+        CFRelease(app as CFTypeRef);
+        set_any && !already
+    }
+}
+
+/// 按名字找应用的结果：pid 之外把「凭什么认定的」也交回去，模型看得懂自己是按标题还是按名字命中的。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppMatch {
+    pub pid: i32,
+    pub name: String,
+    pub bundle: String,
+    pub via: &'static str,
+}
+
+/// 按名字找运行中的应用：显示名 / 可执行名 / bundle id（整个或最后一段）/ **窗口标题**，一次全认。
+///
+/// 为什么要认窗口标题：所有者的 Electron 应用进程叫 Electron、窗口叫「ZipMate 压缩助手」，模型
+/// 眼里只有后者——原来只按应用名找，回一句「未找到窗口」，模型就此放弃整条自动化。
+/// 顺序：三种名字精确相等 > 窗口标题精确 > 窗口标题子串 > 名字子串；同一档里带界面的应用
+/// （activationPolicy regular）排在后台代理前面。找不到时把「屏幕上有窗口的应用（附标题）」交回去，
+/// 让模型一步就能改对，而不是继续猜。
+pub fn resolve_app(query: &str) -> Result<AppMatch, Vec<String>> {
+    use cocoa::base::{id, nil};
+    use objc::{class, msg_send, sel, sel_impl};
+    let want = query.trim();
+    if want.is_empty() {
+        return Err(Vec::new());
+    }
+    let lw = want.to_lowercase();
+    struct App { pid: i32, name: String, bundle: String, exe: String, regular: bool }
+    let mut apps: Vec<App> = Vec::new();
+    unsafe {
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let list: id = msg_send![workspace, runningApplications];
+        let count: usize = msg_send![list, count];
+        let read = |obj: id| -> String {
+            if obj == nil {
+                return String::new();
+            }
+            let ptr: *const i8 = msg_send![obj, UTF8String];
+            if ptr.is_null() {
+                return String::new();
+            }
+            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        };
+        for i in 0..count {
+            let app: id = msg_send![list, objectAtIndex: i];
+            let pid: i32 = msg_send![app, processIdentifier];
+            if pid <= 0 {
+                continue;
+            }
+            let url: id = msg_send![app, executableURL];
+            let exe = if url == nil { String::new() } else { read(msg_send![url, lastPathComponent]) };
+            let policy: isize = msg_send![app, activationPolicy];
+            apps.push(App {
+                pid,
+                name: read(msg_send![app, localizedName]),
+                bundle: read(msg_send![app, bundleIdentifier]),
+                exe,
+                regular: policy == 0,
+            });
+        }
+    }
+    // 带界面的排前面：同名时（比如 Electron 的辅助进程）优先命中真正开着窗口的那个。
+    apps.sort_by_key(|a| !a.regular);
+    let eq = |s: &str| !s.is_empty() && s.to_lowercase() == lw;
+    let found = |a: &App, via: &'static str| AppMatch { pid: a.pid, name: a.name.clone(), bundle: a.bundle.clone(), via };
+    if let Some(a) = apps.iter().find(|a| {
+        eq(&a.name) || eq(&a.bundle) || eq(a.bundle.rsplit('.').next().unwrap_or("")) || eq(&a.exe)
+    }) {
+        return Ok(found(a, "name"));
+    }
+    let windows = crate::system::window_titles();
+    for exact in [true, false] {
+        if let Some(w) = windows.iter().find(|w| {
+            let t = w.title.to_lowercase();
+            !t.is_empty() && if exact { t == lw } else { t.contains(&lw) }
+        }) {
+            if let Some(a) = apps.iter().find(|a| a.pid == w.pid) {
+                return Ok(found(a, "window_title"));
+            }
+            return Ok(AppMatch { pid: w.pid, name: w.owner.clone(), bundle: String::new(), via: "window_title" });
+        }
+    }
+    if let Some(a) = apps.iter().find(|a| {
+        a.name.to_lowercase().contains(&lw) || a.bundle.to_lowercase().contains(&lw) || a.exe.to_lowercase().contains(&lw)
+    }) {
+        return Ok(found(a, "substring"));
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    for a in apps.iter().filter(|a| a.regular) {
+        let titles: Vec<&str> = windows
+            .iter()
+            .filter(|w| w.pid == a.pid && !w.title.is_empty() && w.title != a.name)
+            .map(|w| w.title.as_str())
+            .take(3)
+            .collect();
+        if windows.iter().any(|w| w.pid == a.pid) {
+            candidates.push(if titles.is_empty() { a.name.clone() } else { format!("{}（{}）", a.name, titles.join(" / ")) });
+        }
+        if candidates.len() >= 14 {
+            break;
+        }
+    }
+    Err(candidates)
+}
+
+/// 找不到时给模型的一句话：候选列表就是下一步该填的名字。
+pub fn no_such_app(query: &str, candidates: &[String]) -> String {
+    if candidates.is_empty() {
+        format!("没有找到名字里含「{query}」的运行中应用（显示名 / 可执行名 / bundle id / 窗口标题都试过了）；用 window.list 看，或直接给 pid")
+    } else {
+        format!(
+            "没有找到名字里含「{query}」的运行中应用（显示名 / 可执行名 / bundle id / 窗口标题都试过了）。屏幕上有窗口的是：{}。挑一个重发，或直接给 pid",
+            candidates.join("、")
+        )
+    }
+}
+
 pub fn name_of(pid: i32) -> Option<String> {
     use cocoa::base::{id, nil};
     use objc::{class, msg_send, sel, sel_impl};
@@ -643,53 +912,8 @@ pub fn name_of(pid: i32) -> Option<String> {
 
 /// 按应用名找进程号。window.restore 要用，和 macos.rs 里那个是同一件事。
 pub fn pid_of(title: &str) -> Option<i32> {
-    use cocoa::base::{id, nil};
-    use objc::{class, msg_send, sel, sel_impl};
-    // localizedName **是本地化的**：中文系统上 Finder 叫「访达」、Terminal 叫「终端」。
-    // 只比它的话，模型说 "Finder" 永远找不到——实测本机就是这样，而失败长得像
-    // 「这个应用没在跑」。所以三样都比：显示名、bundle id、以及 bundle id 的最后一段
-    // （com.apple.finder → finder，正好等于英文可执行名的小写）。
-    let want = title.trim();
-    if want.is_empty() {
-        return None;
-    }
-    let lw = want.to_lowercase();
-    unsafe {
-        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let apps: id = msg_send![workspace, runningApplications];
-        let count: usize = msg_send![apps, count];
-        let read = |obj: id| -> String {
-            if obj == nil {
-                return String::new();
-            }
-            let ptr: *const i8 = msg_send![obj, UTF8String];
-            if ptr.is_null() {
-                return String::new();
-            }
-            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
-        };
-        let mut fallback: Option<i32> = None;
-        for i in 0..count {
-            let app: id = msg_send![apps, objectAtIndex: i];
-            let name = read(msg_send![app, localizedName]);
-            let bundle = read(msg_send![app, bundleIdentifier]);
-            let short = bundle.rsplit('.').next().unwrap_or("").to_string();
-            let pid: i32 = msg_send![app, processIdentifier];
-            if pid <= 0 {
-                continue;
-            }
-            if name == want || short.eq_ignore_ascii_case(want) {
-                return Some(pid); // 精确命中优先于子串命中
-            }
-            if fallback.is_none()
-                && (name.to_lowercase().contains(&lw)
-                    || bundle.to_lowercase().contains(&lw))
-            {
-                fallback = Some(pid);
-            }
-        }
-        fallback
-    }
+    // 和 resolve_app 是同一条规则：读屏解析到谁、动作就打谁，两边不许各认各的。
+    resolve_app(title).ok().map(|m| m.pid)
 }
 
 /// 最小化 / 还原某个应用的窗口。
@@ -699,6 +923,44 @@ pub fn pid_of(title: &str) -> Option<i32> {
 /// 模型照着调必然报错。而 AX 侧本来就有 AXMinimized 这个可写属性，几行就能实现。
 ///
 /// 按应用名匹配（和 window.activate 一致），只动第一个尺寸够大的窗口。
+/// 把 pid 的某扇窗口（标题含 query，不分大小写）提到最前。应用切到前台只保证它的**某个**窗口在前，
+/// 模型点名的那扇可能还压在同一应用的别的窗口下面。找不到匹配的窗口就什么都不做（返回 false）。
+pub fn raise_window(pid: i32, query: &str) -> bool {
+    let lw = query.trim().to_lowercase();
+    if lw.is_empty() {
+        return false;
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        AXUIElementSetMessagingTimeout(app, 1.0);
+        let key = CFString::new("AXWindows");
+        let mut raw: CFTypeRef = ptr::null();
+        let mut raised = false;
+        if AXUIElementCopyAttributeValue(app, key.as_concrete_TypeRef(), &mut raw) == 0 && !raw.is_null() {
+            let arr = raw as CFArrayRef;
+            let n = CFArrayGetCount(arr);
+            for i in 0..n {
+                let w = CFArrayGetValueAtIndex(arr, i) as AXUIElementRef;
+                if w.is_null() {
+                    continue;
+                }
+                let title = attr_string(w, "AXTitle").unwrap_or_default().to_lowercase();
+                if !title.is_empty() && title.contains(&lw) {
+                    let action = CFString::new("AXRaise");
+                    raised = AXUIElementPerformAction(w, action.as_concrete_TypeRef()) == 0;
+                    break;
+                }
+            }
+            CFRelease(raw);
+        }
+        CFRelease(app as CFTypeRef);
+        raised
+    }
+}
+
 pub fn set_minimized(pid: i32, minimized: bool) -> Result<String, String> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);

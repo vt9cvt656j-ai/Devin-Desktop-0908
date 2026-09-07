@@ -17,27 +17,18 @@ impl MacOSControl {
 
     /// 按应用名找进程号。activate_window 里那段遍历做的是同一件事。
 unsafe fn pid_of_app(title: &str) -> Option<i32> {
-    let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-    let apps: id = msg_send![workspace, runningApplications];
-    let count: usize = msg_send![apps, count];
-    for i in 0..count {
-        let app: id = msg_send![apps, objectAtIndex: i];
-        let app_name: id = msg_send![app, localizedName];
-        if app_name == nil {
-            continue;
-        }
-        let ptr: *const i8 = msg_send![app_name, UTF8String];
-        let name = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
-        if name.contains(title) {
-            let pid: i32 = msg_send![app, processIdentifier];
-            return Some(pid);
-        }
-    }
-    None
+    // 和读屏 / 激活是同一条规则（macos_tree::resolve_app），不许各认各的。
+    crate::platform::macos_tree::pid_of(title)
 }
 
-/// 当前前台应用名。切前台失败时光说「没成功」没法排查，得说出是谁占着前台。
+/// 当前前台应用的显示名。先读窗口服务器的 z 序（活的），读不到再问 NSWorkspace——后者在这个
+/// 没有事件循环的进程里是启动时的旧快照（见 macos_tree::frontmost_pid 的说明）。
 fn frontmost_app_name() -> Option<String> {
+    if let Some(w) = crate::platform::macos_tree::front_app() {
+        if !w.owner.is_empty() {
+            return Some(w.owner);
+        }
+    }
     unsafe {
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let app: id = msg_send![workspace, frontmostApplication];
@@ -51,6 +42,73 @@ fn frontmost_app_name() -> Option<String> {
         let ptr: *const i8 = msg_send![name, UTF8String];
         Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string())
     }
+}
+
+/// 把某个进程切到前台并**回读确认**。activateWithOptions 只是发请求：被 Space、对话框、权限提示挡住时
+/// 它照样返回，而合成按键只进前台应用——不确认就往下打字，字就打进别的应用里。
+///
+/// 确认必须问活的来源（目标应用自己的 AXFrontmost，其次窗口服务器的 z 序）。NSRunningApplication.isActive
+/// 在这个没有事件循环的进程里永远是旧值：老实现拿它回读，激活明明成功也报「2.5 秒后仍不在前台」，
+/// 模型就此停手——这是所有者「动不动报错」里实测到的一条。
+///
+/// 三级升级：NSRunningApplication 请求 → AX 让它自己 activate（macOS 14+ 协作式激活拒绝前者时这条仍通）
+/// → LaunchServices（/usr/bin/open -b，和用户点 Dock 是同一条路）。每级都回读，切到了就立刻返回。
+fn activate_running_app(pid: i32, name: &str) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let confirmed = || -> bool {
+        match crate::platform::macos_tree::is_frontmost(pid) {
+            Some(v) => v,
+            None => crate::platform::macos_tree::frontmost_pid() == Some(pid),
+        }
+    };
+    let wait = |ms: u64| -> bool {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        loop {
+            if confirmed() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    if confirmed() {
+        return Ok(());
+    }
+    let bundle = unsafe {
+        let app: id = msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if app == nil {
+            return Err(Error::ElementNotFound(format!("没有 pid 为 {pid} 的运行中应用")));
+        }
+        // 1 = ActivateAllWindows，2 = ActivateIgnoringOtherApps：两个都带，最小化以外的窗口一起提前。
+        let _: bool = msg_send![app, activateWithOptions: 3usize];
+        let bid: id = msg_send![app, bundleIdentifier];
+        if bid == nil {
+            String::new()
+        } else {
+            let ptr: *const i8 = msg_send![bid, UTF8String];
+            std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string()
+        }
+    };
+    if wait(900) {
+        return Ok(());
+    }
+    if crate::platform::macos_tree::set_frontmost(pid) && wait(700) {
+        return Ok(());
+    }
+    if !bundle.is_empty() {
+        let _ = std::process::Command::new("/usr/bin/open").arg("-b").arg(&bundle).status();
+        if wait(900) {
+            return Ok(());
+        }
+    }
+    let front = frontmost_app_name().unwrap_or_else(|| "（读不到）".to_string());
+    Err(Error::Timeout(format!(
+        "已用三种方式请求把「{name}」切到前台（激活请求 / 辅助功能 / LaunchServices），2.5 秒后它仍不在前台，\
+当前前台是「{front}」。合成按键和点击只进前台应用，此刻继续 keyboard.type / mouse.click 会打进「{front}」。\
+先处理挡在前面的东西（模态对话框、权限提示、另一个 Space、全屏应用），或用 read_screen 看它此刻在显示什么。"
+    )))
 }
 
 impl WindowControl for MacOSControl {
@@ -74,21 +132,9 @@ impl WindowControl for MacOSControl {
             kCGWindowListOptionOnScreenOnly,
         };
 
-        let frontmost = unsafe {
-            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let app: id = msg_send![workspace, frontmostApplication];
-            if app == nil {
-                String::new()
-            } else {
-                let n: id = msg_send![app, localizedName];
-                if n == nil {
-                    String::new()
-                } else {
-                    let ptr: *const i8 = msg_send![n, UTF8String];
-                    std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string()
-                }
-            }
-        };
+        // 前台 = z 序第一扇普通窗口的主人。NSWorkspace.frontmostApplication 在这个没有事件循环的
+        // 进程里是旧快照，拿它标 is_frontmost 会让 keyboard.type 的回执把字说成进了别的窗口。
+        let mut front_pid: Option<i32> = None;
 
         let mut windows = Vec::new();
         let Some(list) = copy_window_info(
@@ -141,6 +187,8 @@ impl WindowControl for MacOSControl {
             if owner.is_empty() {
                 continue;
             }
+            let pid = n_of("kCGWindowOwnerPID") as i32;
+            let front_pid = *front_pid.get_or_insert(pid);
             let title = s_of("kCGWindowName");
             windows.push(WindowInfo {
                 title: if title.is_empty() { owner.clone() } else { title },
@@ -150,7 +198,7 @@ impl WindowControl for MacOSControl {
                 width: w.max(0.0) as u32,
                 height: h.max(0.0) as u32,
                 is_visible: true,
-                is_frontmost: !frontmost.is_empty() && owner == frontmost,
+                is_frontmost: pid == front_pid,
                 is_minimized: false,
             });
         }
@@ -162,54 +210,22 @@ impl WindowControl for MacOSControl {
         Ok(windows.into_iter().find(|w| w.title.contains(title)))
     }
     
+    /// 按窗口标题或应用名激活。名字怎么认见 macos_tree::resolve_app（显示名 / 可执行名 / bundle id /
+    /// 窗口标题一次全认）；按标题命中的还会把那扇窗口本身提到最前，不只是把应用切到前台。
     fn activate_window(&self, title: &str) -> Result<()> {
-        unsafe {
-            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let apps: id = msg_send![workspace, runningApplications];
-            let count: usize = msg_send![apps, count];
-            
-            for i in 0..count {
-                let app: id = msg_send![apps, objectAtIndex: i];
-                let app_name: id = msg_send![app, localizedName];
-                
-                if app_name == nil {
-                    continue;
-                }
-                
-                let name_ptr: *const i8 = msg_send![app_name, UTF8String];
-                let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy();
-                
-                if name.contains(title) {
-                    let _: () = msg_send![app, activateWithOptions: 0];
-                    // 激活是异步的，而合成按键和点击只会投给**当前**前台应用。
-                    // 发完就回 Ok 等于把「请求已发出」当成「已经切过去了」——冷启动、
-                    // 跨 Space、被对话框截胡时它根本没切成，而后面每一次 keyboard.type
-                    // 都打进上一个应用，并且一路返回成功。所以这里必须回读。
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_millis(2500);
-                    loop {
-                        let active: bool = msg_send![app, isActive];
-                        if active {
-                            return Ok(());
-                        }
-                        if std::time::Instant::now() >= deadline {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(60));
-                    }
-                    let front = frontmost_app_name()
-                        .unwrap_or_else(|| "（读不到）".to_string());
-                    return Err(Error::Timeout(format!(
-                        "已向「{}」发出激活请求，但 2.5 秒后它仍不在前台，当前前台是「{}」。\
-合成按键和点击只进前台应用，此刻继续 keyboard.type / mouse.click 会打进「{}」。\
-先处理挡在前面的东西（对话框、权限提示、另一个 Space），或改用 system open。",
-                        name, front, front
-                    )));
-                }
-            }
+        let m = crate::platform::macos_tree::resolve_app(title)
+            .map_err(|c| Error::ElementNotFound(crate::platform::macos_tree::no_such_app(title, &c)))?;
+        activate_running_app(m.pid, &m.name)?;
+        if m.via == "window_title" {
+            crate::platform::macos_tree::raise_window(m.pid, title);
         }
-        
-        Err(Error::ElementNotFound(format!("未找到窗口: {}", title)))
+        Ok(())
+    }
+
+    fn activate_pid(&self, pid: i32) -> Result<()> {
+        let name = crate::platform::macos_tree::name_of(pid)
+            .ok_or_else(|| Error::ElementNotFound(format!("没有 pid 为 {pid} 的运行中应用")))?;
+        activate_running_app(pid, &name)
     }
     
     fn minimize_window(&self, title: &str) -> Result<()> {

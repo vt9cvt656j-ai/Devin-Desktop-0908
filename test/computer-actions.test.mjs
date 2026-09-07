@@ -164,3 +164,18 @@ test("几何说明：整屏截图说尺寸和坐标规则；标注图加「编�
   const locked = describeScreenImage({ image_px: { width: 1280, height: 827 }, marks: 9, screen_locked: true }, { marked: true });
   assert.match(locked, /锁着/); assert.match(locked, /解锁/); assert.ok(!/1280×827/.test(locked), "锁屏时别再教它按图上像素给坐标");
 });
+
+test("window_activate 认窗口标题、应用名、pid 三种写法；一个都没给才报错", () => {
+  // 所有者的 Electron 应用：进程叫 Electron、窗口叫「ZipMate 压缩助手」，模型眼里只有后者——
+  // 三个键都收，值是标题还是应用名由 sidecar 的 app.resolve 一次全认。
+  assert.deepEqual(mapComputerAction({ action: "window_activate", title: "ZipMate 压缩助手" }).params, { title: "ZipMate 压缩助手" });
+  assert.deepEqual(mapComputerAction({ action: "window_activate", app: "Finder" }).params, { title: "Finder" });
+  assert.deepEqual(mapComputerAction({ action: "window_activate", name: "访达" }).params, { title: "访达" });
+  // read_screen / app.resolve 回来的就是 pid，直接透传，不再翻译成名字。
+  assert.deepEqual(mapComputerAction({ action: "window_activate", pid: 511 }).params, { pid: 511 });
+  assert.deepEqual(mapComputerAction({ action: "window_activate", pid: "511" }).params, { pid: 511 });
+  const bad = mapComputerAction({ action: "window_activate" });
+  assert.match(bad.error, /title/);
+  assert.match(bad.error, /应用名/);
+  assert.deepEqual(mapComputerAction({ action: "window_minimize", app: "Finder" }).method, "window.minimize");
+});
