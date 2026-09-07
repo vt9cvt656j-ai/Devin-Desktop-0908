@@ -105,3 +105,30 @@ test("drainJournal：流式会话每 3 秒拍一次在途消息快照，内容�
   s._journalClearPending = true; await drainJournal([s], invoke, { snapshotHtml: () => dom, now });
   assert.equal(s._draftHtmlLast, "");
 });
+
+test("大快照放慢节拍：整份 HTML 每次都要过一遍 IPC，连着刷会顶主线程", async () => {
+  const { drainJournal, htmlSnapshotInterval, HTML_SNAPSHOT_INTERVAL_MS, HTML_SNAPSHOT_LARGE_BYTES, HTML_SNAPSHOT_LARGE_FACTOR } =
+    await import("../src/agent/stream-journal.js");
+  assert.equal(htmlSnapshotInterval(0), HTML_SNAPSHOT_INTERVAL_MS);
+  assert.equal(htmlSnapshotInterval(HTML_SNAPSHOT_LARGE_BYTES), HTML_SNAPSHOT_INTERVAL_MS);
+  assert.equal(htmlSnapshotInterval(HTML_SNAPSHOT_LARGE_BYTES + 1), HTML_SNAPSHOT_INTERVAL_MS * HTML_SNAPSHOT_LARGE_FACTOR);
+
+  let clock = 0;
+  const now = () => clock;
+  const calls = [];
+  const invoke = async (cmd, args) => { calls.push([cmd, args]); };
+  const s = { id: "s1", streaming: true, _liveMsgEl: {}, _runGen: 1 };
+  let dom = "<div>" + "b".repeat(HTML_SNAPSHOT_LARGE_BYTES + 10) + "</div>";
+  clock += HTML_SNAPSHOT_INTERVAL_MS;
+  await drainJournal([s], invoke, { snapshotHtml: () => dom, now });
+  assert.equal(calls.filter((c) => c[0] === "stream_draft_snapshot").length, 1, "第一份大快照照拍");
+
+  dom = "<div>" + "c".repeat(HTML_SNAPSHOT_LARGE_BYTES + 10) + "</div>";
+  clock += HTML_SNAPSHOT_INTERVAL_MS;
+  await drainJournal([s], invoke, { snapshotHtml: () => dom, now });
+  assert.equal(calls.filter((c) => c[0] === "stream_draft_snapshot").length, 1, "大快照 3 秒后不该又拍一次");
+
+  clock += HTML_SNAPSHOT_INTERVAL_MS * HTML_SNAPSHOT_LARGE_FACTOR;
+  await drainJournal([s], invoke, { snapshotHtml: () => dom, now });
+  assert.equal(calls.filter((c) => c[0] === "stream_draft_snapshot").length, 2, "到了放慢后的节拍就该拍");
+});

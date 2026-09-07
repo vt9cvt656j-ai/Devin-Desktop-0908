@@ -3,7 +3,7 @@
 // 这里用一个几十行的假 DOM 跑真行为（仓库没有 jsdom）：只实现模块用到的那几个查询。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { settleLiveClone, liveMessageHtml, markRecoveredMessage, recoveredThinkingOpen, LIVE_HTML_MAX_CHARS } from "../src/agent/draft-recovery.js";
+import { settleLiveClone, liveMessageHtml, markRecoveredMessage, recoveredThinkingOpen, shedInlineMedia, shedLargestBlocks, LIVE_HTML_MAX_CHARS } from "../src/agent/draft-recovery.js";
 
 class El {
   constructor(tag, classes = [], attrs = {}, children = []) {
@@ -17,10 +17,15 @@ class El {
   get className() { return [...this._cls].join(" "); }
   set className(v) { this._cls = new Set(String(v).split(/\s+/).filter(Boolean)); }
   setAttribute(k, v) { this.attrs[k] = v; }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; }
   matches(sel) {
     return sel.split(",").map((s) => s.trim()).some((simple) => {
       if (/^\[(.+)\]$/.test(simple)) return this.attrs[RegExp.$1] != null;
-      return simple.split(".").filter(Boolean).every((c) => this._cls.has(c));
+      // 标签名（"img"）和类链（".a.b"）都要认：瘦身那段按标签找媒体元素。
+      const m = /^([a-z][a-z0-9]*)?((?:\.[^.]+)*)$/i.exec(simple);
+      if (!m) return false;
+      if (m[1] && m[1].toLowerCase() !== String(this.tag).toLowerCase()) return false;
+      return m[2].split(".").filter(Boolean).every((c) => this._cls.has(c));
     });
   }
   *walk() { for (const c of this.children) { yield c; yield* c.walk(); } }
@@ -42,7 +47,11 @@ class El {
   appendChild(c) { c.parent = this; this.children.push(c); return c; }
   insertBefore(c, ref) { c.parent = this; const i = this.children.indexOf(ref); this.children.splice(i < 0 ? this.children.length : i, 0, c); return c; }
   cloneNode() { const k = new El(this.tag, [...this._cls], this.attrs, this.children.map((c) => c.cloneNode())); k.textContent = this.textContent; return k; }
-  get outerHTML() { return `<${this.tag} class="${this.className}">${this.textContent}${this.children.map((c) => c.outerHTML).join("")}</${this.tag}>`; }
+  // 属性也要进去：内嵌图片那几百 KB 的 data URL 就在属性里，不算进来就量不出体积。
+  get outerHTML() {
+    const attrs = Object.entries(this.attrs).map(([k, v]) => ` ${k}="${v}"`).join("");
+    return `<${this.tag} class="${this.className}"${attrs}>${this.textContent}${this.children.map((c) => c.outerHTML).join("")}</${this.tag}>`;
+  }
 }
 const doc = { createElement: (tag) => new El(tag) };
 
@@ -104,4 +113,77 @@ test("没有 HTML 快照时的思考默认展开：只有正文为空且有思�
   assert.equal(recoveredThinkingOpen({ hasText: false, hasReason: true }), true);
   assert.equal(recoveredThinkingOpen({ hasText: true, hasReason: true }), false);
   assert.equal(recoveredThinkingOpen({ hasText: false, hasReason: false }), false);
+});
+
+// ── 超预算不许整份丢：所有者「软件只要被关闭之前的内容就都不显示了」的落点 ─────────────
+//
+// 原来是「太大就返回 ""」，于是**专挑最该保住的那些丢**：一轮里只要有一张截图（data URL 的
+// base64 几百 KB 到几 MB）或几个大文件预览，快照当场超限、静默变空，恢复退回那份
+// 「这一轮执行过的步骤（N 步）」清单。现在按代价从小到大瘦身。
+
+/** 造一张带 N 字节 data URL 的截图卡（就是压垮快照的那个东西）。 */
+function shotCard(bytes) {
+  const img = new El("img", ["atc-shot", "atc-shot--full"], { src: "data:image/png;base64," + "A".repeat(bytes) });
+  const vp = new El("div", ["atc-viewport"], {}, [img]);
+  const res = new El("span", ["atc-result", "atc-result--ok"]); res.textContent = "已截图";
+  return new El("div", ["agent-tool-step"], {}, [res, vp]);
+}
+/** 造一张展开区里塞了 N 个字的读取卡。 */
+function readCard(chars) {
+  const pre = new El("pre", ["tc-pre"]); pre.textContent = "x".repeat(chars);
+  const vp = new El("div", ["atc-viewport"], {}, [pre]);
+  const res = new El("span", ["atc-result", "atc-result--ok"]); res.textContent = "已读取";
+  return new El("div", ["agent-tool-step"], {}, [res, vp]);
+}
+function msgWith(...cards) {
+  const body = new El("div", ["msg__body"], {}, cards);
+  return new El("div", ["msg", "assistant"], {}, [new El("div", ["msg__main"], {}, [body])]);
+}
+
+test("一张大截图不该让整份快照变成空——图换成占位，卡片和结果原样留着", () => {
+  const msg = msgWith(shotCard(400_000));
+  const cap = 100_000;
+  assert.equal(msg.outerHTML.length > cap, true, "前提：这条消息确实超预算");
+  const html = liveMessageHtml(msg, cap);
+  assert.notEqual(html, "", "超预算就整份丢＝恢复退回步骤清单，正是所有者报的那个症状");
+  assert.ok(html.length <= cap);
+  assert.match(html, /agent-tool-step/, "工具卡不能跟着图一起没了");
+  assert.match(html, /已截图/, "卡片上的结果要留着");
+  assert.match(html, /data-shed="media"/, "被换掉的图要标出来");
+  assert.doesNotMatch(html, /AAAAAAAAAA/, "几百 KB 的 base64 不该还在里面");
+  assert.match(html, /svg/, "占位图本身要在，位置和说明都还在");
+});
+
+test("图换完还超，就从最大的展开区开始收；卡头一律保留，小的那些不动", () => {
+  const msg = msgWith(readCard(80_000), readCard(2_000), shotCard(120_000));
+  const cap = 20_000;
+  const html = liveMessageHtml(msg, cap);
+  assert.notEqual(html, "");
+  assert.ok(html.length <= cap);
+  assert.equal((html.match(/agent-tool-step/g) || []).length, 3, "三张卡一张都不能少");
+  assert.match(html, /已读取/);
+  assert.match(html, /重启后没有保留/, "被收掉的展开区要说清楚它去哪了");
+  assert.match(html, /xx/, "小的那份展开区不该被顺手收掉");
+});
+
+test("没超预算时一个字都不动——正常那条路的保真度不受影响", () => {
+  const msg = msgWith(shotCard(100), readCard(50));
+  const html = liveMessageHtml(msg, LIVE_HTML_MAX_CHARS);
+  assert.doesNotMatch(html, /data-shed/, "没超就不该瘦身");
+  assert.match(html, /data:image\/png;base64,A{100}/, "小图原样保留");
+});
+
+test("两级都做完还超（重量在正文本身）才返回空——那份正文走文字那条老路照样恢复", () => {
+  const body = new El("div", ["msg__body"]); body.textContent = "字".repeat(50_000);
+  const msg = new El("div", ["msg", "assistant"], {}, [new El("div", ["msg__main"], {}, [body])]);
+  assert.equal(liveMessageHtml(msg, 1_000), "");
+});
+
+test("瘦身两级各自是纯函数，单独也能验", () => {
+  const msg = msgWith(shotCard(50_000));
+  assert.equal(shedInlineMedia(msg), 1, "认得出 img 上的大 data URL");
+  assert.equal(shedInlineMedia(msg), 0, "换过一次就不该再算一次");
+  const big = msgWith(readCard(30_000));
+  assert.equal(shedLargestBlocks(big, 1_000), 1);
+  assert.equal(shedLargestBlocks(msgWith(readCard(10)), 1_000_000), 0, "没超预算就一个都不收");
 });

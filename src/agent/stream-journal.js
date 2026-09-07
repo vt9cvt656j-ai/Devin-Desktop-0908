@@ -54,6 +54,17 @@ export function mergeJournalIntoDrafts(snapshots, journal) {
 
 /** 在途消息 DOM 快照的落盘节拍（毫秒）：比 400ms 的 delta 节拍慢，因为一次是整条消息的克隆 + 序列化。 */
 export const HTML_SNAPSHOT_INTERVAL_MS = 3000;
+/** 超过这个体积的快照放慢节拍：整份 HTML 要经 IPC 序列化一次，大的连着刷会顶到主线程。 */
+export const HTML_SNAPSHOT_LARGE_BYTES = 512 * 1024;
+/** 大快照的节拍倍数。3s → 9s：被强杀时最多多丢 6 秒，换掉长任务上的周期性卡顿。 */
+export const HTML_SNAPSHOT_LARGE_FACTOR = 3;
+
+/** 这一份快照下一次该隔多久再拍。只看上一次的体积——大的放慢，小的照旧。 */
+export function htmlSnapshotInterval(lastBytes) {
+  return Number(lastBytes) > HTML_SNAPSHOT_LARGE_BYTES
+    ? HTML_SNAPSHOT_INTERVAL_MS * HTML_SNAPSHOT_LARGE_FACTOR
+    : HTML_SNAPSHOT_INTERVAL_MS;
+}
 
 /**
  * 一拍：把每个会话缓冲的 delta 增量刷进 Rust 真文件；收尾会话删其日志文件。
@@ -83,12 +94,13 @@ export async function drainJournal(sessions, invoke, opts = {}) {
       }
     }
     if (!snapshotHtml || !s.streaming || !s._liveMsgEl) continue;
-    if (now - (Number(s._draftHtmlAt) || 0) < HTML_SNAPSHOT_INTERVAL_MS) continue;
+    if (now - (Number(s._draftHtmlAt) || 0) < htmlSnapshotInterval(s._draftHtmlBytes)) continue;
     s._draftHtmlAt = now;
     let html = "";
     try { html = String(snapshotHtml(s) || ""); } catch { html = ""; }
     if (!html || html === s._draftHtmlLast) continue;
     s._draftHtmlLast = html;
+    s._draftHtmlBytes = html.length;
     try { await invoke("stream_draft_snapshot", { sessionId: s.id, gen: Number(s._runGen) || 0, at: now, html }); } catch {}
   }
 }

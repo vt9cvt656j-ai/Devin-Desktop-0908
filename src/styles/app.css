@@ -7554,6 +7554,16 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 /* 视频和透明底的图用深色垫底，别让透明区域透出卡片的白。 */
 .atc-shot--media { background: #000; }
 
+/* 重启恢复时被"瘦掉"的那部分（agent/draft-recovery.js）：快照超预算时先丢内嵌媒体、
+   再收最大的展开区，而不是整份丢掉。这里让它看起来是**有意为之**，不像内容坏了。 */
+.atc-viewport[data-shed="block"] {
+  padding: 9px 13px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.atc-shot[data-shed="media"] { background: transparent; }
+
 /* 容器查询的锚点。锚 .ld-card 而不是 .atc-viewport：后者带 display:none + 展开动画，
    在那儿加 containment 会波及每一张工具卡的开合。 */
 .ld-card { container-type: inline-size;

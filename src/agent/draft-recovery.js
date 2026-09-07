@@ -39,16 +39,99 @@ export function settleLiveClone(root, { interruptedLabel = "中断" } = {}) {
   return root;
 }
 
+// ── 超预算时按代价从小到大瘦身 ───────────────────────────────────────────────
+//
+// 原来是「太大就整份放弃」。听起来保守，实际是**专挑最该保住的那些丢**：一轮里只要有一张
+// 截图（data URL 的 base64 动辄几百 KB 到几 MB）或者几个大文件预览，快照当场超限、静默变成
+// 空串，恢复只好退回那份「这一轮执行过的步骤（N 步）」清单——所有者看到的就是这个。
+// 而超限的重量几乎全在两处，且这两处都是**可以只丢它们**的：内嵌媒体、工具卡的展开区。
+
+/** 被丢掉的内嵌图用它顶替：一张自带说明文字的 SVG，几百字节顶替几百 KB。 */
+const SHED_MEDIA_SRC =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="600" height="56">' +
+      '<rect width="600" height="56" fill="none" stroke="#9aa0a6" stroke-width="1" stroke-dasharray="4 3"/>' +
+      '<text x="300" y="33" text-anchor="middle" font-family="system-ui,-apple-system,sans-serif" font-size="13" fill="#9aa0a6">' +
+      "图片太大，重启后没有保留" +
+      "</text></svg>",
+  );
+
+const MEDIA_TAGS = new Set(["img", "video", "audio", "source", "image", "canvas"]);
+const MEDIA_ATTRS = ["src", "href", "poster", "data-src"];
+/** 这个尺寸以下的 data URL 不值得动（图标、favicon）。 */
+const SMALL_DATA_URL = 4096;
+
+/** 遍历所有元素后代。真 DOM 和测试里那个假 DOM 都走得通（不依赖通配选择器）。 */
+function eachElement(root, fn) {
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    for (const child of Array.from(node?.children || [])) {
+      fn(child);
+      stack.push(child);
+    }
+  }
+}
+
+function tagOf(el) {
+  return String(el?.tagName || el?.tag || "").toLowerCase();
+}
+
+/** 第一级：把内嵌的 base64 媒体换成占位。卡片、编号、说明文字全都还在，只有像素没了。 */
+export function shedInlineMedia(root) {
+  let shed = 0;
+  eachElement(root, (el) => {
+    if (!MEDIA_TAGS.has(tagOf(el))) return;
+    for (const attr of MEDIA_ATTRS) {
+      const v = el.getAttribute?.(attr);
+      if (typeof v !== "string" || v.length <= SMALL_DATA_URL || !v.startsWith("data:")) continue;
+      el.setAttribute?.(attr, attr === "src" ? SHED_MEDIA_SRC : "");
+      el.setAttribute?.("data-shed", "media");
+      shed++;
+    }
+  });
+  return shed;
+}
+
+/** 第二级：工具卡的展开区从大到小收，收到进预算为止。卡头（做了什么、结果）一律保留。 */
+export function shedLargestBlocks(root, maxChars) {
+  const blocks = Array.from(root?.querySelectorAll?.(".atc-viewport") || [])
+    .map((el) => ({ el, size: String(el.outerHTML || "").length }))
+    .sort((a, b) => b.size - a.size);
+  let shed = 0;
+  for (const { el } of blocks) {
+    if (String(root?.outerHTML || "").length <= maxChars) break;
+    const chars = String(el.textContent || "").length;
+    for (const child of Array.from(el.children || [])) child.remove?.();
+    el.textContent = chars
+      ? `（这里原有 ${chars} 个字符的内容，太大，重启后没有保留）`
+      : "（内容太大，重启后没有保留）";
+    el.setAttribute?.("data-shed", "block");
+    shed++;
+  }
+  return shed;
+}
+
 /**
- * 在途 `.msg` 元素 → 静止 HTML。太大就放弃（返回 ""），让恢复走文字那条老路而不是把
- * 几 MB 的字符串塞进每 3 秒一次的落盘。克隆是一次性的、每 3 秒一次，不在每 token 的热路上。
+ * 在途 `.msg` 元素 → 静止 HTML。
+ *
+ * 超预算时**逐级瘦身**而不是整份丢：先换掉内嵌媒体，再从大到小收工具卡的展开区。
+ * 两级都做完还超，说明重量在正文本身——那份走文字那条老路照样能恢复，这时才返回 ""。
+ * 克隆一次性、每 3 秒一次，不在每 token 的热路上。
  */
 export function liveMessageHtml(msgEl, maxChars = LIVE_HTML_MAX_CHARS) {
   if (!msgEl || typeof msgEl.cloneNode !== "function") return "";
   let clone;
   try { clone = msgEl.cloneNode(true); } catch { return ""; }
   settleLiveClone(clone);
-  const html = String(clone.outerHTML || "");
+  let html = String(clone.outerHTML || "");
+  if (html.length <= maxChars) return html;
+  if (shedInlineMedia(clone)) {
+    html = String(clone.outerHTML || "");
+    if (html.length <= maxChars) return html;
+  }
+  if (shedLargestBlocks(clone, maxChars)) html = String(clone.outerHTML || "");
   return html.length > maxChars ? "" : html;
 }
 
