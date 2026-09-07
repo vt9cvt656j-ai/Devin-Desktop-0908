@@ -5,8 +5,13 @@
 // 为什么把它从 main.js 拆出来：这块是纯字符串拼接，拆出来能在 Node 里真渲染一次核对结构，
 // 也能让官网 / 预览夹具用同一份实现，而不是各抄一份 DOM 再漂开。
 //
-// 站点头像：Rust 侧随页面状态给出 favicon 地址（<link rel=icon> 或 /favicon.ico）；图标加载失败
-// 时退回站点名首字母的方块头像（bindBrowserLinkCard 监听 error 把 <img> 摘掉，字母就露出来）。
+// 站点头像：用网站**真实的**图标——Rust 侧在页面里找 <link rel=icon>（没有就 /favicon.ico），
+// 把图片字节取回来编成 data URL 一起返回；所以这里拿到的 favicon 通常是 data:image/…，不用
+// 再让 webview 跨站去拉（打包后 CSP、站点的防外链、登录态三种情况都会让 <img src=https://…> 空掉）。
+// 万一图标真的没有或加载失败，才退回站点名首字母的方块头像（bindBrowserLinkCard 监听 error 把
+// <img> 摘掉，字母就露出来）。
+// 标题、描述过长：数据层先按 TITLE_MAX / DESC_MAX 截断补「…」，CSS 再用两行 clamp 按视觉宽度收口
+//（WebKit / Blink 都会在第二行末尾画出「…」），两道都在，长文案不会把卡撑成一屏也不会被硬切。
 // 截图默认裁到 360px 高、顶部对齐，点一下展开完整一张（.is-expanded）。
 
 /** 只取主机名；不是合法 URL 时原样返回（比如只有一个标题、或者 about:blank）。 */
@@ -26,9 +31,25 @@ export function siteInitial(host) {
   return h ? h[0].toUpperCase() : "∙";
 }
 
+/** 标题 / 描述在数据层的字符上限（按码点数，中英文各算一个）。 */
+export const TITLE_MAX = 100;
+export const DESC_MAX = 140;
+
+/**
+ * 超过 max 个字符就截断并补「…」；截断点前面拖着的空白和标点一起去掉，不出现「，…」。
+ * 不超上限时一个字都不动。这是兜底：meta 描述动辄几百字，先在数据层截掉，卡片不会带着
+ * 一大段看不见的文字撑布局；视觉上的收口由 CSS 两行 clamp 负责。
+ */
+export function clipText(text, max) {
+  const chars = Array.from(String(text || ""));
+  if (chars.length <= max) return chars.join("");
+  return chars.slice(0, Math.max(0, max - 1)).join("").replace(/[\s,，、;；:：.。!！?？-]+$/u, "") + "…";
+}
+
 /**
  * @param {{url?: string, title?: string, description?: string, screenshot?: string, favicon?: string}} state
- *   浏览器工具返回的页面状态；screenshot 是 data URL，favicon 是站点图标的绝对地址。
+ *   浏览器工具返回的页面状态；screenshot 是 data URL，favicon 是站点图标（Rust 取回后编成的
+ *   data URL，或一个 http(s) 地址）。
  * @param {(s: string) => string} escHtml 调用方的 HTML 转义。
  * @returns {string} 一段可直接塞进 .atc-viewport 的 HTML；什么都没有时返回空串。
  */
@@ -55,8 +76,8 @@ export function browserLinkCardHtml(state, escHtml) {
   const rows = [
     site,
     // 标题缺失或和主机名一样时只画站点行，否则两行渲染出一模一样的字，像重复了一遍。
-    title && title !== host ? `<span class="browser-link-card__title">${esc(title)}</span>` : "",
-    desc ? `<span class="browser-link-card__desc">${esc(desc)}</span>` : "",
+    title && title !== host ? `<span class="browser-link-card__title">${esc(clipText(title, TITLE_MAX))}</span>` : "",
+    desc ? `<span class="browser-link-card__desc">${esc(clipText(desc, DESC_MAX))}</span>` : "",
   ].join("");
   return `<div class="browser-link-card">${media}<div class="browser-link-card__meta">${rows}</div></div>`;
 }
