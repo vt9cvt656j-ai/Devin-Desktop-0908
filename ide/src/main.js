@@ -176,7 +176,7 @@ import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPers
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
 import { automationNeed, automationAllowed, automationBlockedReceipt, offerToVerifySuggestion } from "./agent/automation-need.js";
-import { LIVE_WATCH_STORE_KEY, WATCH_SOURCES, normalizeLiveWatchConfig, normalizeRule, resolveWatchPolicy, detectTerminalError, detectPreviewError, detectCaptureFailure, makeWatchEvent, newWatchState, matchRules, decideFire, composeWatchNotice, describeWatchEventForUser, stripAnsi as _watchStripAnsi } from "./agent/live-watch.js";
+import { LIVE_WATCH_CONFIG_FILE, normalizeLiveWatchConfig, detectTerminalError, detectPreviewError, detectCaptureFailure, makeWatchEvent, newWatchState, matchRules, decideFire, composeWatchNotice, stripAnsi as _watchStripAnsi } from "./agent/live-watch.js";
 import {
   addHidden, chipBeside, chipPadMove, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
   planExplorerDrop, planMove, topLevelOf,
@@ -66947,42 +66947,35 @@ let _captureTotal = 0;
 //
 // 所有者 2026-09-07：「实时监听最有用，用户用的过程中出现问题或者出现 xxx 内容，他能够全自动去帮用户
 // 去改内容、优化内容、操作，而不是傻傻等着用户一直手动反馈。」
-const _liveWatch = { cfgCache: {}, state: null, askBar: null, askTimer: null, screenTimer: null, btn: null, panel: null, uiBound: false };
+// **没有开关、没有面板**：所有者 2026-09-07 看到输入框工具条上的「实时监听」按钮后定调「这个选项不需要出现，
+// 是 AI 把控的」。它一直开着；规则（出现什么 → 做什么）由智能体按用户的话写进工作区的
+// .mrdayone/live-watch.json（LIVE_WATCH_CONFIG_FILE），这里每 15 秒重读一次。用户看到的只有聊天里那一行
+// 「发现问题 · …」的系统通知和随后自动开的那一轮。
+const _liveWatch = { cfgByRoot: {}, state: null, screenTimer: null, cfgTimer: null };
 
 function _liveWatchRoot() {
   try { return String(_currentSession()?.project || rootPath || workspaceRoots[0] || "").replace(/\/+$/, ""); } catch { return ""; }
 }
-function _liveWatchStoreKey(root = _liveWatchRoot()) { return `${LIVE_WATCH_STORE_KEY}:${root || "_global"}`; }
 function _liveWatchConfig(root = _liveWatchRoot()) {
-  const key = _liveWatchStoreKey(root);
-  if (_liveWatch.cfgCache[key]) return _liveWatch.cfgCache[key];
-  let raw = null;
-  try { raw = JSON.parse(localStorage.getItem(key) || "null"); } catch { raw = null; }
-  const cfg = normalizeLiveWatchConfig(raw);
-  _liveWatch.cfgCache[key] = cfg;
-  return cfg;
+  return _liveWatch.cfgByRoot[root || "_global"] || normalizeLiveWatchConfig(null);
 }
-function _liveWatchSaveConfig(cfg, root = _liveWatchRoot()) {
-  const key = _liveWatchStoreKey(root);
-  const norm = normalizeLiveWatchConfig(cfg);
-  _liveWatch.cfgCache[key] = norm;
-  try { localStorage.setItem(key, JSON.stringify(norm)); } catch {}
+/** 重读工作区里的规则文件；没有就是默认（四个来源全开、没有规则）。 */
+async function _liveWatchRefreshConfig(root = _liveWatchRoot()) {
+  if (!inTauri || !root) return;
+  let raw = null;
+  try {
+    const text = await backend.readTextFile(`${root}/${LIVE_WATCH_CONFIG_FILE}`);
+    raw = JSON.parse(String(text || "null"));
+  } catch { raw = null; }
+  _liveWatch.cfgByRoot[root] = normalizeLiveWatchConfig(raw);
   _liveWatchSyncTimers();
-  _liveWatchRenderBadge();
-  return norm;
 }
 function _liveWatchState() {
   if (!_liveWatch.state) _liveWatch.state = newWatchState();
   return _liveWatch.state;
 }
-function _liveWatchPolicy() {
-  let autonomy = "proactive";
-  try { autonomy = String(_loadAdaptiveProfile()?.autonomy || "proactive"); } catch {}
-  return resolveWatchPolicy(_liveWatchConfig(), autonomy);
-}
-/** 这个来源现在盯不盯：策略不是 off，且来源开着；用户明确写的规则不受来源开关影响。 */
+/** 这个来源现在盯不盯：来源开着，或用户写了针对它的规则。 */
 function _liveWatchWants(source) {
-  if (_liveWatchPolicy() === "off") return false;
   const cfg = _liveWatchConfig();
   if (cfg.sources[source]) return true;
   return cfg.rules.some((r) => r.enabled !== false && (r.source === source || r.source === "any"));
@@ -66991,12 +66984,9 @@ function _liveWatchWants(source) {
 /** 所有源头的汇合点：规则匹配 → 去重限流 → 自动开一轮 / 先提示 / 只记录。 */
 function _liveWatchEvent(ev, ctx = {}) {
   const cfg = _liveWatchConfig();
-  const policy = _liveWatchPolicy();
   const rule = matchRules(cfg.rules, ev);
   if (!rule && !cfg.sources[ev.source]) return;
-  const d = decideFire(_liveWatchState(), ev, cfg, policy);
-  _liveWatchRenderBadge();
-  if (_liveWatch.panel && !_liveWatch.panel.hidden) _liveWatchRenderPanel();
+  const d = decideFire(_liveWatchState(), ev, cfg, "auto");
   if (!d.fire) return;
   const sess = _currentSession();
   if (!sess) return;
@@ -67007,8 +66997,7 @@ function _liveWatchEvent(ev, ctx = {}) {
     terminalLabel: ctx.terminalLabel || "",
     workspaceRoot: _liveWatchRoot(),
   });
-  if (d.reason === "auto") _liveWatchDispatch(sess, notice, ev);
-  else _liveWatchAsk(sess, notice, ev);
+  _liveWatchDispatch(sess, notice, ev);
 }
 function _liveWatchDispatch(sess, notice, ev) {
   _queueNotice(sess, notice.text, { source: "live_watch", kind: "watch", task: notice.task, status: notice.status, display: notice.display });
@@ -67016,37 +67005,7 @@ function _liveWatchDispatch(sess, notice, ev) {
   const rec = _liveWatchState().recent.find((r) => r.id === ev.id);
   if (rec) rec.outcome = "auto";
   try { _flashTitle("实时监听：发现问题，自动处理中"); } catch {}
-  _liveWatchRenderBadge();
 }
-/** 「先提示我」：输入框上方挂一条，用户点「自动修复」才开一轮；一分钟没理会就收起（记录还在）。 */
-function _liveWatchAsk(sess, notice, ev) {
-  const composer = document.getElementById("composer");
-  if (!composer) return;
-  _liveWatchDismissAsk();
-  const bar = document.createElement("div");
-  bar.className = "watch-ask";
-  bar.innerHTML = `<span class="watch-ask__dot" aria-hidden="true"></span><span class="watch-ask__t"></span>`
-    + `<button type="button" class="watch-ask__btn watch-ask__btn--fix"></button><button type="button" class="watch-ask__btn"></button>`;
-  bar.querySelector(".watch-ask__t").textContent = `${t("watch.btn")}：${describeWatchEventForUser(ev)}`;
-  const [fixBtn, ignoreBtn] = bar.querySelectorAll(".watch-ask__btn");
-  fixBtn.textContent = t("watch.ask.fix");
-  ignoreBtn.textContent = t("watch.ask.ignore");
-  fixBtn.addEventListener("click", () => { _liveWatchDismissAsk(); _liveWatchDispatch(sess, notice, ev); });
-  ignoreBtn.addEventListener("click", () => {
-    const rec = _liveWatchState().recent.find((r) => r.id === ev.id);
-    if (rec) rec.outcome = "dismissed";
-    _liveWatchDismissAsk();
-  });
-  composer.insertBefore(bar, composer.firstChild);
-  _liveWatch.askBar = bar;
-  _liveWatch.askTimer = setTimeout(() => _liveWatchDismissAsk(), 60_000);
-  try { _flashTitle("实时监听：发现问题"); } catch {}
-}
-function _liveWatchDismissAsk() {
-  if (_liveWatch.askTimer) { clearTimeout(_liveWatch.askTimer); _liveWatch.askTimer = null; }
-  if (_liveWatch.askBar) { try { _liveWatch.askBar.remove(); } catch {} _liveWatch.askBar = null; }
-}
-
 // 源头 1：预览页面的控制台（调试桥送来的 preview-log）。
 function _liveWatchPreviewLog(d) {
   if (!_liveWatchWants("preview")) return;
@@ -67092,7 +67051,6 @@ function _liveWatchCaptureFlow(flow) {
 async function _liveWatchScreenTick() {
   if (!inTauri) return;
   const cfg = _liveWatchConfig();
-  if (_liveWatchPolicy() === "off") return;
   const rules = cfg.rules.filter((r) => r.enabled !== false && r.source === "screen" && r.app && r.pattern);
   if (!rules.length) return;
   const apps = [...new Set(rules.map((r) => r.app))];
@@ -67112,135 +67070,16 @@ async function _liveWatchScreenTick() {
 }
 function _liveWatchSyncTimers() {
   const cfg = _liveWatchConfig();
-  const need = inTauri && _liveWatchPolicy() !== "off" && cfg.rules.some((r) => r.enabled !== false && r.source === "screen");
+  const need = inTauri && cfg.rules.some((r) => r.enabled !== false && r.source === "screen");
   if (need && !_liveWatch.screenTimer) _liveWatch.screenTimer = setInterval(() => { void _liveWatchScreenTick(); }, 4000);
   if (!need && _liveWatch.screenTimer) { clearInterval(_liveWatch.screenTimer); _liveWatch.screenTimer = null; }
 }
+// 规则文件每 15 秒重读一次（智能体按用户的话改了它，不用重启就生效）。
+if (inTauri && !_liveWatch.cfgTimer) {
+  _liveWatch.cfgTimer = setInterval(() => { void _liveWatchRefreshConfig(); }, 15_000);
+  setTimeout(() => { void _liveWatchRefreshConfig(); }, 3000);
+}
 
-// ── UI：输入框工具条上的按钮 + 面板 ─────────────────────────────────────────
-function _liveWatchBindUI() {
-  if (_liveWatch.uiBound) return;
-  const bar = document.querySelector("#composer .composer__bar");
-  const anchor = document.getElementById("modelPicker");
-  if (!bar) return;
-  _liveWatch.uiBound = true;
-  const wrap = document.createElement("span");
-  wrap.className = "watch-picker";
-  wrap.innerHTML = `<button type="button" class="watch-btn" id="watchBtn" aria-haspopup="dialog" aria-expanded="false">`
-    + `<span class="watch-btn__dot" aria-hidden="true"></span><span class="watch-btn__label"></span><span class="watch-btn__count" hidden></span></button>`
-    + `<div class="watch-panel" id="watchPanel" role="dialog" hidden></div>`;
-  if (anchor && anchor.parentNode === bar) anchor.insertAdjacentElement("afterend", wrap); else bar.appendChild(wrap);
-  _liveWatch.btn = wrap.querySelector("#watchBtn");
-  _liveWatch.panel = wrap.querySelector("#watchPanel");
-  _liveWatch.btn.querySelector(".watch-btn__label").textContent = t("watch.btn");
-  _liveWatch.btn.title = t("watch.title");
-  _liveWatch.btn.addEventListener("click", (e) => { e.preventDefault(); _liveWatchTogglePanel(); });
-  document.addEventListener("mousedown", (e) => {
-    if (!_liveWatch.panel || _liveWatch.panel.hidden) return;
-    if (wrap.contains(e.target)) return;
-    _liveWatchTogglePanel(false);
-  });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && _liveWatch.panel && !_liveWatch.panel.hidden) _liveWatchTogglePanel(false); });
-  _liveWatchRenderBadge();
-  _liveWatchSyncTimers();
-}
-function _liveWatchTogglePanel(force) {
-  const panel = _liveWatch.panel;
-  if (!panel) return;
-  const open = force === undefined ? panel.hidden : !!force;
-  panel.hidden = !open;
-  _liveWatch.btn?.setAttribute("aria-expanded", open ? "true" : "false");
-  if (open) {
-    _liveWatchRenderPanel();
-    // 按钮贴在输入框工具条的右侧，面板按钮下方左对齐会伸出聊天栏。改成固定定位：贴着按钮上沿，
-    // 左右都夹在视口里（聊天栏很窄时向左伸到编辑器上方也没关系，它是浮层）。
-    try {
-      const r = _liveWatch.btn.getBoundingClientRect();
-      const w = Math.min(440, window.innerWidth - 16);
-      const left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
-      panel.style.width = `${w}px`;
-      panel.style.left = `${left}px`;
-      panel.style.bottom = `${Math.max(8, window.innerHeight - r.top + 8)}px`;
-      panel.style.maxHeight = `${Math.max(240, r.top - 16)}px`;
-    } catch {}
-  }
-}
-function _liveWatchRenderBadge() {
-  const btn = _liveWatch.btn;
-  if (!btn) return;
-  const policy = _liveWatchPolicy();
-  btn.dataset.policy = policy;
-  const recent = _liveWatchState().recent.filter((r) => Date.now() - r.at < 60 * 60 * 1000 && (r.outcome === "auto" || r.outcome === "ask"));
-  const c = btn.querySelector(".watch-btn__count");
-  if (c) { c.hidden = !recent.length; c.textContent = String(recent.length); }
-}
-function _liveWatchRenderPanel() {
-  const panel = _liveWatch.panel;
-  if (!panel) return;
-  const cfg = _liveWatchConfig();
-  const policy = _liveWatchPolicy();
-  let autonomyLabel = "";
-  try { autonomyLabel = _adaptiveOptionLabel("autonomy", _loadAdaptiveProfile()?.autonomy); } catch {}
-  const esc = (v) => _escHtml(String(v ?? ""));
-  const modes = [["auto", t("watch.mode.auto", { v: autonomyLabel })], ["on", t("watch.mode.on")], ["ask", t("watch.mode.ask")], ["off", t("watch.mode.off")]];
-  const srcLabel = (k) => t(`watch.source.${k}`);
-  const rules = cfg.rules;
-  const recent = _liveWatchState().recent.slice(0, 12);
-  const fmtTime = (at) => { try { return new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); } catch { return ""; } };
-  panel.innerHTML = `
-    <div class="watch-panel__head"><span class="watch-panel__title">${esc(t("watch.title"))}</span><span class="watch-panel__policy" data-policy="${esc(policy)}">${esc(t(`watch.policy.${policy}`))}</span></div>
-    <p class="watch-panel__desc">${esc(t("watch.desc"))}</p>
-    <div class="watch-panel__sec"><div class="watch-panel__label">${esc(t("watch.mode"))}</div>
-      <div class="watch-panel__modes">${modes.map(([v, l]) => `<label class="watch-panel__opt"><input type="radio" name="watchMode" value="${esc(v)}"${cfg.mode === v ? " checked" : ""}><span>${esc(l)}</span></label>`).join("")}</div></div>
-    <div class="watch-panel__sec"><div class="watch-panel__label">${esc(t("watch.sources"))}</div>
-      <div class="watch-panel__sources">${WATCH_SOURCES.map((k) => `<label class="watch-panel__opt"><input type="checkbox" data-src="${esc(k)}"${cfg.sources[k] ? " checked" : ""}><span>${esc(srcLabel(k))}</span></label>`).join("")}</div></div>
-    <div class="watch-panel__sec"><div class="watch-panel__label">${esc(t("watch.rules"))}</div>
-      <div class="watch-panel__rules">${rules.length ? rules.map((r) => `<div class="watch-rule" data-id="${esc(r.id)}"><label class="watch-rule__on"><input type="checkbox" data-rule-on="${esc(r.id)}"${r.enabled !== false ? " checked" : ""}></label><span class="watch-rule__src">${esc(r.source === "any" ? t("watch.source.any") : srcLabel(r.source))}${r.app ? ` · ${esc(r.app)}` : ""}</span><code class="watch-rule__pat">${esc(r.pattern || "*")}</code><span class="watch-rule__do">${esc(r.prompt || t("watch.rule.fix"))}</span><button type="button" class="watch-rule__del" data-rule-del="${esc(r.id)}" title="${esc(t("watch.rule.delete"))}">×</button></div>`).join("") : ""}</div>
-      <div class="watch-add">
-        <span class="watch-add__src"></span>
-        <input name="pattern" type="text" placeholder="${esc(t("watch.rule.pattern"))}" maxlength="300">
-        <input name="app" type="text" placeholder="${esc(t("watch.rule.app"))}" maxlength="120" hidden>
-        <input name="prompt" type="text" placeholder="${esc(t("watch.rule.prompt"))}" maxlength="2000">
-        <label class="watch-panel__opt watch-add__re"><input name="isRegex" type="checkbox"><span>regex</span></label>
-        <button type="button" class="watch-add__btn">${esc(t("watch.rule.add"))}</button>
-      </div></div>
-    <div class="watch-panel__sec"><div class="watch-panel__label">${esc(t("watch.recent"))}</div>
-      <div class="watch-panel__recent">${recent.length ? recent.map((r) => `<div class="watch-recent" data-outcome="${esc(r.outcome)}"><span class="watch-recent__t">${esc(fmtTime(r.at))}</span><span class="watch-recent__src">${esc(srcLabel(r.source))}</span><span class="watch-recent__msg" title="${esc(r.text)}">${esc(r.text.split("\n")[0].slice(0, 90))}</span><span class="watch-recent__out">${esc(t(`watch.outcome.${r.outcome || "recorded"}`))}</span></div>`).join("") : `<div class="watch-panel__empty">${esc(t("watch.recent.empty"))}</div>`}</div></div>`;
-  panel.querySelectorAll('input[name="watchMode"]').forEach((el) => el.addEventListener("change", () => {
-    _liveWatchSaveConfig({ ...cfg, mode: el.value }); _liveWatchRenderPanel();
-  }));
-  panel.querySelectorAll("input[data-src]").forEach((el) => el.addEventListener("change", () => {
-    _liveWatchSaveConfig({ ...cfg, sources: { ...cfg.sources, [el.dataset.src]: el.checked } });
-  }));
-  panel.querySelectorAll("input[data-rule-on]").forEach((el) => el.addEventListener("change", () => {
-    _liveWatchSaveConfig({ ...cfg, rules: cfg.rules.map((r) => (r.id === el.dataset.ruleOn ? { ...r, enabled: el.checked } : r)) });
-  }));
-  panel.querySelectorAll("button[data-rule-del]").forEach((el) => el.addEventListener("click", () => {
-    _liveWatchSaveConfig({ ...cfg, rules: cfg.rules.filter((r) => r.id !== el.dataset.ruleDel) }); _liveWatchRenderPanel();
-  }));
-  // 面板住在 #composer 那个 <form> 里：嵌套 <form> 会被解析器丢掉，所以这里是 div + 按钮，
-  // 回车在这几个输入框里也要拦住——否则会把整个输入框表单（发消息）提交出去。
-  const form = panel.querySelector(".watch-add");
-  const appInput = form.querySelector('input[name="app"]');
-  // 来源下拉用自绘的 buildSelectControl（原生 <select> 的弹出菜单由系统画，CSS 管不着）。
-  let _addSource = "any";
-  const syncApp = () => { appInput.hidden = _addSource !== "screen"; };
-  const srcOptions = ["any", ...WATCH_SOURCES].map((k) => [k, k === "any" ? t("watch.source.any") : srcLabel(k)]);
-  form.querySelector(".watch-add__src").appendChild(buildSelectControl(srcOptions, _addSource, (val) => { _addSource = String(val); syncApp(); }));
-  syncApp();
-  const addRule = () => {
-    const val = (n) => String(form.querySelector(`input[name="${n}"]`)?.value || "");
-    const rule = normalizeRule({ source: _addSource, pattern: val("pattern"), app: val("app"), prompt: val("prompt"), isRegex: !!form.querySelector('input[name="isRegex"]')?.checked });
-    if (!rule) { showToast(t("watch.rule.invalid")); return; }
-    _liveWatchSaveConfig({ ...cfg, rules: [...cfg.rules.filter((r) => r.id !== rule.id), rule] });
-    _liveWatchRenderPanel();
-  };
-  form.querySelector(".watch-add__btn").addEventListener("click", (e) => { e.preventDefault(); addRule(); });
-  form.querySelectorAll('input[type="text"]').forEach((el) => el.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); addRule(); }
-  }));
-}
-try { _liveWatchBindUI(); } catch {}
 
 function _onCaptureFlow(flow) {
   if (!flow || typeof flow !== "object") return;
