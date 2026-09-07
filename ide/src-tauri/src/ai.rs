@@ -635,7 +635,20 @@ async fn read_sse_text(
 ) -> Result<(String, String), String> {
     use futures_util::StreamExt;
     let deadline = Instant::now() + timeout;
-    let mse_stream = response.headers().get("x-mse-stream").is_some() && MSE.is_active();
+    // 判据只看响应头：头在 = body 就是密文，必须解得开，解不开要**响地失败**。
+    // 原来还 && 了 MSE.is_active()——会话在请求发出到响应回来之间被换掉时它照样为真（拿新密钥
+    // 解旧帧，一样失败），被 invalidate() 清空时它为假（于是把密文当明文 JSON 解析、整条流被
+    // 静默丢掉）。会话按 sid 找，见 mse.rs 的 Sessions。
+    let mse_stream = response.headers().get("x-mse-stream").is_some();
+    let mse_sid: Option<String> = response
+        .headers()
+        .get("x-mse-sid")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if mse_stream && !MSE.can_open_sse(mse_sid.as_deref()) {
+        return Err("MSE: 收到密文流，但封它的那个会话已经不在本地了（会话在途中被轮换或作废）。没有把密文当明文解析——重试一次即可。".to_string());
+    }
     let mse_req_seq: u64 = if mse_stream {
         response
             .headers()
@@ -694,7 +707,7 @@ async fn read_sse_text(
             // MSE: 外层 data 行是密文帧，先解开再拿到上游原本的 JSON。
             let mse_inner;
             let data = if mse_stream {
-                match MSE.open_sse_frame(data, mse_frame, mse_req_seq) {
+                match MSE.open_sse_frame(mse_sid.as_deref(), data, mse_frame, mse_req_seq) {
                     Ok(plaintext) => {
                         mse_frame += 1;
                         if crate::mse::MseClient::is_eos(&plaintext) {
@@ -3560,7 +3573,23 @@ async fn ai_chat_inner(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
-    let mse_stream = resp.headers().get("x-mse-stream").is_some() && MSE.is_active();
+    // 同上：只看头，会话按 sid 找（mse.rs 的 Sessions）。
+    let mse_stream = resp.headers().get("x-mse-stream").is_some();
+    let mse_sid: Option<String> = resp
+        .headers()
+        .get("x-mse-sid")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if mse_stream && !MSE.can_open_sse(mse_sid.as_deref()) {
+        let message = "MSE: 收到密文流，但封它的那个会话已经不在本地了（会话在途中被轮换或作废）。没有把密文当明文解析——重试一次即可。".to_string();
+        let _ = on_event.send(AiEvent::Error {
+            message: message.clone(),
+            endpoint: gateway_endpoint.clone(),
+            retry_elsewhere: None,
+        });
+        return Err(message);
+    }
     let mse_req_seq: u64 = if mse_stream {
         resp.headers()
             .get("x-mse-seq")
@@ -3715,7 +3744,7 @@ async fn ai_chat_inner(
             // MSE: 外层 data 行是密文帧，先解开再拿到上游原本的 JSON。
             let mse_inner;
             let data = if mse_stream {
-                match MSE.open_sse_frame(data, mse_frame, mse_req_seq) {
+                match MSE.open_sse_frame(mse_sid.as_deref(), data, mse_frame, mse_req_seq) {
                     Ok(plaintext) => {
                         mse_frame += 1;
                         if crate::mse::MseClient::is_eos(&plaintext) {

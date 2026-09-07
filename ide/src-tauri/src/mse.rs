@@ -35,9 +35,60 @@ const H_STREAM: &str = "x-mse-stream";
 
 /// 客户端会话状态。整个 App 生命周期内共享一个实例。
 pub struct MseClient {
-    session: RwLock<Option<Session>>,
+    sessions: RwLock<Sessions>,
     /// 允许的服务端 kid 列表（pin）。为空时接受任何 kid。
     pinned_kids: Vec<String>,
+}
+
+/// 当前会话，外加最近**退役**的几份。
+///
+/// 为什么要留退役的：会话是全局一份，而一条 SSE 流会跑几分钟。这期间只要有别的东西换掉
+/// 会话——保活循环发现过期后重建（ai.rs 的 `start_gateway_transport_warmup`）、另一个并发
+/// 请求吃到 409 rekey 后 `invalidate` + `establish`——在途那条流剩下的每一帧就都用新会话的
+/// 密钥和 sid 去解，AAD 和密钥双双对不上，于是「MSE: 帧解密失败: MSE: 解密失败」，一整轮
+/// 几分钟的回答当场作废。帧是服务端用**收到请求时那个会话**封的，所以客户端必须按响应头
+/// 里的 sid 回到那一份，而不是拿"此刻的"那一份去猜。
+///
+/// 留几份就够：轮换本身很少（TTL 半小时级 / 409），而在途的流最多也就几条。退役的密钥是
+/// 已经用过的会话密钥、仍在同一个进程内存里，界限没有变宽；Session 的 Drop 照旧 zeroize。
+#[derive(Default)]
+struct Sessions {
+    current: Option<Session>,
+    retired: Vec<Session>,
+}
+
+/// 最多留几份退役会话。
+const RETIRED_KEEP: usize = 4;
+
+impl Sessions {
+    /// 换上新会话，旧的转入退役队列（**不是丢掉**）。
+    fn install(&mut self, next: Session) {
+        if let Some(prev) = self.current.take() {
+            self.retired.insert(0, prev);
+            self.retired.truncate(RETIRED_KEEP);
+        }
+        self.current = Some(next);
+    }
+
+    /// 作废当前会话（服务端 409）。同样转入退役队列：此刻在途的流还得靠它解帧。
+    fn retire_current(&mut self) {
+        if let Some(prev) = self.current.take() {
+            self.retired.insert(0, prev);
+            self.retired.truncate(RETIRED_KEEP);
+        }
+    }
+
+    /// 按 sid 找会话。`None` = 对端没告诉我们 sid（老网关），退回当前那一份。
+    fn find(&self, sid: Option<&str>) -> Option<&Session> {
+        match sid {
+            None => self.current.as_ref(),
+            Some(want) => self
+                .current
+                .as_ref()
+                .filter(|s| s.sid == want)
+                .or_else(|| self.retired.iter().find(|s| s.sid == want)),
+        }
+    }
 }
 
 struct Session {
@@ -104,7 +155,7 @@ struct SealedResponse {
 impl MseClient {
     pub fn new(pinned_kids: Vec<String>) -> Self {
         Self {
-            session: RwLock::new(None),
+            sessions: RwLock::new(Sessions::default()),
             pinned_kids,
         }
     }
@@ -198,26 +249,41 @@ impl MseClient {
             expires_at: unix_secs() + ttl.saturating_sub(30),
         };
 
-        if let Ok(mut guard) = self.session.write() {
-            *guard = Some(session);
+        if let Ok(mut guard) = self.sessions.write() {
+            guard.install(session);
         }
         Ok(())
     }
 
     /// 会话是否可用且未过期。
     pub fn is_active(&self) -> bool {
-        self.session
+        self.sessions
             .read()
             .ok()
-            .and_then(|g| g.as_ref().map(|s| s.expires_at > unix_secs()))
+            .and_then(|g| g.current.as_ref().map(|s| s.expires_at > unix_secs()))
             .unwrap_or(false)
     }
 
-    /// 服务端返回 409 rekey 时清掉会话，下一次请求走明文。
+    /// 服务端返回 409 rekey 时作废当前会话，下一次请求重新握手。
+    ///
+    /// **转入退役而不是丢掉**：此刻可能有别的流正在用它解帧，丢了那条流就整段废掉。
     pub fn invalidate(&self) {
-        if let Ok(mut guard) = self.session.write() {
-            *guard = None;
+        if let Ok(mut guard) = self.sessions.write() {
+            guard.retire_current();
         }
+    }
+
+    /// 这条流的帧解得开吗（sid 来自响应头 `x-mse-sid`）。
+    ///
+    /// 调用方据此决定「按密文解」还是「报错」，**不要**再拿 `is_active()` 判：会话在请求
+    /// 发出到响应回来之间被换掉时它照样为真，于是拿新密钥去解旧帧，一样失败；反过来被
+    /// `invalidate()` 清空时它为假，调用方会把密文当明文 JSON 解析，然后静默丢掉整条流。
+    pub fn can_open_sse(&self, sid: Option<&str>) -> bool {
+        self.sessions
+            .read()
+            .ok()
+            .map(|g| g.find(sid).is_some())
+            .unwrap_or(false)
     }
 
     /// 封装一个 POST 请求。返回 (headers, sealed_body)。
@@ -228,8 +294,8 @@ impl MseClient {
         body: &serde_json::Value,
         extra_headers: Option<std::collections::HashMap<String, String>>,
     ) -> Result<(Vec<(String, String)>, Vec<u8>), String> {
-        let mut guard = self.session.write().map_err(|_| "MSE: 锁中毒")?;
-        let session = guard.as_mut().ok_or("MSE: 会话未建立")?;
+        let mut guard = self.sessions.write().map_err(|_| "MSE: 锁中毒")?;
+        let session = guard.current.as_mut().ok_or("MSE: 会话未建立")?;
 
         if session.expires_at <= unix_secs() {
             return Err("MSE: 会话过期".to_string());
@@ -270,8 +336,12 @@ impl MseClient {
         resp_headers: &reqwest::header::HeaderMap,
         body: &[u8],
     ) -> Result<(u16, serde_json::Value), String> {
-        let guard = self.session.read().map_err(|_| "MSE: 锁中毒")?;
-        let session = guard.as_ref().ok_or("MSE: 会话未建立")?;
+        let guard = self.sessions.read().map_err(|_| "MSE: 锁中毒")?;
+        // 按响应自己报的 sid 找会话：并发的重新握手会换掉 current，拿它解旧响应必然失败。
+        let sid = resp_headers.get(H_SID).and_then(|v| v.to_str().ok());
+        let session = guard
+            .find(sid)
+            .ok_or_else(|| session_gone_msg("响应", sid))?;
 
         let seq: u64 = resp_headers
             .get(H_SEQ)
@@ -306,12 +376,15 @@ impl MseClient {
     /// 与服务端不匹配，解密失败。
     pub fn open_sse_frame(
         &self,
+        sid: Option<&str>,
         frame_data: &str,
         frame_seq: u64,
         req_seq: u64,
     ) -> Result<Vec<u8>, String> {
-        let guard = self.session.read().map_err(|_| "MSE: 锁中毒")?;
-        let session = guard.as_ref().ok_or("MSE: 会话未建立")?;
+        let guard = self.sessions.read().map_err(|_| "MSE: 锁中毒")?;
+        // 帧是服务端用**收到这个请求时**那个会话封的。全局的 current 可能已经被保活循环或
+        // 另一个请求的 409 rekey 换掉了，按 sid 回到原来那一份，而不是拿此刻这份去解。
+        let session = guard.find(sid).ok_or_else(|| session_gone_msg("流", sid))?;
 
         let envelope = B64U
             .decode(frame_data.trim())
@@ -321,9 +394,37 @@ impl MseClient {
         open(&session.k_s2c, &aad, &envelope)
     }
 
+    /// 造一个会话装进去。只给测试用——真会话必须走 `establish` 的 ECDH。
+    #[cfg(test)]
+    fn install_test_session(&self, sid: &str, k_s2c: [u8; 32]) {
+        let mut guard = self.sessions.write().unwrap();
+        guard.install(Session {
+            kid: "test-kid".into(),
+            sid: sid.into(),
+            epk_b64u: String::new(),
+            k_c2s: [0u8; 32],
+            k_s2c,
+            seq: 0,
+            server_time_offset: 0,
+            expires_at: unix_secs() + 3600,
+        });
+    }
+
     /// 检测一个 SSE data 行是否是 EOS 标记。
     pub fn is_eos(plaintext: &[u8]) -> bool {
         plaintext == b"{\"__mse_eos\":true}"
+    }
+}
+
+/// 找不到封这条数据的那个会话时说的话。分清「从来没建立」和「建立过但已经轮换掉了」——
+/// 后者不是中间人，是本地会话在途中被换了，重试就能好。
+fn session_gone_msg(what: &str, sid: Option<&str>) -> String {
+    match sid {
+        Some(sid) => format!(
+            "MSE: 封这条{what}的会话（sid {}）已经不在本地了——会话在收到它之前被轮换或作废了。这不是篡改，重试一次即可。",
+            sid.chars().take(12).collect::<String>()
+        ),
+        None => format!("MSE: 会话未建立，无法解开这条{what}"),
     }
 }
 
@@ -470,6 +571,80 @@ mod tests {
         let spki = b"test-spki-data-for-sid";
         assert_eq!(sid_of(spki), sid_of(spki));
         assert_eq!(B64U.decode(sid_of(spki)).unwrap().len(), 18);
+    }
+
+    /// 造一帧服务端会发出来的东西：`base64url(seal(k_s2c, aad_sse(sid, req_seq, frame), block))`。
+    fn server_frame(sid: &str, k: &[u8; 32], req_seq: u64, frame: u64, block: &[u8]) -> String {
+        B64U.encode(seal(k, &aad_sse(sid, req_seq, frame), block).unwrap())
+    }
+
+    /// **这条是那个 bug 的落点。**
+    ///
+    /// 会话是全局一份，而一条流要跑几分钟。保活循环重建会话、或者另一个并发请求吃到 409 后
+    /// invalidate+establish，都会在流跑到一半时把它换掉；换掉之后剩下的每一帧都拿新密钥、新
+    /// sid 去解，于是「MSE: 帧解密失败: MSE: 解密失败」，一整轮几分钟的回答当场作废。
+    /// 帧要按**封它的那个会话**（响应头 x-mse-sid）解，不是按"此刻的"那一份。
+    #[test]
+    fn a_rotation_mid_stream_does_not_break_the_frames_already_in_flight() {
+        let c = MseClient::new(vec![]);
+        let k_a = [11u8; 32];
+        c.install_test_session("sid-A", k_a);
+        let f0 = server_frame("sid-A", &k_a, 7, 0, b"data: {\"i\":0}\n\n");
+        let f1 = server_frame("sid-A", &k_a, 7, 1, b"data: {\"i\":1}\n\n");
+        assert_eq!(c.open_sse_frame(Some("sid-A"), &f0, 0, 7).unwrap(), b"data: {\"i\":0}\n\n");
+
+        // 流跑到一半，别的东西把会话换了（409 rekey / 保活重建）。
+        c.install_test_session("sid-B", [22u8; 32]);
+        assert!(
+            c.open_sse_frame(Some("sid-A"), &f1, 1, 7).is_ok(),
+            "会话在流中途被换掉，剩下的帧就解不开了——这正是所有者截图里那条「MSE: 帧解密失败」"
+        );
+
+        // 409 作废当前会话也一样：在途那条流还得靠它。
+        c.invalidate();
+        assert!(c.open_sse_frame(Some("sid-A"), &f1, 1, 7).is_ok(), "invalidate 把在途的流一起废了");
+    }
+
+    /// 不按 sid 找就会拿错会话——这是修之前的行为，钉住它免得有人"顺手简化"回去。
+    #[test]
+    fn the_current_session_is_the_wrong_key_once_it_has_rotated() {
+        let c = MseClient::new(vec![]);
+        let k_a = [11u8; 32];
+        c.install_test_session("sid-A", k_a);
+        let f = server_frame("sid-A", &k_a, 1, 0, b"x");
+        c.install_test_session("sid-B", [22u8; 32]);
+        assert!(c.open_sse_frame(None, &f, 0, 1).is_err(), "None 该退回 current（新会话），解不开");
+        assert!(c.open_sse_frame(Some("sid-A"), &f, 0, 1).is_ok());
+    }
+
+    /// 退役队列是有界的；超出之后要说清是"轮换掉了、重试即可"，不是"被篡改"。
+    #[test]
+    fn a_long_gone_session_says_it_rotated_not_that_someone_tampered() {
+        let c = MseClient::new(vec![]);
+        let k_a = [11u8; 32];
+        c.install_test_session("sid-A", k_a);
+        let f = server_frame("sid-A", &k_a, 1, 0, b"x");
+        assert!(c.can_open_sse(Some("sid-A")));
+        for i in 0..=RETIRED_KEEP {
+            c.install_test_session(&format!("sid-{i}"), [33u8; 32]);
+        }
+        assert!(!c.can_open_sse(Some("sid-A")));
+        let err = c.open_sse_frame(Some("sid-A"), &f, 0, 1).unwrap_err();
+        assert!(err.contains("轮换"), "{err}");
+        assert!(err.contains("重试"), "{err}");
+        assert!(!err.contains("解密失败"), "别再报成解密失败——那读起来像被篡改：{err}");
+    }
+
+    /// AAD 里的帧号和请求号仍然管用：重排、跨请求重放都开不了。
+    #[test]
+    fn frames_are_still_bound_to_their_order_and_request() {
+        let c = MseClient::new(vec![]);
+        let k = [11u8; 32];
+        c.install_test_session("sid-A", k);
+        let f2 = server_frame("sid-A", &k, 7, 2, b"x");
+        assert!(c.open_sse_frame(Some("sid-A"), &f2, 2, 7).is_ok());
+        assert!(c.open_sse_frame(Some("sid-A"), &f2, 3, 7).is_err(), "帧号错位不该开得了");
+        assert!(c.open_sse_frame(Some("sid-A"), &f2, 2, 8).is_err(), "换个请求号不该开得了");
     }
 
     #[test]

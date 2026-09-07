@@ -1276,7 +1276,13 @@ fn seal_stream(ctx: Ctx, parts: axum::http::response::Parts, body: Body) -> Resp
             // 缓冲里已经有完整事件块就先发它。
             if let Some(cut) = find_event_end(&s.buf) {
                 let block: Vec<u8> = s.buf.drain(..cut).collect();
-                let out = seal_frame(&s.ctx, s.frame, &block);
+                // 封不上就**就地断流**（不发 EOS）：客户端读不到结束标记 = 知道这条流是断的。
+                // 原来是发一行注释再照常 `frame += 1`——客户端看不见注释里的帧、自己的帧号不动，
+                // 从那之后每一帧的 AAD 都错位一个，报的是「MSE: 帧解密失败: MSE: 解密失败」，
+                // 读起来像被篡改，实际是这里悄悄跳了个号。旁边注释原本承诺的就是"报截断"。
+                let Some(out) = seal_frame(&s.ctx, s.frame, &block) else {
+                    return None;
+                };
                 s.frame += 1;
                 return Some((out, s));
             }
@@ -1284,12 +1290,15 @@ fn seal_stream(ctx: Ctx, parts: axum::http::response::Parts, body: Body) -> Resp
                 // 收尾：残留的不完整块（上游没以空行结束）也要送出去，然后是 EOS。
                 if !s.buf.is_empty() {
                     let block: Vec<u8> = std::mem::take(&mut s.buf);
-                    let out = seal_frame(&s.ctx, s.frame, &block);
+                    let Some(out) = seal_frame(&s.ctx, s.frame, &block) else {
+                        return None;
+                    };
                     s.frame += 1;
                     return Some((out, s));
                 }
                 s.finished = true;
-                let out = seal_frame(&s.ctx, s.frame, br#"{"__mse_eos":true}"#);
+                // EOS 都封不上就别发：宁可让客户端判成截断，也别发一行它解不开的东西。
+                let out = seal_frame(&s.ctx, s.frame, br#"{"__mse_eos":true}"#)?;
                 return Some((out, s));
             }
             match s.inner.next().await {
@@ -1323,12 +1332,22 @@ fn seal_stream(ctx: Ctx, parts: axum::http::response::Parts, body: Body) -> Resp
     res
 }
 
-fn seal_frame(ctx: &Ctx, frame: u64, block: &[u8]) -> axum::body::Bytes {
+/// 封一帧。封不上返回 `None` —— 调用方据此**断流**。
+///
+/// 不能发一行注释再把帧号加一：客户端只数它真正解开的帧，服务端多加的这一号会让之后
+/// 每一帧的 AAD 都错位，症状是「MSE: 帧解密失败」，而真正发生的事是跳号。断流让客户端
+/// 读不到 EOS，判成截断——那才是这里本来要给的信号。
+fn seal_frame(ctx: &Ctx, frame: u64, block: &[u8]) -> Option<axum::body::Bytes> {
     let aad = aad_sse(&ctx.sid, ctx.seq, frame);
     match seal(&ctx.k_s2c, &aad, block) {
-        Ok(env) => axum::body::Bytes::from(format!("data: {}\n\n", B64U.encode(env))),
-        // 封不上就发一个注释行；客户端读不到 EOS 会报截断，好过静默塞明文过去。
-        Err(_) => axum::body::Bytes::from_static(b": mse-frame-error\n\n"),
+        Ok(env) => Some(axum::body::Bytes::from(format!(
+            "data: {}\n\n",
+            B64U.encode(env)
+        ))),
+        Err(_) => {
+            tracing::error!("MSE: 帧 {frame} 封装失败，断流（客户端会判成截断）");
+            None
+        }
     }
 }
 
