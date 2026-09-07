@@ -1812,7 +1812,7 @@
     "type": "function",
     "function": {
       "name": "browser",
-      "description": "Drive a real Chromium-based browser (Chrome / Edge / Brave / Chromium, configurable) and return screenshots, numbered interactive nodes and visible text. It runs on a persistent profile — whatever was signed into here stays signed in — and sessions are sticky and reused by default: close only releases this task's hold, close with force:true actually shuts it down. Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) → this tool, which addresses elements by node number. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → automation, which synthesises real OS mouse and keyboard events. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser — re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. The account the user is already signed into in their OWN everyday browser is unreachable from here (a debugging port is a launch-time flag): use system open → read_screen → ui_click instead. To merely show the user a page (a dev server you started, a deployed site, a doc) use action open: it hands the URL to their default browser with no automation window, and you do not see it. Actions: mytabs, open, navigate, observe, viewport, click, dblclick, rightclick, longpress, type, clear, append, autofill/fill, hover, drag, slide, swipe, wheel, toggle/uncheck, select, focus/blur, press, scroll, wait, eval, screenshot, design, network, inspect, nodes, assert, check, batch, upload, cookies, storage, tab, back, forward, reload, task, close. Start with observe or nodes, then act by node; for multi-step interaction use batch — real pointer/mouse events, drag/slide/swipe/wheel, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, settling after each action, and expect* acceptance checks that stop and report why on failure; for sign-in, sign-up, search and admin forms use autofill and read back missing/invalid. Verify afterwards with assert, nodes or check; inspect for styling, network for requests. Before delivering UI, check both desktop and phone via viewport for a public-facing site; an explicitly desktop context needs desktop only. Unsure how many steps a page flow takes → action task with a goal: the tool observes, acts and re-observes by itself, up to max_steps rounds, and reports what it did plus the result (summary). Several pages at once — read a code in webmail, compare two pages — → tab (op list / new / switch / close; later actions target the current tab); back / forward / reload move through history.",
+      "description": "Drive a real Chromium browser (Chrome / Edge / Brave, configurable) on a persistent automation profile: whatever you sign into here stays signed in; sessions are sticky and reused by default (close only releases this task's hold, force:true really quits). Every action returns the page after it: a screenshot with red numbers on interactive elements, the numbered node list ([n] role \"name\" state; off = outside the viewport), what changed since the previous step (URL / title / nodes / focus / dialogs / new tabs), where the viewport sits on the page, and a text excerpt. One numbering everywhere: red digit = node = the [n] inside read output; act with node=n and use fresh numbers after every step. Workflow: navigate → read (the page as a document, paged by offset) or find (text / pattern / role → matching nodes plus text hits with context, first hit scrolled into view) → act by node (click / type / select / toggle / press / hover / drag / upload / scroll to a node) → verify with assert / check / find. Many steps at once → batch: real pointer/mouse events, drag / slide / swipe / wheel, targeting through Shadow DOM and same-origin iframes, occlusion detection, and expect* checks that stop on failure. Unknown number of steps → task with a goal: the tool observes, acts, notes findings and re-observes by itself up to max_steps rounds and returns a summary. Forms → autofill with fields by meaning, then read back missing / invalid. Several pages → tab (list / new / switch / close); back / forward / reload move through history. JS dialogs are accepted automatically and reported; a link that opens a new tab is followed automatically; a click blocked by a cookie banner or modal dismisses it first and says so; a captcha or login wall stops with the reason instead of retrying. Target lives INSIDE a web page (DOM nodes, forms, text, page screenshots, network / console, cookies / storage, design / inspect for styling) → this tool, which addresses elements by node number. Target lives OUTSIDE the page — an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps — or the page blocks CDP → computer (automation is an alias), which synthesises real OS mouse and keyboard events. Both drive the same browser brand (one setting decides for both). Do not reach for computer just because a click failed in browser — re-read the nodes first; and do not drive a web page through computer coordinates when browser can address it by node. The user's OWN everyday browser is unreachable (a debugging port is a launch flag): use system open → read_screen → ui_click for it. Just showing the user a page → open (hands the URL to their default browser; you see nothing). Before delivering a public-facing UI, check desktop and phone via viewport.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1852,6 +1852,8 @@
               "network",
               "inspect",
               "nodes",
+              "read",
+              "find",
               "assert",
               "check",
               "batch",
@@ -1865,7 +1867,7 @@
               "reload",
               "tab"
             ],
-            "description": "The browser action to perform. mytabs = look at what the user already has open in their OWN browser (titles and URLs only, macOS, no automation window) — check it first when the task touches a page they may already be on. open = hand the URL to the USER'S OWN default browser for them to look at; you do not see the page. observe = structured page state (ready/active/iframe/shadow/nodes). check only performs a page health check; checkboxes and switches use toggle with checked, or batch op check/uncheck. upload sends a file to an <input type=file>: selector picks the input, path/paths the absolute local file path. task = give the goal in plain language (goal, optional url, max_steps): the tool observes, acts and re-observes by itself, up to max_steps rounds, and reports what it did and the result — use it when you do not know how many steps a page flow takes. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. back / forward / reload move through history."
+            "description": "The browser action to perform. read = the page as a document (offset / max_chars / selector or node). find = locate by text / pattern / role: node hits plus text hits with context, scrolls to the first. nodes / observe = structured node list. scroll = by amount, or to a node / target text. mytabs = look at what the user already has open in their OWN browser (titles and URLs only, macOS, no automation window) — check it first when the task touches a page they may already be on. open = hand the URL to the USER'S OWN default browser for them to look at; you do not see the page. task = goal + optional url + max_steps: observe → act → note → re-observe by itself, returns a summary. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. check only performs a page health check; checkboxes and switches use toggle with checked. upload sends a file to an <input type=file>: selector picks the input, path / paths the absolute local file path. back / forward / reload move through history."
           },
           "url": {
             "type": "string",
@@ -2102,6 +2104,22 @@
               "close"
             ],
             "description": "For tab: list / new (opens url when given) / switch (tab) / close (tab)."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "For read: start at this character offset (the next value returned by the previous read)."
+          },
+          "max_chars": {
+            "type": "integer",
+            "description": "For read: characters per page, default 6000, max 16000."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "For find: a case-insensitive regular expression instead of text."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "For find: maximum hits per kind (nodes / text), default 12."
           },
           "tab": {
             "type": "integer",

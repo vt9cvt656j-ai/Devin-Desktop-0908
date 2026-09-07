@@ -14,6 +14,9 @@
 // shadows, gradients, CSS custom properties, and motion (durations + easing). Lets
 // the agent design GROUNDED in a real reference instead of from memory. No regex
 // (so it's safe inside a template literal / no backslash escaping).
+// 节点编号器和 read / find 住在 browser-read-scripts.js；nodes 快照用同一份编号器，红数字 = node 号。
+import { NODE_TAG_SNIPPET, NODE_TAG_CAP } from "./browser-read-scripts.js";
+
 export const _DESIGN_EXTRACT_JS = `(() => {
   try {
     const vars = {};
@@ -305,72 +308,14 @@ export function _swapTwClass(classStr, prop, value) {
 
 export const _NODES_EXTRACT_JS = `(() => {
   try {
-    var clean = function(s){ s=String(s||''); var out='', sp=false; for (var k=0;k<s.length;k++){ var ch=s[k]; if (ch===' '||ch==='\\n'||ch==='\\t'||ch==='\\r'){ if(!sp){ out+=' '; sp=true; } } else { out+=ch; sp=false; } } return out.trim(); };
-    var rootList = function(){
-      // blocked：**够不着**的 iframe（跨域）。此前它们被静默跳过，contexts.iframes 只数同源的，
-      // 模型看到 iframes:0 就以为页面没有嵌套内容，然后对着一个根本不在本文档里的元素
-      // 无穷换选择器。Stripe 支付、第三方登录、嵌入式播放器全是这个形态。
-      var out = [], seen = [], iframeCount = 0, shadowCount = 0, blocked = [];
-      var push = function(root, depth){
-        if (!root || seen.indexOf(root) >= 0 || depth > 5) return;
-        seen.push(root); out.push(root);
-        var all = [];
-        try { all = Array.prototype.slice.call(root.querySelectorAll('*'), 0, 2200); } catch(e){}
-        for (var i=0;i<all.length;i++){
-          var el = all[i];
-          try { if (el.shadowRoot) { shadowCount++; push(el.shadowRoot, depth + 1); } } catch(e1){}
-          try { if (el.tagName === 'IFRAME') { if (el.contentDocument) { iframeCount++; push(el.contentDocument, depth + 1); } else { var _r = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r.width), h: Math.round(_r.height) }); } } } catch(e2){ try { var _r2 = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r2.width), h: Math.round(_r2.height) }); } catch(e3){} }
-        }
-      };
-      push(document, 0);
-      out.iframeCount = iframeCount; out.shadowCount = shadowCount; out.blockedFrames = blocked;
-      return out;
-    };
-    var qsa = function(sel){
-      var out = [], rs = rootList();
-      for (var d=0; d<rs.length; d++){ try { out = out.concat(Array.prototype.slice.call(rs[d].querySelectorAll(sel))); } catch(e){} }
-      return out.filter(function(el, i){ return el && out.indexOf(el) === i; });
-    };
-    var rootOf = function(el){ try { return el && el.getRootNode ? el.getRootNode() : document; } catch(e){ return document; } };
-    var parentDeep = function(el){ try { return el && (el.parentElement || (rootOf(el).host || null)); } catch(e){ return null; } };
-    var closestDeep = function(el, sel){ var cur = el, guard = 0; while (cur && cur.nodeType === 1 && guard++ < 80) { try { if (cur.matches && cur.matches(sel)) return cur; } catch(e){} cur = parentDeep(cur); } return null; };
-    qsa('[data-mnode]').forEach(function(e){ e.removeAttribute('data-mnode'); });
-    var SEL = 'a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=tab],[role=menu],[role=menuitem],[role=menuitemcheckbox],[role=listbox],[role=option],[role=checkbox],[role=switch],[role=radio],[role=combobox],[role=slider],[onclick],[draggable=true],[data-radix-collection-item],[data-state],[data-value],[cmdk-item],[contenteditable=""],[contenteditable=true],summary,label';
-    var nameOf = function(el){ var t = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') || (el.tagName==='INPUT'||el.tagName==='SELECT'||el.tagName==='TEXTAREA'? '' : (el.innerText||el.textContent||'')) || el.getAttribute('name') || ''; try { var lab = closestDeep(el, 'label'); if (lab && !t) t = lab.innerText || lab.textContent || ''; } catch(e){} try { var host = rootOf(el).host; if (host && !t) t = host.getAttribute('aria-label') || host.getAttribute('title') || host.getAttribute('data-testid') || host.getAttribute('id') || ''; } catch(e2){} return clean(t).slice(0,52); };
-    var isH = function(tag){ return tag.length===2 && tag.charAt(0)==='h' && tag.charAt(1)>='1' && tag.charAt(1)<='6'; };
-    var roleOf = function(el){ var r=el.getAttribute('role'); if (r) return r; var tag=el.tagName.toLowerCase();
-      if (tag==='a') return 'link'; if (tag==='button') return 'button';
-      if (tag==='input'){ var ty=(el.getAttribute('type')||'text').toLowerCase(); if (ty==='checkbox') return 'checkbox'; if (ty==='radio') return 'radio'; if (ty==='submit'||ty==='button'||ty==='reset'||ty==='image') return 'button'; if (ty==='range') return 'slider'; if (ty==='file') return 'file'; return 'textbox'; }
-      if (tag==='select') return 'combobox'; if (tag==='textarea') return 'textbox';
-      if (isH(tag)) return 'heading'; if (tag==='summary') return 'summary'; if (tag==='label') return 'label';
-      return tag; };
-    var stateOf = function(el){ var s={};
-      if (el.disabled || el.getAttribute('aria-disabled')==='true') s.disabled=true;
-      if (el.checked || el.getAttribute('aria-checked')==='true') s.checked=true;
-      var exp=el.getAttribute('aria-expanded'); if (exp!=null) s.expanded=(exp==='true');
-      if (el.getAttribute('aria-selected')==='true') s.selected=true;
-      if ((el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.tagName==='SELECT') && el.value) s.value=String(el.value).slice(0,32);
-      if (el.tagName==='A' && el.getAttribute('href')) s.href=el.getAttribute('href').slice(0,70);
-      return s; };
-    var roots = rootList(), nodes=[], id=0;
-    var els = qsa(SEL).slice(0, 1500);
-    for (var i=0;i<els.length;i++){
-      if (id>=110) break;
-      var el=els[i], r; try { r=el.getBoundingClientRect(); } catch(e){ continue; }
-      var cs=getComputedStyle(el);
-      if (r.width<1||r.height<1||cs.visibility==='hidden'||cs.display==='none'||cs.opacity==='0') continue;
-      el.setAttribute('data-mnode', String(id));
-      var inView = !(r.bottom<=0||r.right<=0||r.top>=innerHeight||r.left>=innerWidth);
-      var node={ i:id, r:roleOf(el), n:nameOf(el) };
-      var st=stateOf(el); for (var kk in st){ node.s=st; break; }
-      if (!inView) node.off=1;
-      nodes.push(node); id++;
-    }
-    var heads = qsa('h1,h2,h3').slice(0, 20)
+    ${NODE_TAG_SNIPPET}
+    var T = __mtag(${NODE_TAG_CAP}), clean = T.clean, roots = T.roots;
+    var nodes = T.nodes.map(function(n){ var o = { i:n.i, r:n.r, n:n.n }; if (n.s) o.s = n.s; if (n.off) o.off = 1; return o; });
+    var heads = T.qsa('h1,h2,h3', roots).slice(0, 20)
       .map(function(h){ return { r:'h'+(h.tagName.charAt(1)), n:clean(h.innerText||'').slice(0,56) }; })
       .filter(function(h){ return h.n; }).slice(0,12);
-    return JSON.stringify({ url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:document.activeElement ? nameOf(document.activeElement) : '', contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0, crossOriginFrames:(roots.blockedFrames||[]).slice(0,6) }, total:id, structure:heads, nodes:nodes,
-      legend:'i=节点号(用 browser click/type node=i 操作)·r=角色·n=名称·s=状态(disabled/checked/expanded/value/href)·off=1 表示在视口外(先 scroll 再点)·contexts.iframes/shadowRoots=同源的已纳入观察；contexts.crossOriginFrames=**够不着**的跨域 iframe，里面的元素在这份快照里一个都没有，别对它们换选择器——改成 navigate 到那个 src，或换用接口/其它路径' });
+    return JSON.stringify({ url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:document.activeElement && document.activeElement !== document.body ? T.nameOf(document.activeElement) : '', contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0, crossOriginFrames:(roots.blockedFrames||[]).slice(0,6) }, total:T.total, structure:heads, nodes:nodes,
+      legend:'i=节点号(用 browser click/type node=i 操作；和截图上的红数字是同一套编号)·r=角色·n=名称·s=状态(disabled/checked/expanded/value/href)·off=1 表示在视口外(直接操作会先滚过去)·contexts.iframes/shadowRoots=同源的已纳入观察；contexts.crossOriginFrames=**够不着**的跨域 iframe，里面的元素在这份快照里一个都没有，别对它们换选择器——改成 navigate 到那个 src，或换用接口/其它路径' });
   } catch (e) { return JSON.stringify({ error: String(e) }); }
 })()`;
 

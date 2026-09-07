@@ -163,3 +163,67 @@ test("模型 config：直连自定义模型按它的地址/协议且不走网关
   assert.equal(taskModelConfig(base, () => null).viaGateway, true);
   assert.equal(TASK_DEFAULTS.hardMaxSteps, 30);
 });
+
+// ── 2026-09-06 加的 read / find / note / back / tab ──
+const article = { url: "https://x.io/post", title: "文章", nodes: [{ i: 1, r: "link", n: "下一页" }], text: "第一段 价格 99 元" };
+const readJs = (o) => `READ:${JSON.stringify(o)}`;
+const findJs = (o) => `FIND:${JSON.stringify(o)}`;
+function makeReaderWorld({ pages, replies }) {
+  const w = makeWorld({ pages, replies });
+  const inner = w.invoke;
+  w.invoke = async (name, args) => {
+    w.calls.push([name, args]);
+    if (name === "browser_eval" && /^READ:/.test(args.script)) { const o = JSON.parse(args.script.slice(5)); return { screenshot: "img", url: "https://x.io/post", result: JSON.stringify({ root: "main", offset: o.offset || 0, chars: 5, total: 12, next: (o.offset || 0) + 5 < 12 ? (o.offset || 0) + 5 : null, outline: [], text: o.offset ? "后半段" : "价格 99 元" }) }; }
+    if (name === "browser_eval" && /^FIND:/.test(args.script)) { const o = JSON.parse(args.script.slice(5)); return { screenshot: "img", url: "https://x.io/post", result: JSON.stringify({ query: o.text, nodeMatches: [], textMatches: o.text === "价格" ? [{ ctx: "价格 99 元", node: 1, inView: true }] : [], scrolled: true }) }; }
+    w.calls.pop();
+    return inner(name, args);
+  };
+  return w;
+}
+
+test("read / find / note 是观察：读到的内容进下一轮提示，记下的发现每轮都带着并进最后的 summary；连着读几页不算没进展", async () => {
+  const seen = [];
+  const w = makeReaderWorld({ pages: [article], replies: [
+    '{"thought":"先读正文","steps":[{"op":"read"},{"op":"find","text":"价格"}],"done":false}',
+    (msgs) => { seen.push(msgs[1].content); return '{"thought":"记下价格","steps":[{"op":"note","text":"价格 99 元"},{"op":"read","offset":5}],"done":false}'; },
+    (msgs) => { seen.push(msgs[1].content); return '{"thought":"继续读","steps":[{"op":"read","offset":10}],"done":false}'; },
+    (msgs) => { seen.push(msgs[1].content); return '{"done":true}'; },
+  ] });
+  const r = await runBrowserTask({ goal: "读出价格", invoke: w.invoke, fastJs: w.fastJs, nodesScript: w.nodesScript, readJs, findJs, askModel: w.askModel });
+  assert.equal(r.status, "done", r.text);
+  assert.equal(r.summary, "价格 99 元", "done 没写 summary 时，记下的发现就是交付物");
+  assert.deepEqual(r.findings, ["价格 99 元"]);
+  assert.match(seen[0], /上一轮读到的：[\s\S]*价格 99 元/, "read 的内容要进下一轮提示");
+  assert.match(seen[0], /查找「价格」/, "find 的结果也要进下一轮提示");
+  assert.match(seen[1], /已记下的发现[\s\S]*1\. 价格 99 元/, "note 记下的东西每轮都带着");
+  assert.match(seen[2], /已记下的发现/);
+  assert.match(r.transcript[0], /read ✓ \(还有后面，下一页 offset=5\); find "价格" ✓ 1 处/);
+  assert.equal(r.stepsRun, 3, "页面三轮没变，但每轮都只是读，不该判成没进展");
+  const evals = w.calls.filter((c) => c[0] === "browser_eval" && /^READ:/.test(c[1].script)).map((c) => JSON.parse(c[1].script.slice(5)).offset);
+  assert.deepEqual(evals, [0, 5, 10]);
+});
+
+test("back 走页内 history 再等一拍；tab 走 browser_tab（action 给标签页操作）；回复里的 offset/pattern/role 都被认出来", async () => {
+  const w = makeReaderWorld({ pages: [article, login], replies: [
+    '{"thought":"回退再开新页","steps":[{"op":"back"},{"op":"tab","action":"new","url":"https://mail.io/"}],"done":false}',
+    '{"done":true,"summary":"ok"}',
+  ] });
+  const r = await runBrowserTask({ goal: "g", invoke: w.invoke, fastJs: w.fastJs, nodesScript: w.nodesScript, readJs, findJs, askModel: w.askModel });
+  assert.equal(r.status, "done");
+  const seq = w.calls.filter((c) => !(c[0] === "browser_eval" && c[1].script === NODES)).map((c) => c[0]);
+  assert.deepEqual(seq, ["browser_eval", "browser_wait", "browser_tab"]);
+  assert.deepEqual(w.calls.find((c) => c[0] === "browser_tab")[1], { op: "new", index: null, url: "https://mail.io/" });
+  assert.match(r.transcript[0], /back ✓ → after-wait; tab new https:\/\/mail\.io\/ ✓/);
+  const p = parseTaskReply('{"steps":[{"op":"read","offset":"6000"},{"op":"find","pattern":"\\\\d+ 元","role":"link"},{"op":"find"},{"op":"note","text":"  "},{"op":"tab","action":"switch","index":2},{"op":"tab"}]}');
+  assert.deepEqual(p.steps, [{ op: "read", offset: 6000 }, { op: "find", pattern: "\\d+ 元", role: "link" }, { op: "tab", tabOp: "switch", index: 2 }, { op: "tab", tabOp: "list" }], "find 没给条件、note 没内容要丢掉");
+});
+
+test("提示词里的 op 清单包含 read / find / note / back / tab，且说明 note 会进 summary", () => {
+  const msgs = buildTaskPrompt({ goal: "g", history: [], page: "url: a", stepNo: 1, maxSteps: 3, findings: ["A"], extras: "读到的东西" });
+  assert.match(msgs[0].content, /read\{offset\} \/ find\{text 或 pattern, role\} \/ note\{text\} \/ back \/ tab/);
+  assert.match(msgs[0].content, /最后自动进 summary/);
+  assert.match(msgs[1].content, /已记下的发现[\s\S]*1\. A/);
+  assert.match(msgs[1].content, /上一轮读到的：\n读到的东西/);
+  assert.ok(msgs[1].content.indexOf("上一轮读到的") < msgs[1].content.indexOf("当前页面："), "读到的在页面之前");
+  assert.equal(TASK_DEFAULTS.hardMaxSteps, 30);
+});

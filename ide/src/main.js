@@ -87,6 +87,8 @@ import {
   formatStackHint as _formatStackHint,
 } from "./agent/stack.js";
 import { _browserBatchFastJS } from "./agent/browser-batch-script.js";
+import { _readPageJS, _findInPageJS, _scrollToJS } from "./agent/browser-read-scripts.js";
+import { renderBrowserFeedback, renderReadResult, renderFindResult } from "./agent/browser-delta.js";
 import {
   _DESIGN_EXTRACT_JS, _pageHookSrc, _NETWORK_CAPTURE_JS, _checkJS, _visualInspectJS,
   _rgbToHex, _swapTwClass, _NODES_EXTRACT_JS, _assertJS, _browserAutofillJS,
@@ -35443,9 +35445,9 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       // "open" 排头：它是**默认该先想到的那个**——只是要让用户看一眼页面时，交给他自己的
       // 默认浏览器，不起自动化窗口。这份名单会覆盖上面 schema 字面量里的 enum，
       // 只改那边等于没改（这次就先踩了一次）。
-      const wantedActions = ["mytabs", "open", "navigate", "observe", "viewport", "click", "dblclick", "rightclick", "longpress", "type", "clear", "append", "autofill", "fill", "hover", "drag", "slide", "swipe", "wheel", "toggle", "uncheck", "select", "focus", "blur", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close", "task", "back", "forward", "reload", "tab"];
+      const wantedActions = ["mytabs", "open", "navigate", "observe", "viewport", "click", "dblclick", "rightclick", "longpress", "type", "clear", "append", "autofill", "fill", "hover", "drag", "slide", "swipe", "wheel", "toggle", "uncheck", "select", "focus", "blur", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "read", "find", "assert", "check", "batch", "upload", "cookies", "storage", "close", "task", "back", "forward", "reload", "tab"];
       browserProps.action.enum = wantedActions;
-      browserProps.action.description = "The browser action to perform. mytabs = look at what the user already has open in their OWN browser (titles and URLs only, macOS, no automation window) — check it first when the task touches a page they may already be on. open = hand the URL to the USER'S OWN default browser for them to look at; you do not see the page. observe = structured page state (ready/active/iframe/shadow/nodes). check only performs a page health check; checkboxes and switches use toggle with checked, or batch op check/uncheck. upload sends a file to an <input type=file>: selector picks the input, path/paths the absolute local file path. task = give the goal in plain language (goal, optional url, max_steps): the tool observes, acts and re-observes by itself, up to max_steps rounds, and reports what it did and the result — use it when you do not know how many steps a page flow takes. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. back / forward / reload move through history.";
+      browserProps.action.description = "The browser action to perform. read = the page as a document (offset / max_chars / selector or node). find = locate by text / pattern / role: node hits plus text hits with context, scrolls to the first. nodes / observe = structured node list. scroll = by amount, or to a node / target text. mytabs = look at what the user already has open in their OWN browser (titles and URLs only, macOS, no automation window) — check it first when the task touches a page they may already be on. open = hand the URL to the USER'S OWN default browser for them to look at; you do not see the page. task = goal + optional url + max_steps: observe → act → note → re-observe by itself, returns a summary. tab = this browser's own tabs: op list / new (url) / switch (tab) / close (tab); every later action targets the current tab. check only performs a page health check; checkboxes and switches use toggle with checked. upload sends a file to an <input type=file>: selector picks the input, path / paths the absolute local file path. back / forward / reload move through history.";
     }
     browserProps.width = { type: "integer", description: "For viewport: width, e.g. 1440 on desktop, 390 on a phone." };
     browserProps.height = { type: "integer", description: "For viewport: height, e.g. 900 on desktop, 844 on a phone." };
@@ -37134,6 +37136,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         expectValue: args.expectValue,
         expectAbsent: !!args.expectAbsent,
         script: args.script || "",
+        offset: Number.isFinite(+args.offset) ? +args.offset : undefined, maxChars: Number.isFinite(+(args.max_chars ?? args.maxChars)) ? +(args.max_chars ?? args.maxChars) : undefined, pattern: String(args.pattern || ""), limit: Number.isFinite(+args.limit) ? +args.limit : undefined, // read / find
         width: Number.isFinite(+args.width) ? +args.width : undefined,
         height: Number.isFinite(+args.height) ? +args.height : undefined,
         deviceScaleFactor: Number.isFinite(+args.device_scale_factor) ? +args.device_scale_factor : undefined,
@@ -64463,7 +64466,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       else if (call.index != null && Number.isFinite(+call.index)) _bsel = `[data-mref="${Math.floor(+call.index)}"]`;
       
       // Browser action dedup check: skip repeated identical operations within same turn
-      const _isDeduppableAction = ["screenshot", "check", "assert", "inspect", "nodes", "cookies", "storage"].includes(act);
+      const _isDeduppableAction = ["screenshot", "check", "assert", "inspect", "nodes", "read", "find", "cookies", "storage"].includes(act);
       if (_isDeduppableAction && _browserRepeatedStableOperation(run?._browserOpLog, act, _bsel)) {
         const latest = run._browserOpLog[run._browserOpLog.length - 1];
         return { type: "browser", path: act, content: `[已执行过·结果未变] ${act} on "${_bsel}" at ${latest.urlOrigin || "当前页面"} 连续两次结果相同，已停止重复调用。` };
@@ -64519,7 +64522,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           state = _cr.state; const parsed = _cr.parsed;
           if (parsed && parsed.ok === false) { res.className = "atc-result atc-result--err"; res.textContent = "点击未生效"; return { type: "browser", path: "click", browserResult: state?.result, content: `[失败] 浏览器 click 未生效：${(parsed.log || []).join("\n") || JSON.stringify(parsed.failed || {})}` }; }
         }
-        else if (act === "task") { const _cfg = taskModelConfig(loadConfig(), _customModelById); const _tr = await runBrowserTask({ goal: call.goal, maxSteps: call.maxSteps, startUrl: call.url, invoke: (n, a) => backend.invoke(n, a), fastJs: _browserBatchFastJS, nodesScript: _NODES_EXTRACT_JS, askModel: (messages, maxTokens) => _cognitiveLegComplete(_cfg, { model: _cfg.model, messages, temperature: 0, ...(_cfg.viaGateway && _isAnthropicWireFamily(_cfg.model) ? { reasoning_effort: "off" } : {}) }, maxTokens), onProgress: (line) => { res.textContent = line; } }); state = _tr.state || (await backend.invoke("browser_screenshot")); if (state) state.result = _tr.text; } // 目标驱动循环：观察→行动→再观察，见 browser-task.js
+        else if (act === "task") { const _cfg = taskModelConfig(loadConfig(), _customModelById); const _tr = await runBrowserTask({ goal: call.goal, maxSteps: call.maxSteps, startUrl: call.url, invoke: (n, a) => backend.invoke(n, a), fastJs: _browserBatchFastJS, nodesScript: _NODES_EXTRACT_JS, readJs: (o) => _readPageJS(o), findJs: (o) => _findInPageJS(o), askModel: (messages, maxTokens) => _cognitiveLegComplete(_cfg, { model: _cfg.model, messages, temperature: 0, ...(_cfg.viaGateway && _isAnthropicWireFamily(_cfg.model) ? { reasoning_effort: "off" } : {}) }, maxTokens), onProgress: (line) => { res.textContent = line; } }); state = _tr.state || (await backend.invoke("browser_screenshot")); if (state) state.result = _tr.text; } // 目标驱动循环：观察→行动→再观察，见 browser-task.js
         else if (act === "back" || act === "forward" || act === "reload" || act === "tab") state = await browserNavAction({ act, call, invoke: (n, a) => backend.invoke(n, a) });
         else if (act === "observe") {
           state = await backend.invoke("browser_eval", { script: _browserBatchFastJS([{ op: "observe" }]) });
@@ -64596,7 +64599,11 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           if (!_paths.length) { res.className = "atc-result atc-result--err"; res.textContent = "缺文件路径"; return { type: "browser", path: "upload", content: "[失败] upload 需要 path/paths（要上传的本地文件绝对路径）。" }; }
           state = await backend.invoke("browser_upload_file", { selector: _rs, paths: _paths });
         }
-        else if (act === "scroll") state = await backend.invoke("browser_scroll", { amount: Number.isFinite(call.amount) ? Math.round(call.amount) : 600 });
+        else if (act === "scroll") {
+          // 带目标（node / selector / target 文字）就是「滚到它」，没有才是按像素滚。
+          if (_bsel || call.target || call.text) state = await backend.invoke("browser_eval", { script: _scrollToJS({ selector: _bsel, text: call.target || call.text || "" }) });
+          else state = await backend.invoke("browser_scroll", { amount: Number.isFinite(call.amount) ? Math.round(call.amount) : 600 });
+        }
         else if (act === "wait") {
           let _ws = _bsel || null;
           if (!_ws && (call.target || call.text || call.role)) {
@@ -64612,6 +64619,10 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         else if (act === "design") state = await backend.invoke("browser_eval", { script: _DESIGN_EXTRACT_JS });
         else if (act === "network") state = await backend.invoke("browser_eval", { script: _NETWORK_CAPTURE_JS });
         else if (act === "inspect") state = await backend.invoke("browser_eval", { script: _visualInspectJS(call.selector || "") });
+        // read：把页面当一篇文档分页读（正文里的链接 / 按钮带节点号）；find：按文字 / 正则 / 角色定位并滚过去。
+        // 两段页内脚本在 agent/browser-read-scripts.js，回执渲染在 agent/browser-delta.js。
+        else if (act === "read") state = await backend.invoke("browser_eval", { script: _readPageJS({ offset: call.offset, maxChars: call.maxChars, selector: _bsel || "" }) });
+        else if (act === "find") state = await backend.invoke("browser_eval", { script: _findInPageJS({ text: call.text || call.target || "", pattern: call.pattern || "", role: call.role || "", limit: call.limit }) });
         else if (act === "nodes") state = await backend.invoke("browser_eval", { script: _NODES_EXTRACT_JS });
         // assert 要用翻译过的 _bsel（node:N / index:N 已经在上面转成 CSS 了）。
         // 此前这里只读 call.selector：模型写 assert(node:12) 时选择器是空的，
@@ -64735,6 +64746,10 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         content += `\n**网络抓包**（这一页加载/请求的真实情况，结构化数据，比看截图可靠）。**样式 / 图片 / 视觉出问题，先看这里**：\`failures\` = 加载失败的资源(CSS/JS/字体/图片/接口，多半就是根因)，\`apiCalls\` = 捕获到的 fetch/XHR(看 \`ok:false\` 的就是失败接口，及其状态/响应片段)。逐条核对失败项再去改：\n${state.result}`;
       } else if (act === "inspect" && state.result != null && state.result !== "") {
         content += `\n**视觉/样式解析**（基于计算后样式 + 布局做的结构化体检——对比度、盒模型、坏图、塌陷、裁切、横向溢出；用真实数字判断，别只靠肉眼看图）。\`issues\` 里 \`sev=error\` 是确定的视觉缺陷（看不见的文字 / 坏图 / 尺寸塌陷），\`warn\` 是疑似问题。逐条核对并修，改完再 inspect 复查：\n${state.result}`;
+      } else if (act === "read" && state.result != null && state.result !== "") {
+        const _rr = renderReadResult(state.result); content += `\n${_rr.text}`; call._readNext = _rr.next;
+      } else if (act === "find" && state.result != null && state.result !== "") {
+        const _fr = renderFindResult(state.result); content += `\n${_fr.text}`; call._findCount = _fr.count;
       } else if (act === "nodes" && state.result != null && state.result !== "") {
         content += `\n**页面节点清单**（整页已转成结构化节点，比一遍遍截图快得多）。每个 \`nodes[]\`：\`i\`=节点号、\`r\`=角色、\`n\`=名称、\`s\`=状态、\`off\`=在视口外。**用 \`browser click node=i\` / \`type node=i text=…\` 直接操作**；\`off\` 的先 scroll 让它进视口。操作后再 \`nodes\` 或 \`assert\` 看状态变化来验证：\n${state.result}`;
       } else if (act === "assert" && state.result != null && state.result !== "") {
@@ -64759,17 +64774,13 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       } else if (state.result != null && state.result !== "") {
         content += `\nJS 结果: ${state.result}`;
       }
-      const _els = Array.isArray(state.elements) ? state.elements : [];
-      if (_els.length) {
-        content += `\n可交互元素（截图上有对应红色数字标记，用 index=编号 直接 click/type，最准）:\n` +
-          _els.map(e => `[${e.ref}] <${e.tag}${e.type ? " " + e.type : ""}> ${(e.text || "").trim()}`.trim()).join("\n");
+      // 动作后的回执——这一步改变了什么、视口在页面哪里、节点清单（[n] 角色 "名称" 状态）、正文节选、
+      // 下一步一句——全在 agent/browser-delta.js，措辞只在那一处；上一步的快照挂在 run 上做比较。
+      {
+        const _fb = renderBrowserFeedback({ act, state, prev: run?._browserPrevState, extra: { next: call._readNext, count: call._findCount } });
+        content += _fb.text;
+        if (run) run._browserPrevState = _fb.snapshot;
       }
-      if (state.text) content += `\n页面可见文本(截断):\n${state.text.slice(0, 1500)}`;
-      content += act === "batch" || act === "observe"
-        ? `\n（下一步优先用 assert/check/nodes 或继续 batch；不要为了确认每个动作都 screenshot。需要最终视觉排版验收时，再截桌面/移动两张。）`
-        : (act === "autofill" || act === "fill")
-          ? `\n（表单类任务下一步先看 autofill 返回的 invalid/missing；缺字段就补字段后再 submit，不要只看截图猜。）`
-          : `\n（截图里每个可点元素都标了**红色数字**；优先用 index=该数字 来 click / type，定位最准、不用猜选择器；连续多步请用 batch，不要每一步 screenshot。登录/注册/搜索表单优先用 autofill 一次填完并看 invalid/missing。）`;
       // 这次拿到的是哪个浏览器（接管了已开着的 / 另起了一个 / 用了临时配置），后端只在
       // 浏览器刚起来的那一次给，所以这里原样带上，不做去重也不做加工。
       if (state.session_note) content += `\n\n[浏览器会话] ${state.session_note}`;
