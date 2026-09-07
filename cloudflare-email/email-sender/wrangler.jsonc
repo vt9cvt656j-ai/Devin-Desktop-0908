@@ -1,0 +1,40 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mrday-email-sender",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+
+  // Cloudflare Email Sending 绑定(免费层 1000封/天)
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "remote": true
+    }
+  ],
+
+  // KV 命名空间
+  "kv_namespaces": [
+    {
+      "binding": "VERIFICATION_CODES",
+      "id": "16de6990e5ad4d48b89f98e3bf38fbf2"
+    },
+    {
+      "binding": "RATE_LIMIT",
+      "id": "0480b417c716420cb34387ce4bec6f24"
+    }
+  ],
+
+  // 公开环境变量
+  "vars": {
+    "FROM_NAME": "Mrday",
+    "FROM_EMAIL": "noreply@mrday.one",
+    "APP_NAME": "Mrday"
+  }
+
+  // 敏感配置用 secret 命令行设置:
+  //   npx wrangler secret put API_KEY
+}
