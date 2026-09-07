@@ -294,6 +294,7 @@ import { _AUTOMATION_METHODS, _COMPUTER_METHODS } from "./agent/automation-metho
 import { mapComputerAction, applyScreenMap, screenMapFrom, annotateReceipt, describeScreenImage, COMPUTER_ACTIONS } from "./agent/computer-actions.js";
 import { runBrowserTask, taskModelConfig, automationBrowserCall, mergedBrowserNote, browserNavAction } from "./agent/browser-task.js";
 import { runOfficeStep } from "./agent/office-tool.js";
+import { browserLinkCardHtml, bindBrowserLinkCardMedia } from "./agent/browser-link-card.js";
 
 // Global shared state store for sub-agent collaboration
 const _globalSharedStore = getSharedStore();
@@ -64696,21 +64697,9 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       }
       res.className = "atc-result atc-result--ok"; res.textContent = act;
       if (vp) {
-        const _hasUrlInfo = !!(state.title || state.url);
-        let _vpHtml = `<img src="${state.screenshot}" alt="page" style="max-width:100%;border-radius:${_hasUrlInfo ? "8px 8px 0 0" : "8px"};display:block;border:1px solid rgba(128,128,128,.25)${_hasUrlInfo ? ";border-bottom:none" : ""}">`;
-        if (_hasUrlInfo) {
-          let _host = state.url || "";
-          try { _host = new URL(state.url).hostname; } catch {}
-          // Telegram 链接预览的顺序：**站点名在上（强调色）、标题在下**。
-          // 标题缺失时只画站点名那一行 —— 原来是 `state.title || _host`，没标题时
-          // 两行会渲染出一模一样的字，看着像重复了一遍。
-          const _title = String(state.title || "").trim();
-          _vpHtml += `<div class="browser-url-card"><div class="browser-url-card__bar"></div>`
-            + `<div class="browser-url-card__text"><span class="browser-url-card__host">${_escHtml(_host)}</span>`
-            + (_title && _title !== _host ? `<span class="browser-url-card__title">${_escHtml(_title)}</span>` : "")
-            + `</div></div>`;
-        }
-        vp.innerHTML = _vpHtml;
+        // 链接预览卡（Telegram 形状：竖条 | 站点 / 标题 / 截图），实现和结构测试在 agent/browser-link-card.js。
+        vp.innerHTML = browserLinkCardHtml(state, _escHtml);
+        bindBrowserLinkCardMedia(vp);
       }
       // 常驻实时预览：有它在，逐轮的截图卡默认收起（要看证据/指元素再点开），
       // 只有明确的 screenshot 视觉验收才自动展开——不再一轮一张糊满对话。
