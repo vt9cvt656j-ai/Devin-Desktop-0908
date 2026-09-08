@@ -1,10 +1,20 @@
-# michael-design motion layer: orchestrate as needed
+# michael-design motion layer: pick the smallest tool, then retrieve the recipe
 
-This block appears only for a full-site redesign, an immersive page, motion work, scroll storytelling, 3D/WebGL, or when high expressiveness is explicitly required. Pick a mutually compatible combination from the Motion & Effects Repertoire in composition-repertoire first; do not pile every effect onto one page, and do not copy a single uniform fade-up and call it advanced animation.
+**Get the recipe from the corpus, not from memory.** `knowledge_search(domain="michael-design")` carries effect-named blueprints with real durations, easing, mobile rules and fallbacks, plus a library catalogue with licences. Search the effect the user named — Chinese effect names hit directly.
 
-1. Signature scroll storytelling: prefer the project's existing animation library. With GSAP + ScrollTrigger, implement scrub, pin, and the trigger range; with Motion for React, use useScroll + useTransform; on other frameworks, use their equivalent API. A signature effect connects at least two business sections, and you state its progress, timeline, and visual purpose.
-2. Reusable section entrances: unify multi-section entrances with SectionReveal/ScrollSection and IntersectionObserver instead of hand-writing them in each place.
-3. Control micro-interactions: buttons, cards, tabs, and form states get restrained 150-250ms ease-out feedback — a slight lift, a shadow, a state transition.
-4. Responsive orchestration: on mobile, use the current framework's media-query API or native matchMedia to adjust reveal distance, duration, stagger, and concurrency limits, and to drop pinning and heavy canvases or swap them for a static or short-distance version.
+## Order of preference
 
-All motion must have a static fallback under `prefers-reduced-motion`. Lenis is available for smooth scrolling and Lottie for rich vector animation; a Three.js/WebGL scene needs a performance budget, a loading state, a degradation path, and verification on the real canvas.
+1. **Browser-native, zero dependency**: View Transitions for route and shared-element morphs; scroll-driven animations (`animation-timeline: scroll()/view()`) for progress, reveals, parallax; `@starting-style` for `popover`/`dialog` entrances. Ship inside `@supports`, static layout as fallback.
+2. **Tailwind projects**: `tw-animate-css` utilities and `data-[state=open]` variants — what shadcn/ui ships on v4. Never add the unmaintained `tailwindcss-animate`.
+3. **Component motion**: Motion (npm `motion`, ex-Framer Motion) — `whileInView`, `AnimatePresence`, `layout`/`layoutId`, gestures. `motion-v` for Vue.
+4. **Timeline and scroll choreography**: GSAP + ScrollTrigger, all plugins now free commercially; `useGSAP()` in React so tweens revert. Lenis for smooth scroll, driven from `gsap.ticker`.
+5. **3D**: React Three Fiber + drei, with a performance budget, loading state and fallback.
+6. **Single-purpose helpers** beat hand-rolling for lists, counters, toasts, sheets, carousels and confetti — the corpus names the current pick for each.
+
+**Licence check before copying a component.** Magic UI and Motion Primitives are MIT. React Bits and animate-ui carry a Commons Clause forbidding redistribution — never emit their source into a user's project; reimplement against the project's own tokens.
+
+## Compose, do not pile up
+
+One signature moment + reusable section reveals + micro-interaction feedback. Never a scrub-pinned story, parallax, tilt, marquee and particles on one page. One easing (`cubic-bezier(0.16,1,0.3,1)`), one scale: 120ms feedback, 200ms transitions, 300–500ms entrances.
+
+Every effect ships three things or it does not ship: a mobile story (drop pin/parallax/tilt/autoplay below 768px, reveal ~12px), a `prefers-reduced-motion` fallback keeping the information and dropping the movement, and a keyboard/assistive path — split text keeps its `aria-label`, hover-only effects are never the sole affordance, anything autoplaying can be paused.

@@ -697,10 +697,17 @@ const DESIGN_KNOWLEDGE_SECTION_QUERIES: &[&str] = &[
     "mobile responsive app ui dashboard component",
     "portfolio agency showcase premium animation",
 ];
+/// 保底动效名额用哪些查询去捞。
+///
+/// 前三条是整站/滚动叙事那一档。**第四条是微交互档**：组件轮次和「改好看点」轮次里，
+/// 用户要的是 hover 反馈、光晕、展开收起这些，拿滚动叙事的查询去捞只会捞回整站蓝本，
+/// 而那一段对着一个按钮毫无用处（实测：一轮「把按钮改好看点」拿到的全部动效知识
+/// 只有一行 --duration:150ms）。
 const DESIGN_KNOWLEDGE_MOTION_QUERIES: &[&str] = &[
     "GSAP ScrollTrigger scrub pinning multi section advanced motion choreography responsive fallback",
     "useScroll useTransform parallax mask clip reveal layoutId sticky stacking animation",
     "Lottie Rive Three.js WebGL canvas interactive effect website",
+    "hover press focus feedback micro interaction spotlight cursor glow magnetic border beam accordion skeleton toast easing duration",
 ];
 const DESIGN_KNOWLEDGE_LAYOUT_QUERIES: &[&str] = &[
     "responsive cards grid item count columns breakpoints mobile tablet desktop",
@@ -2505,7 +2512,7 @@ fn design_knowledge_block(
     };
 
     Some(format!(
-        "--- michael-design blueprint (421 pieces of production-grade UI knowledge, retrieved on demand) ---\n\
+        "--- michael-design blueprint ({design_corpus_size} pieces of production-grade UI knowledge, retrieved on demand) ---\n\
          {scope_instruction}\n\
          Michael Design facts must come from a live `knowledge_search(domain=\"michael-design\")` this round; the hits injected here can be used as evidence directly, and when evidence for a category, palette, layout, component or motion is missing, keep calling that knowledge base and record the specific section. A prompt summary, the model's memory, and stack habit are none of them a substitute for live retrieval, and Michael Design conclusions must never be fabricated.\n\
          The stack must be decided by inspecting the real workspace first, in this order — a Michael Design blueprint is not an instruction to change stacks:\n\
@@ -2515,7 +2522,10 @@ fn design_knowledge_block(
          When the product name is an invented word, infer the category from the functional description and search by the category term — never use the invented name as the query. Take the palette only from same-category Michael Design sources and map it onto the current project's native palette and semantic roles; only the branch that ends up on Tailwind may convert colour values into a Tailwind family + step. A cross-category hit may lend only structure, components and motion. The specific component, media, data, motion, engineering and verification requirements are owned by the separate modules already loaded this round, and are not repeated here.\n\
          The blueprints below may contain Tailwind v3-era `tailwind.config.js/ts`, `theme.extend`, `@tailwind base/components/utilities`, `postcss.config.js`, `autoprefixer`, `tailwindcss-animate` and `content: [...]`. Those are version-stamped implementation samples and do not by themselves decide the current project's stack. **Only when Tailwind v4 is the final choice or the project already uses it** should you translate those v3 forms into v4 CSS-first: the three `@tailwind base/components/utilities` lines → one `@import \"tailwindcss\";`; `theme.extend.colors/fontFamily/borderRadius` → `--color-*` / `--font-*` / `--radius-*` inside `@theme inline` in the CSS entry point (nested colour names flattened to `--color-a-b`); `darkMode: [\"class\"]` → `@custom-variant dark (&:is(.dark *));`; `content` globs and the old postcss chain → handled per v4 and the actual build tool. Every other branch (including an existing Tailwind v3 project and non-Tailwind projects) maps the blueprint's visual judgement and token semantics onto the project's own native token/build/style/component mechanism, keeps the project's existing configuration, and installs neither Tailwind, shadcn/ui nor React and creates none of their config files or directories.\n\n{}\n\n{}",
         design_color_direction_block(color_direction),
-        sections.join("\n\n———\n\n")
+        sections.join("\n\n———\n\n"),
+        // 照实报数。写死的「421」在加了动效和组件语料之后就是假的，而模型拿这个数字
+        // 判断「这个库值不值得查」。运行时统计，加文件不用改代码、也不会有测试跟着漂。
+        design_corpus_size = crate::knowledge::section_count(DESIGN_KNOWLEDGE_DOMAIN),
     ))
 }
 
@@ -2923,6 +2933,20 @@ fn design_hit_defaults_to_dark(hit: &crate::knowledge::SearchHit) -> bool {
     .any(|needle| lead.contains(needle))
 }
 
+/// 这一段命中算不算「有真动效可抄」。
+///
+/// 这张表原来只认**滚动叙事和 3D 库**（gsap+scrolltrigger / usescroll+usetransform / parallax /
+/// three.js / lottie…）。两个后果，都是实测出来的：
+///
+/// ① **整个微交互层结构性地进不来。** 鼠标跟随光晕、磁吸按钮、光束边框、按钮四态、手风琴、
+///    骨架屏、吐司、打字机——这些一个库都不用，纯 CSS 加几行 JS，于是全部被判成「没有动效」。
+///    而「把这个按钮改好看点」「做一个 XX 组件」这两条路要的恰恰只有这一层：Focused 档的
+///    保底动效名额永远留给滚动叙事，组件轮次拿到的动效知识是零。
+/// ② **浏览器原生那批新能力被判成不是动效。** scroll-driven animations（animation-timeline）、
+///    View Transitions、@starting-style 在 2025-2026 已经陆续 Baseline，零依赖就能做转场和
+///    滚动驱动——按旧表它们一条都不算数，于是知识库里最现代的做法反而最取不到。
+///
+/// 判据改成「这段文字里有没有可抄的动效实现」，而不是「它提到的是不是那五个库」。
 fn design_hit_has_advanced_motion(hit: &crate::knowledge::SearchHit) -> bool {
     let text = hit.text.to_lowercase();
     let has_gsap_scroll = text.contains("gsap") && text.contains("scrolltrigger");
@@ -2930,6 +2954,7 @@ fn design_hit_has_advanced_motion(hit: &crate::knowledge::SearchHit) -> bool {
     has_gsap_scroll
         || has_motion_scroll
         || [
+            // —— 滚动叙事 / 3D（原有）——
             "scrub:",
             "pinning",
             "parallax",
@@ -2942,6 +2967,22 @@ fn design_hit_has_advanced_motion(hit: &crate::knowledge::SearchHit) -> bool {
             "webgl",
             "shader",
             "pathlength",
+            // —— 浏览器原生（2025-2026 陆续 Baseline，零依赖）——
+            "animation-timeline",
+            "view-transition",
+            "startviewtransition",
+            "@starting-style",
+            "scroll-snap-type",
+            // —— 微交互层：不用库，但同样是真动效实现 ——
+            "@keyframes",
+            "whileinview",
+            "whilehover",
+            "animatepresence",
+            "staggerchildren",
+            "cubic-bezier",
+            "prefers-reduced-motion",
+            "animation-play-state",
+            "transition-delay",
         ]
         .iter()
         .any(|needle| text.contains(needle))
@@ -8091,7 +8132,13 @@ mod tests {
         // 但"硬上限"这个框架把品质迭代也一起封死了，而那正是界面变好看的方式。
         assert!(system.contains("real-browser matrix and stop conditions"));
         assert!(system.contains("--- michael-design blueprint"));
-        assert!(system.contains("421 pieces of production-grade UI knowledge"));
+        // 数字是运行时统计的（加一个语料文件就变），所以钉句式不钉数字——
+        // 钉数字的话每次扩充语料都要改测试，而改测试的人未必知道为什么要改。
+        assert!(system.contains("pieces of production-grade UI knowledge"));
+        assert!(
+            crate::knowledge::section_count(DESIGN_KNOWLEDGE_DOMAIN) >= 400,
+            "michael-design 语料没加载或大幅缩水，注入块会报一个很小的数"
+        );
         assert!(system.contains("full page / whole-site packet"));
         assert!(system.contains("list the michael-design sources you are using"));
         assert!(system.contains("knowledge_search(domain=\"michael-design\")"));

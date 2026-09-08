@@ -872,6 +872,16 @@ pub fn get() -> &'static KnowledgeIndex {
 }
 
 /// BM25 search over the corpus. `domain` optionally restricts to one domain.
+/// 某个域下有多少个可检索小节。注入块要照实报数：写死的数字每加一个语料文件就更不准，
+/// 而模型是拿它当「这个库有多大」的依据的。
+pub fn section_count(domain: &str) -> usize {
+    get()
+        .chunks
+        .iter()
+        .filter(|c| c.domain == domain && !c.section.trim().is_empty())
+        .count()
+}
+
 pub fn search(query: &str, domain: Option<&str>, top_k: usize) -> Vec<SearchHit> {
     search_inner(query, domain, top_k, None, None)
 }
