@@ -26707,23 +26707,48 @@ async function _agentFindProjectFiles(root, matcher, options = {}) {
   const maxDepth = Math.max(0, Math.min(5, Number(options.maxDepth) || 3));
   const maxHits = Math.max(1, Math.min(40, Number(options.maxHits) || 12));
   const hits = [];
-  const walk = async (dir, depth) => {
-    if (hits.length >= maxHits) return;
+  // **同一层的子目录并发读。** 原来是 `for` 里 `await walk(...)`：一个目录一次 Tauri IPC
+  // 往返，一个个排队。本仓库实测 118~152 次往返、约 0.6~0.8 秒，而原生文件系统只花 7.7ms
+  // —— 97% 的墙钟纯粹是往返在排队。它跑在每个写过文件的回合上、还压着 1600ms 整体超时，
+  // 超时一到整份结果作废、下一轮重来。
+  //
+  // 旁边的 marker 探测和 known-path 探测在 2026-09-0x 就并行化过了（实测 195ms → 12ms），
+  // 唯独这棵树漏了。
+  //
+  // **次序和串行版逐字一致**：本层的命中照原顺序先入列，子目录的结果按它们在目录里的
+  // 原顺序合并回来——并发只改快慢，不改结果。限宽是为了别在超大仓库里一次开几百个
+  // 文件描述符；批与批之间仍然串行，maxHits 的短路因此照旧有效。
+  const FANOUT = 32;
+  const collect = async (dir, depth) => {
+    const found = [];
     let entries = [];
-    try { entries = await backend.readDir(dir); } catch { return; }
+    try { entries = await backend.readDir(dir); } catch { return found; }
+    const subdirs = [];
     for (const entry of Array.isArray(entries) ? entries : []) {
-      if (hits.length >= maxHits) break;
       const name = _agentDirEntryName(entry);
       if (!name || name === "." || name === "..") continue;
       const isDir = _agentDirEntryIsDir(entry);
       if (isDir && _AGENT_CONTEXT_SKIP_DIRS.has(name)) continue;
       const abs = _normalizeFsPath(String(entry?.path || `${dir}/${name}`)).replace(/\/+$/, "");
       const rel = _normRel(abs, root) || name;
-      if (matcher({ name, abs, rel, isDir })) hits.push(rel + (isDir ? "/" : ""));
-      if (isDir && depth < maxDepth) await walk(abs, depth + 1);
+      if (matcher({ name, abs, rel, isDir })) found.push(rel + (isDir ? "/" : ""));
+      if (isDir && depth < maxDepth) subdirs.push(abs);
     }
+    // 够了就别再往下走：这道短路是串行版 maxHits 的等价物，只是粒度从"每个条目"
+    // 变成"每一批"。多读一批的代价远小于把整棵树读完。
+    for (let i = 0; i < subdirs.length; i += FANOUT) {
+      if (hits.length + found.length >= maxHits) break;
+      const batch = await Promise.all(
+        subdirs.slice(i, i + FANOUT).map((sub) => collect(sub, depth + 1)),
+      );
+      for (const list of batch) found.push(...list);
+    }
+    return found;
   };
-  await walk(root, 0);
+  for (const hit of await collect(root, 0)) {
+    if (hits.length >= maxHits) break;
+    hits.push(hit);
+  }
   return hits;
 }
 
@@ -29702,8 +29727,24 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const _routeSource = _turnEngineeringResolved?.intentSource === "ai"
     ? _turnEngineeringResolved
     : (_fastRouteProfile || _turnEngineeringResolved);
-  // 完整裁决落定＝模型判过了。_routeSource 为空时不置：那是「两条腿都没回」。
-  if (_routeSource) { try { sess._semanticProfileFromModel = true; } catch {} }
+  // 「真的有模型判过吗」必须单独算，**不能拿 _routeSource 当这个问题的答案**。
+  //
+  // 这里原来是 `if (_routeSource) { sess._semanticProfileFromModel = true; }`，配着一句
+  // 注释「_routeSource 为空时不置：那是两条腿都没回」——而它**永远不为空**：兜底项
+  // `_turnEngineeringResolved` 来自 `_semanticEngineeringEvidence()`，那个函数无论输入是
+  // 什么都返回一个 `{ referenceWebsiteUrls: [...] }` 对象。所以这一位在每个会话的第一轮
+  // 就被无条件置真，哪怕两条腿一条都没回。
+  //
+  // 三条兜底一起哑掉，而且都是静默的：
+  //   ① `unjudged` 位（_sessionStableSemanticProfile 读的就是这一位）永远不出现，
+  //      网关那条「还没判就先按工程任务挂工程块」的兜底一次都没触发过；
+  //   ② `_profileStillEmpty` 从第 2 发起恒假，快通道整条会话不再发车——而弱模型上
+  //      恰恰只有快通道跑得通；
+  //   ③ `modelProfileMissing: !_routeSource` 恒假，执行事实那条 engineering 兜底
+  //      两个入口一起死。
+  // _routeSource 本身要保留兜底：它还要拿去拼请求头，那里用本地证据是对的。
+  const _routeJudged = _turnEngineeringResolved?.intentSource === "ai" || !!_fastRouteProfile;
+  if (_routeJudged) { try { sess._semanticProfileFromModel = true; } catch {} }
   config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _semanticProfileHeaderFor(_routeSource, text));
   // 执行事实这条腿也要在**第一发之前**并进来，而不是等到循环边界。
   //
@@ -29720,7 +29761,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 判据一个字不放宽：仍要 hasWorkspace + snapshotReady + 顶层非空，空目录（从零建）
   // 照旧不点 existing_project——那正是它和已有项目的分界。
   try {
-    const _factFlags = _executionFactSemanticFlags({ root: _curRoot, _writeLedger: null }, { modelProfileMissing: !_routeSource });
+    const _factFlags = _executionFactSemanticFlags({ root: _curRoot, _writeLedger: null }, { modelProfileMissing: !_routeJudged });
     if (Object.keys(_factFlags).length) {
       config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _ideSemanticProfile(_factFlags));
     }
