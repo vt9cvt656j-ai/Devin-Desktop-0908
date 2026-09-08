@@ -48425,17 +48425,27 @@ async function _detectVerifyCmd(root, stack = null) {
   // 两个门禁调用点（中途 + 收尾）都经过这层存在性过滤，不给一条跑不动的命令。
   return _filterVerifyCmdSteps(root, await _detectVerifyCmdRaw(root, stack));
 }
+/// `compileall` 必须跳过的目录。
+///
+/// 不排除的后果是实测到的：一个真实项目根下 978 个 .py 里有 25 个语法错，全在
+/// `decompiled/*.rt.py` 这类反编译产物和 `.venv` 的第三方包里——收尾验证会因此**恒红**，
+/// 把模型推去修它从没碰过、也不该碰的垃圾文件。
+const _PY_COMPILE_SKIP = "-x '(^|/)(\\.?venv|node_modules|decompiled|site-packages|build|dist|__pycache__)(/|$)'";
+
 async function _detectVerifyCmdRaw(root, stack = null) {
   if (!root) return null;
-  const known = stack || _projectStacks.get(String(root).replace(/\/+$/, ""));
+  // 在**某一个目录**里探一次。抽成闭包而不是模块级函数：这个函数被测试用 load() 抠出来
+  // 真跑，多一个自由标识符就抠不动了（test/helpers/source.mjs 那套的硬限制）。
+  const probeIn = async (dir, stackHint) => {
+  const known = stackHint || _projectStacks.get(String(dir).replace(/\/+$/, ""));
   const knownCommands = _verificationCommandsForStack(known);
   if (knownCommands.length) return knownCommands.join(" && ");
-  const has = async (f) => { try { await backend.readTextFile(root + "/" + f); return true; } catch { return false; } };
+  const has = async (f) => { try { await backend.readTextFile(dir + "/" + f); return true; } catch { return false; } };
   if (await has("Cargo.toml")) return "cargo check --message-format=short && cargo test";
   if (await has("go.mod")) return "go test ./... && go build ./...";
   if (await has("tsconfig.json")) return "npx --no-install tsc --noEmit";
   try {
-    const pkg = JSON.parse(await backend.readTextFile(root + "/package.json"));
+    const pkg = JSON.parse(await backend.readTextFile(dir + "/package.json"));
     const s = (pkg && pkg.scripts) || {};
     const pm = pkg.packageManager ? String(pkg.packageManager).split("@")[0] : "npm";
     const run = (name) => pm === "yarn" ? `yarn ${name}` : pm === "pnpm" ? `pnpm run ${name}` : pm === "bun" ? `bun run ${name}` : `npm run ${name}`;
@@ -48462,23 +48472,66 @@ async function _detectVerifyCmdRaw(root, stack = null) {
   // 优先用项目自己的虚拟环境（venv 里有就一定能跑），其次才看系统里有没有；两者都没有
   // 就退回**一定存在**的语法编译检查 —— 它至少能抓语法错和 import 时错误，比给一条跑
   // 不了的命令强得多。
-  if (await has("pyproject.toml") || await has("requirements.txt") || await has("setup.py")) {
-    for (const venv of [".venv/bin", "venv/bin", ".venv/Scripts", "venv/Scripts"]) {
-      if (await has(`${venv}/python`) || await has(`${venv}/python.exe`)) {
-        const py = `${venv}/python`;
-        const parts = [];
-        if (await has(`${venv}/ruff`)) parts.push(`${venv}/ruff check .`);
-        if (await has(`${venv}/pytest`)) parts.push(`${venv}/pytest -q`);
-        if (parts.length) return parts.join(" && ");
-        return `${py} -m compileall -q .`;
-      }
+  // **venv 探测提到 manifest 判断外面**（2026-09-08）。原来这四行嵌在
+  // `if (pyproject || requirements.txt || setup.py)` 的花括号**里面**，于是「根下有 .venv、
+  // 但 manifest 在子目录」这个非常常见的形状连进都进不去——用户打开的往往是装着项目的
+  // 那个上层文件夹。实测 30 个真实运行根里有 3 个正好是这个形状。
+  //
+  // 但它仍然**留在 Python 这条腿里**、排在前面三条语言腿之后：一个混了 .venv 的
+  // Rust/Go/TS 仓库必须还是走 `cargo check && cargo test`，不能因为角落里有个虚拟环境
+  // 就掉成 compileall。
+  for (const venv of [".venv/bin", "venv/bin", ".venv/Scripts", "venv/Scripts"]) {
+    if (await has(`${venv}/python`) || await has(`${venv}/python.exe`)) {
+      const py = `${venv}/python`;
+      const parts = [];
+      if (await has(`${venv}/ruff`)) parts.push(`${venv}/ruff check .`);
+      if (await has(`${venv}/pytest`)) parts.push(`${venv}/pytest -q`);
+      if (parts.length) return parts.join(" && ");
+      return `${py} -m compileall -q ${_PY_COMPILE_SKIP} .`;
     }
+  }
+  if (await has("pyproject.toml") || await has("requirements.txt") || await has("setup.py")) {
     // Windows 上 python3 不是命令（python.org 的包只产出 python.exe；同名的 python3.exe
     // 是微软商店的应用执行别名，跑它会弹商店）。这条是"收尾必跑"的验证命令，给错了等于
     // 每次收尾都失败一次。
-    return `${_isWin ? "python" : "python3"} -m compileall -q .`;
+    return `${_isWin ? "python" : "python3"} -m compileall -q ${_PY_COMPILE_SKIP} .`;
   }
   return null;
+  };
+
+  const atRoot = await probeIn(root, stack);
+  if (atRoot) return atRoot;
+
+  // ── 根这层什么都没探到 → 往下看一层 ────────────────────────────────
+  //
+  // 为什么值得：用户打开的常常是**装着项目的那个文件夹**，不是项目本身。实测 30 个
+  // 真实运行根里 19 个（63%）在根这层三条腿全空，其中 6 个只要下探一层就能探到
+  // （小学课本→ledger、猪八戒→web、Music→ThesisX、SUM→scum_client、mr day one→emberfall、
+  // Michael-IDE→ide）。这道 hook 是「模型自己没跑验证时」唯一的正确性检查，近 7 天
+  // 152 个动过代码的 run 里有 29 个（19%）整轮一条命令都没跑过——那些 run 里只有它。
+  //
+  // **恰好一个子目录命中才采纳。** 命中多个说明这是个 monorepo 或者放了一堆项目的
+  // 文件夹，猜哪个都可能猜错，不如不猜（实测 30 个根里这种情况 0 次）。
+  let picked = null;
+  try {
+    const entries = await backend.readDir(root);
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      const name = _agentDirEntryName(entry);
+      if (!name || name.startsWith(".") || !_agentDirEntryIsDir(entry)) continue;
+      if (_AGENT_CONTEXT_SKIP_DIRS.has(name)) continue;
+      const sub = String(root).replace(/\/+$/, "") + "/" + name;
+      const cmd = await probeIn(sub, null);
+      if (!cmd) continue;
+      if (picked) return null;   // 两个都能探到 → 猜不了，放弃
+      picked = { name, cmd };
+    }
+  } catch { return null; }
+  if (!picked) return null;
+  // 目录名一律加引号：中文、空格、括号都常见，而剥前导 cd 的那个正则
+  // （_looksLikeVerificationCommand 里 `^cd\s+(?:"[^"]*"|'[^']*'|[\w./~@:+-]+)$`）
+  // 只认引号形式或纯 ASCII 路径——不加引号，`cd 逆水寒-自动化脚本 && pytest` 会被整条
+  // 判成「不是验证命令」，等于白跑。
+  return `cd "${picked.name}" && ${picked.cmd}`;
 }
 
 // --- Vision bridge: let TEXT-ONLY models (DeepSeek, etc.) "see" images too. ---
