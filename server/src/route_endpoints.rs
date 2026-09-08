@@ -2222,6 +2222,10 @@ pub struct RouteOut {
     /// 单模型定价和显示名（线路上的那一份），出口窗口里可以就地编辑。
     pub model_prices: serde_json::Value,
     pub model_names: serde_json::Value,
+    /// 每个模型此刻的目录现价（含出口带来的），出口窗口里摆在价格框旁边：留空 = 按它收。
+    pub catalog_prices: serde_json::Value,
+    /// 人民币口径的换算，和「线路」页同源。
+    pub cny_per_usd: f64,
     /// 线路自带那个地址的调度状态（它也是一个出口）。
     pub sched: &'static str,
     pub retry_in: Option<u64>,
@@ -2614,6 +2618,8 @@ pub async fn admin_list(
             active: r.active,
             model_count: crate::models::allowed_ids(r).len(),
             models: crate::models::allowed_ids(r),
+            // 先算价再把 eff 搬进去（字段按书写顺序求值）。
+            catalog_prices: serde_json::Value::Object(crate::models::catalog_price_map(&eff)),
             effective_models: eff,
             own_rate_ok: own_rates.get(&r.id).map(|(ok, _)| *ok).unwrap_or(0),
             own_rate_bad: own_rates.get(&r.id).map(|(_, bad)| *bad).unwrap_or(0),
@@ -2622,6 +2628,7 @@ pub async fn admin_list(
             cache_disabled: r.cache_disabled,
             model_prices: r.model_prices.clone(),
             model_names: r.model_names.clone(),
+            cny_per_usd: 10_000.0 / crate::settings::usd_per_cny_bps() as f64,
             sched: sched_word(r.id),
             retry_in: retry_in_secs(r.id),
             live: aggregate_live(&state, r.id, now).await.to_string(),

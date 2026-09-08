@@ -3006,6 +3006,29 @@ pub(crate) fn allowed_ids(m: &Model) -> Vec<String> {
     allowed_ids_parts(&m.enabled_models, &m.model_id)
 }
 
+/// 这些模型此刻的 OpenRouter 目录价（每百万 token 美元），只收目录里查得到的。
+///
+/// 「线路」页和「多路由」的出口窗口共用：两页都要在价格框旁边摆出现价，留空的意思才说得清
+/// （留空 = 按现价收，降价自动跟）。原来只有「线路」页下发，出口窗口里价格框一片空白 ——
+/// 所有者：「输入和输出价格没有跟随线路那里的」。
+pub(crate) fn catalog_price_map(ids: &[String]) -> serde_json::Map<String, serde_json::Value> {
+    ids.iter()
+        .filter_map(|mid| {
+            let e = crate::model_catalog::lookup(mid)?;
+            let (i, o) = (e.input_price?, e.output_price?);
+            Some((
+                mid.clone(),
+                json!({
+                    "in": i,
+                    "out": o,
+                    "cache_read": e.cache_read_price,
+                    "cache_write": e.cache_write_price,
+                }),
+            ))
+        })
+        .collect()
+}
+
 /// 同 `allowed_ids`，但按字段传：admin_update 里 `m` 的别的字段已经被搬走，整体借不了。
 pub(crate) fn allowed_ids_parts(enabled_models: &[String], model_id: &Option<String>) -> Vec<String> {
     if !enabled_models.is_empty() {
@@ -3592,25 +3615,10 @@ pub async fn admin_list(
                 //
                 // 这里直接从内存里的目录取（每 6 小时刷新，不发网络请求），所以列表一打开
                 // 就有，且永远是现价。
-                "catalog_prices": crate::route_endpoints::effective_models(
-                        m,
-                        outlets.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]),
-                    )
-                    .iter()
-                    .filter_map(|mid| {
-                        let e = crate::model_catalog::lookup(mid)?;
-                        let (i, o) = (e.input_price?, e.output_price?);
-                        Some((
-                            mid.clone(),
-                            json!({
-                                "in": i,
-                                "out": o,
-                                "cache_read": e.cache_read_price,
-                                "cache_write": e.cache_write_price,
-                            }),
-                        ))
-                    })
-                    .collect::<serde_json::Map<_, _>>(),
+                "catalog_prices": catalog_price_map(&crate::route_endpoints::effective_models(
+                    m,
+                    outlets.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]),
+                )),
                 "power_route": m.power_route,
                 "effective_models": crate::route_endpoints::effective_models(
                     m,
@@ -15061,9 +15069,28 @@ mod live_price_tests {
             body.contains("\"catalog_prices\":"),
             "线路列表没下发实时目录价 —— 控制台就只能显示当初填死的那个数",
         );
+        // 实时价的取法抽成了 catalog_price_map（「线路」页和「多路由」的出口窗口共用）：
+        // 钉「线路列表用的是它」+「它真从内存目录取」+「多路由那份也带」+「出口窗口真用了」。
         assert!(
-            body.contains("crate::model_catalog::lookup(mid)"),
+            body.contains("\"catalog_prices\": catalog_price_map("),
+            "线路列表的实时价没走公用的 catalog_price_map —— 两页会各自漂",
+        );
+        let helper_at = src.find("pub(crate) fn catalog_price_map(").expect("catalog_price_map 没了");
+        let helper_end = src[helper_at..].find("\n}\n").map(|i| helper_at + i).unwrap_or(src.len());
+        assert!(
+            src[helper_at..helper_end].contains("crate::model_catalog::lookup(mid)"),
             "实时价不是从内存目录取的 —— 那就又是一份会过期的快照",
+        );
+        let outlets = include_str!("route_endpoints.rs");
+        assert!(
+            outlets.contains("catalog_prices: serde_json::Value::Object(crate::models::catalog_price_map(&eff))"),
+            "「多路由」那页的线路没带实时价 —— 出口窗口里的价格框又是一片空白（所有者：输入和输出价格没有跟随线路那里的）",
+        );
+        let dialog = include_str!("../admin-ui/src/pages/RouteEndpoints.tsx");
+        assert!(dialog.contains("const livePrice = (m: string)"), "出口窗口没读实时价");
+        assert!(
+            dialog.contains("title=\"清掉手填价，改为跟随 OpenRouter 现价"),
+            "出口窗口没有「用现价」那颗按钮 —— 填过的价退不回自动",
         );
 
         let ui = include_str!("../admin-ui/src/pages/Routing.tsx");

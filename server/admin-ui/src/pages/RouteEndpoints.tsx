@@ -121,6 +121,9 @@ type Route = {
   cache_disabled: boolean;
   model_prices: Record<string, { in?: number; out?: number }>;
   model_names: Record<string, string>;
+  /** 每个模型此刻的目录现价（每百万 token 美元）。留空的价格框按它收。 */
+  catalog_prices?: Record<string, { in: number; out: number; cache_read?: number | null; cache_write?: number | null }>;
+  cny_per_usd?: number;
   sched: string;
   retry_in: number | null;
   live: string;
@@ -757,6 +760,24 @@ export function RouteEndpoints() {
   const storedPrice = (m: string, side: "in" | "out"): string => {
     const v = draft ? routeOf(draft.route_id)?.model_prices?.[m]?.[side] : undefined;
     return v === undefined || v === null ? "" : String(v);
+  };
+  /// 这个模型此刻的目录现价；目录没收录就没有。
+  const livePrice = (m: string): { in: number; out: number } | null => {
+    const v = draft ? routeOf(draft.route_id)?.catalog_prices?.[m] : undefined;
+    return v && typeof v.in === "number" && typeof v.out === "number" ? { in: v.in, out: v.out } : null;
+  };
+  /// 价格框里此刻显示的那个数（草稿里填的，其次库里存的）。
+  const shownPrice = (m: string, side: "in" | "out"): string =>
+    String(draft?.prices[m]?.[side] ?? storedPrice(m, side) ?? "");
+  /// 你填的价是现价的几倍，取入价出价里大的那个。拿不到现价或没填回 0。
+  const priceGapOf = (m: string): number => {
+    const live = livePrice(m);
+    if (!live) return 0;
+    const pin = priceNum(shownPrice(m, "in")) ?? 0;
+    const pout = priceNum(shownPrice(m, "out")) ?? 0;
+    const gi = live.in > 0 && pin > 0 ? pin / live.in : 0;
+    const go = live.out > 0 && pout > 0 ? pout / live.out : 0;
+    return Math.max(gi, go);
   };
   /// 这个模型的两个价是不是都有(草稿里填的,或库里已存的)。
   /// 目录查不到价的模型必须两个都有才能开放 —— 只填输入价就勾上的话,
@@ -1504,7 +1525,16 @@ export function RouteEndpoints() {
                         />
                         <Input
                           className="h-7 w-full text-xs"
-                          placeholder="输入价"
+                          placeholder={livePrice(m) ? String(livePrice(m)!.in) : "输入价"}
+                          title={
+                            livePrice(m)
+                              ? `留空即按现价 $${livePrice(m)!.in}/1M 收` +
+                                (routeOf(draft.route_id)?.cny_per_usd
+                                  ? `（≈ ¥${(livePrice(m)!.in * routeOf(draft.route_id)!.cny_per_usd!).toFixed(2)}/1M）`
+                                  : "") +
+                                "。单位是美元每百万 token，这是用户付的价。"
+                              : "目录里没有这个模型的现价：要开放它，入价出价都得填（美元每百万 token）"
+                          }
                           value={
                             draft.prices[m]?.in ?? storedPrice(m, "in")
                           }
@@ -1521,7 +1551,16 @@ export function RouteEndpoints() {
                         />
                         <Input
                           className="h-7 w-full text-xs"
-                          placeholder="输出价"
+                          placeholder={livePrice(m) ? String(livePrice(m)!.out) : "输出价"}
+                          title={
+                            livePrice(m)
+                              ? `留空即按现价 $${livePrice(m)!.out}/1M 收` +
+                                (routeOf(draft.route_id)?.cny_per_usd
+                                  ? `（≈ ¥${(livePrice(m)!.out * routeOf(draft.route_id)!.cny_per_usd!).toFixed(2)}/1M）`
+                                  : "") +
+                                "。单位是美元每百万 token，这是用户付的价。"
+                              : "目录里没有这个模型的现价：要开放它，入价出价都得填（美元每百万 token）"
+                          }
                           value={
                             draft.prices[m]?.out ?? storedPrice(m, "out")
                           }
@@ -1537,6 +1576,50 @@ export function RouteEndpoints() {
                           }
                         />
                         <span className="flex shrink-0 items-center gap-1">
+                        {/*
+                          和「线路」页同一套话：留空 = 跟随现价（绿），填了 = 摆出现价和倍数，
+                          一键「用现价」清掉手填价。原来这一格什么都没有，价格框又是空的，
+                          运维分不出「没定价」和「按现价收」—— 所有者：「没写的话也应该和线路那里
+                          一样能用实时现价，或者我手动输入」。
+                        */}
+                        {(() => {
+                          const live = livePrice(m);
+                          if (!live) return null;
+                          const filled = shownPrice(m, "in").trim() !== "" || shownPrice(m, "out").trim() !== "";
+                          if (!filled) {
+                            return (
+                              <span
+                                className="text-[11px] text-emerald-600"
+                                title={`按 OpenRouter 现价收：$${live.in}/$${live.out} 每 1M，它降价你自动跟着降`}
+                              >
+                                跟随现价
+                              </span>
+                            );
+                          }
+                          const gap = priceGapOf(m);
+                          return (
+                            <>
+                              <span
+                                className={cn("text-[11px] tabular-nums", gap >= 2 ? "font-medium text-amber-600" : "text-muted-foreground")}
+                                title={`OpenRouter 现价 $${live.in}/$${live.out} 每 1M`}
+                              >
+                                现价 {live.in}/{live.out}
+                                {gap >= 1.1 && ` · 你 ${gap.toFixed(1)}×`}
+                              </span>
+                              <button
+                                type="button"
+                                className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[11px] hover:bg-muted"
+                                title="清掉手填价，改为跟随 OpenRouter 现价（保存后生效，同一条线路的几个出口共用这份价）"
+                                onClick={(ev) => {
+                                  ev.preventDefault();
+                                  setDraft({ ...draft, prices: { ...draft.prices, [m]: { in: "", out: "" } } });
+                                }}
+                              >
+                                用现价
+                              </button>
+                            </>
+                          );
+                        })()}
                         {carried && (
                           <Badge
                             variant="outline"
@@ -1577,8 +1660,8 @@ export function RouteEndpoints() {
                   <br />
                   <b className="text-foreground">输入价 / 输出价是「用户付多少」，不是你的进价。</b>
                   单位每百万 token 美元，最终扣费 = 这个价 × 这条线路的倍率。
-                  <b>填了会存到线路上</b>（同一条线路的几个出口共用一份价），
-                  目录里有官方价的可以不填。
+                  <b>填了会存到线路上</b>（同一条线路的几个出口共用一份价，和「线路」那页是同一份）；
+                  留空 = 按框里灰字写的现价收，它降价你自动跟着降；目录里没现价的要两个都填。
                   你付给中转的<b>进价</b>在「模型对账」里填，两者不是一回事 ——
                   把进价填到这儿会当场改掉客户账单。
                   全勾 = 承载这条线路的全部模型（以后线路加了新模型也自动跟着有）。
