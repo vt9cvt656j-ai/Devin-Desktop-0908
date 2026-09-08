@@ -1,6 +1,6 @@
 # Michael Design Library — motion-micro-interactions
 
-Control-level and component-level motion: cursor-following effects, hover and press feedback, expand/collapse, loading states, toasts, drawers, carousels and celebration moments. Each entry is named after the EFFECT a user asks for (中文效果名同列) and carries a copyable implementation with real numbers. 14 entries.
+Control-level motion blueprints. Each entry is named after the effect a user asks for, with a copyable implementation. 14 entries.
 
 ## Spotlight Card Following The Cursor — 鼠标跟随光晕 / 聚光灯卡片 / 光标辉光 [motion/spotlight-card-cursor-follow-radial-glow-mousemove]
 
@@ -51,7 +51,7 @@ Reset on `mouseleave` with a slightly longer transition (300–400ms) than the t
 
 For an actual front/back flip (a different effect users also call 翻转): two faces with `backface-visibility: hidden`, the back pre-rotated `rotateY(180deg)`, parent toggling `rotateY(180deg)` over 500–600ms. The flipped face must be reachable by keyboard — bind the flip to `:focus-within` as well as `:hover`, and never hide essential content behind it.
 
-Lift and shadow should move together: pair the tilt with `translateY(-2px)` and a shadow that grows from `0 1px 2px` to `0 12px 24px` at reduced alpha. Gate behind `@media (hover: hover)`, disable under reduced motion.
+Lift and shadow should move together: pair the tilt with `translateY(-2px)` and a shadow that grows from `0 1px 2px` to `0 12px 24px` at reduced alpha. Gate behind `@media (hover: hover)`; under `@media (prefers-reduced-motion: reduce)` drop the tilt and keep a plain shadow change.
 
 ## Magnetic Button — 磁吸按钮 / 吸附跟随 [motion/magnetic-button-cursor-attraction-elastic-snap]
 
@@ -142,7 +142,7 @@ The container needs `position: relative; overflow: hidden` and the ripple `point
 
 Use ripples only in a Material-flavoured system. Mixed into a system whose other controls use lift-and-shadow feedback they read as a foreign object. Keep the press-state transform as well; ripple alone gives no feedback at the moment of contact, only after.
 
-Reduced motion: skip the ripple and keep the press state.
+Under `@media (prefers-reduced-motion: reduce)` skip the ripple and keep the press state — the press is the feedback that matters.
 
 ## Skeleton And Shimmer Loading — 骨架屏 / 加载闪光 / 占位动画 [motion/skeleton-shimmer-loading-placeholder-pulse]
 
@@ -176,6 +176,8 @@ Numbers: enter 200–260ms from 16px below (or from the edge it docks to); exit 
 
 Position bottom-right on desktop, top on mobile (bottom collides with the browser chrome and the thumb). Announce through a polite live region; an error toast should be `role="alert"`.
 
+Under `@media (prefers-reduced-motion: reduce)` fade in place instead of sliding, and keep the dwell time.
+
 A toast is the wrong control for anything that must be read: destructive confirmations, form validation next to a field, or errors requiring a retry belong inline or in a dialog.
 
 ## Drawer And Bottom Sheet — 抽屉 / 底部弹出 / 侧边滑出 [motion/drawer-bottom-sheet-slide-drag-snap-points]
@@ -188,7 +190,7 @@ Numbers: enter 280–350ms with a decelerating ease; exit 200–250ms. Dismiss t
 
 Mandatory: scroll lock on the body while open, focus trap inside, Escape closes, an overlay that also closes on click, and `overscroll-behavior: contain` on the scrollable content so dragging its bottom does not pull the page behind it. Snap points (say 40% and 92%) are worth it only when there is a genuine two-stage reading; otherwise one height is calmer.
 
-Reduced motion: fade the panel and overlay in place over 150ms instead of sliding.
+Under `@media (prefers-reduced-motion: reduce)` fade the panel and overlay in place over 150ms instead of sliding.
 
 ## Typewriter And Rotating Words — 打字机效果 / 文字轮播 / 逐字输入 [motion/typewriter-rotating-words-cursor-caret-cycle]
 

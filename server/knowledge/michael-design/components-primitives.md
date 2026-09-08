@@ -1,6 +1,6 @@
 # Michael Design Library — components-primitives
 
-Single-control blueprints (单个组件 / 控件蓝本): sizing scale, variant API, the full state matrix, keyboard and ARIA contract, and component-level motion parameters for each primitive. Use these when the task is "make me one component", not a whole page. 12 entries.
+Single-control blueprints (单个组件 / 控件蓝本). Use these when the task is one control, not a whole page. 12 entries.
 
 ## Button Primitive — 按钮组件 / 主次按钮 / 变体与状态 [components/button-variants-sizes-states-cva-loading]
 

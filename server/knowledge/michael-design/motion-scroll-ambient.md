@@ -1,6 +1,6 @@
 # Michael Design Library — motion-scroll-ambient
 
-Page-level motion blueprints: scroll storytelling, section reveals, parallax, ambient backgrounds and page transitions. Each entry is named after the EFFECT a user asks for (中文效果名同列), and carries a copyable implementation with real durations, easing and mobile fallbacks. 12 entries.
+Page-level motion blueprints. Each entry is named after the effect a user asks for, with a copyable implementation. 12 entries.
 
 ## Scroll Scrub Pinned Story — 滚动钉住叙事 / 滚动驱动动画 [motion/scroll-scrub-pin-storytelling-gsap-scrolltrigger]
 

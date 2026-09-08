@@ -1,6 +1,6 @@
 # Michael Design Library — motion-library-stack
 
-Which animation library to reach for, verified against the real repositories in September 2026: stars, last release, licence, bundle size, what each one is actually best at, and when not to use it. Read this before adding an animation dependency to a project. 6 entries.
+Which animation library to reach for, verified against the real repositories in September 2026. 6 entries.
 
 ## Choosing An Animation Library — 动画库选型 / 用哪个动画库 [motion/animation-library-selection-decision-matrix-2026]
 
