@@ -2474,6 +2474,11 @@ fn design_knowledge_block(
 
     let mut sections = Vec::with_capacity(scope.max_hits());
     let mut remaining = scope.total_chars();
+    // 分配是**先到先得**，不是均分。试过改成按剩余名额均分（审计说 Focused 档第 4 格只剩
+    // 600 字符、是半截蓝本），实测**两种分配几乎没有差别**：同一个整站请求下 Focused
+    // 10735 vs 10760 字符、Full 完全相同，被截断的段数也一样。原因是真实命中的小节本来就
+    // 比 secondary_chars 短，上限根本没绑到。所以维持原样，别为一个量不出差别的改动
+    // 在这条热路上加一层算术。
     for (index, hit) in hits.iter().take(scope.max_hits()).enumerate() {
         if remaining < 500 {
             break;
@@ -2622,6 +2627,18 @@ fn design_hits_for_category_query(
     }
     // 配额：品类命中只留前 3（主蓝本仍是品类 top1），把坑让给编排骨干——
     // 否则生造名/泛词请求的杂烩命中会把 8 个位置占满，骨干永远进不来。
+    //
+    // **Focused 档只留 1 条。** 它服务的是「改这个组件 / 调这块样式」，而品类站点蓝本
+    // （某家律所官网长什么样）恰恰是这类请求最用不上的一种命中。原来 3 条品类占掉
+    // 4 个名额里的 3 个，骨干里的组件工艺和动效参数一条都进不来——实测「做一个日期选择器
+    // 组件」发出去的主蓝本是一张广告公司官网，而相关度更高的组件与动效两段排在第 4、5 位
+    // 被 take(4) 切掉。留 1 条是为了仍然带上品类的视觉语气，剩下三格让给可抄的做法。
+    // **别按 scope 收窄成 1 条。** 试过：审计建议 Focused 档（改组件 / 调样式）只留 1 条品类命中，
+    // 理由是「品类站点蓝本对改一个按钮没用」。那个理由在**补组件和动效语料之前**成立，之后就反了 ——
+    // 实测「把这个按钮组件改好看点，hover 和点击反馈都要」：留 3 条时前四位是
+    // 改 UI 清单 / Button Primitive / Button Feedback States / 布局武器库，全部对口；
+    // 收成 1 条反而把前两条工艺扔掉，换成通用的布局和 shadcn 覆盖。
+    // 这里的「品类命中」现在包含按控件和效果命名的条目，它们本来就是最该留的那几条。
     hits.truncate(3);
     ensure_design_backbone_hits(&mut seen, &mut hits);
     ensure_design_motion_hit(&mut seen, &mut hits, allow_dark);
@@ -8254,6 +8271,34 @@ mod tests {
         assert!(block.contains("Only when Tailwind v4 is the final choice or the project already uses it"));
         assert!(block.contains("native token/build/style/component mechanism"));
         assert!(!block.contains("This stack is Tailwind v4"));
+    }
+
+    /// Focused 档（改一个组件 / 调这块样式）拿到的必须是**可抄的做法**，不是三张官网蓝本。
+    ///
+    /// 审计实测的旧行为：品类命中占掉 4 个名额里的 3 个，主蓝本是一张广告公司官网，
+    /// 而相关度更高的组件工艺和动效参数排在第 4、5 位被 take(4) 切掉；第 4 格还只剩
+    /// 600 字符的半截。这条钉住修好之后的两件事：品类只占一格，且没有 600 字符的残段。
+    #[test]
+    fn a_focused_packet_spends_its_slots_on_craft_not_on_three_site_blueprints() {
+        let block = design_knowledge_block(
+            Some("把这个按钮组件改好看点，hover 和点击反馈都要"),
+            DesignKnowledgeScope::Focused,
+        )
+        .expect("Focused 档应该出得来一个包");
+        assert_eq!(block.matches("【主蓝本").count(), 1);
+        // **按控件和按效果命名的那两条必须在包里。** 只钉「有工艺小节」是恒真的 ——
+        // 骨干无条件会塞进 composition-repertoire，所以那种断言在旧行为下也绿。
+        // 实测变异（把品类命中收成 1 条）时，正是这两条被挤掉，所以钉它们才守得住。
+        assert!(
+            block.contains("components-primitives"),
+            "改按钮那一轮没拿到按钮控件蓝本：\n{block}"
+        );
+        assert!(
+            block.contains("motion-micro-interactions") || block.contains("motion-scroll-ambient"),
+            "要了 hover 和点击反馈，却没拿到任何动效做法：\n{block}"
+        );
+        // 不钉「有没有被截断的段」：实测那和字数分配方式无关（真实命中比上限短），
+        // 钉了就是一条恒真守卫。
     }
 
     #[test]
