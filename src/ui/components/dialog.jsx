@@ -1,6 +1,7 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { XIcon } from "lucide-react";
 import { cn } from "../lib/cn.js";
+import { t } from "../../i18n.js";
 
 /**
  * Dialog —— 这是"必须用 React"的那一类组件。
@@ -67,7 +68,8 @@ export function DialogContent({ className, children, showCloseButton = true, ...
             className="absolute right-4 top-4 rounded-sm opacity-70 transition-opacity hover:opacity-100 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:pointer-events-none cursor-pointer"
           >
             <XIcon className="size-4" />
-            <span className="sr-only">Close</span>
+            {/* 读屏器念的就是这句：写死英文的话，中文界面里它是整个对话框唯一一处英文。 */}
+            <span className="sr-only">{t("common.close") || "关闭"}</span>
           </DialogPrimitive.Close>
         )}
       </DialogPrimitive.Content>

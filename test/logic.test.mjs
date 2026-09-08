@@ -8,6 +8,7 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { dbIcon } from "../src/agent/db-icons.js";
 import { toolLedgerStats } from "../src/agent/tool-ledger.js";
 import { decideQuietTurn as _decideQuietTurn, QUIET_RESUME_POOL } from "../src/agent/quiet-turn.js";
 import { joinReasoningDelta as _joinReasoningDelta } from "../src/agent/reasoning-join.js";
@@ -2012,8 +2013,16 @@ test("assistant header groups its capabilities behind one vertical capabilities 
     "两项都要在同一个菜单里选得到");
   assert.doesNotMatch(INDEX_HTML, /id="skillsBtn"|id="mcpBtn"/,
     "old separate Skills/MCP header buttons should not remain visible in markup");
-  assert.match(SRC, /const _ICON_CAPABILITIES = '<svg[\s\S]{0,220}<circle cx="12" cy="5" r="1\.85"\/>[\s\S]{0,180}<circle cx="12" cy="19" r="1\.85"\/><\/svg>';/,
-    "capability entry should use the redesigned vertical three-dot icon");
+  // 2026-09-07：手画的 SVG 常量全部换成 db-icons（Lucide 烤出的那份），所有者点名
+  // 「很多图标很小众，不是大厂用的」。判据跟着从「字面量长这样」换成两条真断言：
+  // 取自共用图标集，且那个键真的是**竖排**三点（横排的是另一个键，换错了菜单会变样）。
+  assert.match(SRC, /const _ICON_CAPABILITIES = _dbIcon\("dotsV"\);/,
+    "capability entry should use the shared icon set, not a hand-drawn SVG");
+  const dotsV = dbIcon("dotsV");
+  const cys = [...dotsV.matchAll(/cy="(\d+)"/g)].map((m) => m[1]);
+  const cxs = new Set([...dotsV.matchAll(/cx="(\d+)"/g)].map((m) => m[1]));
+  assert.deepEqual(cys.sort(), ["12", "19", "5"], "dotsV 不是三点竖排");
+  assert.equal(cxs.size, 1, "三个点的 cx 不一样，那是横排");
   assert.match(SRC, /_capBtn\.addEventListener\("click"[\s\S]{0,260}_toggleCapabilitiesMenu\(\)/,
     "capability button should toggle the menu");
   // 两项都是"用户自己写、AI 要照做"的东西；技能面板列的是磁盘上发现的 SKILL.md，
@@ -3164,7 +3173,8 @@ test("在新目录里第一次建配置文件时，老配置被搬过来，而�
   const panel = stripJsComments(SRC);
   assert.match(panel, /content: seeded \|\| _CAPABILITY_STARTER/,
     "面板绕过了搬迁直接写示例——老配置会在用户点「新建」的那一刻失效");
-  assert.match(panel, /const seeded = await _seedFromLegacyScopeFile\(s\.path\)/);
+  // 变量名从 s 改成 sc（面板重做时 s 被外层的 section 占了）；判据只认调用点，不认变量名。
+  assert.match(panel, /const seeded = await _seedFromLegacyScopeFile\(\w+\.path\)/);
 });
 
 test("目录从 .michael/ 改名到 .mrdayone/：老配置照样生效，新的一旦存在就完全盖过老的", async () => {
@@ -5464,7 +5474,6 @@ test("conversation compaction reports removed media for object URL cleanup", () 
 
 test("session picker shows true memory stats and searches historical summaries", () => {
   const stats = load("_sessionMemoryStats");
-  const label = load("_sessionMemoryLabel");
   const searchText = load("_sessionSearchText");
   const preview = load("_sessionLastPreview");
   const session = {
@@ -5495,29 +5504,30 @@ test("session picker shows true memory stats and searches historical summaries",
     fileEvidenceCount: 1,
     correctionCount: 1,
   });
-  assert.equal(label(st), "145 turns · 1 msg · 1 summary · 1 files · 1 corrections");
-  // Zero-valued extras are dropped rather than printed — "0 summaries · 0 files" repeated
-  // on every row was most of the old line's width and distinguished nothing.
-  assert.equal(label({ totalTurns: 3, recentCount: 3, summaryCount: 0, fileEvidenceCount: 0 }),
-    "3 turns · 3 msgs");
+  // 2026-09-07：行里的计数改由岛按 i18n 拼（src/ui/session-list.js 的 metaText），_sessionMemoryLabel 删了。
   assert.match(searchText(session), /会话记忆不能丢/);
   // 这条原来搜的是里程碑文本（账本已删）。改搜文件证据——那是还活着的第二条非 recent 通道。
   assert.match(searchText(session), /session picker implementation/i);
   assert.equal(preview(session), "最新回答：已经修好弹窗");
   // The picker is now a React island (src/ui/session-picker.jsx) styled with shadcn + Tailwind,
   // so its surface comes from the theme bridge rather than a hardcoded .session-picker rule.
-  assert.match(PICKER_SRC, /stay in context as summaries/,
-    "picker subtitle must explain that older chat is summarized rather than lost");
+  // 2026-09-07：文案搬进 i18n（sessions.*）。截图里「会议 / 简历」就是英文字面量被运行时翻译器
+  // 翻错的样子。判据换成：键在，且三种语言都有。
+  const I18N_TEXT = readFileSync(join(HERE, "../src/i18n.js"), "utf8");
+  for (const key of ["sessions.subtitle", "sessions.title", "sessions.search", "sessions.today"]) {
+    assert.ok(PICKER_SRC.includes(`"${key}"`), `picker 不再引用 ${key}`);
+    const hits = (I18N_TEXT.match(new RegExp(`"${key.replace(/\./g, "\\.")}":`, "g")) || []).length;
+    assert.equal(hits, 3, `${key} 只有 ${hits} 种语言，EN / ZH / JA 三份都要`);
+  }
   assert.match(SRC, /search: _sessionSearchText\(s\)/,
     "picker search must cover summaries/file evidence, not only recent messages");
   assert.match(PICKER_SRC, /\(e\.search \|\| ""\)\.includes\(q\)/,
     "the island must filter on that full search text");
   // The count chip became a per-row CURRENT/RESUME tag plus a resumable total in the footer —
   // both themed from the token bridge rather than hardcoded Google blue.
-  assert.match(PICKER_SRC, /bg-primary\/10 text-primary/,
-    "the current-session tag should use the theme's primary tint");
-  assert.match(PICKER_SRC, /\{resumableCount\} resumable/,
-    "the picker should still say how many sessions can be restored");
+  // 不用品牌色块，也不再有页脚计数和标签（所有者逐个否掉）。
+  assert.doesNotMatch(PICKER_SRC, /bg-primary\/10/, "当前会话又变回品牌蓝色块了");
+  assert.doesNotMatch(PICKER_SRC, /resumableSuffix|sessions\.resume|sessions\.current/, "标签 / 页脚又回来了");
   // The slash popup is now a React island (src/ui/slash-menu.jsx) rather than .atmenu markup
   // shared with the @-file picker — that sharing is what forced the file-row proportions onto
   // three words of text. Same intent as the old .atmenu__item--slash assertion, stronger form:
@@ -5565,12 +5575,14 @@ test("closed chat tabs stay in the session library and can be restored", () => {
 
   const picker = extractFn("_openSessionPicker");
   assert.match(picker, /const entries = _sessionPickerEntries\(\)/);
-  assert.match(picker, /tag: active \? "current" : state === "closed" \? "resume" : ""/,
-    "each row must say whether it is the current session or a restorable one");
+  // 2026-09-07 所有者把「当前 / 可恢复」标签否了（「太丑了」）：行上不再带 tag，当前会话只靠 active 加粗。
+  assert.doesNotMatch(picker, /tag: active \?/, "「当前 / 可恢复」标签又回来了");
+  assert.match(picker, /active,\n/, "行上仍要带 active，岛靠它给当前会话加粗");
   assert.match(picker, /_restoreClosedChatSession\(row\.index\)/,
     "clicking a closed session row should reopen it as a real chat tab");
-  assert.match(PICKER_SRC, /\{e\.tag\}/,
-    "closed/recoverable rows need a visible state instead of looking like the active one");
+  // 当前会话只靠字重区分：不铺常驻底色、不挂标签（所有者：悬浮时两块灰挨在一起丑死了）
+  assert.match(PICKER_SRC, /e\.active && "font-medium"/, "当前会话要靠字重能认出来");
+  assert.doesNotMatch(PICKER_SRC, /e\.active && "bg-/, "当前会话又铺常驻底色了");
 });
 
 test("memory center uses Michael-owned labels and hides competitor implementation details", () => {
@@ -5583,19 +5595,29 @@ test("memory center uses Michael-owned labels and hides competitor implementatio
   const panel = extractFn("openMemoryPanel");
   assert.match(panel, /openMemoryCenterIsland\(\{/,
     "the memory center should render through its island");
-  assert.match(MEMORY_SRC, /Project memory/);
-  assert.match(MEMORY_SRC, /Global preferences/);
-  assert.match(MEMORY_SRC, /One entry per line/,
-    "the panel must still say how entries are written");
-  assert.match(MEMORY_SRC, /ref=\{attachGlobe\}/,
-    "memory center should mount the 3D network-globe container");
-  assert.match(panel, /_mcGlobeInit\(host, host/,
-    "the globe must be initialized with real memory data");
-  assert.match(panel, /globe\.rebuild\(\)|_memoryGlobe\?\.rebuild\(\)/,
-    "editing must still rebuild the graph");
-  // Clicking a node selecting its source line is the reason the graph earns its space.
-  assert.match(panel, /ta\.setSelectionRange\(pos, pos \+ len\)/,
-    "clicking a graph node must still select that line in the editor");
+  // 2026-09-07：文案从英文字面量搬进 i18n（面板此前靠运行时翻译器现翻，于是同一屏
+  // 中英混排）。判据跟着换成更强的一条：每个键都要在 EN / ZH / JA 三份里都有，
+  // 缺一份就是那种「换个语言就露出英文」的回退。
+  const I18N_SRC = readFileSync(join(HERE, "../src/i18n.js"), "utf8");
+  for (const key of ["memory.tab.memory", "memory.tab.preferences", "memory.subtitle", "memory.core.hint"]) {
+    assert.ok(MEMORY_SRC.includes(`"${key}"`), `面板不再引用 ${key}`);
+    const hits = (I18N_SRC.match(new RegExp(`"${key.replace(/\./g, "\\.")}":`, "g")) || []).length;
+    assert.equal(hits, 3, `${key} 只有 ${hits} 种语言，EN / ZH / JA 三份都要`);
+  }
+  assert.doesNotMatch(MEMORY_SRC, />\s*(?:Core|Memory|Preferences|Graph|Save)\s*</,
+    "又把文案写成了写死的英文 —— 换语言时会半截中文半截英文");
+  // 2026-09-07 所有者：「记忆里面不需要有关系图，彻底删除」。3D 网络地球连同 main.js 里
+  // 那份命令式 WebGL（_mcGlobeInit / _mcScatter）和它的样式一起摘掉了——这条断言从
+  // 「地球必须还在」翻成「一个字都不许回来」，否则下一次「顺手接回去」没人拦得住。
+  // 剥注释再断言：面板的文件头注释里写着「删掉的是 _mcGlobeInit / _mcScatter」这段来历，
+  // 直接扫原文会被自己的注释喂到（本仓踩过好几次，见 memory source-assert-vs-comments）。
+  const noComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/^\s*\/\/.*$/gm, " ");
+  const MEMORY_CODE = noComments(MEMORY_SRC);
+  for (const dead of ["_mcGlobeInit", "_mcScatter", "onGlobeMount", "_memoryGlobe", "mc-globe"]) {
+    assert.ok(!SRC.includes(dead), `main.js 里还留着关系图的残骸：${dead}`);
+    assert.ok(!MEMORY_CODE.includes(dead), `面板里还留着关系图的残骸：${dead}`);
+  }
+  assert.ok(!APP_CSS.includes("mc-globe"), "关系图的样式还在，删了标记却留着样式表");
   assert.doesNotMatch(MEMORY_SRC, /Windsurf|Claude Code|Copilot|AGENTS\.md|CLAUDE\.md|\.cursorrules|copilot-instructions/i,
     "the island must not expose competitor names either");
   assert.doesNotMatch(panel, /Windsurf|Claude Code|Copilot|AGENTS\.md|CLAUDE\.md|\.cursorrules|copilot-instructions/i,
@@ -5608,10 +5630,15 @@ test("memory center uses Michael-owned labels and hides competitor implementatio
   // there is no hardcoded .memory-center rule left to drift from it.
   assert.match(MEMORY_SRC, /<DialogContent/,
     "the memory center should use the shared dialog surface");
-  assert.match(APP_CSS, /\.mc-globe-3d\s*\{[\s\S]*position:\s*absolute;/,
-    "the memory center should host a full-bleed 3D network globe");
-  assert.match(APP_CSS, /\.mc-edit-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/,
-    "project and global memory editors should be side-by-side on desktop");
+  // 一页到底、分段，没有标签栏（照 Cursor 的 Rules 页）：三段各是「标题 + 一句人话 +
+  // 一块编辑区」，段间一条发丝线，页脚只有一个保存。
+  assert.ok(!MEMORY_SRC.includes("TabsList"), "又退回标签栏了——只有三段内容不该撑起一根空侧栏");
+  assert.ok((MEMORY_SRC.match(/<Section/g) || []).length >= 3, "三段（核心 / 项目记忆 / 偏好）少了");
+  assert.match(MEMORY_SRC, /onSaveCore\?\.\(coreUser, coreProject\);\s*\n\s*onSave\?\.\(project, global\);/,
+    "一个保存要把三段一起存：分页保存那一版改了两段只存下当前那段，而界面从没说过");
+  // 主按钮不许再是品牌蓝（发送按钮 2026-09-01 定过同一件事）
+  assert.match(MEMORY_SRC, /bg-\[var\(--send-bg\)\]/, "保存按钮又变回品牌蓝了");
+  assert.doesNotMatch(MEMORY_SRC, /bg-primary(?![\w-])/, "面板里出现了品牌色实底");
 });
 
 test("blob video snapshots fall back to durable key-frame rendering", () => {
@@ -27499,7 +27526,7 @@ test("typed literals are exempt from the auto-localizer", () => {
   assert.doesNotMatch(SLASH, /data-i18n-skip[^>]*>\{item\.desc\}/,
     "the description is UI copy and should still localize");
 
-  assert.match(PICKER_SRC, /data-i18n-skip>\{e\.name\}/,
+  assert.match(PICKER_SRC, /data-i18n-skip>\s*\{e\.name/,
     "a session's title is the user's own prompt and must not be translated");
 
   // And the mechanism must still be the one i18n.js honours.

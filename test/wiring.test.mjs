@@ -1244,7 +1244,9 @@ test("/sessions 必须能看到内存装不下的那部分历史会话", () => {
   assert.match(main, /async function _restoreArchivedSession\(sessionId\)/);
 
   // 3) picker 必须把归档行拼进清单，并且点击时走归档恢复路径。
-  const picker = main.slice(main.indexOf("async function _openSessionPicker"), main.indexOf("async function _openSessionPicker") + 3000);
+  // 按 AST 取整个函数，别切固定 3000 字符：2026-09-07 取数改成 load() 之后函数变长，onPick 滑出了窗口，
+  // 这条测试就假红了（固定窗口的另一种形态是函数变短后假绿）。
+  const picker = blockFrom("async function _openSessionPicker() {");
   assert.match(picker, /await _archivedSessionRows\(\)/, "picker 要去取归档清单");
   assert.match(picker, /entries: \[\.\.\.rows, \.\.\.archivedRows\]/, "归档行要真的进 entries");
   assert.match(picker, /row\.state === "archived"/, "点归档行要走归档恢复");

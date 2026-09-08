@@ -192,22 +192,42 @@ function dynamicImportGuard() {
 // build still looks correct (a three3d chunk exists, the app runs). Same outcome if the
 // entry HTML ever preloads three3d directly.
 //
-// So assert both directions: nothing eagerly loaded may reference three3d, and three3d
-// must actually exist as long as globe.gl is a dependency.
+// 判据 2026-09-07 翻过一次。原来是「三样都查，且 three3d **必须存在**」——那条建立在
+// 「globe.gl 一直是依赖」之上。记忆面板的 3D 网络地球被所有者点名删掉之后，没有任何模块
+// 再 import three / globe.gl，于是这个分包**本就不该被打出来**，而守卫把「删干净了」报成了
+// 构建失败。
+//
+// 真正要守的从来不是「那个分包在不在」，是**那 2 MB 有没有回到冷启动路径上**。所以改成
+// 按**模块来源**查：凡是被 index.html 预加载的块，里面不许出现 three/globe 树里的任何一个包。
+// 这一版比原来更硬——原来靠「chunk 名叫 three3d」间接判断，一次依赖改名就会静默失效
+//（正是注释里写的那个回归形态）；现在直接看模块路径，改名也躲不掉。
+const THREE_TREE_RE = new RegExp(
+  `node_modules/(?:${[...THREE_GLOBE_TREE].map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})/`,
+);
+/** 被 index.html 预加载、也就是冷启动一定会下载的那几个块。 */
+const EAGER_CHUNK_RE = /^assets\/(vendor|rolldown-runtime|main|overlay|tailwind)-/;
+
 function threeChunkGuard() {
   return {
     name: "three-chunk-guard",
     generateBundle(_options, bundle) {
       const names = Object.keys(bundle);
       const three3d = names.filter((n) => /^assets\/three3d-/.test(n));
-      if (three3d.length === 0) {
-        throw new Error(
-          "[three-chunk-guard] no three3d chunk was emitted — manualChunks no longer matches " +
-          "the globe/three tree (a dependency rename?). Without it the 2 MB tree is folded " +
-          "back into `vendor`, which index.html modulepreloads, and every cold start pays for " +
-          "a panel most users never open.",
-        );
+      // 先按模块来源查：这一条不依赖分包存不存在，依赖改名也绕不过去。
+      for (const [fileName, chunk] of Object.entries(bundle)) {
+        if (chunk.type !== "chunk" || !EAGER_CHUNK_RE.test(fileName)) continue;
+        const leaked = Object.keys(chunk.modules || {}).filter((id) => THREE_TREE_RE.test(id));
+        if (leaked.length) {
+          throw new Error(
+            `[three-chunk-guard] ${fileName} 里打进了 globe/three 树的模块（${leaked.slice(0, 3).join(", ")}` +
+            `${leaked.length > 3 ? ` 等 ${leaked.length} 个` : ""}）——它被 index.html 预加载，` +
+            "这 2 MB 就回到了冷启动路径上。要么让引用它的代码走懒加载，要么把新的传递依赖补进 THREE_GLOBE_TREE。",
+          );
+        }
       }
+      // 没打出 three3d 这个块，在「树整个删掉了」之后是**正确结果**，不是回归：
+      // 上面那条已经证明了它没有偷偷折回 vendor。
+      if (three3d.length === 0) return;
       for (const [fileName, chunk] of Object.entries(bundle)) {
         // Only chunks that are themselves eagerly loaded can drag three3d into startup.
         // `vendor` and the entry chunks are modulepreloaded; three3d's own facade is not.

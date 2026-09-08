@@ -37,6 +37,7 @@ import { buildSqlAssistMessages as _dbBuildSqlAssistMessages, extractSqlFromRepl
 import { ribbonHtml as _dbRibbonHtml, treeHtml as _dbTreeHtml, objectsHtml as _dbObjectsHtml, infoHtml as _dbInfoHtml, connectionDialogHtml as _dbConnectionDialogHtml, confirmDialogHtml as _dbConfirmDialogHtml, centerTabsHtml as _dbCenterTabsHtml, statusHtml as _dbStatusHtml, cellHtml as _dbCellHtml } from "./agent/db-workbench-views.js";
 import { configureDbWorkbenchPanels, tableTabHtml as _dbTableTabHtml, queryTabHtml as _dbQueryTabHtml, serverTabHtml as _dbServerTabHtml, historyPanelHtml as _dbHistoryPanelHtml, aiPanelHtml as _dbAiPanelHtml } from "./agent/db-workbench-panels.js";
 import { dbIcon as _dbIcon, dbObjectIcon as _dbObjIcon } from "./agent/db-icons.js";
+import { openBillingPanel as _openBillingPanel } from "./ui/billing-panel.js";
 import { applyLayoutDensity, viewportW, viewportH } from "./agent/layout-density.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { parseSlashInvocation, findSlashSkill, buildSlashInvocationMessage } from "./agent/skill-invoke.js";
@@ -10393,6 +10394,8 @@ function setActiveWorkspaceRoot(path) {
   _invalidateProjectFileCache();
   path = _toPosix(path);
   rootPath = path;
+  // 广播给界面：/sessions 面板开着时按新根目录重画（只看这个项目的会话）。
+  try { window.dispatchEvent(new CustomEvent("mrday:root-changed", { detail: { root: path } })); } catch {}
   _launchConfigsCache = null;
   _agentContextCache = { root: "", ts: 0, data: "" };
   // Reconcile this workspace's memory with its durable real file (once per root) —
@@ -15574,53 +15577,23 @@ function _dispUsd(rawCents, digits = 3) {
 async function _showBillingPanel() {
   const token = localStorage.getItem("michael_token");
   if (!token) { showToast("请先登录"); return; }
-  const dlg = document.createElement("dialog");
-  dlg.className = "billing-dialog";
-  dlg.innerHTML = `<div class="billing-dialog__inner"><div class="billing-dialog__header"><h2>${_escHtml(t("account.billing"))}</h2><button class="billing-dialog__close"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div><div class="billing-dialog__body"><p style="text-align:center;color:#5f6368;padding:40px 0">${_escHtml(t("billing.loading"))}</p></div></div>`;
-  document.body.appendChild(dlg);
-  dlg.showModal();
-  dlg.querySelector(".billing-dialog__close").onclick = () => { dlg.close(); dlg.remove(); };
-  dlg.addEventListener("click", (e) => { if (e.target === dlg) { dlg.close(); dlg.remove(); } });
-  try {
-    const r = await fetch(_michaelBase() + "/api/usage", { headers: { Authorization: "Bearer " + token } });
-    if (!r.ok) throw new Error(r.status);
-    const d = await r.json();
-    const body = dlg.querySelector(".billing-dialog__body");
-    const bal = _dispUsd(d.credits_cents);
-    const spent = _dispUsd(d.total_spent_cents);
-    const all = (d.recent || []).map((u) => {
-      const date = new Date(u.time).toLocaleString("zh-CN", { month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" });
-      const model = u.model || "—";
-      const inp = u.usage_reported ? _tokenShort(u.prompt_tokens || 0) : "未上报";
-      const out = u.usage_reported ? _tokenShort(u.completion_tokens || 0) : "未上报";
-      // Free-model calls are paid from the daily 点 pool, not the wallet. Showing them as
-      // "$0.00" would read as a billing hole; show what was actually spent, in its own unit.
-      const pts = Number(u.free_points_spent) || 0;
-      const cost = pts > 0 ? ((Math.round(pts * 1000) / 1000) + " 点") : _dispUsd(u.cost_cents);
-      return "<tr><td>" + date + "</td><td>" + model + "</td><td>" + inp + "</td><td>" + out + "</td><td>" + cost + "</td></tr>";
-    });
-    const PER = 10;
-    let page = 0;
-    const totalPages = Math.max(1, Math.ceil(all.length / PER));
-    function render() {
-      const slice = all.slice(page * PER, (page + 1) * PER).join("");
-      const noData = '<tr><td colspan="5" style="text-align:center;color:#5f6368;padding:32px 0">暂无记录</td></tr>';
-      const pager = totalPages > 1
-        ? '<div class="billing-dialog__pager"><button class="billing-dialog__pager-btn" data-dir="prev"' + (page === 0 ? " disabled" : "") + '><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg></button><span class="billing-dialog__pager-info">' + (page + 1) + ' / ' + totalPages + '</span><button class="billing-dialog__pager-btn" data-dir="next"' + (page >= totalPages - 1 ? " disabled" : "") + '><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 18l6-6-6-6"/></svg></button></div>'
-        : "";
-      body.innerHTML =
-        '<div class="billing-dialog__balance"><div><div style="margin-bottom:4px">余额</div><strong>' + bal + '</strong></div><div style="margin-left:auto;text-align:right"><div style="margin-bottom:4px">累计消费</div><span style="font-size:20px;font-weight:500;color:#202124">' + spent + '</span></div></div>' +
-        '<div class="billing-dialog__table-wrap"><table class="billing-dialog__table"><thead><tr><th>时间</th><th>模型</th><th>输入</th><th>输出</th><th>费用</th></tr></thead><tbody>' +
-        (slice || noData) +
-        '</tbody></table></div>' + pager;
-      body.querySelectorAll(".billing-dialog__pager-btn").forEach((btn) => {
-        btn.onclick = () => { page += btn.dataset.dir === "prev" ? -1 : 1; render(); };
+  // 正文在 src/ui/billing-panel.js。这里只负责把「钱怎么换算、图标从哪来、去哪取数」
+  // 三样注入进去 —— 那个模块因此可以在 Node 里直接跑，见 test/billing-panel.test.mjs。
+  _openBillingPanel({
+    t,
+    locale: getLocale(),
+    fmtUsd: (cents) => _dispUsd(cents),
+    tokenShort: _tokenShort,
+    icon: (kind) => _dbIcon(kind),
+    fetchUsage: async () => {
+      const r = await fetch(_michaelBase() + "/api/usage", {
+        cache: "no-store",
+        headers: { Authorization: "Bearer " + token },
       });
-    }
-    render();
-  } catch (e) {
-    dlg.querySelector(".billing-dialog__body").innerHTML = '<p style="color:#d93025;text-align:center;padding:32px 0">加载失败: ' + e.message + '</p>';
-  }
+      if (!r.ok) throw new Error(`${t("billing.loadFailed")}（HTTP ${r.status}）`);
+      return r.json();
+    },
+  });
 }
 
 async function showProfile() {
@@ -17639,7 +17612,8 @@ function _createChatSession(name, mode, model, project) {
     // Which project this chat is about (folder it was started under); kept in
     // sync on send. Lets each tab show its project.
     project: project !== undefined ? project : (_knownWorkspaceRoots()[0] || ""),
-    memory: new ConversationMemory(), container, created: Date.now(), _pendingSends: [], _transcriptLoaded: true,
+    // updatedAt：最近一次活动。每轮开跑时 _setStreaming 碰一下；/sessions 按它倒序。
+    memory: new ConversationMemory(), container, created: Date.now(), updatedAt: Date.now(), _pendingSends: [], _transcriptLoaded: true,
   };
   _bindSessionMemoryCleanup(session);
   return session;
@@ -17692,22 +17666,24 @@ function _renderChatTabs() {
   tabBar.appendChild(addBtn);
 }
 // Chat-panel HEADER actions (one layer above the tab bar): one compact capability menu for Skills + MCP.
-const _ICON_CAPABILITIES = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.85"/><circle cx="12" cy="12" r="1.85"/><circle cx="12" cy="19" r="1.85"/></svg>';
-const _ICON_SKILLS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>';
-const _ICON_MCP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v3a6 6 0 0 1-12 0V8z"/></svg>';
-// 用户规则：一张写着条文的纸。刻意不用"齿轮"——齿轮在这个界面里已经是「设置」的意思了。
-// 用户习惯：一个人 + 一条轨迹。和"规则"那张纸区分开——两项都是用户写的文字，
-// 图标是唯一能一眼分出强弱的地方。
-const _ICON_HABITS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="3.2"/><path d="M5.5 20.5a6.5 6.5 0 0 1 13 0"/></svg>';
-const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h5"/></svg>';
-// 浏览器：一个地球仪。下面那段块语句在模块求值时就跑，所以这个常量必须在它**之前**
-// 声明完——放到文件后面会是 TDZ 报错，而且是「应用一启动就白屏」那种，测试还照样全绿。
-const _ICON_BROWSER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3.5 9h17M3.5 15h17"/><ellipse cx="12" cy="12" rx="4" ry="9"/></svg>';
-// 能力：一枚盾 + 一个勾。**必须和上面几个待在一起**——它 2026-08-16 曾被放到文件
-// 27000 行外（挨着它的功能代码），于是下面那段块语句在模块求值时读到未初始化的它，
-// 整个模块顶层从这里中断：应用能起窗口，但后面所有初始化一行都没跑。上面那条注释
-// 早就写过这个坑，注释没挡住第二次，所以现在由 icon_constants_precede_their_use 钉着。
-const _ICON_CAPS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 6v6c0 5 3.4 8.9 8 10 4.6-1.1 8-5 8-10V6z"/><path d="m9 12 2 2 4-4"/></svg>';
+// 界面图标一律从 src/agent/db-icons.js 出（Lucide 烤出来的那份）。
+//
+// 2026-09-07：这一段原来是七个**手画**的 SVG——盾牌加勾、地球仪、人加一条轨迹、三个圆点……
+// 所有者点名「很多图标很小众，不是大厂用的」。手画的问题不是难看，是**不成体系**：粗细、
+// 端点、留白各画各的，凑在一个菜单里就露馅。换成同一套 Lucide 之后风格自动一致。
+//
+// **这几个常量必须留在这里、且排在下面那段块语句之前**：块语句在模块求值时就跑，
+// 常量挪到文件后面就是 TDZ——应用能起窗口，但后面所有初始化一行都不跑，而测试照样全绿。
+// 由 test/logic.test.mjs 的 icon_constants_precede_their_use 钉着。
+const _ICON_CAPABILITIES = _dbIcon("dotsV");
+const _ICON_SKILLS = _dbIcon("bookOpen");
+const _ICON_MCP = _dbIcon("network");
+// 用户习惯是「一再重复的做法」——用循环箭头，不用「人 + 轨迹」那种要解释的画法。
+const _ICON_HABITS = _dbIcon("repeat");
+const _ICON_RULES = _dbIcon("fileText");
+const _ICON_BROWSER = _dbIcon("globe");
+const _ICON_CAPS = _dbIcon("shieldCheck");
+
 {
   const _wrap = document.getElementById("capabilitiesMenuWrap");
   const _capBtn = document.getElementById("capabilitiesBtn");
@@ -22394,6 +22370,9 @@ function _setStreaming(sess, on) {
   if (!sess) return;
   const wasStreaming = !!sess.streaming;
   sess.streaming = !!on;
+  // 每一轮开跑都是这个会话的一次活动：/sessions 按 updatedAt 倒序，最近聊过的排最上面。
+  // 放在这里而不是四处 memory.push 的地方——智能体、纯对话、生图三条路都经过这一个口。
+  if (on) sess.updatedAt = Date.now();
   // Interactive tools (ask_user / pickers) can otherwise keep their promises, listeners
   // and timers alive after a run ends.  Settle them before the transport cancellation so
   // an old run cannot resume itself later.
@@ -34213,10 +34192,11 @@ function _capabilityScopePaths(home, root) {
   const out = [];
   // 面板只指向**新目录**：这是"该往哪写"的答案，不是"读过哪些"的清单。老目录仍然读得到
   // （见 _readFirstExisting），但不该再教人往那儿写。
-  if (home) out.push({ label: "个人（所有项目通用）", path: `${home}/${_STATE_DIR}/settings.json` });
+  // 标签带 i18n 键：面板要三语，而这里是唯一产出这几行文案的地方。
+  if (home) out.push({ key: "caps.scopeUser", label: "个人 · 所有项目通用", path: `${home}/${_STATE_DIR}/settings.json` });
   if (root) {
-    out.push({ label: "项目（跟着仓库走，团队共享）", path: `${root.replace(/\/+$/, "")}/${_STATE_DIR}/settings.json` });
-    out.push({ label: "项目 · 只属于你（别提交）", path: `${root.replace(/\/+$/, "")}/${_STATE_DIR}/settings.local.json` });
+    out.push({ key: "caps.scopeProject", label: "项目 · 跟着仓库走，团队共享", path: `${root.replace(/\/+$/, "")}/${_STATE_DIR}/settings.json` });
+    out.push({ key: "caps.scopeLocal", label: "项目 · 只属于你，别提交", path: `${root.replace(/\/+$/, "")}/${_STATE_DIR}/settings.local.json` });
   }
   return out;
 }
@@ -34248,8 +34228,37 @@ const _CAPABILITY_STARTER = `{
 `;
 
 async function _openCapabilitiesPanel() {
-  const m = _chatToolModal({ title: "能力 · 你自己接进来的", icon: _ICON_CAPS, wide: true });
-  if (!inTauri) { m.body.innerHTML = `<div class="bp-empty">能力声明只在桌面 App 里生效。</div>`; return; }
+  // 2026-09-07 重做（所有者：「弄成大厂风格」）。上一版三个毛病：
+  //   · 它的 .cap-row / .cap-sec__* 和**抓包回放面板**用的是同一批类名，而那份定义在样式表里
+  //     更靠后 —— 于是这个面板的行实际上被另一个面板的规则接管（padding、边框、状态色）。
+  //     这一版整体改前缀 caps-*，两边彻底分开。
+  //   · 颜色写死（Google 蓝的图标、红块报错、灰底按钮），和应用其余部分不是一套语言。
+  //   · 文案全是中文字面量，换语言时靠运行时翻译器现翻，会出现中英混排。
+  // 现在：自己的 <dialog>、只用应用 token（深色不写第二套）、文案走 caps.* 三语。
+  const T = (key, fallback) => { const v = t(key); return v && v !== key ? v : fallback; };
+  const esc = _escHtml;
+
+  const dlg = document.createElement("dialog");
+  dlg.className = "caps";
+  dlg.innerHTML = `<div class="caps__head">
+      <div>
+        <div class="caps__title">${esc(T("caps.title", "能力"))}</div>
+        <div class="caps__sub">${esc(T("caps.subtitle", "你自己接进来的工具、知识库、角色和命令。"))}</div>
+      </div>
+      <button class="caps__x" type="button" aria-label="${esc(T("common.close", "关闭"))}">${_dbIcon("close")}</button>
+    </div>
+    <div class="caps__body"></div>`;
+  document.body.appendChild(dlg);
+  dlg.showModal();
+  const close = () => { try { dlg.close(); } catch {} dlg.remove(); };
+  dlg.querySelector(".caps__x").onclick = close;
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) close(); });
+  const body = dlg.querySelector(".caps__body");
+
+  if (!inTauri) {
+    body.innerHTML = `<div class="caps__empty">${esc(T("caps.desktopOnly", "能力声明只在桌面 App 里生效。"))}</div>`;
+    return;
+  }
   const root = String(_knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
   // 打开面板时**重新读一次**：用户多半是刚改完文件过来看结果的，这时候给他 10 秒前的
   // 缓存等于什么都没说。
@@ -34258,88 +34267,108 @@ async function _openCapabilitiesPanel() {
   let home = "";
   try { home = String((await backend.homeDir?.()) || "").replace(/\/+$/, ""); } catch {}
 
-  const esc = _escHtml;
-  const rows = (items, render) => items.map(render).join("");
-  const section = (title, count, inner) =>
-    `<div class="cap-sec"><div class="cap-sec__head">${esc(title)}<span class="cap-sec__n">${count}</span></div>${inner}</div>`;
+  // 一段：标题 + 右侧计数；有内容就列行，没有就一句灰字说清「怎么才能有」。
+  // 每段带一枚图标：六段标题在纯文字下长得一样高、一样重，扫一眼分不出这是哪一类。
+  // 图标一律从 db-icons（Lucide 烤出的那份）取，不手画。
+  const section = (icon, title, count, inner, mod = "") =>
+    `<section class="caps__sec${mod}"><div class="caps__sec-h">`
+    + `<span class="caps__ico">${_dbIcon(icon)}</span><h3>${esc(title)}</h3>`
+    + (count == null ? "" : `<span class="caps__n" translate="no">${count}</span>`)
+    + `</div>${inner}</section>`;
+  // 一行：名字 + 来源在右，第二行是等宽的细节（地址 / 路径 / 工具矩阵）。
+  const row = (name, source, detail) =>
+    `<div class="caps__row"><div class="caps__row-top">`
+    + `<span class="caps__name" data-i18n-skip>${esc(name)}</span>`
+    + (source ? `<span class="caps__src" data-i18n-skip>${esc(source)}</span>` : "")
+    + `</div>${detail ? `<div class="caps__detail" data-i18n-skip>${esc(detail)}</div>` : ""}</div>`;
+  const list = (items, render) => `<div class="caps__list">${items.map(render).join("")}</div>`;
+  const none = (text) => `<div class="caps__none">${esc(text)}</div>`;
 
   let html = "";
-  // 错误排在最前面，红的。这是这个面板存在的首要理由。
+  // 错误排在最前面——这个面板存在的首要理由就是让写错的声明不再静默消失。
+  //
+  // 但它是**和下面几段同一个形状的一段**，只是图标和计数染成红的：上一版是一整块粉底 +
+  // 左竖线 + 红标题 + 项目符号列表，同一件事说了四遍，读起来像「系统坏了」而不是
+  // 「有一条要改」。大厂设置页的做法是把颜色只留给那一枚图标，别的照常。
   if (caps.errors.length) {
-    html += `<div class="cap-err"><b>${caps.errors.length} 条声明没有生效</b>`
-      + `<ul>${caps.errors.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`
-      + `<span>其余声明照常生效。改完文件回到这里再看一次即可，不用重启。</span></div>`;
+    // 校验器给的是「原因：对象」。拆成两行，和别的行同一个骨架：上面一句人话，下面等宽的对象。
+    const errRows = caps.errors.map((e) => {
+      const at = String(e).indexOf("：");
+      const reason = at > 0 ? String(e).slice(0, at) : String(e);
+      const subject = at > 0 ? String(e).slice(at + 1).trim() : "";
+      return `<div class="caps__row"><div class="caps__row-top">`
+        + `<span class="caps__name" data-i18n-skip>${esc(reason)}</span></div>`
+        + (subject ? `<div class="caps__detail" data-i18n-skip>${esc(subject)}</div>` : "") + `</div>`;
+    }).join("");
+    html += section("warn", T("caps.errTitle", "声明没有生效"), caps.errors.length,
+      `<div class="caps__list">${errRows}</div>`
+      + `<p class="caps__hint">${esc(T("caps.errTail", "其余声明照常生效。改完文件回到这里再看一次即可，不用重启。"))}</p>`,
+      " caps__sec--err");
   }
-  const httpTools = caps.tools.filter((t) => t.kind !== "folder");
-  const folders = caps.tools.filter((t) => t.kind === "folder");
-  html += section("工具", httpTools.length, httpTools.length
-    ? `<div class="cap-list">${rows(httpTools, (t) => `<div class="cap-row"><span class="cap-row__name">${esc(t.name)}</span>`
-      + `<span class="cap-row__src">${esc(t.source || "")}</span>`
-      + `<span class="cap-row__mid">${esc(t.http.method)} ${esc(t.http.url)}</span></div>`)}</div>`
-    : `<div class="cap-none">还没有。下面「新建示例」会给你一份改改就能用的。</div>`);
-  html += section("知识库", folders.length, folders.length
-    ? `<div class="cap-list">${rows(folders, (t) => `<div class="cap-row"><span class="cap-row__name">${esc(t.name)}</span>`
-      + `<span class="cap-row__src">${esc(t.source || "")}</span>`
-      + `<span class="cap-row__mid">${esc(t.folder.path)}</span></div>`)}</div>`
-    : `<div class="cap-none">还没有。指一个本地目录，模型就能在里面检索。</div>`);
-  html += section("角色", caps.roles.length, caps.roles.length
-    ? `<div class="cap-list">${rows(caps.roles, (r) => `<div class="cap-row"><span class="cap-row__name">${esc(r.name)}</span>`
-      + `<span class="cap-row__src">${esc(r.source || "")}</span>`
-      + `<span class="cap-row__mid">${esc((r.tools || []).join("、") || "只有提示词，没有额外工具")}</span></div>`)}</div>`
-    : `<div class="cap-none">还没有。角色可以带自己的提示词和工具矩阵。</div>`);
-  html += section("命令", caps.commands.length, caps.commands.length
-    ? `<div class="cap-list">${rows(caps.commands, (c) => `<div class="cap-row"><span class="cap-row__name">/${esc(c.cmd)}</span>`
-      + `<span class="cap-row__src">${esc(c.source || "")}</span>`
-      + `<span class="cap-row__mid">${esc(c.desc)}</span></div>`)}</div>`
-    : `<div class="cap-none">还没有。写一条就能在输入框里按 / 唤出来。</div>`);
-  html += section("已关闭的内置工具", caps.disabled.length, caps.disabled.length
-    ? `<div class="cap-off">${caps.disabled.map((d) => `<code>${esc(d)}</code>`).join("")}</div>`
-    : `<div class="cap-none">没有关掉任何内置工具。</div>`);
+  const httpTools = caps.tools.filter((tool) => tool.kind !== "folder");
+  const folders = caps.tools.filter((tool) => tool.kind === "folder");
+  html += section("wrench", T("caps.tools", "工具"), httpTools.length, httpTools.length
+    ? list(httpTools, (x) => row(x.name, x.source, `${x.http.method} ${x.http.url}`))
+    : none(T("caps.noTools", "还没有。下面「新建示例」会给你一份改改就能用的。")));
+  html += section("library", T("caps.knowledge", "知识库"), folders.length, folders.length
+    ? list(folders, (x) => row(x.name, x.source, x.folder.path))
+    : none(T("caps.noKnowledge", "还没有。指一个本地目录，模型就能在里面检索。")));
+  html += section("userRound", T("caps.roles", "角色"), caps.roles.length, caps.roles.length
+    ? list(caps.roles, (r) => row(r.name, r.source, (r.tools || []).join("、") || T("caps.roleNoTools", "只有提示词，没有额外工具")))
+    : none(T("caps.noRoles", "还没有。角色可以带自己的提示词和工具矩阵。")));
+  html += section("terminal", T("caps.commands", "命令"), caps.commands.length, caps.commands.length
+    ? list(caps.commands, (c) => row(`/${c.cmd}`, c.source, c.desc))
+    : none(T("caps.noCommands", "还没有。写一条就能在输入框里按 / 唤出来。")));
+  html += section("ban", T("caps.disabled", "已关闭的内置工具"), caps.disabled.length, caps.disabled.length
+    ? `<div class="caps__chips">${caps.disabled.map((d) => `<code data-i18n-skip>${esc(d)}</code>`).join("")}</div>`
+    : none(T("caps.noDisabled", "没有关掉任何内置工具。")));
 
   const scopes = _capabilityScopePaths(home, root);
-  html += `<div class="cap-sec"><div class="cap-sec__head">配置文件</div><div class="cap-files">`
-    + scopes.map((s, i) => `<div class="cap-file"><span class="cap-file__label">${esc(s.label)}</span>`
-      + `<code class="cap-file__path">${esc(s.path)}</code>`
-      + `<button class="cap-btn" data-open="${i}">打开</button>`
-      + `<button class="cap-btn cap-btn--ghost" data-new="${i}">新建示例</button></div>`).join("")
-    + `</div><div class="cap-hint">同名的以先读到的为准（个人 &gt; 项目）；「已关闭」取并集——任一层说别用就算数。改完 10 秒内自动生效。</div></div>`;
-  m.body.innerHTML = html;
+  html += `<section class="caps__sec"><div class="caps__sec-h">`
+    + `<span class="caps__ico">${_dbIcon("fileText")}</span><h3>${esc(T("caps.files", "配置文件"))}</h3></div>`
+    + `<div class="caps__list">` + scopes.map((sc, i) => `<div class="caps__file">`
+      + `<div class="caps__file-main"><div class="caps__name">${esc(T(sc.key, sc.label))}</div>`
+      + `<div class="caps__detail" data-i18n-skip>${esc(sc.path)}</div></div>`
+      + `<div class="caps__acts"><button class="caps__btn" type="button" data-open="${i}">${esc(T("caps.open", "打开"))}</button>`
+      + `<button class="caps__btn" type="button" data-new="${i}">${esc(T("caps.newExample", "新建示例"))}</button></div></div>`).join("")
+    + `</div><p class="caps__hint">${esc(T("caps.hint", "同名的以先读到的为准（个人 > 项目）；「已关闭」取并集——任一层说别用就算数。改完 10 秒内自动生效。"))}</p></section>`;
+  body.innerHTML = html;
 
-  m.body.querySelectorAll("[data-open]").forEach((btn) => {
+  body.querySelectorAll("[data-open]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const s = scopes[Number(btn.dataset.open)];
-      if (!s) return;
+      const sc = scopes[Number(btn.dataset.open)];
+      if (!sc) return;
       try {
-        await openFile(s.path, s.path.split("/").pop());
-        m.close();
-      } catch { showToast("这个文件还不存在，点「新建示例」先建一份"); }
+        await openFile(sc.path, sc.path.split("/").pop());
+        close();
+      } catch { showToast(T("caps.fileMissing", "这个文件还不存在，点「新建示例」先建一份")); }
     });
   });
-  m.body.querySelectorAll("[data-new]").forEach((btn) => {
+  body.querySelectorAll("[data-new]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const s = scopes[Number(btn.dataset.new)];
-      if (!s) return;
+      const sc = scopes[Number(btn.dataset.new)];
+      if (!sc) return;
       // 已经存在就绝不覆盖——用户的配置比一份示例值钱得多。
       try {
-        const existing = await backend.readTextFile(s.path);
+        const existing = await backend.readTextFile(sc.path);
         if (String(existing || "").trim()) {
-          showToast("这个文件已经有内容了，直接打开来改，不覆盖");
-          await openFile(s.path, s.path.split("/").pop());
-          m.close();
+          showToast(T("caps.fileHasContent", "这个文件已经有内容了，直接打开来改，不覆盖"));
+          await openFile(sc.path, sc.path.split("/").pop());
+          close();
           return;
         }
       } catch { /* 不存在，正常往下建 */ }
       // 老目录里有配置就先搬过来，别拿示例把它顶掉——原因见 _seedFromLegacyScopeFile。
-      const seeded = await _seedFromLegacyScopeFile(s.path);
+      const seeded = await _seedFromLegacyScopeFile(sc.path);
       try {
-        await backend.invoke("write_text_file", { path: s.path, content: seeded || _CAPABILITY_STARTER });
-        await openFile(s.path, s.path.split("/").pop());
-        m.close();
+        await backend.invoke("write_text_file", { path: sc.path, content: seeded || _CAPABILITY_STARTER });
+        await openFile(sc.path, sc.path.split("/").pop());
+        close();
         showToast(seeded
-          ? `已把你原来 ${_LEGACY_STATE_DIR}/ 里的配置搬到这里，内容一字未改；旧文件还在，确认没问题后可以删掉`
-          : "已建好一份示例，改成你自己的接口即可");
+          ? `${T("caps.seeded", "已把你原来的配置搬到这里，内容一字未改；旧文件还在，确认没问题后可以删掉")}（${_LEGACY_STATE_DIR}/）`
+          : T("caps.created", "已建好一份示例，改成你自己的接口即可"));
       } catch (e) {
-        showToast(`建不了：${String(e?.message || e).slice(0, 120)}`);
+        showToast(`${T("caps.createFailed", "建不了")}：${String(e?.message || e).slice(0, 120)}`);
       }
     });
   });
@@ -34655,10 +34684,10 @@ const _SKILL_DEFAULT_ICON =
   '<path d="M20 12.1v17M11.5 20.6h17" stroke="#0a4a25" stroke-opacity=".3" stroke-width="4.4" stroke-linecap="round"/>' +
   '<path d="M20 11.5v17M11.5 20h17" stroke="#fff" stroke-width="4.4" stroke-linecap="round"/>' +
   '</svg>';
-const _ICON_EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
-const _ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
-const _ICON_PENCIL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
-const _ICON_IMPORT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M12 18v-6"/><path d="m9 15 3 3 3-3"/></svg>';
+const _ICON_EYE = _dbIcon("eye");
+const _ICON_TRASH = _dbIcon("trash");
+const _ICON_PENCIL = _dbIcon("edit");
+const _ICON_IMPORT = _dbIcon("download");
 function _loadSkillsLocal() { try { const a = JSON.parse(localStorage.getItem(_SKILLS_KEY) || "null"); if (Array.isArray(a)) return a; } catch {} return []; }
 function _saveSkillsLocal(list) { try { localStorage.setItem(_SKILLS_KEY, JSON.stringify(list)); } catch {} }
 
@@ -41245,158 +41274,10 @@ function _clearKgMemory(root) {
   _agentContextCache = { root: null, ts: 0, data: "" };
 }
 
-// ---- 记忆中心 · 网络地球（globe.gl / three.js）：浅色白风格 + 记忆节点 + 飞线弧 + 涟漪 ----
-
-const _MC_GLOBE_CATS = {
-  session: { label: "会话", color: "#0a84ff", lat: 34, lng: -60 },
-  project: { label: "项目", color: "#7c5cff", lat: 12, lng: 96 },
-  global: { label: "偏好", color: "#20a83a", lat: -18, lng: 18 },
-  rules: { label: "规则", color: "#f08a00", lat: -40, lng: 150 },
-};
-
-// 在某枢纽经纬度附近撒点（球面小簇），确定性抖动。
-function _mcScatter(baseLat, baseLng, i) {
-  const gold = i * 137.5;
-  const rad = 8 + Math.sqrt(i + 1) * 5;
-  const lat = baseLat + Math.sin(gold * Math.PI / 180) * rad * 0.6;
-  const lng = baseLng + Math.cos(gold * Math.PI / 180) * rad;
-  return { lat: Math.max(-85, Math.min(85, lat)), lng };
-}
-
-// data: { session:[..], project:[..], global:[..], rules:[..] }
-function _mcGlobeInit(wrapEl, containerEl, _tip, getData, onNodeClick) {
-  let globe = null, dead = false, ro = null, ringTimer = 0;
-
-  const buildLayers = () => {
-    const data = getData();
-    const points = [];
-    const arcs = [];
-    for (const key of Object.keys(_MC_GLOBE_CATS)) {
-      const cat = _MC_GLOBE_CATS[key];
-      points.push({ lat: cat.lat, lng: cat.lng, size: 1.5, color: cat.color, cat: key, hub: true, label: cat.label });
-      const list = (data[key] || []).slice(0, 60);
-      list.forEach((text, i) => {
-        const p = _mcScatter(cat.lat, cat.lng, i);
-        points.push({ lat: p.lat, lng: p.lng, size: 0.62, color: cat.color, cat: key, idx: i, text: String(text || "").slice(0, 300) });
-        // 记忆点 → 枢纽的飞弧
-        arcs.push({ startLat: p.lat, startLng: p.lng, endLat: cat.lat, endLng: cat.lng, color: cat.color });
-      });
-    }
-    // 枢纽之间的跨洲飞线，做出"网络"感
-    const hubs = Object.values(_MC_GLOBE_CATS);
-    for (let i = 0; i < hubs.length; i++) {
-      const a = hubs[i], b = hubs[(i + 1) % hubs.length];
-      arcs.push({ startLat: a.lat, startLng: a.lng, endLat: b.lat, endLng: b.lng, color: [a.color, b.color], cross: true });
-    }
-    return { points, arcs };
-  };
-
-  containerEl.innerHTML = `<div class="mc-globe-loading"><span class="mp-spinner"></span>正在启动网络地球…</div>`;
-
-  (async () => {
-    let Globe, THREE;
-    try {
-      const [g, three] = await Promise.all([import("globe.gl"), import("three")]);
-      Globe = g.default; THREE = three;
-    } catch (e) {
-      if (!dead) containerEl.innerHTML = `<div class="mc-globe-loading">3D 引擎加载失败：${_escHtml(String(e?.message || e).slice(0, 120))}</div>`;
-      return;
-    }
-    if (dead) return;
-    containerEl.innerHTML = "";
-    const { points, arcs } = buildLayers();
-
-    globe = new Globe(containerEl, { animateIn: true })
-      .width(Math.max(320, wrapEl.clientWidth))
-      .height(Math.max(260, wrapEl.clientHeight))
-      .backgroundColor("rgba(0,0,0,0)")
-      // 浅色白瓷地球 + 经纬网格 + 浅蓝大气
-      .showGlobe(true)
-      .globeMaterial(new THREE.MeshPhongMaterial({ color: "#eef3fb", emissive: "#dfe8f6", emissiveIntensity: 0.35, shininess: 6, transparent: true, opacity: 0.96 }))
-      .showGraticules(true)
-      .showAtmosphere(true)
-      .atmosphereColor("#9cc0ff")
-      .atmosphereAltitude(0.2)
-      // 记忆节点
-      .pointsData(points)
-      .pointLat("lat").pointLng("lng").pointColor("color")
-      .pointAltitude((d) => (d.hub ? 0.12 : 0.05))
-      .pointRadius((d) => d.size)
-      .pointsMerge(false)
-      .pointLabel((d) => d.hub
-        ? `<div class="mc-node-tip"><b style="color:${d.color}">${_escHtml(d.label)} · 枢纽</b></div>`
-        : `<div class="mc-node-tip"><b style="color:${d.color}">${_escHtml(_MC_GLOBE_CATS[d.cat].label)}</b>${_escHtml(String(d.text || ""))}</div>`)
-      .onPointClick((d) => {
-        if (globe) globe.pointOfView({ lat: d.lat, lng: d.lng, altitude: 1.6 }, 800);
-        if (!d.hub && onNodeClick) onNodeClick({ cat: d.cat, idx: d.idx, text: d.text });
-      })
-      // 飞线弧：dash 动画流动
-      .arcsData(arcs)
-      .arcColor("color")
-      .arcAltitude((d) => (d.cross ? 0.35 : 0.14))
-      .arcStroke((d) => (d.cross ? 0.7 : 0.32))
-      .arcDashLength(0.45)
-      .arcDashGap(0.6)
-      .arcDashInitialGap(() => Math.random())
-      .arcDashAnimateTime((d) => (d.cross ? 4200 : 2200))
-      // 节点涟漪
-      .ringsData(points.filter((p) => p.hub))
-      .ringLat("lat").ringLng("lng").ringColor((d) => d.color)
-      .ringMaxRadius(5.5).ringPropagationSpeed(2).ringRepeatPeriod(1100);
-
-    // 白色地球需要正面补光才有质感
-    try {
-      const scene = globe.scene();
-      scene.add(new THREE.AmbientLight(0xffffff, 1.6));
-      const dir = new THREE.DirectionalLight(0xffffff, 0.9);
-      dir.position.set(1, 1, 1);
-      scene.add(dir);
-    } catch {}
-
-    // 自转，拖拽即接管
-    try {
-      const controls = globe.controls();
-      controls.autoRotate = true;
-      controls.autoRotateSpeed = 0.55;
-      controls.enableZoom = true;
-      controls.minDistance = 180;
-      controls.maxDistance = 520;
-      containerEl.addEventListener("pointerdown", () => { controls.autoRotate = false; }, { once: true });
-    } catch {}
-    globe.pointOfView({ lat: 6, lng: 20, altitude: 1.95 }, 0);
-
-    ro = new ResizeObserver(() => {
-      if (globe && !dead) {
-        globe.width(Math.max(320, wrapEl.clientWidth));
-        globe.height(Math.max(260, wrapEl.clientHeight));
-      }
-    });
-    ro.observe(wrapEl);
-  })();
-
-  return {
-    rebuild() {
-      if (!globe || dead) return;
-      const { points, arcs } = buildLayers();
-      globe.pointsData(points).arcsData(arcs).ringsData(points.filter((p) => p.hub));
-    },
-    destroy() {
-      dead = true;
-      try { ro?.disconnect(); } catch {}
-      try { clearInterval(ringTimer); } catch {}
-      try { globe?._destructor?.(); } catch {}
-      globe = null;
-    },
-  };
-}
-
 // Memory panel: view / edit / clear the agent's project memory for the current
 // workspace. Opened via the "Manage Project Memory" command (⌘⇧P).
 function openMemoryPanel() {
   const root = rootPath || workspaceRoots[0] || "";
-  const parseLines = (v) => String(v || "").split("\n").map((x) => x.trim()).filter(Boolean);
-  // Latest text lives here, not in React state: the globe rebuilds from it on a debounce and
-  // must see what the user typed a moment ago, not a stale render.
   const text = { project: root ? _kgText(root) : "", global: _kgText("") };
 
   openMemoryCenterIsland({
@@ -41405,48 +41286,6 @@ function openMemoryPanel() {
     initialGlobal: text.global,
     // 核心记忆（Core 页）：initialCore / memoryStats / onSaveCore 由 agent/core-capture.js 装配。
     ...corePanelProps(root, { mirrorProject: () => _scheduleProjectMemoryMirror(root), invalidateContext: () => { _agentContextCache = { root: null, ts: 0, data: "" }; }, toast: showToast }),
-
-    // The graph stays imperative: _mcGlobeInit owns a WebGL context and its own animation loop,
-    // which React should not be re-running on every keystroke. The island hands over a container
-    // and the two textareas, and gets back a handle it destroys on unmount.
-    onGlobeMount: ({ host, projectEl, globalEl }) => {
-      const globeData = () => {
-        const stats = typeof _sessionMemoryStats === "function" ? _sessionMemoryStats(_currentSession?.() || {}) : null;
-        const session = [];
-        if (stats?.recentCount) session.push(`最近对话 ${stats.recentCount} 条`);
-        if (stats?.summaryCount) session.push(`历史摘要 ${stats.summaryCount} 段`);
-        if (stats?.correctionCount) session.push(`有效纠正 ${stats.correctionCount} 条`);
-        if (!session.length) session.push("当前会话暂无摘要");
-        return {
-          session,
-          project: root ? parseLines(text.project) : [],
-          global: parseLines(text.global),
-          rules: ["项目根目录规则文件（自动识别注入）"],
-        };
-      };
-      const globe = _mcGlobeInit(host, host, null, globeData, (n) => {
-        // Clicking a node selects the line it came from — the reason the graph is worth keeping.
-        const ta = n.cat === "project" ? (root ? projectEl : null) : n.cat === "global" ? globalEl : null;
-        if (!ta) return;
-        const raw = ta.value.split("\n");
-        let count = -1, pos = 0, len = 0;
-        for (let i = 0; i < raw.length; i++) {
-          if (raw[i].trim()) count++;
-          if (count === n.idx) { len = raw[i].length; break; }
-          pos += raw[i].length + 1;
-        }
-        ta.focus();
-        try { ta.setSelectionRange(pos, pos + len); } catch {}
-      });
-      _memoryGlobe = globe;
-      return globe;
-    },
-
-    onTextChange: (which, value) => {
-      text[which] = value;
-      clearTimeout(_memoryGlobeRebuild);
-      _memoryGlobeRebuild = setTimeout(() => { try { _memoryGlobe?.rebuild(); } catch {} }, 400);
-    },
 
     onSave: (project, global) => {
       const projectCount = root ? _saveKgText(root, project) : 0;
@@ -41457,11 +41296,8 @@ function openMemoryPanel() {
     },
     onClearProject: () => { if (!root) return; text.project = ""; _clearKgMemory(root); showToast("项目记忆已清空"); },
     onClearGlobal: () => { text.global = ""; _clearKgMemory(""); showToast("全局偏好已清空"); },
-    onClose: () => { clearTimeout(_memoryGlobeRebuild); _memoryGlobe = null; },
   });
 }
-let _memoryGlobe = null;
-let _memoryGlobeRebuild = null;
 
 
 /**
@@ -77239,22 +77075,6 @@ function _sessionMemoryStats(session) {
   };
 }
 
-function _sessionMemoryLabel(stats) {
-  const s = stats || {};
-  const total = Number(s.totalTurns) || Number(s.recentCount) || 0;
-  // Terse, like Claude Code's resume list: the counts that tell two sessions apart, and
-  // nothing that reads the same on every row. Zero-valued extras are dropped rather than
-  // printed as "0 summaries · 0 files", which was most of the old line's width.
-  const parts = [];
-  if (total) parts.push(`${total} turn${total === 1 ? "" : "s"}`);
-  const recent = Number(s.recentCount) || 0;
-  if (recent) parts.push(`${recent} msg${recent === 1 ? "" : "s"}`);
-  const summaries = Number(s.summaryCount) || 0;
-  if (summaries) parts.push(`${summaries} summar${summaries === 1 ? "y" : "ies"}`);
-  if (Number(s.fileEvidenceCount) > 0) parts.push(`${Number(s.fileEvidenceCount)} files`);
-  if (Number(s.correctionCount) > 0) parts.push(`${Number(s.correctionCount)} corrections`);
-  return parts.join(" · ");
-}
 
 function _sessionSearchText(session) {
   const memory = session?.memory;
@@ -77392,58 +77212,60 @@ async function _openSessionPicker() {
   // Data prep only — the panel is a React island (src/ui/session-picker.jsx). Everything the
   // island needs is flattened to plain values here so it stays presentational and main.js keeps
   // ownership of session state.
-  const entries = _sessionPickerEntries();
-  // 归档行是异步取的（一次 SQLite 查询）。**先把内存里的画出来再补**，不要让
-  // /sessions 卡在一次查询上——历史多的时候那会是几百毫秒的空白面板。
-  const archived = await _archivedSessionRows();
-  const resumable = entries.filter((entry) => entry.state === "closed").length + archived.length;
-  const rows = entries.map(({ session: s, index: i, state }) => {
-    const modeObj = _AI_MODES.find((m) => m.id === s.mode);
-    const active = state === "open" && i === _activeChatIdx;
-    return {
-      key: `${state}:${i}`,
-      index: i,
-      state,
-      active,
-      // Claude Code's identity order: custom title, else the first prompt, else the sequential
-      // name as a last resort (a brand-new session has no prompt yet).
-      name: _sessionFirstPrompt(s) || s.name,
-      project: s.project ? (s.project.split("/").filter(Boolean).pop() || "") : "",
-      dot: modeObj?.color || "#1a73e8",
-      // One compact secondary line, not five competing fields. The mode, the file-evidence and
-      // correction counts were on every row and never decided which session you wanted; the
-      // turn count and the project do.
-      meta: [_sessionMemoryLabel(_sessionMemoryStats(s)), s.project ? (s.project.split("/").filter(Boolean).pop() || "") : ""]
-        .filter(Boolean).join(" · "),
-      // Which session you are in, and which are closed but restorable, is the distinction the
-      // list exists to make — a row you cannot tell apart from the current one is a trap.
-      tag: active ? "current" : state === "closed" ? "resume" : "",
-      preview: _sessionLastPreview(s),
-      search: _sessionSearchText(s),
-    };
-  });
-  // 归档行：只有清单信息，没有 session 对象，所以单独拼，不走上面那个 map。
-  const archivedRows = archived.map(({ row: r }, n) => ({
-    key: `archived:${r.sessionId}`,
-    index: n,
-    sessionId: r.sessionId,
-    state: "archived",
-    active: false,
-    name: (r.preview || "").trim().slice(0, 80) || r.name || "（未命名会话）",
-    project: r.project ? (r.project.split("/").filter(Boolean).pop() || "") : "",
-    dot: (_AI_MODES.find((m) => m.id === r.mode)?.color) || "#8a8a8d",
-    meta: [
-      Number(r.totalTurns) ? `${r.totalTurns} turn${r.totalTurns === 1 ? "" : "s"}` : "",
-      r.project ? (r.project.split("/").filter(Boolean).pop() || "") : "",
-    ].filter(Boolean).join(" · "),
-    tag: "resume",
-    preview: r.preview || "",
-    search: [r.name, r.project, r.preview].filter(Boolean).join(" ").toLowerCase(),
-  }));
+  //
+  // 2026-09-07 所有者：「最新的排上面；每个窗口只看自己这个项目的会话；换了文件夹要自动更新」。
+  // 于是取数改成一个可重复调用的 load()：岛第一次挂载调一次，之后根目录一变
+  //（setActiveWorkspaceRoot 发的 mrday:root-changed）由 mount 那层再调一次重画。
+  // 排序、按项目过滤、按天分组都在岛那边的纯函数里（src/ui/session-list.js），
+  // 这里只负责把每一行的**时间戳**和**项目路径**带出去。
+  const load = async () => {
+    const entries = _sessionPickerEntries();
+    // 归档行是异步取的（一次 SQLite 查询）；历史多的时候是几百毫秒。
+    const archived = await _archivedSessionRows();
+    const rows = entries.map(({ session: s, index: i, state }) => {
+      const modeObj = _AI_MODES.find((m) => m.id === s.mode);
+      const active = state === "open" && i === _activeChatIdx;
+      return {
+        key: `${state}:${i}`,
+        index: i,
+        state,
+        active,
+        // Claude Code's identity order: custom title, else the first prompt, else the sequential
+        // name as a last resort (a brand-new session has no prompt yet).
+        name: _sessionFirstPrompt(s) || s.name,
+        project: s.project ? (s.project.split("/").filter(Boolean).pop() || "") : "",
+        projectPath: s.project || "",
+        // 最近一次活动：每轮开跑时 _setStreaming 会碰 updatedAt；老会话没有这个字段，退到
+        // 关闭时间、再退到创建时间——总有一个，排序才不会把它们挤成一团沉底。
+        at: Number(s.updatedAt) || Number(s.closedAt) || Number(s.created) || 0,
+        dot: modeObj?.color || "#8a8a8d",
+        stats: _sessionMemoryStats(s),
+        // 不再带 tag：所有者把「当前 / 可恢复」两枚标签都否了，当前会话只靠 active 让岛加粗标题。
+        preview: _sessionLastPreview(s),
+        search: _sessionSearchText(s),
+      };
+    });
+    // 归档行：只有清单信息，没有 session 对象，所以单独拼，不走上面那个 map。
+    const archivedRows = archived.map(({ row: r }, n) => ({
+      key: `archived:${r.sessionId}`,
+      index: n,
+      sessionId: r.sessionId,
+      state: "archived",
+      active: false,
+      name: (r.preview || "").trim().slice(0, 80) || r.name || "",
+      project: r.project ? (r.project.split("/").filter(Boolean).pop() || "") : "",
+      projectPath: r.project || "",
+      at: Number(r.updatedAt) || Number(r.closedAt) || Number(r.created) || 0,
+      dot: (_AI_MODES.find((m) => m.id === r.mode)?.color) || "#8a8a8d",
+      stats: { totalTurns: Number(r.totalTurns) || 0 },
+      preview: r.preview || "",
+      search: [r.name, r.project, r.preview].filter(Boolean).join(" ").toLowerCase(),
+    }));
+    return { entries: [...rows, ...archivedRows], root: rootPath || "" };
+  };
 
   openSessionPickerIsland({
-    entries: [...rows, ...archivedRows],
-    resumableCount: resumable,
+    load,
     onPick: (row) => {
       if (row.state === "archived") void _restoreArchivedSession(row.sessionId);
       else if (row.state === "closed") _restoreClosedChatSession(row.index);
@@ -80968,7 +80790,7 @@ const _explorerEl = document.getElementById("explorer");
 // settlement requestId, so abandoned drafts cannot compete with the foreground model.
 const _composerEl = document.getElementById("composer");
 // bot 图标 = 引用到 AI 对话（唯一还在用的投放区图标）。
-const _ICON_AI = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>';
+const _ICON_AI = _dbIcon("sparkle");
 function _mkDropZone(cls, labelCls, icon, label) {
   const z = document.createElement("div");
   z.className = cls;

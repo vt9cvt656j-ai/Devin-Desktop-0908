@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 // 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
 import { fnSource as extractFn, CODE, SRC as SHARED_SRC} from "./helpers/source.mjs";
+import { dbIcon } from "../src/agent/db-icons.js";
 
 // 源码文本用共享的那一份（helpers/source.mjs 的 SRC = main.js + src/agent/* 拼接）。
 // 自己 readFileSync("src/main.js") 的话，每从 main.js 搬出一个模块就假红一次；
@@ -1287,9 +1288,12 @@ test("卡片名字守得住最小宽度，徽章换行而不是把名字截成�
 test("线性图标补上描边，不再渲染成黑方块", () => {
   assert.match(APP_CSS, /\.ctp-iconbtn svg:not\(\[stroke\]\) \{[^}]*fill: none;[^}]*stroke: currentColor/s,
     "_dbUiIconSvg 那批图标没有 fill/stroke，会按默认黑色实心填充画出来");
-  // 只补给自己没声明的那些：_ICON_TRASH 自带属性，不该被这条规则改宽改细。
-  assert.match(SRC, /_ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"/,
+  // 只补给自己没声明的那些：垃圾桶自带属性，不该被这条规则改宽改细。
+  // 2026-09-07 起这批图标改从 db-icons（Lucide 烤出的那份）取，所以判据也从「字面量长这样」
+  // 换成**真跑一次拿产物看**——换个图标源、换个键名都拦得住，字面量断言拦不住。
+  assert.match(dbIcon("trash"), /^<svg [^>]*fill="none"[^>]*stroke="currentColor"/,
     "垃圾桶图标本来就自带描边，:not([stroke]) 才不会误伤它");
+  assert.match(SRC, /const _ICON_TRASH = _dbIcon\("trash"\);/, "垃圾桶又变回手画的了");
 });
 
 // ── 服务自己说了什么，要能看到 ─────────────────────────────────────────────────
