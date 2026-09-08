@@ -52249,7 +52249,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     try {
       const _avCmd = await _detectVerifyCmd(root, _projectStacks.get(root) || null);
       if (!_avCmd || !_live()) return;
-      const _avCall = { type: "cmd", command: _avCmd, purpose: "verify", timeoutSecs: 600, _autoVerify: true };
+      // 600 秒等于"永不超时"：一条挂死的验证（等端口、等交互输入）能把这一整轮吊住十分钟。
+      // 180 秒是按本仓库实测定的——单次全量 67 秒、解析成 pnpm+cargo 那条 95 秒，
+      // 留一倍余量还早早止血。真需要更久的验证，模型自己用 run_in_terminal 跑，那条有退出通知。
+      const _avCall = { type: "cmd", command: _avCmd, purpose: "verify", timeoutSecs: 180, _autoVerify: true };
       const _avStep = _createToolStep(_avCall);
       body.appendChild(_avStep);
       _scroll();
@@ -52278,9 +52281,28 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // 结果按事实交回：绿了一句话；红了带上裁剪后的真实输出（留头尾 + 追回中段报错行，
       // 测试的失败汇总几乎总在末尾，裸 slice 头部正好把它砍掉）。
       const _avExit = typeof _avRes?.exitCode === "number" ? _avRes.exitCode : (typeof _avRes?.code === "number" ? _avRes.code : null);
-      messages.push({ role: "user", content: _ORCH_NOTE
-        + `[AUTO_VERIFY] 收尾前 IDE 代跑了 \`${_avCmd}\`：${_avOk ? "通过，这一版的验证证据已记上。" : `没过${_avExit != null ? `（退出码 ${_avExit}）` : ""}，修掉再收尾：`}`
-        + (_avOk ? "" : "\n" + _clipPreservingErrors(_stripAnsi(String(_avRes?.content || _avOut)) || "(无输出)", 3000)) });
+      const _avNote = `[AUTO_VERIFY] 收尾前 IDE 代跑了 \`${_avCmd}\`：${_avOk ? "通过，这一版的验证证据已记上。" : `没过${_avExit != null ? `（退出码 ${_avExit}）` : ""}，修掉再收尾：`}`
+        + (_avOk ? "" : "\n" + _clipPreservingErrors(_stripAnsi(String(_avRes?.content || _avOut)) || "(无输出)", 3000));
+      // 结果往哪回，取决于**这一刻 run 还在不在**。这个函数现在是发射出去的，
+      // 所以两种收场都要接住：
+      //
+      //   · run 还在转 → 照旧塞进 messages，下一轮模型就看见了（红构建门也已经
+      //     从 run._executionEvidence 里读到了同一份证据）。
+      //   · run 已经收尾 → messages 那个数组再也不会被发出去，push 进去等于把结果
+      //     扔了。改走后台通知：和终端命令退出、后台监控同一条路（_queueNotice），
+      //     用户不用重新说话，模型自己接着修。绿了就不打扰——没有坏消息就是好消息。
+      const _runStillLive = session?._activeRun === run && _live();
+      if (_runStillLive) {
+        messages.push({ role: "user", content: _ORCH_NOTE + _avNote });
+      } else if (!_avOk) {
+        _queueNotice(session, _avNote, {
+          source: "auto_verify",
+          task: `收尾验证 — ${_avCmd}`,
+          status: _avExit != null ? `没过（退出码 ${_avExit}）` : "没过",
+          display: `收尾验证没过：${_avCmd}`,
+        });
+        _drainFollowups(session);
+      }
     } catch { /* 兜底失败就是没兜底，绝不因此让这一轮跑不起来 */ }
   };
   try {
@@ -52971,9 +52993,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 不碰 _planSteps / _diagnosticBlock / _implOps / 任何计数器（核对过）。
         // Stop-hook：模型想收尾、这一轮落过实现改动却没验证过 → 先跑项目自己的检查（_autoVerifyNow）。
         // 绿了记证据放行；红了下面的红构建门喂回真实输出、再转一轮。
+        // **发出去就走，不在这儿干等。** 这一等就是整套构建加测试：本仓库实测单次 67 秒
+        // （build 15 秒 + 251 个测试文件 52 秒），而它发生在模型正文已经流完之后 ——
+        // 用户看完了答复，圈还在转一分多钟。那正是 53116 那处收尾评审并发化时，
+        // 所有者点名要改掉的同一个现象（「正文不动了、圈还在转」），这半边当时漏了。
+        //
+        // 敢并发的依据和那边逐字相同：这份结论**不决定这一轮要不要继续跑**。它的出口
+        // 只有两个，两个都不需要在此刻拿到 ——
+        //   · 证据落进 run._executionEvidence：run 还在转的话，下一轮红构建门自己会读；
+        //   · 结果文字：run 还在就进 messages，已收尾就走后台通知续一轮（见函数结尾）。
+        // 所以晚一轮到不损失任何兜底覆盖面，只是把等待从用户那儿挪走了。
         if (run.mode === "agent" && _implOps > 0 && _verifiedAtImplOps < _implOps
             && run._autoVerifyAtImplOps !== _implOps && (run._autoVerifyRuns || 0) < 3 && _live()) {
-          await _autoVerifyNow();
+          run._verifyPromise = _autoVerifyNow().catch(() => null);
         }
         const _buildFail = _freshBuildFailure(run, _implOps);
         const _pendingPlan = (Array.isArray(run._planSteps) ? run._planSteps : [])
@@ -56361,6 +56393,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           new Promise((r) => setTimeout(r, WRAP_UP_VERDICT_GRACE_MS)),
         ]);
       } catch { /* 评审失败不该弄坏收尾 */ }
+    }
+    // 自动验证同样是并发发射的。这里只**短等一下**、绝不等它跑完：跑得快就赶上这一轮的
+    // 结局判定（verificationPassed 已经在函数里就地置位了）；跑得慢就让它在后台跑完，
+    // 红了自己走通知续一轮。等满才是原来那个"圈转一分多钟"的病。
+    if (run._verifyPromise) {
+      try {
+        await Promise.race([
+          run._verifyPromise,
+          new Promise((r) => setTimeout(r, WRAP_UP_VERDICT_GRACE_MS)),
+        ]);
+      } catch { /* 兜底失败就是没兜底 */ }
     }
     const _outcomeFacts = {
       stoppedEarly: _stoppedEarly, incompleteReason: run._incompleteReason, hitCap,

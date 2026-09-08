@@ -15981,8 +15981,20 @@ test("验证事实由真实命令/诊断提供，不由 IDE 收尾门强行代�
     "② 兜底必须走 _executeToolStep：绕过它就等于绕过工具卡片和授权检查点");
   assert.match(loopWithoutComments, /_verifiedAtImplOps < _implOps[\s\S]{0,120}?run\._autoVerifyAtImplOps !== _implOps[\s\S]{0,120}?_autoVerifyRuns/,
     "③ 武装位按实现版本记（不是整个 run 一次性烧掉），且有全 run 上限");
-  assert.match(loopWithoutComments, /await _autoVerifyNow\(\);[\s\S]{0,400}?const _buildFail = _freshBuildFailure\(run, _implOps\);/,
-    "③ 兜底要跑在红构建门读证据**之前**：红了那道门才接得住");
+  // ③ 2026-09-08：这一句原来钉的是**顺序**（兜底 await 在红构建门读证据之前）。顺序本身
+  //    不是要守的东西，它守的是「红了有人接得住」。而同步等的代价是当着用户的面干等一整套
+  //    构建加测试（本仓库实测 67 秒，正文早流完了、圈还在转），所以兜底改成了发射。
+  //    接住的路因此变成两条，两条都得在，缺一条红结果就被丢了：
+  //      · run 还在转 → 证据照旧进 run._executionEvidence，红构建门下一轮读到；
+  //      · run 已收尾 → 走 _queueNotice（和终端退出、后台监控同一条），模型自己接着修。
+  assert.match(loopWithoutComments, /run\._verifyPromise = _autoVerifyNow\(\)/,
+    "③ 兜底又变回同步等了：那是「答复出来了圈还在转」的病");
+  assert.match(loopWithoutComments, /const _buildFail = _freshBuildFailure\(run, _implOps\);/,
+    "③ 红构建门没了：run 还在转时这是接住红结果的那条路");
+  assert.match(autoVerify, /run\._executionEvidence\.push\(_rec\)/,
+    "③ 兜底结果没进证据表，红构建门就无从接起");
+  assert.match(autoVerify, /_queueNotice\(\s*session/,
+    "③ run 收尾之后跑完的红结果没人接：必须走后台通知续一轮，否则等于白跑");
   assert.match(autoVerify, /_evidenceCertifies\(_rec, _implOps\)/,
     "④ 兜底另开了授信判据：必须和模型自跑走同一套证据结算");
   assert.doesNotMatch(loopWithoutComments, /\[BLOCKED\][^\n]*验证|codeVerifyNudges[^\n]*continue/);
@@ -16018,11 +16030,19 @@ test("兜底自动验证按实现版本重新武装，不是烧在第一批落�
     "旧的一次性布尔还留着——两套武装位并存，一次性那条会先短路掉版本那条");
 
   // 2026-09-05：兜底搬到收尾那一刻（Stop-hook 形状），触发条件跟着换了位置和形状。
-  const cond = /if \(run\.mode === "agent" && _implOps > 0 && _verifiedAtImplOps < _implOps[\s\S]{0,300}?\) \{\s*await _autoVerifyNow\(\);/.exec(loop);
+  // 2026-09-08：**改成发射，不再干等**。这一等就是整套构建加测试（本仓库实测单次 67 秒），
+  // 而它发生在模型正文流完之后——用户看完答复、圈还在转一分多钟。和 53116 那处收尾评审
+  // 并发化是同一个理由，当时漏了这半边。所以下面钉的是「条件没变、等待没了」。
+  const cond = /if \(run\.mode === "agent" && _implOps > 0 && _verifiedAtImplOps < _implOps[\s\S]{0,300}?\) \{\s*run\._verifyPromise = _autoVerifyNow\(\)/.exec(loop);
   assert.ok(cond, "收尾兜底的触发条件不是以「agent 模式、落过实现、这一版还没验过」起头");
   assert.ok(cond[0].length < 500, `触发条件切出了 ${cond[0].length} 字节，锚点漂了`);
   assert.match(cond[0], /run\._autoVerifyAtImplOps !== _implOps/, "少了「这一版还没兜过」");
   assert.match(cond[0], /_autoVerifyRuns \|\| 0\) < 3/, "少了全 run 上限");
+  // 别变回同步等：那是「答复出来了圈还在转」的病，所有者已经点名要求改掉过一次。
+  assert.doesNotMatch(loop, /await _autoVerifyNow\(\)/,
+    "自动验证又被 await 在主循环里了——整套构建加测试会当着用户的面干等，本仓库实测 67 秒");
+  // 发射出去的东西必须有人接：收尾处短等一下（拿到就用），跑不完的走后台通知续一轮。
+  assert.match(loop, /run\._verifyPromise\b/, "发射了却没存 promise，收尾判定读不到它");
 
   assert.match(loop, /run\._autoVerifyAtImplOps = _implOps;/,
     "武装位没有记实现版本号——记布尔量就等于回到「烧一次就没了」");
