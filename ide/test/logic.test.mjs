@@ -39252,3 +39252,19 @@ test("辅助调用向网关报裸上限：x-ide-aux 的值形如 intent-c900，�
   assert.match(gw, /fn reclaim_aux_headroom\(/, "网关没有收回余量");
   assert.match(gw, /if aux\.starts_with\("leg"\)/, "网关不认腿的身份");
 });
+
+test("菜单：视图里没有组件长廊；帮助是 文档/关于 一组、检查更新单独一组且不带省略号", () => {
+  // 所有者 2026-09-07 截图点名的三处。长廊连代码一起删了，Tailwind 的样式改由 island.jsx 那行带进来。
+  const menus = extractFn("getMenus", { code: true });
+  assert.doesNotMatch(menus, /uiGallery|showUIGallery/, "组件长廊的菜单项又回来了");
+  assert.doesNotMatch(SRC, /mount-gallery|showUIGallery/, "长廊代码没删干净");
+  assert.match(SRC, /import "\.\/ui\/island\.jsx";/, "Tailwind 的引入位置丢了——岛里的组件会压不过旧选择器");
+  const help = menus.slice(menus.indexOf('t("menu.help")'));
+  const docs = help.indexOf('t("menu.documentation")'), about = help.indexOf('t("menu.about")'), upd = help.indexOf('t("updates.check")');
+  assert.ok(docs > 0 && about > docs && upd > about, "帮助菜单顺序必须是 文档 → 关于 → 检查更新");
+  assert.ok(!/sep: true/.test(help.slice(docs, about)), "文档和关于之间不该有分隔线：它们是一组");
+  assert.ok(/sep: true/.test(help.slice(about, upd)), "关于和检查更新之间要有分隔线：看东西和做动作分开");
+  assert.match(I18N, /"updates\.check":\s*"检查更新",/, "检查更新不带省略号");
+  assert.match(I18N, /"updates\.check":\s*"Check for Updates",/, "英文同样不带省略号");
+  assert.doesNotMatch(I18N, /menu\.uiGallery/, "长廊的文案键没删");
+});
