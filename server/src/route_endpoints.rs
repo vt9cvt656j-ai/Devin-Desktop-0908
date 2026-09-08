@@ -3881,6 +3881,28 @@ mod tests {
     }
 
     #[test]
+    fn a_fast_typist_that_keeps_failing_still_loses() {
+        // 吐字速度这一维刚加进得分，必须当场钉住它**不会**把流量推给不稳的出口。
+        // 线上真数字（2026-09-08，grok-4.6，同一条线路上的两个出口）：
+        //
+        //   XXY       吐字 51.3 tok/s（更快）  成功 96  失败 29 → 76.8%
+        //   3ecc0e13  吐字 43.1 tok/s          成功 945 失败 50 → 95.0%
+        //
+        // 吐字快 1.19 倍，但每四次坏一次——一次失败的代价是白等一整个来回，
+        // 那笔账比快出来的十几秒贵得多。得分里的 1/成功率 必须盖过速度那一项。
+        let fast_flaky = expected_turn_ms(Some(5_000), Some(51.3)).unwrap();
+        let steady = expected_turn_ms(Some(4_000), Some(43.1)).unwrap();
+        let best = fast_flaky.min(steady) as f64;
+        // 同价（cost=1.0），只让成败数说话。
+        let score_flaky = endpoint_score(1.0, 96, 29, Some(fast_flaky), Some(best));
+        let score_steady = endpoint_score(1.0, 945, 50, Some(steady), Some(best));
+        assert!(
+            score_steady < score_flaky,
+            "吐字快但四次坏一次的出口排到前面去了：{score_steady} 对 {score_flaky}"
+        );
+    }
+
+    #[test]
     fn no_throughput_evidence_falls_back_to_the_first_byte() {
         // 没有证据不构成降级理由——这个文件里到处都是这条。一个还没被观测过的新出口
         // 必须拿到和改动之前一模一样的排序，否则"加一个出口"会先经历一段无谓的冷宫。
