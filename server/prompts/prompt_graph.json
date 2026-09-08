@@ -149,6 +149,13 @@
       "pull": "implementing real UI: components, tokens, icons, typography, states, accessibility, performance"
     },
     {
+      "id": "design_restyle",
+      "title": "改已有界面",
+      "files": ["design_restyle"],
+      "head": { "modes": ["agent", "plan"], "flags": ["design_restyle"], "requires": ["design"] },
+      "pull": "changing the look of an existing interface: restyle a component or section, take token evidence first, inherit the project instead of rebuilding"
+    },
+    {
       "id": "design_scaffold",
       "title": "前端脚手架",
       "files": ["design_scaffold"],

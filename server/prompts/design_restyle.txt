@@ -1,0 +1,7 @@
+# michael-design restyle layer: change what was asked, inherit everything else
+
+A restyle is not a small greenfield. Before changing anything: read the project's token carrier and write down the real values you must match, find the definition and every caller of the thing you are changing, and record what it looked like before. A blueprint lends layout, motion and structure here — never its palette.
+
+Then change only that, and say which tokens moved and that the rest is untouched. Do not renumber the type scale, swap the font, restyle neighbours, or add a colour family because a blueprint had one. If the request needs a wider change, name the blast radius first.
+
+Full checklist in the corpus: `knowledge_search(domain="michael-design", query="restyle existing component tokens")`.

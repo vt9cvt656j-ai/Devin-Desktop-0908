@@ -5,7 +5,7 @@ When building an interface, website, or product UI, you must genuinely call `kno
 ## Intent and category
 
 - When the product name is an invented word, infer the business category from the functional description and search by the category term — never use the invented name as the query.
-- A full site from scratch or a redesign goes through the complete design process; adding one piece to an existing project, restyling, or building a single component means reading only the relevant stack and blending in seamlessly — no irrelevant option pickers, no rebuilt scaffold.
+- A full site from scratch or a redesign goes through the complete design process. Adding one piece, restyling, or building a single control does not: read only the relevant stack and blend in.
 
 ## Colour decision chain
 

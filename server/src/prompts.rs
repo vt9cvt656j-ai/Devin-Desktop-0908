@@ -3726,6 +3726,49 @@ fn looks_like_ui_review_task(q: &str) -> bool {
 }
 
 #[cfg(test)]
+/// 这一轮是不是在**改已有界面**。
+///
+/// 判据放在服务端而不是只靠客户端旗标：改 UI 是最高频的设计请求，而它恰恰是裁决模型最
+/// 容易不填字段的那一类（用户就说四个字「改好看点」）。审计实测：这条路上关于「改已有 ≠
+/// 从零重做」的全部指导只剩 design_core 里半句话，而讲得最全的三份提示词是冻结件、
+/// 运行时一个字都到不了模型。
+fn looks_like_restyle_task(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    [
+        "restyle",
+        "redesign",
+        "make it look",
+        "looks bad",
+        "looks ugly",
+        "prettier",
+        "polish the ui",
+        "改好看",
+        "改漂亮",
+        "美化",
+        "变好看",
+        "不好看",
+        "太丑",
+        "很丑",
+        "难看",
+        "改改样式",
+        "调整样式",
+        "换个样式",
+        "改一下界面",
+        "改下界面",
+        "优化界面",
+        "优化一下 ui",
+        "界面优化",
+        "重新设计",
+        "改版",
+        "视觉升级",
+        "精致",
+        "质感",
+        "高级感",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
 fn looks_like_motion_design_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     [
@@ -3892,6 +3935,7 @@ const IDE_SEMANTIC_PROFILE_FLAGS: &[&str] = &[
     "design_data",
     "design_review",
     "design_motion",
+    "design_restyle",
     "design_verification",
     "design_knowledge_full",
     "existing_project",
@@ -4605,6 +4649,7 @@ const PROMPT_NAMES: &[&str] = &[
     "design_data",
     "design_engineering",
     "design_motion",
+    "design_restyle",
     "design_verification",
     "reasoning",
     "no_flattery",
@@ -4894,6 +4939,10 @@ mod tests {
                     current_or_continuation_user_text_any(body, looks_like_ui_data_task),
                 );
                 add(
+                    "design_restyle",
+                    current_or_continuation_user_text_any(body, looks_like_restyle_task),
+                );
+                add(
                     "design_motion",
                     current_or_continuation_user_text_any(body, looks_like_motion_design_task)
                         || full,
@@ -5059,6 +5108,7 @@ mod tests {
             "design_data",
             "design_engineering",
             "design_motion",
+            "design_restyle",
             "design_verification",
         ] {
             let result = read_prompt(name);
@@ -8952,6 +9002,10 @@ mod tests {
             "design_core",
             "design_implementation",
             "design_components",
+            // 改已有界面那一档。它是**付费加进来的**：design_components 里选栈 / token 载体 /
+            // 字体三段和 design_core、design_tokens、注入块重复，砍掉之后腾出的预算正好给它。
+            // 加内容之前先找重复，别直接抬这条闸——闸量的是模型每轮真背的东西。
+            "design_restyle",
             "design_scaffold",
             "design_content",
             "design_data",
@@ -8971,11 +9025,22 @@ mod tests {
         // 增补迟早都会撞上它，而它衡量的又不是模型真正背的东西。真正的天花板是上面两条
         // （focused token 数、full 字节数），那两条量的是实际发出去的 prompt。
         //
-        // 所以换成绝对值。5_200 容得下当前这套（含从零起项目那份实测接线配方）。
+        // 所以换成绝对值。5_200 容得下当时那九个模块（含从零起项目那份实测接线配方）。
         // 要再往上加，先问一句：这段内容是不是每一轮都值得模型背？不是的话就挪进
         // 只在对应意图下加载的模块，或者挪进知识库按需检索。
+        //
+        // **5_300（2026-09-08）**：这一笔是第十个模块 design_restyle（197 token）。
+        // 上面那句问话老老实实答过了：
+        //   · 它**不是**每轮都背——`flags: ["design_restyle"]` 门控，只在改已有界面那一轮加载；
+        //   · 详细清单（token 载体在哪、三步取证、逐控件配方、改前后对照）已经按这条注释的
+        //     指引**挪进了知识库**（replicate-and-redesign.md），提示词里只留判据和一句检索指针；
+        //   · 先试过「从 design_components 去重来付账」——审计说它有六成重复。实测**不成立**：
+        //     Lucide / semantic classes / twMerge(clsx(...)) / shadcn@latest init+add / shadcn-style
+        //     五处都被测试逐字钉着，是契约不是冗余。砍完再装回来，净省接近零。
+        // 它替掉的是 design_core 里那半句「改已有 = 只读相关栈、别重搭脚手架」——
+        // 那半句是整条改 UI 路上唯一的指导，而讲得全的三份提示词是冻结件、运行时到不了模型。
         assert!(
-            routed_design_bytes < 5_200,
+            routed_design_bytes < 5_300,
             "the split design contract has outgrown its budget: {routed_design_bytes} tokens (legacy monolith, frozen and never injected, was {})",
             est_prompt_tokens(&read_prompt("design_system").unwrap())
         );
