@@ -25677,6 +25677,32 @@ function _michaelDesignResearchPlan(task, profile = null) {
     .replace(/\s+/g, " ").trim().slice(0, 180) || "当前产品";
   const categoryTerms = _michaelDesignCategoryTerms(task);
   const scopedSubject = [subject, categoryTerms].filter(Boolean).join(" ");
+  // 改已有界面和从零做，要查的**不是同一批东西**。
+  //
+  // 原来无论哪种都发这三条整站形状的检索（信息架构 / 标志性滚动动效 / 真实头像媒体）。
+  // 用户说「把这个按钮改好看点」时，harness 替他问回来的是一份整站蓝本——和当前任务错位，
+  // 而模型容易顺着蓝本把改动做大，正是改 UI 这条路上最常见的失败形状。
+  // 这一档改问三件真正用得上的：现有设计系统怎么取证、这个控件的状态与微交互怎么写、
+  // 改已有的工作流（切片、基线、什么该留什么该换）。
+  if (p.designMode === "michael_design_2_5_existing" || p.workspaceAction === "modify") {
+    return [
+      {
+        id: "existing-tokens",
+        query: `${scopedSubject} restyle existing component tokens theme variables cva variants audit`,
+        purpose: "现有设计系统取证：token 载体、主题变量、组件变体",
+      },
+      {
+        id: "control-states",
+        query: `${scopedSubject} button card form surface hover focus active disabled state transition micro-interaction spec`,
+        purpose: "这个控件的状态矩阵与微交互参数",
+      },
+      {
+        id: "redesign-workflow",
+        query: `${scopedSubject} redesign refactor workflow migration slices baseline keep replace`,
+        purpose: "改已有的工作流：切片迁移、改前基线、什么该留什么该换",
+      },
+    ];
+  }
   return [
     {
       id: "architecture-color",
