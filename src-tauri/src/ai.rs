@@ -89,6 +89,13 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
 });
 
 /// 桌面端 MSE 加密客户端。网关地址是固定的，所以 pin 列表在编译时就定好。
+/// 密文流到了，封它的那个会话却已经不在本地（在途中被轮换或作废）。
+///
+/// 这里只回**码**，不回措辞。理由不是洁癖：客户端二进制里的中文既进不了 JS 那套字符串
+/// 剥离、也没法按语言换——日文用户会看到一句中文。措辞在 main.js 的 _nativeErrorText 里，
+/// 三语各一份。棘轮见 test/rust-agent-text.test.mjs。
+const MSE_SESSION_GONE: &str = "[MSE_SESSION_GONE]";
+
 static MSE: LazyLock<crate::mse::MseClient> = LazyLock::new(|| {
     crate::mse::MseClient::new(vec![])
 });
@@ -647,7 +654,7 @@ async fn read_sse_text(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
     if mse_stream && !MSE.can_open_sse(mse_sid.as_deref()) {
-        return Err("MSE: 收到密文流，但封它的那个会话已经不在本地了（会话在途中被轮换或作废）。没有把密文当明文解析——重试一次即可。".to_string());
+        return Err(MSE_SESSION_GONE.to_string());
     }
     let mse_req_seq: u64 = if mse_stream {
         response
@@ -726,6 +733,10 @@ async fn read_sse_text(
                 saw_done = true;
                 break;
             }
+            // read_sse_text 是**纯文本**读取器（辅助调用、标题生成这类），这里没有工具调用，
+            // 一个坏帧最多少一段字。跳过是对的——中转商发的 `data: OPENROUTER PROCESSING`
+            // 这类纯文本心跳也走这条。带工具调用的主流式在另一个函数里，那里坏帧必须报错，
+            // 理由见那一处：参数少半截的工具调用会真的写到磁盘上。
             let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue;
             };
@@ -3362,6 +3373,31 @@ mod stream_timeout_tests {
         assert_eq!(strip(unknown), baseline);
     }
 
+    /// 坏帧要报错，**中转商的纯文本帧不能跟着一起报错**——这是同一个判据的另一半。
+    /// 部分中转（DeepSeek 系列尤甚）会夹 `data: OPENROUTER PROCESSING` 这类状态行；
+    /// 把它们也当成坏帧的话，走这些线路的每一个请求都会当场失败。
+    #[tokio::test]
+    async fn plain_text_relay_frames_are_skipped_not_treated_as_corruption() {
+        let good = serde_json::json!({"choices": [{"delta": {"content": "ok"}}]});
+        let body = format!(
+            "data: OPENROUTER PROCESSING\n\ndata: keep-alive\n\ndata: {good}\n\ndata: [DONE]\n\n"
+        )
+        .into_bytes();
+
+        let (result, events) = run_raw_sse_body(body).await;
+
+        assert!(result.is_ok(), "纯文本帧被当成坏帧了：{result:?}");
+        let kinds = non_metric_kinds(&events);
+        assert!(
+            !kinds.iter().any(|k| k == "error"),
+            "纯文本帧报了错：{kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "done"),
+            "整条流没有正常收尾：{kinds:?}"
+        );
+    }
+
     #[tokio::test]
     async fn malformed_json_before_done_rejects_complete_tool_argument_prefix() {
         let arguments = r#"{"path":"src/main.js","content":"prefix"}"#;
@@ -3582,7 +3618,7 @@ async fn ai_chat_inner(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
     if mse_stream && !MSE.can_open_sse(mse_sid.as_deref()) {
-        let message = "MSE: 收到密文流，但封它的那个会话已经不在本地了（会话在途中被轮换或作废）。没有把密文当明文解析——重试一次即可。".to_string();
+        let message = MSE_SESSION_GONE.to_string();
         let _ = on_event.send(AiEvent::Error {
             message: message.clone(),
             endpoint: gateway_endpoint.clone(),
@@ -3784,12 +3820,34 @@ async fn ai_chat_inner(
             let v = match serde_json::from_str::<serde_json::Value>(data) {
                 Ok(value) => value,
                 Err(error) => {
-                    // 部分中转（尤其 DeepSeek 系列）偶尔夹杂非 JSON 帧（状态行、
-                    // 心跳、格式错误），在已经收到有效内容后不应打断整条流。
-                    // read_sse_text 那条路早就是 skip 的，这里对齐。
+                    // 解析不了的帧分两种，后果差得很远，判据是**它想不想当 JSON**：
+                    //
+                    //  · 纯文本帧（`data: OPENROUTER PROCESSING` 这类状态行 / 心跳，部分中转
+                    //    尤其 DeepSeek 系列会夹）：本来就不承载内容，跳过，整条流照旧。
+                    //  · `{` 或 `[` 开头却解析失败：这是一个**被截断或损坏的帧**。行是按 `\n`
+                    //    切出来的完整一行，而合法 JSON 的字符串里不会有裸换行——所以它不是
+                    //    "还没传完"，是真的坏了。
+                    //
+                    // 这里原来两种一起跳。后果不是少一段字：这条路上攒着**工具调用的参数**，
+                    // 坏帧一丢、后面的 [DONE] 照收，整轮以成功收场，而模型带着**少了后半截的
+                    // 参数**去执行——write_file 会把一份截断的文件真写到磁盘上，屏幕上没有
+                    // 任何异样。「跳过和不跳过有区别吗」——区别是一份假的成功。
+                    // （纯文本读取器 read_sse_text 那条路没有工具调用，仍然一律跳过。）
+                    if data.starts_with('{') || data.starts_with('[') {
+                        let message =
+                            format!("上游发来一个残缺的数据帧（malformed SSE JSON）：{error}");
+                        // 先发事件再回 Err：Err 只回给调用方，界面上那条错误是靠事件出来的。
+                        // 少了这一句，用户看到的是一轮**安静地什么都没发生**。
+                        let _ = on_event.send(AiEvent::Error {
+                            message: message.clone(),
+                            endpoint: gateway_endpoint.clone(),
+                            retry_elsewhere: None,
+                        });
+                        return Err(message);
+                    }
                     tracing::warn!(
                         data = data,
-                        "skipping malformed SSE frame: {error}"
+                        "skipping non-JSON SSE frame: {error}"
                     );
                     continue;
                 }

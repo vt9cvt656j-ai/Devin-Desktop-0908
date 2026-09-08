@@ -17971,7 +17971,9 @@ async function _renderMsgRange(session, from, to, options = {}) {
       if (session._disposed || !session.container) return;
     }
     const m = page[index];
-    if (m && m.content != null) {
+    // quiet 通知只进模型的上下文，不进对话：重画历史时也得照样跳过，否则重开这个会话
+    // 那两行灰字又会冒出来（同一条通知，删了一次得删在两个地方）。
+    if (m && m.content != null && !(m.role !== "assistant" && m._ideMeta?.notice?.quiet)) {
       const _notice = m.role !== "assistant" && m._ideMeta?.notice ? m._ideMeta.notice : null;
       const displayContent = m.role === "assistant"
         ? _withoutLegacyReasoningSummary(m.content, m.reasoning)
@@ -19617,6 +19619,7 @@ async function restoreChatHistory() {
       const session = _newChatSession("Chat 1");
       for (const m of saved) {
         session.memory.push(m);
+        if (m._ideMeta?.notice?.quiet) continue; // 只给模型的通知，不画（同 _renderPage）
         addMessage(m.role === "assistant" ? "assistant" : "user", m._ideMeta?.notice?.display || m._ideMeta?.slashDisplay || m.content, undefined, [], m._ideMeta?.notice ? { notice: m._ideMeta.notice } : {});
       }
     }
@@ -28979,6 +28982,11 @@ function _queueNotice(sess, text, meta = {}) {
   const notice = {
     source: String(meta.source || "ide"),
     display: String(meta.display || "").trim() || t.split("\n")[0].slice(0, 160),
+    // quiet：这条只给模型，对话里不画那一行灰字。用在「用户在别处已经看得见这件事」的
+    // 来源上——终端命令退出就是：终端卡片和终端页签都写着它退了，再补一句
+    //「终端「install-deps」的命令已退出」是同一件事的第三遍。所有者指着两行这样的字说
+    //「这种提示可以删除了」。模型那一侧一个字没少，它照样知道命令结束了、能接着做。
+    quiet: !!meta.quiet,
   };
   // 形状照 Claude Code 的 task-notification：先两行结构化的「任务 / 状态」，再是正文。
   const head = [meta.task ? `任务：${String(meta.task)}` : "", meta.status ? `状态：${String(meta.status)}` : ""].filter(Boolean).join("\n");
@@ -28993,7 +29001,7 @@ function _queueNotice(sess, text, meta = {}) {
   if (sess.streaming && sess._runIsLoop) {
     (sess._steerQueue = sess._steerQueue || []).push({ text: content, body, attachments: [], notice });
     sess.memory.push({ role: "user", content, attachments: [], _ideMeta: { notice } });
-    try { addMessage("user", notice.display, sess, [], { notice }); } catch {}
+    if (!notice.quiet) { try { addMessage("user", notice.display, sess, [], { notice }); } catch {} }
     saveChatHistory({ immediate: true });
     return;
   }
@@ -29565,7 +29573,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // opts.alreadyInTranscript：气泡和记忆在别处已经落过了——收尾时被搁下的插话走这条路
   // 重发一轮，再画一次就是同一句话在对话里出现两遍。
   // opts.notice：IDE 自己续上的一轮（后台监控等到了…），画成一行系统通知，不画用户气泡。
-  if (opts.notice) { if (!opts.alreadyInTranscript) addMessage("user", opts.notice.display || text, sess, [], { notice: opts.notice }); }
+  if (opts.notice) { if (!opts.alreadyInTranscript && !opts.notice.quiet) addMessage("user", opts.notice.display || text, sess, [], { notice: opts.notice }); }
   else if (!opts.alreadyInTranscript) addMessage("user", _slashDisplay || text, sess, attachments);
   // 直接把「真正的助手消息壳」（头像+消息框+思考卡）提前上屏——和流式开始时那张是同一张，
   // 而不是先塞一个裸转圈占位（没有消息框结构、跟上文挤在一起，1-2 秒后又被真卡替换）。
@@ -43075,11 +43083,17 @@ async function _runModelRequestWithRetry({
     // 网关说「还有没试过的上游出口」——重发会落到别处，不该走限流的长退避。
     let attemptRetryElsewhere = false;
     let attemptEndpoint = "";
+    // 原生层的错误码 → 人话。理由同 _browserSessionNoteText：措辞不写进二进制。
+    const _nativeErrorText = (msg) => {
+      const m = String(msg || "").trim();
+      if (m.startsWith("[MSE_SESSION_GONE]")) return t("stream.mseSessionGone");
+      return m;
+    };
     let attemptProgress = false;
     try {
       await currentInvoke((ev) => {
         if (ev?.kind === "error") {
-          attemptError = String(ev.message || "模型线路出现问题");
+          attemptError = _nativeErrorText(ev.message) || "模型线路出现问题";
           attemptStatus = Number(ev.status) || 0;
           attemptRetryElsewhere = ev.retryElsewhere === true;
           if (ev.endpoint) attemptEndpoint = String(ev.endpoint);
@@ -57217,11 +57231,22 @@ function _settleCallLiveWritePreview(call, result) {
 // 大工具调用（设计看板/方案预览…）的参数可能要生成几百行，期间又不像 write_file 有实时
 // 代码预览——没任何进度指示就会让界面看着"半天没反应"。给非写文件的（可能大的）工具一个轻量
 // 进度卡：转圈 + "正在生成 X…（N 字符）"，参数流到哪显示到哪；停顿时心跳也会接管更新它。
+// 名单是**穷举**的，不是兜底：只有这几个工具「参数要生成很久，而且自己没有任何卡片」。
+// 别再往这里加已经有自己卡片的工具——那正是下面注释里说的那个错。
 const _TOOL_PROGRESS_LABELS = { design_board: "设计看板", preview_choices: "方案预览", visual_explain: "讲解漫画", generate_image: "生成图片", design_research: "设计调研" };
 function _liveToolProgress(entry, container) {
   if (!entry || !entry.name || !container || entry.name === "update_plan") return; // update_plan 有自己的计划 UI
   const args = entry.args || "";
-  if (!(entry.name in _TOOL_PROGRESS_LABELS) && args.length < 200) return; // 小调用一闪而过、不打扰
+  //
+  // 只认名单里那几个。这里原来还有一条兜底：**任何**工具只要参数超过 200 字符就给一张
+  // 进度卡。后果是所有者实拍到的那张 ——「已生成 run_cmd · 等待执行 · 1.5k 字符」：
+  //   · run_cmd 有自己的终端卡片，进度卡是同一件事的第二个说法；
+  //   · 名单里没有它，`friendly` 就退化成**工具的注册名**，于是界面上直接出现 `run_cmd`
+  //     这个英文标识符 —— 所有者：「run_cmd 直接用终端卡片就可以，没必要显示 run_cmd
+  //     这个样式，这样是旧的」。旧就旧在这儿：内部名字漏到了脸上。
+  // 所以判据换成「这个工具有没有自己的卡片」，而不是「参数长不长」。参数长短说明不了
+  // 需不需要额外的进度指示。
+  if (!(entry.name in _TOOL_PROGRESS_LABELS)) return;
   if (!entry.progCard) {
     const card = document.createElement("div");
     card.className = "code-card code-card--streaming";
@@ -57230,7 +57255,7 @@ function _liveToolProgress(entry, container) {
     entry.progCard = card;
     _chatFollow(container);
   }
-  const friendly = _TOOL_PROGRESS_LABELS[entry.name] || entry.name;
+  const friendly = _TOOL_PROGRESS_LABELS[entry.name];
   const label = entry.progCard.querySelector(".code-card__label");
   if (label) label.textContent = "正在生成 " + friendly + "…";
   const meta = entry.progCard.querySelector(".code-card__linecount");
@@ -65023,8 +65048,9 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         if (run) run._browserPrevState = _fb.snapshot;
       }
       // 这次拿到的是哪个浏览器（接管了已开着的 / 另起了一个 / 用了临时配置），后端只在
-      // 浏览器刚起来的那一次给，所以这里原样带上，不做去重也不做加工。
-      if (state.session_note) content += `\n\n[浏览器会话] ${state.session_note}`;
+      // 浏览器刚起来的那一次给。原生层回的是**码加事实**，措辞在 _browserSessionNoteText 里。
+      const _sessNote = _browserSessionNoteText(state.session_note);
+      if (_sessNote) content += `\n\n[浏览器会话] ${_sessNote}`;
       // 落在人机验证 / 反爬挑战页上。把事实告知模型，让它自行决定怎么过。
       if (state.blocked) {
         content = `[人机验证] 当前页面是一道验证/反爬挑战：${state.blocked}\n`
@@ -65043,9 +65069,9 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           + `<span>智能体正在尝试处理，如果需要你帮忙会告诉你。</span></div>`);
       }
       // 「Dock 里为什么多出一个 Chrome」的答案，就贴在它出现的那一次上。
-      if (state.session_note && vp) {
+      if (_sessNote && vp) {
         vp.insertAdjacentHTML("beforeend",
-          `<div class="browser-session-note">${_escHtml(state.session_note)}</div>`);
+          `<div class="browser-session-note">${_escHtml(_sessNote)}</div>`);
       }
       const runOwnedDevUrl = !!state._runOwnedDevUrl || _isRunOwnedDevUrl(run, state.url || "");
       // Log browser operation for dedup - **必须移到 return 前**，这是唯一 push 点
@@ -79163,7 +79189,8 @@ function _notifyTerminalCommandEnded(entry) {
   const verdict = failed ? `输出里有失败特征（${hit.pattern}）` : "交互式终端里拿不到退出码，按输出判断";
   _queueNotice(sess,
     `[run_in_terminal 结束] 终端「${label}」里的命令已经退出：\n$ ${cmd}\n${verdict}。最后的输出：\n${tail || "(无)"}\n如果你在等它的结果，现在接着做；要看更早的输出用 read_terminal（name=「${label}」）。`,
-    { source: "terminal", task: `终端「${label}」`, status: failed ? "已退出（输出里有失败特征）" : "已退出", display: `终端「${label}」的命令已退出` });
+    { source: "terminal", task: `终端「${label}」`, status: failed ? "已退出（输出里有失败特征）" : "已退出",
+      display: `终端「${label}」的命令已退出`, quiet: true });
   _drainFollowups(sess);
 }
 
@@ -79562,6 +79589,36 @@ function _runOwnedDevServerUrl(run) {
   if (!server || server.requestId !== (run._reqId || "") || !_sameWorkspace(server.root, run.root)) return "";
   if (server.entry && (server.entry.exited || server.entry.backendId == null)) return "";
   return server.url || "";
+}
+
+/**
+ * 原生层回来的浏览器会话提示：**码 + 事实**，措辞在这里。
+ *
+ * 2026-09-07 从 Rust 挪过来的。写在 src-tauri 里的中文有两个治不好的毛病：进不了 JS 那套
+ * 字符串剥离（`strings` 也扫不到，UTF-8 整段跳过），而且永远只有一种语言——日文用户会
+ * 看到一句中文。棘轮 test/rust-agent-text.test.mjs 守着它不再长回去。
+ *
+ * 逐行翻：一条提示可能是「上一份配置用不了」那句加上一行码。不认识的行原样留着，
+ * 宁可露出一行码，也不要把后端真说了的话吞掉。
+ */
+function _browserSessionNoteText(note) {
+  const raw = String(note || "").trim();
+  if (!raw) return "";
+  const kv = (line) => Object.fromEntries(
+    [...line.matchAll(/(\w+)=([^\s]+)/g)].map((m) => [m[1], m[2]]));
+  return raw.split("\n").map((line) => {
+    const l = line.trim();
+    if (l.startsWith("[EXT_IGNORED_CHROME137]")) {
+      const n = Number(kv(l).count) || 0;
+      return t("browser.note.extIgnored").replace("{n}", String(n));
+    }
+    if (l.startsWith("[ATTACHED_OWN_APP]")) {
+      const f = kv(l);
+      return t("browser.note.attachedOwnApp")
+        .replace("{who}", f.who || "").replace("{brand}", f.brand || "").replace("{port}", f.port || "");
+    }
+    return line;
+  }).join("\n").trim();
 }
 
 function _isRunOwnedDevUrl(run, url) {

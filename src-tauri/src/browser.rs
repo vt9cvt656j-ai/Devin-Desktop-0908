@@ -824,7 +824,10 @@ fn launch() -> Result<Session, String> {
     // 配了却不生效必须当场说清楚，不然用户会以为是自己路径写错了。
     if !exts.is_empty() && kind.id == "chrome" {
         note = format!(
-            "{note}\n注意：配了 {} 个浏览器扩展，但 Chrome 从 137 起已经不再接受命令行加载扩展，这些扩展**不会生效**。要用扩展得把自动化浏览器换成 Edge / Brave / Chromium（本机没装的话要先装）。",
+            // 只回码和数目，一句话都不带：会话提示会原样进模型上下文，而**措辞属于
+            // 装配侧**（main.js 的 _browserSessionNoteText，三语各一份）。写在这里的中文
+            // 既进不了 JS 那套字符串剥离，也永远只有一种语言。
+            "{note}\n[EXT_IGNORED_CHROME137] count={}",
             exts.len()
         );
     }
@@ -1260,9 +1263,8 @@ pub async fn browser_attach(
             old
         };
         drop(old);
-        set_session_note(format!(
-            "已接管 {who} 的窗口（{brand}，调试端口 {port}）——这是用户自己在开发的应用，后面每个 browser 动作都作用在它上面；close 只断开连接，不会关掉应用。"
-        ));
+        // 同上：码 + 事实。这一句原来还把下面 [ATTACHED] 那行的意思重说了一遍。
+        set_session_note(format!("[ATTACHED_OWN_APP] who={who} brand={brand} port={port}"));
         snapshot(
             &tab,
             Some(format!("[ATTACHED] 已接管 {who}（{brand}）的窗口「{title}」{url}；close 只断开，不关应用。")),

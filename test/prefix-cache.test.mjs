@@ -20,7 +20,9 @@ test("a turn that classifies narrower does not drop the session's blocks", () =>
   const session = {};
 
   // Turn 1, the real classifier shape for "fix the login page and run it".
-  const t1 = stable(session, profileOf({ ui: true, workspaceAction: "modify", applies: true }));
+  // automationNeed 是 2026-09-07 加的档位（none / diagnostic / requested）：**用户要求跑一下**，
+  // design_verification 才挂。"run it" 正是 requested，所以这一轮四面设计旗齐亮。
+  const t1 = stable(session, profileOf({ ui: true, workspaceAction: "modify", applies: true, automationNeed: "requested" }));
   // 2026-09-05 起裁决没落定的会话最前面带一位 unjudged（不粘，模型判过就消失）。
   assert.equal(t1, "2.5:unjudged,engineering,design,design_implementation,design_verification");
 
@@ -34,7 +36,7 @@ test("a turn that classifies narrower does not drop the session's blocks", () =>
 
 test("a session that genuinely widens pays once and then settles", () => {
   const session = {};
-  const t1 = stable(session, profileOf({ ui: true, workspaceAction: "modify", applies: true }));
+  const t1 = stable(session, profileOf({ ui: true, workspaceAction: "modify", applies: true, automationNeed: "requested" }));
 
   // The user now asks for a commit — git is real new capability, so the prefix legitimately grows.
   const t2 = stable(session, profileOf({ applies: true, git: true }));
@@ -44,13 +46,13 @@ test("a session that genuinely widens pays once and then settles", () => {
 
   // ...and every turn after that is byte-identical, which is the whole point.
   assert.equal(stable(session, profileOf({ applies: true })), t2);
-  assert.equal(stable(session, profileOf({ ui: true, workspaceAction: "modify", applies: true })), t2);
+  assert.equal(stable(session, profileOf({ ui: true, workspaceAction: "modify", applies: true, automationNeed: "requested" })), t2);
   assert.equal(stable(session, profileOf({ applies: true, git: true })), t2);
 });
 
 test("stickiness is per session, so a new session starts focused", () => {
   const a = {};
-  stable(a, profileOf({ ui: true, workspaceAction: "modify", applies: true, fullWebsite: true }));
+  stable(a, profileOf({ ui: true, workspaceAction: "modify", applies: true, fullWebsite: true, automationNeed: "requested" }));
 
   // Not a global accumulator: the full flag set assembles an 84KB prefix against 26KB here, and
   // blocks the model does not need are more instructions competing with the ones it does.
