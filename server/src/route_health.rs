@@ -217,6 +217,68 @@ pub fn spawn_attempt(
     });
 }
 
+/// 把这一条流**吐得多快**记进库：吐了多少 token、流了多少毫秒。
+///
+/// # 和 `spawn_attempt` 的分工
+///
+/// `spawn_attempt` 在**响应头到手**那一刻就记了，它答的是「接不接得通、多久开口」。
+/// 这个函数在**流结束**才记，答的是另一半：开口之后，一个字一个字吐完要多久。
+///
+/// 两半必须分开记，因为它们在时间上就是分开的 —— 响应头那一刻还不知道会吐多少。
+/// 落库落在同一行（day, endpoint_id, model_id），只是这一次只碰吐字那三列。
+///
+/// # 为什么这一半才是用户等的大头
+///
+/// 线上实测（2026-09-08，主对话）：一步的墙钟里首字约 5 秒、吐字 60~70 秒，
+/// 吐字占 93%。而派单得分原来只看首字 —— 它在优化那 7%，对 93% 完全瞎。
+///
+/// # 什么样的观测才算数
+///
+/// 只在**流完整结束**且真的吐出了内容时记。中途断掉的那些一律不记：在 agentic IDE 里
+/// 流中断多半是用户按了停止，那一段「时长」量的是用户什么时候改的主意，不是出口的速度。
+/// 太短的流也不记（`MIN_STREAM_MS`）—— 一次几百毫秒的回答里，首块抖动就能让算出来的
+/// 速度翻倍，这种样本进了平均值只会让排序天天翻烧饼。
+///
+/// 和 `spawn_ok` 一样 tokio::spawn 出去，派单路径上一个 await 都不加。
+pub fn spawn_throughput(
+    state: &AppState,
+    endpoint_id: Uuid,
+    model_id: &str,
+    out_tokens: u64,
+    stream_ms: u64,
+) {
+    if model_id.trim().is_empty() || out_tokens == 0 || stream_ms < MIN_STREAM_MS {
+        return;
+    }
+    let st = state.clone();
+    let model = model_id.to_string();
+    // 上限和 ttfb 那边同一个量级：一条流不可能真的跑十分钟还算正常样本，
+    // 真跑了也说明它慢到不该拿来定义「正常速度」。
+    let tokens = out_tokens.min(1_000_000) as i64;
+    let ms = stream_ms.min(600_000) as i64;
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO route_attempt \
+               (day, endpoint_id, model_id, out_tokens_sum, stream_ms_sum, stream_n) \
+             VALUES (current_date, $1, $2, $3, $4, 1) \
+             ON CONFLICT (day, endpoint_id, model_id) DO UPDATE SET \
+               out_tokens_sum = route_attempt.out_tokens_sum + EXCLUDED.out_tokens_sum, \
+               stream_ms_sum  = route_attempt.stream_ms_sum  + EXCLUDED.stream_ms_sum, \
+               stream_n       = route_attempt.stream_n       + 1, \
+               updated_at     = now()",
+        )
+        .bind(endpoint_id)
+        .bind(&model)
+        .bind(tokens)
+        .bind(ms)
+        .execute(&st.db)
+        .await;
+    });
+}
+
+/// 短于这个的流不进吐字速度的样本。见 `spawn_throughput` 里那段。
+pub const MIN_STREAM_MS: u64 = 1_500;
+
 /// 记一次成功，**不等它写完**。
 ///
 /// 派单路径上一个 await 都不加：观测失败绝不能让用户多等一毫秒，也绝不能把一次请求

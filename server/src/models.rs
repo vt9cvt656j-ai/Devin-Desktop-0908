@@ -13988,6 +13988,31 @@ pub async fn chat_completions(
                     _ => (json!({}), false),
                 }
             };
+            // ── 这一条流吐得多快 → 喂回派单 ──────────────────────────────────
+            //
+            // 派单得分原来只认「多久开口」（ttfb）。线上实测（2026-09-08，主对话）说明
+            // 那是错的那一段：一步 73 秒里首字约 5 秒，剩下 68 秒是把 4000 个 token
+            // 一个一个吐出来。而吐字速度跨出口差到 2.2 倍（deepseek 同模型：83.2 对
+            // 38.4 token/秒），得分里却没有这一维 —— 于是流量长期送给便宜且慢的那个。
+            //
+            // 分母只取「表头到手 → 流结束」这一段。等表头那一段是 ttfb，已经单独记过，
+            // 算进来等于让一个慢首字在得分里被罚两次。
+            //
+            // `usage_reported` 是硬条件：上游没报或只报了半截时，token 数是猜的，
+            // 拿猜的数去算速度就是给排序喂噪声，而这个排序决定所有人走哪个出口。
+            if complete && usage_reported {
+                let out_tokens = usage
+                    .get("completion_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                crate::route_health::spawn_throughput(
+                    &st,
+                    hid,
+                    &req_model,
+                    out_tokens,
+                    response_opened_at.elapsed().as_millis() as u64,
+                );
+            }
             // **流中途死掉也要记一笔失败。**
             //
             // 在这之前，成功与否只在拿到响应表头那一刻记（`spawn_ok`）—— 于是一个

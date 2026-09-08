@@ -134,6 +134,22 @@ pub struct Endpoint {
     pub real_sum: Option<i64>,
     #[sqlx(default)]
     pub real_n: Option<i64>,
+    /// 最近 7 天**真实流完**的吐字速度：吐出的 token 总数、对应的流式毫秒总数、样本数。
+    ///
+    /// 和 `real_sum/real_n` 同一个形状、同一张表（`route_attempt`），但量的是另一段时间：
+    /// `real_sum` 是「多久开口」，这三个是「开口之后吐完要多久」。
+    ///
+    /// 存两个总量而不是算好的速度，是因为要按 token 数加权 —— 吐 50 个 token 那次的
+    /// 速度噪声极大，和吐 4000 个 token 那次等权平均等于让噪声说了算。总量之比天然
+    /// 让长请求主导，而长请求正是用户真正在等的那些。
+    ///
+    /// 同样每一处 `SUM(` 都显式 `::bigint`，理由见上面那段。
+    #[sqlx(default)]
+    pub tps_tokens: Option<i64>,
+    #[sqlx(default)]
+    pub tps_ms: Option<i64>,
+    #[sqlx(default)]
+    pub tps_n: Option<i64>,
     /// 最近这段时间的**真实成败次数**。选路的第三个维度：成功率。
     ///
     /// 窗口是「最近 24 小时，样本不够就退回 7 天」—— 一天一刷，昨天的坏运气不会
@@ -286,13 +302,20 @@ pub fn confidently_below_floor(ok: i64, total: i64) -> bool {
 /// # 三个维度怎么合成一个数
 ///
 /// ```text
-///   得分 = 进价 × (1 / 成功率) × √(首字延迟 / 同线路最快)
+///   得分 = 进价 × (1 / 成功率) × √(整轮预计耗时 / 同线路最快)
 /// ```
 ///
 /// * `1 / 成功率`：一次失败的代价是**白等一个来回**。平均要发两次才成的出口，
 ///   等同于把一次请求的代价翻倍 —— 所以它必须便宜一半才值得排在前面。
-/// * `√(延迟倍数)`：慢要罚，但不该压过价钱。四倍慢罚两倍，八倍慢罚 2.8 倍。
-///   用开方而不是线性，是因为首字延迟本身抖动很大，线性会让排序天天翻烧饼。
+/// * `√(耗时倍数)`：慢要罚，但不该压过价钱。四倍慢罚两倍，八倍慢罚 2.8 倍。
+///   用开方而不是线性，是因为耗时本身抖动很大，线性会让排序天天翻烧饼。
+///
+/// # 这里的「耗时」是整轮，不是首字
+///
+/// `ms` 这一位收到的是 `expected_turn_ms` 算出来的**等它开口 + 等它吐完**，
+/// 不是首字延迟。原来只罚首字，而线上实测（2026-09-08）首字只占一步墙钟的 7%，
+/// 剩下 93% 是一个字一个字吐出来的时间 —— 那等于在优化 7%、对 93% 完全瞎。
+/// 换算的判据和权重都在 `expected_turn_ms` 自己那段。
 ///
 /// 两个惩罚都有**证据门槛**：样本不够就不罚（`MIN_RATE_SAMPLES`），也都有上限，
 /// 免得一次抖动把一个好出口永久除名。这和这个文件里其它地方一条规矩：
@@ -326,6 +349,53 @@ impl Endpoint {
             _ => None,
         }
     }
+
+    /// 实测吐字速度（token/秒）。样本不够 `MIN_STREAM_SAMPLES` 就是没有。
+    ///
+    /// 和 `real_ttfb_ms` 一样，"没有"和"很慢"必须是两个值：没有证据不构成降级理由，
+    /// 这是这个文件里一以贯之的一条。返回 None 时 `expected_turn_ms` 会原样退回首字，
+    /// 也就是这次改动之前的行为 —— 一个还没被观测过的新出口不会因为"没数"被压到最后。
+    pub fn real_tps(&self) -> Option<f64> {
+        let (tokens, ms, n) = (self.tps_tokens?, self.tps_ms?, self.tps_n.unwrap_or(0));
+        (n >= MIN_STREAM_SAMPLES && tokens > 0 && ms > 0)
+            .then(|| tokens as f64 * 1000.0 / ms as f64)
+    }
+}
+
+/// 吐字速度要几个样本才算数。比首字那道门（`MIN_REAL_SAMPLES`）松一格：
+/// 一次完整流完的观测里有几千个 token，本身就比一次首字读数结实得多。
+pub const MIN_STREAM_SAMPLES: i64 = 3;
+
+/// 排序时用的「典型一步要吐多少 token」。
+///
+/// 线上实测（2026-09-08，grok-4.6 主对话 787 个样本）：每步平均输出 2042 token。
+/// 这个数只用来给两段时间**定权重** —— 首字那一段是固定成本，吐字那一段和它成正比。
+/// 取整到 2000：再精确也没有意义，它随任务类型天天变，而排序只需要量级对。
+pub const TYPICAL_TURN_OUTPUT_TOKENS: f64 = 2000.0;
+
+/// 一次请求用户**真正要等**的毫秒：等它开口 + 等它吐完。
+///
+/// # 为什么排序不能只看首字
+///
+/// 线上实测（2026-09-08，主对话）：一步 73 秒里首字约 5 秒，剩下 68 秒是把 4000 个
+/// token 一个一个吐出来 —— 首字只占 7%。而得分原来只罚首字，等于在优化那 7%、
+/// 对 93% 完全瞎。同一天同一个模型跨出口的吐字速度差到 2.2 倍
+/// （deepseek-v4-flash：83.2 对 38.4 token/秒），比首字的差距还大。
+///
+/// 后果是可以指名道姓的：grok-4.6 的流量 787 次去了 43.1 token/秒的出口，
+/// 而旁边 51.3 token/秒的那个只接到 79 次 —— 因为它贵一点点，而得分里没有这一维。
+///
+/// # 没有观测时原样退回
+///
+/// 拿不到吐字速度就返回首字本身，也就是这次改动之前的排序。新出口不会因为"还没被
+/// 观测过"被压到最后 —— 那条规矩（没有证据不构成降级理由）在这个文件里到处都是。
+pub fn expected_turn_ms(ttfb_ms: Option<i32>, tps: Option<f64>) -> Option<i32> {
+    let ttfb = ttfb_ms?;
+    let Some(tps) = tps.filter(|v| *v > 0.0) else {
+        return Some(ttfb);
+    };
+    let stream_ms = TYPICAL_TURN_OUTPUT_TOKENS * 1000.0 / tps;
+    Some(((ttfb as f64) + stream_ms).min(i32::MAX as f64) as i32)
 }
 
 /// 判「慢不慢」该拿哪个耗时。**有真实流量就用真实的。**
@@ -703,7 +773,10 @@ pub fn expand(
                     0, // 可靠性档，等候选收齐（拿到成败数）再填
                     e.cost_ratio,
                 ),
-                effective_ms(e.real_ttfb_ms(), e.real_n, e.probe_ms),
+                expected_turn_ms(
+                    effective_ms(e.real_ttfb_ms(), e.real_n, e.probe_ms),
+                    e.real_tps(),
+                ),
                 m,
             ));
             rate_of.push((e.real_ok.unwrap_or(0), e.real_bad.unwrap_or(0)));
@@ -1001,11 +1074,18 @@ pub async fn load_for_routes_for_model(
         //
         // `MAX(last_ok_at)/MAX(last_fail_at)` 同样跟着 $2 收窄：它们喂的是排序**第一键**
         // `availability_tier`，跨模型取最大等于拿别的模型的成败给这个模型定档。
-        "SELECT e.*, a.last_ok_at, a.last_fail_at, a.real_sum, a.real_n, a.real_ok, a.real_bad FROM route_endpoints e \
+        "SELECT e.*, a.last_ok_at, a.last_fail_at, a.real_sum, a.real_n, a.real_ok, a.real_bad, \
+                a.tps_tokens, a.tps_ms, a.tps_n FROM route_endpoints e \
          LEFT JOIN (SELECT endpoint_id, MAX(last_ok_at) AS last_ok_at, \
                            MAX(last_fail_at) AS last_fail_at, \
                            COALESCE(SUM(ttfb_ms_sum) FILTER (WHERE day >= current_date - 6), 0)::bigint AS real_sum, \
                            COALESCE(SUM(ttfb_ms_n)   FILTER (WHERE day >= current_date - 6), 0)::bigint AS real_n, \
+                           -- 吐字速度：分子分母各自求和，除法留到 Rust 那边（`real_tps`）。
+                           -- 在 SQL 里除会得到 NUMERIC，而这一行按 i64 解码，类型对不上
+                           -- 就整份返回空 —— 所有出口凭空消失，界面上什么都不报。
+                           COALESCE(SUM(out_tokens_sum) FILTER (WHERE day >= current_date - 6), 0)::bigint AS tps_tokens, \
+                           COALESCE(SUM(stream_ms_sum)  FILTER (WHERE day >= current_date - 6), 0)::bigint AS tps_ms, \
+                           COALESCE(SUM(stream_n)       FILTER (WHERE day >= current_date - 6), 0)::bigint AS tps_n, \
                            -- 成功率的窗口是「今天，样本不够退回 7 天」：一天一刷，
                            -- 昨天的坏运气不压着今天；而流量稀的出口也不会因为样本太少
                            -- 被一两次失败判死。判据 MIN_RATE_SAMPLES 在 Rust 那边。
@@ -3538,6 +3618,9 @@ mod tests {
             real_n: None,
             real_ok: None,
             real_bad: None,
+            tps_tokens: None,
+            tps_ms: None,
+            tps_n: None,
             route_id: uuid::Uuid::nil(),
             label: String::new(),
             base_url: url.into(),
@@ -3774,6 +3857,57 @@ mod tests {
     }
 
     /// 派单排序真的读到了这个得分 —— 不然上面几条只是在测一个没人调用的函数。
+    #[test]
+    fn a_faster_typist_outranks_a_faster_first_byte() {
+        // 线上实测 2026-09-08，grok-4.6 同一条线路上的两个出口：
+        //   3ecc0e13   首字略快，43.1 token/秒   ← 787 次流量全去了这里
+        //   XXY        首字略慢，51.3 token/秒   ← 只接到 79 次
+        // 只罚首字时前者赢；按"用户真正等的那段"算，后者赢——因为一步要吐 2000 个 token，
+        // 吐字那一段是首字的十倍长。这条测试就是钉住这个翻转。
+        let slow_typist = expected_turn_ms(Some(4_000), Some(43.1)).expect("有首字就有预计");
+        let fast_typist = expected_turn_ms(Some(5_000), Some(51.3)).expect("有首字就有预计");
+        assert!(
+            fast_typist < slow_typist,
+            "吐得快的那个该先交货：{fast_typist}ms 对 {slow_typist}ms"
+        );
+        // 而按老判据（只看首字）结论正好相反——这正是改动之前流量走错的原因。
+        assert!(4_000 < 5_000, "老判据下慢吐字的那个反而排前面");
+
+        // 差距要真的进得了得分：同价同成功率时，快的那个得分更小（越小越先用）。
+        let best = fast_typist as f64;
+        let a = endpoint_score(1.0, 100, 0, Some(fast_typist), Some(best));
+        let b = endpoint_score(1.0, 100, 0, Some(slow_typist), Some(best));
+        assert!(a < b, "得分没跟着整轮耗时走：{a} 对 {b}");
+    }
+
+    #[test]
+    fn no_throughput_evidence_falls_back_to_the_first_byte() {
+        // 没有证据不构成降级理由——这个文件里到处都是这条。一个还没被观测过的新出口
+        // 必须拿到和改动之前一模一样的排序，否则"加一个出口"会先经历一段无谓的冷宫。
+        assert_eq!(expected_turn_ms(Some(3_200), None), Some(3_200));
+        // 0 或负的速度是坏数据，不是"很慢"，同样退回首字。
+        assert_eq!(expected_turn_ms(Some(3_200), Some(0.0)), Some(3_200));
+        // 连首字都没有就还是没有：不许凭空造一个数出来排序。
+        assert_eq!(expected_turn_ms(None, Some(50.0)), None);
+    }
+
+    #[test]
+    fn throughput_needs_enough_samples_before_it_counts() {
+        let mut e = ep(1.0, Some(true), "https://x.test");
+        // 一次观测不算数：样本门槛没过就当没有，退回首字那条路。
+        e.tps_tokens = Some(4_000);
+        e.tps_ms = Some(80_000);
+        e.tps_n = Some(1);
+        assert_eq!(e.real_tps(), None, "样本不够却报了速度");
+        // 够了就算得出来：4000 token / 80 秒 = 50 token/秒。
+        e.tps_n = Some(MIN_STREAM_SAMPLES);
+        let tps = e.real_tps().expect("样本够了该有速度");
+        assert!((tps - 50.0).abs() < 1e-6, "算错了：{tps}");
+        // 分子分母缺一半也当没有——除法留在 Rust 这边就是为了不让它变成 NaN。
+        e.tps_ms = Some(0);
+        assert_eq!(e.real_tps(), None, "分母 0 竟然算出了速度");
+    }
+
     #[test]
     fn the_dispatch_order_uses_the_score() {
         let me = src();
@@ -5902,6 +6036,9 @@ mod retire_tests {
             real_n: None,
             real_ok: None,
             real_bad: None,
+            tps_tokens: None,
+            tps_ms: None,
+            tps_n: None,
             route_id: uuid::Uuid::nil(),
             label: label.into(),
             base_url: url.into(),
