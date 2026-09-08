@@ -33,7 +33,7 @@ import {
 import { api } from "@/lib/api";
 import { useRowFlash } from "@/lib/flash";
 import { cents, num } from "@/lib/format";
-import { cn } from "@/lib/utils";
+import { cn, hasModel } from "@/lib/utils";
 
 /**
  * 模型线路 — the provider connections every IDE request is routed through, and what each
@@ -1029,7 +1029,9 @@ function initialRows(c: Conn | null): Row[] {
   // 出口带来的模型也要在这张表里：IDE 按 effective_models 出列表，这里只列线路自己的话，
   // 运维在 IDE 里看到一个模型、回到这页却找不到它，也没法取消 —— 所有者「我没用的模型了，
   // 他还保存着，很奇怪」。它们带着「由出口带来」的标记，取消勾选会从那些出口上拿掉。
-  const carriedIds = (c.effective_models || []).filter((id) => !own.includes(id));
+  // 忽略大小写：出口把 minimax-m3 写成 MiniMax-M3 时，那不是「出口带来的新模型」，
+  // 而是同一款货的另一种拼法（服务端已归并，这里是同一把尺的第二处）。
+  const carriedIds = (c.effective_models || []).filter((id) => !hasModel(own, id));
   return [...own, ...carriedIds].map((id) => {
     const p = prices[id] || {};
     const b = billing[id] || {};

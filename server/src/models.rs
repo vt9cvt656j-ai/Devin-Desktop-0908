@@ -3774,7 +3774,7 @@ pub async fn admin_model_estimate(
         .await?
         .ok_or_else(|| AppError::bad("模型连接不存在"))?;
     let model_id = req.model_id.trim();
-    if model_id.is_empty() || !allowed_ids(&model).iter().any(|id| id == model_id) {
+    if model_id.is_empty() || !crate::route_endpoints::has_model(&allowed_ids(&model), model_id) {
         return Err(AppError::bad("该连接没有开放这个模型"));
     }
     if is_image_gen_model(model_id) {
@@ -3930,7 +3930,7 @@ pub async fn admin_quota_estimate(
         .await?
         .ok_or_else(|| AppError::bad("模型连接不存在"))?;
     let model_id = req.model_id.trim();
-    if model_id.is_empty() || !allowed_ids(&model).iter().any(|id| id == model_id) {
+    if model_id.is_empty() || !crate::route_endpoints::has_model(&allowed_ids(&model), model_id) {
         return Err(AppError::bad("该连接没有开放这个模型"));
     }
     if model.billing_mode == "per_call" {
@@ -4496,7 +4496,9 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
         // 那是漏洞不是功能。见 route_endpoints::priceable。
         for mid in crate::route_endpoints::effective_models(m, ep_map.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]))
         {
-            if !allowed_ids(m).contains(&mid) && !crate::route_endpoints::priceable(m, &mid) {
+            if !crate::route_endpoints::has_model(&allowed_ids(m), &mid)
+                && !crate::route_endpoints::priceable(m, &mid)
+            {
                 tracing::warn!(
                     model = %mid,
                     route = %m.label,
@@ -5092,11 +5094,71 @@ pub async fn user_usage(
     .bind(uid)
     .fetch_one(&state.db)
     .await?;
+
+    // 账单面板的「每日消费」和「按模型」两块。**窗口起点不能早于单位分水岭。**
+    //
+    // `model_usage.cost_cents` 在 2026-08-28 从美元分变成人民币分（差 7.1 倍），而库里没有
+    // 任何一列能把两个年代分开（判别列 sell_micro_usd 是后来加的、且不回填）。跨过那一天
+    // 直接 SUM，图上会凭空多出一段高 7 倍的历史 —— 那不是「旧数据」，是**错的数**。
+    // 分水岭当天两种单位都可能有，整天丢掉。窗口起点随响应一起回给客户端，界面照实写。
+    // 见 memory cost-cents-unit-broke-on-0828。
+    const COST_UNIT_EPOCH: &str = "2026-08-29T00:00:00Z";
+    let epoch: chrono::DateTime<chrono::Utc> = COST_UNIT_EPOCH.parse().expect("常量是合法时间戳");
+    let window_from = (chrono::Utc::now() - chrono::Duration::days(30)).max(epoch);
+
+    // 天按 UTC 切。客户端只拿它当标签用（不再换算时区），两边说的是同一个格子。
+    // SUM() 回的是 numeric 不是 bigint，不显式 ::bigint 的话 Rust 侧按 i64 接会运行期 500。
+    type DailyRow = (String, i64, i64);
+    let daily: Vec<DailyRow> = sqlx::query_as(
+        "SELECT to_char(date_trunc('day', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD'), \
+                COALESCE(SUM(cost_cents),0)::bigint, COUNT(*)::bigint \
+         FROM model_usage WHERE user_id = $1 AND created_at >= $2 \
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind(uid)
+    .bind(window_from)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    type ModelRow = (String, i64, i64, i64, i64);
+    let by_model: Vec<ModelRow> = sqlx::query_as(
+        "SELECT model_name, COALESCE(SUM(cost_cents),0)::bigint, COUNT(*)::bigint, \
+                COALESCE(SUM(prompt_tokens),0)::bigint, COALESCE(SUM(completion_tokens),0)::bigint \
+         FROM model_usage WHERE user_id = $1 AND created_at >= $2 \
+         GROUP BY 1 ORDER BY 2 DESC, 3 DESC LIMIT 8",
+    )
+    .bind(uid)
+    .bind(window_from)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    // 窗口内的合计单独给：客户端不该把 by_model 的前 8 名相加当成「这段时间一共花了多少」，
+    // 那会把第 9 名之后的钱悄悄抹掉。
+    let (window_cents, window_calls): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(cost_cents),0)::bigint, COUNT(*)::bigint \
+         FROM model_usage WHERE user_id = $1 AND created_at >= $2",
+    )
+    .bind(uid)
+    .bind(window_from)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or((0, 0));
+
     Ok(Json(json!({
         "credits_cents": credits,
         "plan": plan,
         "total_spent_cents": total_spent,
         "recent": list,
+        "window_from": window_from,
+        "window_cost_cents": window_cents,
+        "window_calls": window_calls,
+        "daily": daily.iter().map(|r| json!({ "day": r.0, "cost_cents": r.1, "calls": r.2 })).collect::<Vec<_>>(),
+        "by_model": by_model.iter().map(|r| json!({
+            "model": r.0, "cost_cents": r.1, "calls": r.2,
+            "prompt_tokens": r.3, "completion_tokens": r.4,
+        })).collect::<Vec<_>>(),
     })))
 }
 
@@ -11766,7 +11828,7 @@ pub async fn chat_completions(
     // No header → no-op (existing behavior untouched).
     crate::prompts::assemble_into(&headers, &mut body)
         .map_err(|err| AppError::internal(format!("IDE prompt graph unavailable: {err}")))?;
-    let model_id = body
+    let mut model_id = body
         .get("model")
         .and_then(|v| v.as_str())
         .map(String::from)
@@ -11827,6 +11889,25 @@ pub async fn chat_completions(
     } else {
         active_models_cached(&state.db).await?.as_ref().clone()
     };
+    // 模型 id 的大小写不算区别，但**从这里往下一律用线路自己写的那个拼法**。
+    //
+    // 各家中转对同一款货的写法不统一（线上：线路写 `minimax-m3`，一个出口照抄成 `MiniMax-M3`），
+    // 客户端手上那份列表也可能是旧的。匹配放宽是为了别把人挡在门外；而**发出去和记账的那个 id
+    // 必须收敛成一个**——计价、显示名、用量、route_attempt 全按 id 查表，让 `MINIMAX-M3` 这种
+    // 写法流下去会查不到单模型价，然后静默按 0 元计费（见 memory silent-zero-charge）。
+    if let Some(canon) = conns
+        .iter()
+        .flat_map(allowed_ids)
+        .find(|x| crate::route_endpoints::same_model(x, &model_id))
+    {
+        if canon != model_id {
+            tracing::info!(asked = %model_id, canonical = %canon, "模型 id 大小写归一");
+            model_id = canon;
+            if let Some(m) = body.get_mut("model") {
+                *m = serde_json::Value::String(model_id.clone());
+            }
+        }
+    }
     // 「Claude 强力版」：IDE 打开那个开关时带 x-ide-power-route，这一轮只在运维勾了
     // power_route 的线路里挑。
     //
@@ -11858,11 +11939,13 @@ pub async fn chat_completions(
         .filter(|m| {
             // 出口带来的模型也算这条线路能接。真正派给哪个出口由 expand 再筛一次 ——
             // 线路自带地址没有这款货时，它不会成为候选。
-            crate::route_endpoints::effective_models(
-                m,
-                endpoint_map.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]),
+            crate::route_endpoints::has_model(
+                &crate::route_endpoints::effective_models(
+                    m,
+                    endpoint_map.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]),
+                ),
+                &model_id,
             )
-            .contains(&model_id)
         })
         .collect()
     };
@@ -14461,9 +14544,10 @@ pub async fn responses_proxy(
         .ok_or_else(|| AppError::bad("缺少 model"))?;
 
     let conns = active_models_cached(&state.db).await?;
+    // 大小写不算区别（和 chat 主路径同一条判据，见 route_endpoints::same_model）。
     let conn = conns
         .iter()
-        .find(|m| allowed_ids(m).contains(&model_id))
+        .find(|m| crate::route_endpoints::has_model(&allowed_ids(m), &model_id))
         .cloned()
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
@@ -14752,9 +14836,10 @@ pub async fn image_generations(
         .ok_or_else(|| AppError::bad("缺少 model"))?;
 
     let conns = active_models_cached(&state.db).await?;
+    // 大小写不算区别（和 chat 主路径同一条判据，见 route_endpoints::same_model）。
     let conn = conns
         .iter()
-        .find(|m| allowed_ids(m).contains(&model_id))
+        .find(|m| crate::route_endpoints::has_model(&allowed_ids(m), &model_id))
         .cloned()
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 

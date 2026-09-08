@@ -447,6 +447,28 @@ pub fn own_order_key() -> (u8, u8, f64) {
     (0, 0, 1.0)
 }
 
+/// 模型 id 的大小写不算区别。
+///
+/// 线上实测（2026-09-08）：MiniMax 线路自己写的是 `minimax-m3`，而「极速API」那个出口里
+/// 存的是 `MiniMax-M3` —— 运维照抄中转控制台上的写法，而各家中转的写法本来就不统一。
+/// 逐字节比的后果有两面，第二面更贵：
+///   · `effective_models` 把它当成线路没有的新模型 → **IDE 的模型列表里同一个模型出现两次**
+///     （所有者：「明明添加的模型不是新增的，IDE 里却把已有的当成重复的显示」）；
+///   · `expand()` 里那道承载判定同样对不上 → 那个出口对 MiniMax **一个请求都接不到**，
+///     挂了等于没挂，而屏幕上它一切正常。
+///
+/// 所以匹配一律忽略大小写，而**存下来和发出去的拼法一律以线路自己那一份为准**（见
+/// `admin_save` 里的归一化和 chat 主路径上的 canonical）：计价、用量、日志都按 id 查表，
+/// 让 `MINIMAX-M3` 这种写法流下去会查不到单模型价、静默落到 0 元。
+pub fn same_model(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// 这份名单里有没有这个模型（忽略大小写）。
+pub fn has_model(list: &[String], id: &str) -> bool {
+    list.iter().any(|x| same_model(x, id))
+}
+
 /// 这条线路**连同它的出口**一共能提供哪些模型。
 ///
 /// 出口可以带来线路本身没有的模型：你新挂一个中转，它那儿多了两款货，那两款就该出现在
@@ -458,7 +480,9 @@ pub fn effective_models(route: &Model, outlets: &[Endpoint]) -> Vec<String> {
     let mut all = crate::models::allowed_ids(route);
     for e in outlets.iter().filter(|e| e.active) {
         for m in &e.enabled_models {
-            if !all.iter().any(|x| x == m) {
+            // 忽略大小写去重，并且**保留先出现的那个拼法**（线路自己的排在最前，所以
+            // 线路的写法赢）。出口把 minimax-m3 写成 MiniMax-M3 时，这里不再多出一个条目。
+            if !has_model(&all, m) {
                 all.push(m.clone());
             }
         }
@@ -475,7 +499,7 @@ pub fn carried_by(route: &Model, outlets: &[Endpoint]) -> serde_json::Value {
     for e in outlets.iter().filter(|e| e.active) {
         let who = if e.label.trim().is_empty() { host_of(&e.base_url) } else { e.label.trim().to_string() };
         for m in &e.enabled_models {
-            if own.iter().any(|x| x == m) {
+            if has_model(&own, m) {
                 continue;
             }
             let entry = map.entry(m.clone()).or_insert_with(|| serde_json::Value::Array(Vec::new()));
@@ -510,7 +534,7 @@ pub fn retire_from_outlet(enabled: &[String], retired: &[String]) -> Option<Reti
     if enabled.is_empty() {
         return None;
     }
-    let remaining: Vec<String> = enabled.iter().filter(|m| !retired.contains(m)).cloned().collect();
+    let remaining: Vec<String> = enabled.iter().filter(|m| !has_model(retired, m)).cloned().collect();
     if remaining.len() == enabled.len() {
         return None;
     }
@@ -616,8 +640,7 @@ pub fn expand(
         //
         // 出口能带来线路本身没有的模型（新挂的中转多了两款货）。那种模型的请求派给
         // 线路自带地址只会撞一个 404 —— 而每个请求只有两次机会，白撞一次就浪费掉一半。
-        let own_has = model_id.is_empty()
-            || crate::models::allowed_ids(r).iter().any(|x| x == model_id);
+        let own_has = model_id.is_empty() || has_model(&crate::models::allowed_ids(r), model_id);
         // 线路自带的地址：在任的那个。见 own_order_key —— 同价位它留在前面，
         // 真便宜的出口才越得过它。
         let mut own = r.clone();
@@ -651,9 +674,9 @@ pub fn expand(
             // 空 = 承载**线路自己**开放的那些（不是并集 —— 别的出口带来的货，
             // 这个出口未必有）。非空 = 就这几款。
             let serves = if e.enabled_models.is_empty() {
-                crate::models::allowed_ids(r).iter().any(|x| x == model_id)
+                has_model(&crate::models::allowed_ids(r), model_id)
             } else {
-                e.enabled_models.iter().any(|x| x == model_id)
+                has_model(&e.enabled_models, model_id)
             };
             if !model_id.is_empty() && !serves {
                 continue;
@@ -2873,12 +2896,21 @@ pub async fn admin_save(
         .iter()
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
+        // 拼法归一到线路自己那一份：出口写 MiniMax-M3、线路写 minimax-m3 时存线路的。
+        // 不归一的话这一行会被当成线路没有的新模型，IDE 列表里就多出一个重复条目。
+        .map(|m| {
+            allowed
+                .iter()
+                .find(|a| same_model(a, &m))
+                .cloned()
+                .unwrap_or(m)
+        })
         .collect();
     enabled_models.sort();
     enabled_models.dedup();
     if let Some(bad) = enabled_models
         .iter()
-        .find(|m| !allowed.contains(m) && !priceable(&route, m))
+        .find(|m| !has_model(&allowed, m) && !priceable(&route, m))
     {
         return Err(reject(AppError::bad(format!(
             "「{bad}」是这条线路没有的新模型，但算不出它的价格 —— 开放出去用户一分不付、\
@@ -2892,7 +2924,7 @@ pub async fn admin_save(
     // 线路有 6 个，勾了 4 个原有 + 2 个新的也是 6 个，按长度判会把整份选择清空，
     // 那两个新模型**静默消失**：存的时候不报错，只是它们再也不会被派到这个出口。
     let is_exactly_the_routes_own = enabled_models.len() == allowed.len()
-        && enabled_models.iter().all(|m| allowed.contains(m));
+        && enabled_models.iter().all(|m| has_model(&allowed, m));
     if is_exactly_the_routes_own {
         enabled_models.clear();
     }
@@ -3316,15 +3348,15 @@ pub async fn admin_available(
     let data: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
     let ids: Vec<String> = crate::models::parse_model_ids(&data);
     let allowed = crate::models::allowed_ids(&route);
-    let here: Vec<String> = allowed.iter().filter(|m| ids.contains(m)).cloned().collect();
-    let missing: Vec<String> = allowed.iter().filter(|m| !ids.contains(m)).cloned().collect();
+    let here: Vec<String> = allowed.iter().filter(|m| has_model(&ids, m)).cloned().collect();
+    let missing: Vec<String> = allowed.iter().filter(|m| !has_model(&ids, m)).cloned().collect();
     // 这家有、而线路没有的 —— 勾上就会**新增**到 IDE 的模型列表里。
     //
     // 分成能开放和不能开放两堆：算不出价格的开放出去，用户一分不付而上游照收你的钱。
     // 所以这里先替运维把这件事分好，而不是等他保存时才报错。
     let (extra_ok, extra_no_price): (Vec<String>, Vec<String>) = ids
         .iter()
-        .filter(|m| !allowed.contains(m))
+        .filter(|m| !has_model(&allowed, m))
         .cloned()
         .partition(|m| priceable(&route, m));
     Ok(Json(serde_json::json!({
@@ -5914,6 +5946,63 @@ mod retire_tests {
         let r = retire_from_outlet(&v(&["b"]), &v(&["b"])).expect("有变化");
         assert!(r.orphaned);
         assert!(r.remaining.is_empty());
+    }
+
+    /// **大小写不算区别。** 线上真实形状：MiniMax 线路写的是小写，「极速API」那个出口
+    /// 照抄中转控制台写成了大写。逐字节比的话 IDE 的模型列表里同一款货出现两次
+    /// （所有者：「明明添加的模型不是新增的，IDE 里却把已有的当成重复的显示」）。
+    #[test]
+    fn a_different_capitalisation_is_the_same_model_not_a_new_one() {
+        let r = route(&["minimax-m3", "minimax-m2.7"]);
+        let jisu = ep(&["MiniMax-M2.7", "MiniMax-M3"], true, "极速API", "https://jisu.example/v1");
+        let ohub = ep(&["minimax-m2.5", "minimax-m2.7", "minimax-m3"], true, "OHub", "https://ohub.example/v1");
+        let all = effective_models(&r, &[jisu.clone(), ohub.clone()]);
+        assert_eq!(all, v(&["minimax-m3", "minimax-m2.7", "minimax-m2.5"]),
+            "大小写变体被当成新模型了 —— IDE 列表里就会出现重复的 MiniMax");
+        // 真正新增的那一款照旧要进来。
+        assert!(has_model(&all, "MINIMAX-M2.5"), "问它的时候大小写也不该影响");
+        // 「哪个出口带来的」同理：大写那两个不是带来的，它们线路本来就有。
+        let carried = carried_by(&r, &[jisu, ohub]);
+        assert!(carried.get("MiniMax-M3").is_none() && carried.get("minimax-m3").is_none());
+        assert!(carried.get("minimax-m2.5").is_some(), "真正新增的那款没标出来路");
+    }
+
+    /// 第二面，也是更贵的那面：派单时对不上，那个出口**一个请求都接不到**，
+    /// 而屏幕上它一切正常（探测通过、排在第一）。
+    #[test]
+    fn the_outlet_still_gets_dispatched_when_only_the_capitalisation_differs() {
+        let r = route(&["minimax-m3"]);
+        let jisu = ep(&["MiniMax-M3"], true, "极速API", "https://jisu.example/v1");
+        let id = jisu.id;
+        let mut by_route: HashMap<uuid::Uuid, Vec<Endpoint>> = HashMap::new();
+        by_route.insert(r.id, vec![jisu]);
+        let picked = expand(&[r.clone()], &by_route, &HashMap::new(), "minimax-m3");
+        assert!(picked.iter().any(|m| m.endpoint_id == Some(id)),
+            "出口写成 MiniMax-M3 就再也接不到 minimax-m3 的请求了");
+        // 反过来也要成立：客户端手上是旧列表、发的是大写，线路自带地址照样认。
+        let picked2 = expand(&[r], &by_route, &HashMap::new(), "MiniMax-M3");
+        assert!(picked2.iter().any(|m| m.endpoint_id.is_none()), "自带地址不认大写写法");
+    }
+
+    /// 取消勾选也按同一把尺，否则线路上取消了小写那个，出口上大写那个还留着。
+    #[test]
+    fn retiring_a_model_ignores_capitalisation_too() {
+        let r = retire_from_outlet(&v(&["MiniMax-M3", "minimax-m2.7"]), &v(&["minimax-m3"])).expect("有变化");
+        assert_eq!(r.remaining, v(&["minimax-m2.7"]));
+    }
+
+    /// **放宽匹配而不收敛拼法**是这次改动唯一的危险形状：计价、显示名、用量全按 id 查表，
+    /// `MINIMAX-M3` 流下去会查不到单模型价，然后静默按 0 元计费。所以主路径必须归一。
+    #[test]
+    fn the_chat_path_pins_the_routes_own_spelling_before_billing() {
+        let src = include_str!("models.rs");
+        let at = src.find("let mut model_id = body").expect("chat 里的 model_id 不再可变");
+        let end = src[at..].find("let endpoint_map =").map(|i| at + i).unwrap_or(src.len());
+        let head = &src[at..end];
+        assert!(head.contains("crate::route_endpoints::same_model(x, &model_id)"),
+            "没有按线路自己的拼法归一 —— 大小写变体会一路流到计价那一步");
+        assert!(head.contains("*m = serde_json::Value::String(model_id.clone());"),
+            "只改了本地变量，发给上游的 body 里还是原来那个拼法");
     }
 
     /// 线路那页要知道「这个模型是哪个出口带来的」；停用的出口带不来任何模型。

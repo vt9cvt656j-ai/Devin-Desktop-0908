@@ -22,6 +22,14 @@ pub struct Config {
     pub smtp_pass: String,
     pub smtp_host: String,
     pub brevo_api_key: String,
+    /// Cloudflare 邮件 Worker（`mrday-email-sender`，发件人 noreply@mrday.one）的地址与密钥。
+    /// 两项都填才启用，启用后优先于 Brevo；发送失败且 Brevo 也配了就退回 Brevo。见 email.rs。
+    pub email_worker_url: String,
+    pub email_worker_key: String,
+    /// 管理员通知邮件（线路告警 / 恢复、出口缺货、亏本停用，全部经 route_health::notify）
+    /// 的合并窗口：这段时间里攒到的通知合并成**一封**再发。所有者 2026-09-07：
+    /// 「直接合并多内容发送就行，不然明明不能用的却同一时间发了许多重复的，给了不同管理员」。
+    pub alarm_batch_window_secs: i64,
     pub mail_from: String,
     pub mail_from_name: String,
     /// Where this service answers from the public internet. Used to build links that are
@@ -149,6 +157,9 @@ impl Config {
             smtp_pass: std::env::var("QQ_SMTP_PASS").unwrap_or_default(),
             smtp_host: opt("SMTP_HOST", "smtp.qq.com"),
             brevo_api_key: std::env::var("BREVO_API_KEY").unwrap_or_default(),
+            email_worker_url: opt("EMAIL_WORKER_URL", "").trim().trim_end_matches('/').to_string(),
+            email_worker_key: std::env::var("EMAIL_WORKER_KEY").unwrap_or_default().trim().to_string(),
+            alarm_batch_window_secs: opt("ALARM_BATCH_WINDOW_SECS", "300").parse::<i64>().map(|v| v.max(10)).unwrap_or(300),
             mail_from: std::env::var("MAIL_FROM")
                 .unwrap_or_else(|_| std::env::var("QQ_SMTP_USER").unwrap_or_default()),
             mail_from_name: opt("MAIL_FROM_NAME", "Michael"),
@@ -215,9 +226,19 @@ impl Config {
         !self.smtp_user.is_empty() && !self.smtp_pass.is_empty()
     }
 
-    /// Whether outbound mail can actually be sent (via the Brevo HTTP API over 443).
-    pub fn mail_enabled(&self) -> bool {
+    /// Brevo's transactional HTTP API is configured.
+    pub fn brevo_enabled(&self) -> bool {
         !self.brevo_api_key.is_empty() && !self.mail_from.is_empty()
+    }
+
+    /// The Cloudflare email Worker is configured — the preferred transport when it is.
+    pub fn worker_enabled(&self) -> bool {
+        !self.email_worker_url.is_empty() && !self.email_worker_key.is_empty()
+    }
+
+    /// Whether outbound mail can actually be sent at all (either transport; both go over 443).
+    pub fn mail_enabled(&self) -> bool {
+        self.worker_enabled() || self.brevo_enabled()
     }
 }
 

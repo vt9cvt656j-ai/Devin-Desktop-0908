@@ -451,12 +451,14 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "generate_texture"
                 | "download_file"
                 | "download_asset"
-                | "automation"
-                // computer 和 automation 是**同一个执行器**（映射层 case "computer"
-                // 直接 return type "automation"）。automation 一直在这份清单里而
-                // computer 不在——于是 Plan/Explorer/Reviewer 禁掉了 automation，
-                // 却留着一条同样能合成真实鼠标键盘的旁路。
+                // automation 不在这里：客户端对它已改成按调用判（观察类动作在只读模式放行、
+                // 合成键鼠挡下），整个拒掉会把能用的那一半也藏起来。computer 仍在——客户端
+                // 那份 strict 名单按名字算它改动类，而它没有单独的按调用判声明。
                 | "computer"
+                // stop_demo 往工作区写 HTML、visual_explain 落 png：客户端 strict 名单里的两个，
+                // 2026-09-07 对账补上（服务端这份漂了一阵，没人跑这条测试）。
+                | "stop_demo"
+                | "visual_explain"
                 // save_skill 往磁盘写技能文件，只读模式不该能写。
                 | "save_skill"
                 // learn_design 会往工作区写 reference/<slug>-design-system.md 和
@@ -467,7 +469,8 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "office_edit"
                 | "ui_click"
                 | "db_query"
-                | "remote"
+                // remote 不在这里：客户端对它是按调用判的（tool-policy.js 里 readOnlyModeBlocked
+                // 是函数），整个拒掉会把它能用的那一半也藏起来——见下面那条测试的说明。
                 // ── 客户端 blockedInReadOnlyMode 里一刀切挡住、而上面那份没有的 ──
                 // create_project 会在用户主目录下建目录并把当前工作区顶掉；
                 // docker_compose_up 起一整套容器；capture_replay 是 http 审批门的旁路；
@@ -9739,10 +9742,12 @@ mod readonly_tool_injection_tests {
             // 豁免要按**声明的 type** 认，不能按工具名认。tool-policy.js 按 type 声明，
             // 而客户端那份 strict 名单按**工具名**——大多数名字恰好等于自己的 type
             //（browser / system / worktree / schedule），所以这个差别一直没露出来。
-            // 下面这四个不等，漏掉就会把「按调用判」的工具误判成「必须整个拒掉」。
+            // 下面这几个不等，漏掉就会把「按调用判」的工具误判成「必须整个拒掉」。
             let policy_type = match name.as_str() {
                 "mcp_server" => "mcpconfig",
                 "run_subagent" | "research_project" | "design_research" => "subagent",
+                // http_request 的策略按 type "http" 登记，按 method 判（GET 放行、写方法挡）。
+                "http_request" => "http",
                 other => other,
             };
             if per_call.contains(policy_type) {

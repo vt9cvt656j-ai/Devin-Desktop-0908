@@ -48,7 +48,13 @@ CN_HOST_OLD="mrday.one.shuerzuo.cn"
 # 镜像也可以**不在这台机器上**：放到国内那台阿里云机器（备案接入的就是它，通配符解析本来就指着它，
 # 中国访客就近、不用跨境）。deploy-cn-box.sh 装好那边之后，把名字写进 /etc/nginx/mrday-cn-host.external
 # （一行）。写了它：分流目标就是它，这里不装镜像站点（证书在那边），老名字这里只剩 301。
-EXTERNAL_CN_HOST="$(head -1 /etc/nginx/mrday-cn-host.external 2>/dev/null | tr -d '[:space:]')"
+# 这个文件是**可选**的：不在就是空串。不能写成 `X="$(head -1 文件 2>/dev/null | tr …)"` 一步到位——
+# head 找不到文件的退出码会被 pipefail 抬成整条流水线失败，再被 set -e 当场终止脚本，而 stderr 又被
+# 2>/dev/null 吞了：deploy.sh 只看到一个一声不吭的 exit 1（2026-09-07 实拍，连失两次发版）。
+EXTERNAL_CN_HOST=""
+if [ -f /etc/nginx/mrday-cn-host.external ]; then
+  EXTERNAL_CN_HOST="$(head -1 /etc/nginx/mrday-cn-host.external | tr -d '[:space:]')"
+fi
 ACTIVE_CN_HOST=""
 LOCAL_CN_SITE=0
 if [ -n "$EXTERNAL_CN_HOST" ]; then

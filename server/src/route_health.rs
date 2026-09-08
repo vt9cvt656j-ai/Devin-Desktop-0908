@@ -37,6 +37,8 @@
 
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
+
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
@@ -789,26 +791,144 @@ pub(crate) async fn notify_admins(state: &AppState, subject: &str, body: &str) -
     notify(state, subject, body).await
 }
 
-/// 发出去。返回**是否至少有一封成功** —— 调用方靠它决定要不要保留冷却。
-async fn notify(state: &AppState, subject: &str, body: &str) -> bool {
-    if !state.cfg.mail_enabled() {
-        tracing::error!(subject, "线路告警无法发出：邮件未配置（brevo_api_key / mail_from 为空）");
-        return false;
+// ---------------------------------------------------------------------------------------
+// 管理员通知：攒一个窗口，合并成一封（2026-09-07）
+//
+// 三个来源（线路告警 / 恢复、出口缺货、进价亏本）都经 `notify` 这一个口。此前每一条都当场
+// 单独发给每个管理员：线路和多路由一抖，十来条线路的告警在同一分钟里各发一封、五个管理员
+// 各收一份 —— 所有者原话「明明不能用的却同一时间发了许多重复的，给了不同管理员」。
+//
+// 现在 `notify` 只往 Redis 队列里放；后台每 ALARM_BATCH_WINDOW_SECS（默认 5 分钟）把队列里攒到
+// 的全部合并成**一封**发出去，同一主题只留最新一条。状态在 Redis：蓝绿两个进程共用同一个
+// 队列，发版不丢，也不会两边各发一份（发送权用 SET NX 抢）。
+// 同一条线路 6 小时内最多一对「告警 / 恢复」，见 evaluate_alarm 里恢复分支的说明。
+// ---------------------------------------------------------------------------------------
+
+fn alarm_key(field: &str) -> String {
+    format!("rh:alarm:{field}")
+}
+
+/// 一条待发的管理员通知。排队时以 JSON 存进 Redis 列表。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct AlarmItem {
+    at: i64,
+    subject: String,
+    body: String,
+}
+
+/// 把几条通知并成一封：同主题只留最新的一条，按时间排序。一条就原样。
+fn digest(mut items: Vec<AlarmItem>) -> (String, String) {
+    items.sort_by_key(|i| i.at);
+    let mut latest: Vec<AlarmItem> = Vec::new();
+    for it in items {
+        if let Some(pos) = latest.iter().position(|x| x.subject == it.subject) {
+            latest.remove(pos);
+        }
+        latest.push(it);
     }
-    let to = alarm_recipients(state).await;
-    if to.is_empty() {
-        tracing::error!(subject, "线路告警无处可发：没有 email 字段是有效邮箱的 admin 账号");
-        return false;
+    if latest.len() == 1 {
+        let only = latest.remove(0);
+        return (only.subject, only.body);
     }
+    let n = latest.len();
+    let first = latest.first().map(|i| i.subject.clone()).unwrap_or_default();
+    let mut body = format!("以下 {n} 条通知在同一个窗口内先后触发，合并成一封（时间为 UTC）：\n");
+    for it in &latest {
+        let when = chrono::DateTime::from_timestamp(it.at, 0)
+            .map(|t| t.format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| it.at.to_string());
+        body.push_str(&format!("\n── {when}  {}\n{}\n", it.subject, it.body));
+    }
+    (format!("[汇总] {n} 条管理员通知：{first} 等"), body)
+}
+
+async fn queue_push(state: &AppState, items: &[AlarmItem]) {
+    let mut conn = state.redis.clone();
+    for it in items {
+        if let Ok(js) = serde_json::to_string(it) {
+            let _: Result<(), _> = redis::cmd("RPUSH").arg(alarm_key("queue")).arg(js).query_async(&mut conn).await;
+        }
+    }
+    let _: Result<(), _> = redis::cmd("EXPIRE").arg(alarm_key("queue")).arg(2 * 86_400).query_async(&mut conn).await;
+}
+
+async fn queue_drain(state: &AppState) -> Vec<AlarmItem> {
+    let mut conn = state.redis.clone();
+    let raw: Vec<String> = redis::cmd("LRANGE").arg(alarm_key("queue")).arg(0).arg(-1).query_async(&mut conn).await.unwrap_or_default();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let _: Result<(), _> = redis::cmd("DEL").arg(alarm_key("queue")).query_async(&mut conn).await;
+    raw.iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+}
+
+/// 真把一封（通常是汇总）发给全部收件人，每一封都进 email_logs（来源 alarm）。
+/// 返回是否至少发出去一封。
+async fn deliver(state: &AppState, to: &[String], subject: &str, body: &str) -> bool {
     let mut any_ok = false;
     for addr in to {
-        match crate::email::send_mail(&state.cfg, &addr, subject, body, false).await {
-            Ok(()) => any_ok = true,
+        match crate::email::send_mail(&state.cfg, addr, subject, body, false).await {
+            Ok(()) => {
+                any_ok = true;
+                crate::email::log_send(state, addr, subject, "sent", None, "alarm").await;
+            }
             // 发不出去也要留痕：静默失败等于没有告警，而这正是要修的东西。
-            Err(err) => tracing::error!(reason = %err.msg, subject, "线路告警发送失败"),
+            Err(err) => {
+                tracing::error!(reason = %err.msg, subject, "线路告警发送失败");
+                crate::email::log_send(state, addr, subject, "failed", Some(err.msg.as_str()), "alarm").await;
+            }
         }
     }
     any_ok
+}
+
+/// 发送权：蓝绿重叠那几十秒里两个进程只有一个抢得到，队列不会被发两遍。
+async fn claim_send(state: &AppState) -> bool {
+    let mut conn = state.redis.clone();
+    let got: Option<String> = redis::cmd("SET").arg(alarm_key("lock")).arg(1).arg("NX").arg("EX").arg(60).query_async(&mut conn).await.unwrap_or(None);
+    got.is_some()
+}
+
+async fn release_send(state: &AppState) {
+    let mut conn = state.redis.clone();
+    let _: Result<(), _> = redis::cmd("DEL").arg(alarm_key("lock")).query_async(&mut conn).await;
+}
+
+/// 每个窗口一次：队列里有东西就合并成一封发出去。
+async fn flush_alarm_queue(state: &AppState) {
+    if !state.cfg.mail_enabled() || !claim_send(state).await {
+        return;
+    }
+    let items = queue_drain(state).await;
+    if !items.is_empty() {
+        let to = alarm_recipients(state).await;
+        if to.is_empty() {
+            tracing::error!(queued = items.len(), "管理员通知无处可发：没有 email 字段是有效邮箱的 admin 账号");
+        }
+        let (subject, body) = digest(items.clone());
+        // 一封都没发出去 → 塞回队列，下一个窗口再试，别丢。
+        if to.is_empty() || !deliver(state, &to, &subject, &body).await {
+            queue_push(state, &items).await;
+        }
+    }
+    release_send(state).await;
+}
+
+/// 收下一条通知：只进队列，由后台按窗口合并成一封发。返回「已收下」——
+/// 调用方靠它决定要不要保留冷却；邮件未配置 / 没收件人时回 false，让调用方下一轮再试。
+async fn notify(state: &AppState, subject: &str, body: &str) -> bool {
+    if !state.cfg.mail_enabled() {
+        tracing::error!(subject, "线路告警无法发出：邮件未配置（EMAIL_WORKER_* / BREVO_API_KEY+MAIL_FROM 都为空）");
+        return false;
+    }
+    if alarm_recipients(state).await.is_empty() {
+        tracing::error!(subject, "线路告警无处可发：没有 email 字段是有效邮箱的 admin 账号");
+        return false;
+    }
+    let item = AlarmItem { at: now_secs(), subject: subject.to_string(), body: body.to_string() };
+    queue_push(state, std::slice::from_ref(&item)).await;
+    tracing::info!(subject, "管理员通知已收进队列，窗口一到与同批通知合并成一封发出");
+    true
 }
 
 /// `POST /api/admin/route-health/test-alarm` —— 往真实收件人发一封测试告警。
@@ -885,18 +1005,30 @@ async fn evaluate_alarm(state: &AppState, route_id: Uuid, label: &str, word: &st
                 .query_async(&mut conn)
                 .await
                 .unwrap_or(None);
-            let _: Result<(), _> = redis::cmd("DEL")
-                .arg(&since_key)
-                .arg(key(route_id, "alarm_sent"))
-                .query_async(&mut conn)
-                .await;
+            // 只清「坏了多久」的起点，**不清发送权**：alarm_sent 的 TTL 就是这条线路的再告警冷却。
+            // 原来恢复时把它一起删了，于是一条抖动的线路每二十分钟就能来一对「告警 / 恢复」，
+            // 一天上百封。现在同一条线路 6 小时内最多一封告警 + 一封恢复，抖动期间的反复只进日志。
+            let _: Result<(), _> = redis::cmd("DEL").arg(&since_key).query_async(&mut conn).await;
             if sent.is_some() {
-                let _ = notify(
-                    state,
-                    &format!("[恢复] 线路「{label}」又能用了"),
-                    &format!("线路：{label}\n当前判定：{word}\n连败计数已清零。"),
-                )
-                .await;
+                let first_recovery: Option<String> = redis::cmd("SET")
+                    .arg(key(route_id, "alarm_recovered"))
+                    .arg(now)
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(ALARM_COOLDOWN_SECS)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or(None);
+                if first_recovery.is_some() {
+                    let _ = notify(
+                        state,
+                        &format!("[恢复] 线路「{label}」又能用了"),
+                        &format!("线路：{label}\n当前判定：{word}\n连败计数已清零。"),
+                    )
+                    .await;
+                } else {
+                    tracing::info!(route = label, "线路恢复通知在冷却期内已发过一次，这次只记日志");
+                }
             }
         }
         return;
@@ -994,6 +1126,20 @@ pub fn spawn(state: AppState) {
                 "线路告警没有收件人：邮件已配置但没有 role='admin' 的用户。\
                  现在的状态是「看起来有告警，实际一封都发不出去」——比没有告警更危险。"
             );
+        }
+
+        // 队列里的通知由这个小循环按窗口合并成一封发出去（notify 只往队列里放）。
+        {
+            let flusher = state.clone();
+            let window = state.cfg.alarm_batch_window_secs.max(10) as u64;
+            tokio::spawn(async move {
+                let mut t = tokio::time::interval(Duration::from_secs(window));
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    t.tick().await;
+                    flush_alarm_queue(&flusher).await;
+                }
+            });
         }
 
         let mut tick = tokio::time::interval(CANARY_EVERY);
@@ -1825,4 +1971,63 @@ mod tests {
         );
     }
 
+
+    // ── 管理员通知：攒一窗口、合并成一封（2026-09-07）────────────────────────────
+
+    #[test]
+    fn a_digest_keeps_one_per_subject_in_time_order_and_leaves_a_single_notice_alone() {
+        let one = digest(vec![AlarmItem { at: 5, subject: "[告警] a".into(), body: "b1".into() }]);
+        assert_eq!(one, ("[告警] a".to_string(), "b1".to_string()), "一条就原样，不套汇总的壳");
+        let (subject, body) = digest(vec![
+            AlarmItem { at: 30, subject: "[告警] a".into(), body: "a-new".into() },
+            AlarmItem { at: 10, subject: "[告警] a".into(), body: "a-old".into() },
+            AlarmItem { at: 20, subject: "线路缺货：x".into(), body: "x".into() },
+        ]);
+        assert!(subject.starts_with("[汇总] 2 条管理员通知"), "{subject}");
+        assert!(body.contains("a-new") && !body.contains("a-old"), "同主题只留最新：{body}");
+        assert!(body.find("线路缺货").unwrap() < body.find("[告警] a").unwrap(), "按时间排序：{body}");
+        assert!(body.contains("── "), "每条要有分隔：{body}");
+    }
+
+    /// 三个来源都走 notify，而 notify 只许进队列——任何一处当场单独发，就又是「同一时间许多重复的」。
+    #[test]
+    fn every_admin_notice_is_batched_not_sent_on_the_spot() {
+        let src = include_str!("route_health.rs");
+        let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let notify = src.split("async fn notify(state: &AppState, subject: &str, body: &str) -> bool").nth(1).expect("notify");
+        let notify = &notify[..notify.find("\n}\n").unwrap_or(notify.len())];
+        assert!(notify.contains("queue_push("), "notify 没进队列——那就是当场发");
+        assert!(!notify.contains("send_mail(") && !notify.contains("deliver("), "notify 当场发信，合并就没有意义了");
+        let flush = src.split("async fn flush_alarm_queue(").nth(1).expect("flush_alarm_queue");
+        let flush = &flush[..flush.find("\n}\n").unwrap_or(flush.len())];
+        assert!(flush.contains("digest(") && flush.contains("deliver("), "冲队列时没有合并成一封");
+        let deliver = src.split("async fn deliver(").nth(1).expect("deliver");
+        let deliver = &deliver[..deliver.find("\n}\n").unwrap_or(deliver.len())];
+        assert!(deliver.contains("log_send("), "每一封都要进 email_logs，否则发了几封没人知道");
+        // 队列要有人按窗口冲：spawn 里必须起那个小循环，间隔读的是配置里的窗口。
+        let spawn = src.split("pub fn spawn(state: AppState)").nth(1).expect("spawn");
+        assert!(spawn.contains("flush_alarm_queue(") && spawn.contains("alarm_batch_window_secs"), "没有按窗口冲队列的循环，排队的通知永远发不出去");
+        // 缺货和亏本两个来源没有绕开 notify 自己发信。
+        for (file, body) in [("manifest_check.rs", include_str!("manifest_check.rs")), ("relay_sync.rs", include_str!("relay_sync.rs"))] {
+            assert!(!body.contains("email::send_mail("), "{file} 绕开了 notify 直接发信，节流对它无效");
+        }
+    }
+
+    /// 恢复不再清发送权：同一条线路 6 小时内最多一对「告警 / 恢复」。
+    #[test]
+    fn a_flapping_route_gets_one_alarm_and_one_recovery_per_cooldown() {
+        let src = include_str!("route_health.rs");
+        let body = src.split("async fn evaluate_alarm").nth(1).expect("evaluate_alarm");
+        let recovery = &body[..body.find("// 第一次判坏").expect("恢复分支后面是首次判坏")];
+        let del = recovery.split("redis::cmd(\"DEL\")").nth(1).expect("恢复分支要清起点");
+        let del = &del[..del.find(".query_async").unwrap_or(del.len())];
+        assert!(del.contains("since_key") && !del.contains("alarm_sent"), "恢复时又把发送权删了——抖动的线路会每 20 分钟来一对邮件");
+        assert!(recovery.contains("alarm_recovered") && recovery.contains("ALARM_COOLDOWN_SECS"), "恢复通知没有自己的冷却");
+    }
+
+    #[test]
+    fn the_batch_window_is_documented_for_the_operator() {
+        let env = include_str!("../.env.example");
+        assert!(env.contains("ALARM_BATCH_WINDOW_SECS="), ".env.example 没写合并窗口这个旋钮");
+    }
 }

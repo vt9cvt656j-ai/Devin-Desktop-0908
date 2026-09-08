@@ -36,7 +36,7 @@ import { Separator } from "@/components/ui/separator";
 import { Truncate } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { num } from "@/lib/format";
-import { cn } from "@/lib/utils";
+import { cn, dedupeModels, hasModel, sameModel } from "@/lib/utils";
 
 /**
  * 多路由 —— 一条线路挂多个上游出口。
@@ -713,8 +713,8 @@ export function RouteEndpoints() {
       // 要开放自己勾。
       const routeModels = routeOf(draft.route_id)?.models ?? [];
       const cur = draft.enabled_models.length ? draft.enabled_models : routeModels;
-      const missing = new Set(r.missing ?? []);
-      const next = cur.filter((m) => !missing.has(m));
+      const missing = r.missing ?? [];
+      const next = cur.filter((m) => !hasModel(missing, m));
       setDraft({ ...draft, enabled_models: next });
       const gone = cur.length - next.length;
       const fresh = (r.extra ?? []).length + (r.extra_no_price ?? []).length;
@@ -992,10 +992,10 @@ export function RouteEndpoints() {
                                         // 名字要写出来。原来只写「只承载 3/5 个模型」，运维得打开编辑
                                         // 窗口才知道是哪三个 —— 而窗口里当时也不列出口带来的那些。
                                         const onRoute = e.enabled_models.filter((m) =>
-                                          (r.models || []).includes(m),
+                                          hasModel(r.models || [], m),
                                         );
                                         const extra = e.enabled_models.filter(
-                                          (m) => !(r.models || []).includes(m),
+                                          (m) => !hasModel(r.models || [], m),
                                         );
                                         const few = (xs: string[]) =>
                                           xs.length <= 6 ? xs.join("、") : `${xs.slice(0, 6).join("、")} 等 ${xs.length} 个`;
@@ -1466,7 +1466,7 @@ export function RouteEndpoints() {
                     线上那个 89 款模型的出口就会撞到这个上限 —— 定值在那儿是真会溢出的。
                   */}
                   <div className="max-h-[min(24rem,calc(88vh-24rem))] overflow-y-auto">
-                  {[...new Set([
+                  {dedupeModels([
                     ...(routeOf(draft.route_id)?.models ?? []),
                     // 这个出口**自己带来的**（线路没有、之前勾过的）。原来不在这份清单里 ——
                     // 不重新拉取就看不见，而它们正是运维最想核对的那几个：
@@ -1476,14 +1476,16 @@ export function RouteEndpoints() {
                     // 但标红且勾不动 —— 让人看见「为什么这个不能用」，而不是它凭空消失。
                     ...(fetched?.extra ?? []),
                     ...(fetched?.extra_no_price ?? []),
-                  ])].map((m) => {
-                    const onRoute = (routeOf(draft.route_id)?.models ?? []).includes(m);
-                    const carried = !onRoute && draft.enabled_models.includes(m);
-                    const isNew = !carried && (fetched?.extra ?? []).includes(m);
-                    const noPrice = (fetched?.extra_no_price ?? []).includes(m);
+                  ]).map((m) => {
+                    // 一律走 hasModel：出口把 minimax-m3 写成 MiniMax-M3 时，这一行仍然是
+                    // 「线路自己的」而不是「这个出口带来的」，勾选状态也认得出来。
+                    const onRoute = hasModel(routeOf(draft.route_id)?.models ?? [], m);
+                    const carried = !onRoute && hasModel(draft.enabled_models, m);
+                    const isNew = !carried && !onRoute && hasModel(fetched?.extra ?? [], m);
+                    const noPrice = hasModel(fetched?.extra_no_price ?? [], m);
                     const on =
-                      draft.enabled_models.length === 0 || draft.enabled_models.includes(m);
-                    const absent = fetched?.missing.includes(m);
+                      draft.enabled_models.length === 0 || hasModel(draft.enabled_models, m);
+                    const absent = hasModel(fetched?.missing ?? [], m);
                     return (
                       <label
                         key={m}
@@ -1497,8 +1499,8 @@ export function RouteEndpoints() {
                             const all = routeOf(draft.route_id)?.models ?? [];
                             const cur = draft.enabled_models.length ? draft.enabled_models : all;
                             const next = ev.target.checked
-                              ? [...cur, m]
-                              : cur.filter((x) => x !== m);
+                              ? dedupeModels([...cur, m])
+                              : cur.filter((x) => !sameModel(x, m));
                             setDraft({ ...draft, enabled_models: next });
                           }}
                         />

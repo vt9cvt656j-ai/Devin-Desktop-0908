@@ -38,19 +38,72 @@ fn admin_only(claims: &Claims) -> ApiResult<()> {
 /// message twice when it is retried, and some never get it at all.
 const SEND_GAP: Duration = Duration::from_millis(120);
 
-/// Send a single email via the Brevo transactional HTTP API (over HTTPS/443, so
-/// it works even when the host's outbound SMTP ports are blocked).
-///
-/// Deliberately unaware of `email_opt_out`: this is the path a login code takes, and
-/// someone who unsubscribed from announcements has not asked to be locked out of their
-/// account. Only the campaign sender filters recipients.
-pub async fn send_mail(
-    cfg: &Config,
-    to: &str,
-    subject: &str,
-    body: &str,
-    html: bool,
-) -> ApiResult<()> {
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Plain text → the HTML the Worker wants, still reading as the text it was: escaped, one
+/// `<br>` per newline (pre-wrap alone is lost in clients that strip styles).
+fn text_to_html(text: &str) -> String {
+    format!(
+        "<div style=\"white-space:pre-wrap;font:15px/1.6 system-ui,sans-serif;color:#18181b\">{}</div>",
+        escape_html(text).replace('\n', "<br>")
+    )
+}
+
+/// The Worker's `POST /api/notify` body. Its field names are the Worker's (`to` / `title` /
+/// `content`), and `content` is always HTML on that side.
+fn worker_notify_payload(to: &str, subject: &str, body: &str, html: bool) -> serde_json::Value {
+    json!({
+        "to": to,
+        "title": subject,
+        "content": if html { body.to_string() } else { text_to_html(body) },
+    })
+}
+
+/// Cloudflare Worker `mrday-email-sender` (`EMAIL_WORKER_URL` / `EMAIL_WORKER_KEY`): sends as
+/// noreply@mrday.one, free tier 1000 messages a day. A 2xx whose body says `success:false`
+/// (its own rate limit / quota) is a failure too — it is the Worker saying so, not a transport.
+async fn send_via_worker(cfg: &Config, to: &str, subject: &str, body: &str, html: bool) -> ApiResult<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let resp = client
+        .post(format!("{}/api/notify", cfg.email_worker_url.trim_end_matches('/')))
+        .bearer_auth(&cfg.email_worker_key)
+        .header("accept", "application/json")
+        .json(&worker_notify_payload(to, subject, body, html))
+        .send()
+        .await
+        .map_err(|e| AppError::internal(format!("邮件 Worker 请求失败: {e}")))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let brief: String = txt.chars().take(300).collect();
+        return Err(AppError::internal(format!("邮件 Worker 返回 {}: {brief}", status.as_u16())));
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+        if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
+            let why = v.get("message").or_else(|| v.get("error")).and_then(|m| m.as_str()).unwrap_or("unknown");
+            return Err(AppError::internal(format!("邮件 Worker 拒绝: {why}")));
+        }
+    }
+    Ok(())
+}
+
+/// Brevo's transactional HTTP API (`BREVO_API_KEY` / `MAIL_FROM`).
+async fn send_via_brevo(cfg: &Config, to: &str, subject: &str, body: &str, html: bool) -> ApiResult<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -77,6 +130,34 @@ pub async fn send_mail(
     Ok(())
 }
 
+/// Send a single email. Two transports, both over HTTPS/443 (so they work even when the
+/// host's outbound SMTP ports are blocked), chosen from the environment at send time:
+///   · the Cloudflare Worker when `EMAIL_WORKER_URL` + `EMAIL_WORKER_KEY` are set — preferred;
+///   · Brevo when `BREVO_API_KEY` + `MAIL_FROM` are set — the only transport if the Worker is
+///     not configured, and the fallback when a Worker send fails (network, 5xx, its quota).
+///
+/// Deliberately unaware of `email_opt_out`: this is the path a login code takes, and
+/// someone who unsubscribed from announcements has not asked to be locked out of their
+/// account. Only the campaign sender filters recipients.
+pub async fn send_mail(
+    cfg: &Config,
+    to: &str,
+    subject: &str,
+    body: &str,
+    html: bool,
+) -> ApiResult<()> {
+    if cfg.worker_enabled() {
+        match send_via_worker(cfg, to, subject, body, html).await {
+            Ok(()) => return Ok(()),
+            Err(e) if cfg.brevo_enabled() => {
+                tracing::warn!("邮件 Worker 发送失败，退回 Brevo：{}", e.msg);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    send_via_brevo(cfg, to, subject, body, html).await
+}
+
 async fn log_email(
     state: &AppState,
     to: &str,
@@ -93,6 +174,12 @@ async fn log_email(
         .bind(by)
         .execute(&state.db)
         .await;
+}
+
+/// 别的模块（管理员通知那条路）往 email_logs 记一笔。`by` 写来源（如 "alarm"），
+/// 控制台的「邮件日志」页据此能分出告警和群发——以前告警发没发、发了几封，没有任何地方留痕。
+pub(crate) async fn log_send(state: &AppState, to: &str, subject: &str, status: &str, error: Option<&str>, by: &str) {
+    log_email(state, to, subject, status, error, by).await;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -605,6 +692,34 @@ mod tests {
         // Rotating the signing secret invalidates every outstanding link, which is what
         // rotating it is for.
         assert_ne!(unsub_token("secret-a", a), unsub_token("secret-b", a));
+    }
+
+    /// Plain text through the Worker must arrive as HTML that still reads as the text it was,
+    /// under the Worker's own field names.
+    #[test]
+    fn worker_payload_uses_the_workers_field_names_and_escapes_text() {
+        let p = worker_notify_payload("a@b.co", "Hi <you>", "line 1\nline 2 & <b>", false);
+        assert_eq!(p["to"], "a@b.co");
+        assert_eq!(p["title"], "Hi <you>");
+        let content = p["content"].as_str().unwrap();
+        assert!(content.contains("line 1<br>line 2 &amp; &lt;b&gt;"), "{content}");
+        assert!(p.get("ctaUrl").is_none(), "no call-to-action unless someone asks for one");
+        // HTML bodies (the login code template) pass through untouched.
+        let h = worker_notify_payload("a@b.co", "s", "<p>x</p>", true);
+        assert_eq!(h["content"], "<p>x</p>");
+    }
+
+    /// The Worker is the preferred transport and Brevo the fallback — in that order, and the
+    /// fallback only when Brevo is actually configured (otherwise a Worker failure is the answer).
+    #[test]
+    fn send_mail_prefers_the_worker_and_falls_back_to_brevo() {
+        let src = include_str!("email.rs");
+        let f = src.split("pub async fn send_mail").nth(1).expect("send_mail");
+        let f = &f[..f.find("\nasync fn log_email").expect("log_email follows send_mail")];
+        let worker = f.find("worker_enabled()").expect("send_mail must ask for the Worker first");
+        let brevo = f.find("send_via_brevo(").expect("send_mail must be able to fall back to Brevo");
+        assert!(worker < brevo, "the Worker is preferred; Brevo is the fallback");
+        assert!(f.contains("brevo_enabled()"), "the fallback must be gated on Brevo being configured");
     }
 
     #[test]
