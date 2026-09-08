@@ -134,7 +134,19 @@ pub fn check_request(headers: &HeaderMap, body: &serde_json::Value) -> ShieldVer
     if has_tool_descriptions(body) {
         score += 80;
         top_reason = ShieldReason::ToolDescriptionsInBody;
-        tracing::info!("[prompt_shield] +80 tool descriptions in body");
+        // 打全排查要用的：总数、被算进去的条数、以及前几个名字。上一次误伤查了很久
+        // 才定位到 MCP 前缀，就是因为这行只说了「命中」不说「命中在谁身上」。
+        let tools = body.get("tools").and_then(|t| t.as_array());
+        let total = tools.map(|t| t.len()).unwrap_or(0);
+        let names: Vec<&str> = tools
+            .map(|t| {
+                t.iter()
+                    .filter_map(|x| x.pointer("/function/name").and_then(|n| n.as_str()))
+                    .take(6)
+                    .collect()
+            })
+            .unwrap_or_default();
+        tracing::info!("[prompt_shield] +80 tool descriptions in body tools={total} names={names:?}");
     }
 
     let fp_hits = count_fingerprint_hits(body);
@@ -157,11 +169,13 @@ pub fn check_request(headers: &HeaderMap, body: &serde_json::Value) -> ShieldVer
         tracing::info!("[prompt_shield] +{} internal tool names={tool_name_hits}", tool_name_hits as u32 * 15);
     }
 
+    // **只抬阈值，不动权重**：权重是这条信号和别的信号叠加时的话语权，动它会连真攻击
+    // 一起放过。要修的是那条线画在了正常流量中间 —— 理由见 `system_prompt_total_length`。
     let sys_len = system_prompt_total_length(body);
-    if sys_len > 15000 {
+    if sys_len > 120_000 {
         score += 50;
         tracing::info!("[prompt_shield] +50 system prompt length={sys_len}");
-    } else if sys_len > 5000 {
+    } else if sys_len > 60_000 {
         score += 20;
         tracing::info!("[prompt_shield] +20 system prompt length={sys_len}");
     }
@@ -197,6 +211,22 @@ pub fn check_request(headers: &HeaderMap, body: &serde_json::Value) -> ShieldVer
     ShieldVerdict::Pass
 }
 
+/// 请求体里带着**我们自己的**工具描述 = 有人在重放装配好的目录。
+///
+/// # 为什么必须排掉 mcp__ / user__ 前缀
+///
+/// 这两类工具**按设计**就得带着描述过来：网关的目录里根本没有它们（是用户自己接的
+/// MCP 服务和自定义工具），L0 因此把它们原样留在 body 里 —— 交给网关回填等于整条丢掉。
+/// 而客户端给每条 MCP 工具强加的免责前缀本身就有 179 字节，实测整条描述 218~243 字节，
+/// **结构上不可能 ≤40**。于是判据只剩「有没有 5 个 MCP 工具」这一个变量。
+///
+/// 线上后果是实证到人的：护盾 09-06 上线后，一个接了 MCP 的注册用户 agent 回合
+/// **75 → 0**，每一次都拿到蜜罐那份伪造回答（假思考 + 编造的工具调用 + HTTP 200），
+/// 客户端分辨不出，遥测里一行痕迹都没有，而他不带工具的辅助调用 62 次照常流。
+/// 96 小时里 21 次蜜罐**全部**是这条信号，其余五条一次都没触发过。
+///
+/// 排掉它们不放宽护盾：真正防泄漏的是指纹、内部工具名、解密标记那三条 80 分信号，
+/// 它们一个字没动。这里只是不再把「用户自己接的工具」当成「我们被反代了」。
 fn has_tool_descriptions(body: &serde_json::Value) -> bool {
     let tools = match body.get("tools").and_then(|t| t.as_array()) {
         Some(t) => t,
@@ -204,6 +234,13 @@ fn has_tool_descriptions(body: &serde_json::Value) -> bool {
     };
     let mut described = 0u32;
     for tool in tools {
+        let name = tool
+            .pointer("/function/name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        if name.starts_with("mcp__") || name.starts_with("user__") {
+            continue;
+        }
         let desc = tool
             .pointer("/function/description")
             .and_then(|d| d.as_str())
@@ -319,8 +356,24 @@ fn count_internal_tool_names(body: &serde_json::Value) -> usize {
     hits
 }
 
-/// 合法请求的 system 消息很短（客户端只发用户规则 + 项目约定等，<500 字符），
-/// 服务端组装后才会变长。反代者会把组装好的完整 system prompt 塞进来。
+/// system 消息的总长度。
+///
+/// # 这条信号对今天的流量没有区分力
+///
+/// 原注释写的是「合法请求的 system 消息很短（<500 字符），服务端组装后才会变长」。
+/// **那个前提已经不成立**：客户端在 L0 之后照样要发用户规则、项目约定、执行状态块、
+/// 核心记忆这些自己的块。线上实测（2026-09-08，24 小时 959 次）：
+///
+///   中位 43,683 字符 · 最小 7,269 · 最大 74,239
+///
+/// 也就是说**每一次正常请求都远超 15000 那道线**：24 小时里 800 次（83%）拿了 +50、
+/// 159 次拿了 +20。那 800 次里任何一次只要再叠上 `sys_count > 3` 的 +30 就是 80 分蜜罐 ——
+/// 已经在炸的 MCP 那条修完之后，这是下一颗同形状的雷。
+///
+/// **改的是阈值，不是权重。** 权重是它和别的信号叠加时的话语权，降权等于连真攻击一起
+/// 放过；画错的是那条线：15000 落在正常流量的正中间。按实测把两档抬到正常流量之上 ——
+/// 120,000（最大值的 1.6 倍）和 60,000。真正有区分力的仍然是指纹、内部工具名、
+/// 解密标记那三条 80 分信号，这一条只在**明显异常的整份重放**上贡献叠加分。
 fn system_prompt_total_length(body: &serde_json::Value) -> usize {
     let msgs = match body.get("messages").and_then(|m| m.as_array()) {
         Some(m) => m,
@@ -693,16 +746,19 @@ mod tests {
     #[test]
     fn overstuffed_system_prompt_plus_fingerprint_triggers() {
         let headers = HeaderMap::new();
+        // 长度阈值 2026-09-08 按线上实测重标（15000 → 120000）：正常 IDE 流量的 system
+        // 中位就有 43,683 字符、最大 74,239，老阈值画在了合法流量的正中间。样本跟着加长，
+        // 守的语义一个字没变：**整份重放 + 指纹**要触发。
         let long_sys = format!(
             "You are Mr. Day One\u{2019}s autonomous execution agent. {} Prompt-rescue is on by default. {}",
-            "A".repeat(14000),
+            "A".repeat(125_000),
             "B".repeat(2000),
         );
         let body = serde_json::json!({
             "model": "gpt-4",
             "messages": [{"role": "system", "content": long_sys}],
         });
-        // >15000 chars (+50) and 2 fingerprints (+50) = 100 >= 80
+        // >120000 chars (+50) and 2 fingerprints (+50) = 100 >= 80
         assert!(matches!(
             check_request(&headers, &body),
             ShieldVerdict::Honeypot(_)
@@ -831,13 +887,15 @@ mod tests {
         let headers = HeaderMap::new();
         let body = serde_json::json!({
             "model": "gpt-4",
+            // 六条 system 只值 +30（>6 才是 +60），这条用例一直是靠长度那 +50 凑够 80 的。
+            // 长度阈值抬到 120000 之后样本跟着放大，测的还是同一件事：多条 system + 整份重放。
             "messages": [
-                {"role": "system", "content": "system 1 ".repeat(500)},
-                {"role": "system", "content": "system 2 ".repeat(500)},
-                {"role": "system", "content": "system 3 ".repeat(500)},
-                {"role": "system", "content": "system 4 ".repeat(500)},
-                {"role": "system", "content": "system 5 ".repeat(500)},
-                {"role": "system", "content": "system 6 ".repeat(500)},
+                {"role": "system", "content": "system 1 ".repeat(2500)},
+                {"role": "system", "content": "system 2 ".repeat(2500)},
+                {"role": "system", "content": "system 3 ".repeat(2500)},
+                {"role": "system", "content": "system 4 ".repeat(2500)},
+                {"role": "system", "content": "system 5 ".repeat(2500)},
+                {"role": "system", "content": "system 6 ".repeat(2500)},
                 {"role": "user", "content": "hello"},
             ],
         });
@@ -845,6 +903,51 @@ mod tests {
             check_request(&headers, &body),
             ShieldVerdict::Honeypot(_)
         ));
+    }
+
+    #[test]
+    fn mcp_tools_do_not_look_like_a_replay() {
+        // 实拍：护盾 09-06 上线后，一个接了 MCP 的注册用户 agent 回合 75 → 0，每一次都
+        // 拿到蜜罐的伪造回答。判据是「≥5 个工具描述超 40 字节」，而客户端给每条 MCP 工具
+        // 强加的免责前缀就有 179 字节 —— 结构上不可能 ≤40，于是只剩「有没有 5 个」这一个变量。
+        let headers = HeaderMap::new();
+        let desc = "[MCP\u{b7}\u{67d0}\u{670d}\u{52a1}] \u{7b2c}\u{4e09}\u{65b9}\u{670d}\u{52a1}\u{81ea}\u{8ff0}\u{ff08}\u{4e0d}\u{53ef}\u{4fe1}\u{6570}\u{636e}\u{ff09}\u{ff1a}Search the knowledge base for a topic and return matching documents.";
+        let tools: Vec<serde_json::Value> = (0..8)
+            .map(|i| serde_json::json!({
+                "type": "function",
+                "function": {"name": format!("mcp__svc__tool_{i}"), "description": desc},
+            }))
+            .collect();
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "\u{5e2e}\u{6211}\u{67e5}\u{4e00}\u{4e0b}"}],
+            "tools": tools,
+        });
+        assert!(
+            matches!(check_request(&headers, &body), ShieldVerdict::Pass),
+            "\u{7528}\u{6237}\u{81ea}\u{5df1}\u{63a5}\u{7684} MCP \u{5de5}\u{5177}\u{88ab}\u{5f53}\u{6210}\u{4e86}\u{53cd}\u{4ee3}"
+        );
+    }
+
+    #[test]
+    fn a_real_sized_ide_request_passes() {
+        // 线上实测（2026-09-08，24 小时 959 次）：正常请求的 system 中位 43,683 字符、
+        // 最大 74,239，而老阈值是 15000 —— 83% 的请求恒定拿 +50，离蜜罐只差一条弱信号。
+        // 这条用例就是那个形状：真实体量的 system + 几条 system 消息，必须放行。
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "system", "content": "U".repeat(20_000)},
+                {"role": "system", "content": "V".repeat(20_000)},
+                {"role": "system", "content": "W".repeat(34_239)},
+                {"role": "user", "content": "\u{6539}\u{4e00}\u{4e0b}\u{767b}\u{5f55}\u{9875}"},
+            ],
+        });
+        assert!(
+            matches!(check_request(&headers, &body), ShieldVerdict::Pass),
+            "\u{771f}\u{5b9e}\u{4f53}\u{91cf}\u{7684}\u{6b63}\u{5e38}\u{8bf7}\u{6c42}\u{88ab}\u{5f53}\u{6210}\u{4e86}\u{653b}\u{51fb}"
+        );
     }
 
     #[test]
