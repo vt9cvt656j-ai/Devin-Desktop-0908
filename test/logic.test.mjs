@@ -19828,8 +19828,15 @@ test("验证器不可用（退出 127）不能被当成验证失败", () => {
   // 兜底那条按平台给解释器：Windows 上 python3 不是命令（python.org 的包只产出
   // python.exe，同名的 python3.exe 是微软商店的应用执行别名，跑它会弹商店）——
   // 而这条恰恰是"收尾必跑"的验证命令，给错了等于每次收尾都失败一次。
-  assert.match(SRC, /\$\{_isWin \? "python" : "python3"\} -m compileall -q \./,
+  assert.match(SRC, /\$\{_isWin \? "python" : "python3"\} -m compileall -q \$\{_PY_COMPILE_SKIP\} \./,
     "两者都没有时要退回一定存在的语法编译检查，而且要按平台给对解释器");
+  // 2026-09-08：compileall 必须带排除清单。实测一个真实项目根下 978 个 .py 里 25 个
+  // 语法错，全在 decompiled/*.rt.py 和 .venv 的第三方包里——不排除，这道收尾验证就是
+  // **恒红**，会把模型推去修它从没碰过的反编译垃圾。
+  assert.match(SRC, /const _PY_COMPILE_SKIP = "-x /, "compileall 的排除清单没了");
+  for (const skip of ["venv", "node_modules", "decompiled", "site-packages"]) {
+    assert.match(SRC, new RegExp(`_PY_COMPILE_SKIP = "[^"]*${skip}`), `排除清单里少了 ${skip}`);
+  }
   assert.match(SRC, /\.venv\/bin/, "优先用项目自带的虚拟环境");
 
   // 栈提示里"猜"的 Python 默认命令不得绕过存在性探测直接进验证管线——
