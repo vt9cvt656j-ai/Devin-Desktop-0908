@@ -5,6 +5,14 @@ import { GATEWAY } from "@/lib/account";
 import { mseFetch } from "@/lib/mse";
 import { extractHeadings, renderMarkdownBlocks, type Heading } from "@/lib/markdown";
 import { CodeBlock } from "@/components/site/code-block";
+import {
+  applyPageMeta,
+  canonicalFor,
+  descriptionFromMarkdown,
+} from "@/lib/page-meta";
+
+const DOCS_TITLE = "Docs — Mr. Day One";
+const DOCS_DESCRIPTION = "Guides for installing and using Mr. Day One.";
 
 /**
  * 用户文档。
@@ -108,6 +116,39 @@ export function DocsPage() {
       alive = false;
     };
   }, [target]);
+
+  // App.tsx can only stamp the /docs landing meta — it does not re-run when
+  // this page pushStates between slugs. Missing articles must noindex or
+  // Google will treat the 200 + "这一页不存在" body as a real result (soft-404).
+  useEffect(() => {
+    if (!target) {
+      applyPageMeta({
+        title: DOCS_TITLE,
+        description: DOCS_DESCRIPTION,
+        canonical: canonicalFor("/docs"),
+      });
+      return;
+    }
+    if (state === "missing" || state === "error") {
+      applyPageMeta({
+        title:
+          state === "missing"
+            ? "这一页不存在 — Mr. Day One"
+            : "没能加载这一页 — Mr. Day One",
+        description: DOCS_DESCRIPTION,
+        canonical: canonicalFor(location.pathname),
+        robots: "noindex",
+      });
+      return;
+    }
+    if (doc) {
+      applyPageMeta({
+        title: `${doc.title} — Docs — Mr. Day One`,
+        description: descriptionFromMarkdown(doc.body) || DOCS_DESCRIPTION,
+        canonical: canonicalFor(location.pathname),
+      });
+    }
+  }, [target, state, doc]);
 
   const open = useCallback((next: string) => {
     history.pushState(null, "", next ? `/docs/${next}` : "/docs");

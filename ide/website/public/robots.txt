@@ -1,0 +1,13 @@
+# Googlebot 单独一组：GSC 的 robots 测试器按 UA 选组。规则与 * 相同，
+# 避免以后有人给 * 加爬取延迟时把 Google 搜索也带进去。
+User-agent: Googlebot
+Allow: /
+Disallow: /app/
+Disallow: /app/*
+
+User-agent: *
+Allow: /
+Disallow: /app/
+Disallow: /app/*
+
+Sitemap: https://mrday.one/sitemap.xml

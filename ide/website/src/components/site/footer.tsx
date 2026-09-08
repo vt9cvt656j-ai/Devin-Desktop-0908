@@ -10,6 +10,9 @@ const columns = [
   {
     heading: "Product",
     links: [
+      { label: "Docs", href: "/docs" },
+      { label: "Changelog", href: "/changelog" },
+      { label: "Rankings", href: "/rankings" },
       { label: "Overview", href: "#features" },
       { label: "How it works", href: "#architecture" },
       { label: "Extensibility", href: "#extensions" },
