@@ -46,3 +46,15 @@ server/src/src/
 .michael-images/
 ide/src/_serve.mjs
 ide/src/*-test.html
+
+# Claude Code local state (本机会话配置，per-machine，不该进仓库)
+.claude/
+.local-backup/
+
+# Microsoft Word / Excel 等 Office 临时锁文件（"~$" 前缀）
+~*.docx
+~*.doc
+~*.xlsx
+~*.xls
+~*.pptx
+~*.ppt
