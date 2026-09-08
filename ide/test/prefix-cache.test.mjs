@@ -128,12 +128,35 @@ test("a brand-new session sends at once and says `unjudged` instead of waiting f
     "「画像还空吗」的真源被换掉了——换成 flags 会被执行事实腿污染，换成别的近似判据同理");
   // 那一位只能由**模型来源**置：快通道落定、sendPrompt 采纳完整裁决、或循环边界迟到采纳。
   assert.match(SRC, /sess\._semanticProfileFromModel = true;/, "没有任何地方置这一位，快通道会每轮重发");
-  const fromModelSets = (SRC.match(/\b(?:sess|session)\._semanticProfileFromModel = true;/g) || []).length;
+  // 数的是 CODE（剥过注释）：main.js 里那段说明逐字引用了被修掉的旧写法，数 SRC 会把注释算进去。
+  const fromModelSets = (CODE.match(/\b(?:sess|session)\._semanticProfileFromModel = true;/g) || []).length;
   // 置位必须**有条件**：两条腿都没回时置了，就等于宣布「模型判过了」，
   // 下一轮快通道不再发车——那和这次要修的回归是同一个形状，只是原因不同。
-  const setAt = SRC.indexOf("if (_routeSource) { try { sess._semanticProfileFromModel");
+  // 2026-09-08：这条守卫此前钉的是 `if (_routeSource)`，而**那个条件恒真**，所以它守的东西
+  // 一直是假的、它自己一直是绿的。`_routeSource` 的兜底项 `_turnEngineeringResolved` 来自
+  // `_semanticEngineeringEvidence()`，那个函数对任何输入都返回一个对象，永远 truthy。
+  // 于是每个会话第一轮都会宣布「模型判过了」，unjudged 位、快通道、执行事实兜底三条一起哑。
+  // 现在置位读的是单独算的 `_routeJudged`，判据只认两个真来源。
+  const setAt = CODE.indexOf("if (_routeJudged) { try { sess._semanticProfileFromModel");
   assert.ok(setAt > 0,
-    "完整裁决那侧的置位没有条件——_routeSource 为空（两条腿都没回）时也会置");
+    "完整裁决那侧的置位又挂回一个含本地证据兜底的条件了——那种条件恒真，等于无条件宣布「模型判过了」");
+  assert.match(CODE, /const _routeJudged = _turnEngineeringResolved\?\.intentSource === "ai" \|\| !!_fastRouteProfile;/,
+    "_routeJudged 的判据变了：它只能认「完整裁决落定」和「快通道落定」两个来源");
+  // 真断言，不只是钉字面量：本地证据那个兜底**对任何输入都 truthy**，所以任何拿它兜底的
+  // 条件都是恒真的。这条跑一遍证明那个陷阱确实存在，换个变量名也躲不过去。
+  {
+    const evidence = load("_semanticEngineeringEvidence");
+    for (const input of ["", "随便一句话", "https://example.com 照着这个做"]) {
+      assert.ok(evidence(input), `_semanticEngineeringEvidence(${JSON.stringify(input)}) 返回了假值——`
+        + "如果它真会返回假值，上面那条恒真的分析就不成立了，这条守卫要重写");
+      assert.equal(evidence(input).intentSource, undefined,
+        "本地证据带上了 intentSource，它会被当成「模型判过了」");
+    }
+  }
+  // 先剥注释：上面那段说明里逐字写着 `modelProfileMissing: !_routeSource`（它讲的正是被修掉的
+  // 那个形状），不剥的话这条断言会被自己的注释喂到，永远红。这个坑这个仓库踩过不止一次。
+  assert.ok(!/modelProfileMissing: !_routeSource\b/.test(CODE),
+    "执行事实腿的 modelProfileMissing 还读着恒真的 _routeSource，那条兜底是死的");
   assert.equal(fromModelSets, 3,
     `置位点有 ${fromModelSets} 处，应为 3（快通道落定 + sendPrompt 采纳完整裁决 + 循环边界迟到采纳）。`
     + "多一处很可能就是又让某个非模型来源冒充了「模型判过了」");

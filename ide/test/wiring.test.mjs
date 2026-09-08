@@ -2673,6 +2673,10 @@ test("测试文件不该手抄 main.js 的源码拼接名单", () => {
       "刻意分开读 web / desktop / gateway 三份源码做对照，拼起来就没法比了",
     "release-tool-descriptions.test.mjs":
       "要对**原始文件文本**跑 stripToolIp 并用剥后结果重建注册表，helpers 那份是拼好且解析过的，用不了",
+    "user-priors.test.mjs":
+      "断言的正是「userPriors 只许在 main.js 里出现在那一个注入点」。helpers 那份把 main.js 和"
+      + " src/agent 各模块拼成一份文本，user-priors.js 自己的标识符会被数进来，这条可达性断言就恒红；"
+      + "而它守的东西恰恰是「先验不许扩散到别处」，必须按文件为单位看",
   };
   // 扫描前先剥掉行注释。不剥的话**这条测试自己**会被数进去——它的注释里就写着
   // 那个调用形状。同一个坑本仓库踩过（一条反漂移断言匹配到了自己的更正说明）。
