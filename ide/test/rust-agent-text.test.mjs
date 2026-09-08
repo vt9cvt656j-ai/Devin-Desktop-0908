@@ -39,7 +39,11 @@ const BASELINE = {
   // browser_click / browser_type 里**抄了三份**，收进 unactionable_reason() 一处共用。
   // 措辞本身仍在客户端（它要区分三种形状、且和 click_via_eval 的返回值强耦合），
   // 但至少不会再改一处漂三份。
-  "browser.rs": 5,
+  // 2026-09-07 5 → 4：会话提示里那两段散文（Chrome 137 不再认命令行扩展、接管用户自研应用）
+  // 改成原生层只回码和事实（[EXT_IGNORED_CHROME137] / [ATTACHED_OWN_APP]），措辞挪到
+  // main.js 的 _browserSessionNoteText，顺带有了三语——写在二进制里的中文永远只有一种语言。
+  // 同一轮 ai.rs 那两条重复的 MSE 文案改成 [MSE_SESSION_GONE]，所以它连基线都不用有。
+  "browser.rs": 4,
   "capture.rs": 1,
   "git.rs": 1,
   "knowledge.rs": 2,

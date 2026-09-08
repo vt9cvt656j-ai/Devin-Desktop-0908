@@ -39179,7 +39179,9 @@ test("后台通知不冒充用户：不画气泡、不进排队卡片、并进�
     "排队小卡片没有把后台通知过滤掉");
   // ③ 抽干时把 notice 交给 sendPrompt；sendPrompt 画通知行、入记忆打标、跳过账本/自动标题/意图裁决
   assert.match(SRC, /alreadyInTranscript: !!next\.alreadyInTranscript, notice: next\.notice \|\| null/, "抽干时没把 notice 传下去");
-  assert.match(SRC, /if \(opts\.notice\) \{ if \(!opts\.alreadyInTranscript\) addMessage\("user", opts\.notice\.display \|\| text, sess, \[\], \{ notice: opts\.notice \}\); \}/, "sendPrompt 还在把通知画成用户气泡");
+  // 2026-09-07 多了一个 quiet 闸：只给模型、不画那行灰字的通知（终端命令退出用它——终端卡片
+  // 和终端页签都已经写着它退了）。判据仍然是「画的是通知行、不是用户气泡」，只是多一个条件。
+  assert.match(SRC, /if \(opts\.notice\) \{ if \(!opts\.alreadyInTranscript && !opts\.notice\.quiet\) addMessage\("user", opts\.notice\.display \|\| text, sess, \[\], \{ notice: opts\.notice \}\); \}/, "sendPrompt 还在把通知画成用户气泡");
   assert.match(SRC, /\.\.\.\(opts\.notice \? \{ _ideMeta: \{ notice: opts\.notice \} \}/, "入记忆时没打 notice 标记，重画历史又会变成用户气泡");
   assert.match(SRC, /if \(!opts\.notice\) \{\s*\n\s*const _lt = text\.trim\(\);/, "通知还在进需求账本");
   assert.match(SRC, /const _autoTitle = opts\.notice \? "" : _chatTitleFrom\(/, "通知还会给会话起标题");

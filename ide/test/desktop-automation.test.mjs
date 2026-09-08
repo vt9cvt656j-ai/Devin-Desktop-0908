@@ -17,9 +17,14 @@ const SRC = readFileSync(join(ROOT, "src/main.js"), "utf8");
  * 面板那份照旧缩进，那是给人看的——所以这里要钉的是「两份不是同一个」。
  */
 test("读屏给模型的那份不带缩进，给人看的那份才带", () => {
+  // 锚到锚，不切固定字数：原来是 `slice(at, at + 1200)`，而 content 那一行躺在第 1213 个
+  // 字符上——正文往里加了一句注释，这条断言就落在窗口外，报的是"喂给模型的不是紧凑那份"
+  // （功能好好的）。固定窗口切源码在这个仓库反复失效，一律改成锚到锚。
   const at = SRC.indexOf('const _rsPayload =');
   assert.ok(at > 0, "read_screen 的结果拼装找不到了");
-  const body = SRC.slice(at, at + 1200);
+  const end = SRC.indexOf("} catch (error) {", at);
+  assert.ok(end > at, "read_screen 那段的结尾锚点没了");
+  const body = SRC.slice(at, end);
 
   assert.ok(
     /const structured = JSON\.stringify\(_rsPayload\);/.test(body),
@@ -30,9 +35,17 @@ test("读屏给模型的那份不带缩进，给人看的那份才带", () => {
     "给人看的那份不带缩进了，面板会变成一坨",
   );
   // 真正决定成败的是 content 里放的是哪一个。放错了上面两条都绿，功能照旧坏。
+  // 不钉整行：这行结尾后来续上了标注图和"这是你正在开发的应用"两段，原来那个要求
+  // `${structured}` 后面紧跟反引号的正则于是不匹配了，报的却是"喂给模型的不是紧凑那份"。
+  // 判据只要两条：正文接的是 structured，且缩进那份一个字都没进去。
   assert.ok(
-    /content: `read_screen 真实结果：\\n\$\{structured\}`/.test(body),
+    /content: `read_screen 真实结果：\\n\$\{structured\}/.test(body),
     "喂给模型的不是紧凑那份",
+  );
+  const contentLine = body.slice(body.indexOf("return { type: \"readscreen\""));
+  assert.ok(
+    !contentLine.includes("structuredForView"),
+    "缩进那份混进了给模型的 content——500 个元素会有九成被从中段挖掉",
   );
   assert.ok(
     /_escHtml\(structuredForView\.slice\(0, 24000\)\)/.test(body),

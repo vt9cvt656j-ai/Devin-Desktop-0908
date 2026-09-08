@@ -34,10 +34,24 @@ test("项目里有界面（uiProject）但这一轮没做界面：四面设计�
 });
 
 test("这一轮确实在做界面（ui）：设计旗照常亮，网关那边的 design.base / implementation / verification 都能装配", () => {
-  const f = flagsOf({ applies: true, ui: true, workspaceAction: "modify" });
+  // design_verification 还多一道门：**用户要不要看**（automationNeed 档位，2026-09-07 起）。
+  // 所有者原话「写完了网站你非要跑全自动化，用户也没提及」——档位 none 的一轮不挂验收模块。
+  const f = flagsOf({ applies: true, ui: true, workspaceAction: "modify", automationNeed: "requested" });
   for (const flag of ["design", "design_implementation", "design_verification"]) assert.equal(f.has(flag), true, flag);
   assert.equal(flagsOf({ applies: true, ui: true, workspaceAction: "inspect" }).has("design_review"), true);
   assert.equal(flagsOf({ applies: true, designKnowledgeRequired: true }).has("design"), true);
+});
+
+test("用户没要求跑一下：界面照做，但验收模块（design_verification）不挂", () => {
+  // 这条守的是 45KB 设计验收套件不再挂到「只写不看」的一轮上。档位缺席和 none 都不挂——
+  // 缺席时 fail-open 正是这个项目在 design_data 上踩过的坑，所以这里两种都钉。
+  for (const need of [undefined, "none"]) {
+    const f = flagsOf({ applies: true, ui: true, workspaceAction: "modify", automationNeed: need });
+    assert.equal(f.has("design_implementation"), true, "界面实现旗不该受档位影响");
+    assert.equal(f.has("design_verification"), false, `automationNeed=${need} 还挂了验收模块`);
+  }
+  // 诊断档（用户报了个显示问题）算要看。
+  assert.equal(flagsOf({ applies: true, ui: true, workspaceAction: "modify", automationNeed: "diagnostic" }).has("design_verification"), true);
 });
 
 test("design_data 那条白名单判据一字不动（route-envelope 钉着），它已经按 dataStrategy 判过了", () => {
