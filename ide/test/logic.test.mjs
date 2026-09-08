@@ -12873,7 +12873,7 @@ test("external source tools stay real but load on demand", () => {
     "lazy loading must derive from the live registry instead of a second static tool table");
 });
 
-test("Agent 开局窗口 28 个：取外部资源那一族、读本机依赖真源码的、自家语料、硬拒点名的、自己造能力的那两个、think、唯一的编排入口、盯着用户做完没的那个，以及桌面三件套，都要在里面", () => {
+test("Agent 开局窗口 27 个：取外部资源那一族、读本机依赖真源码的、自家语料、硬拒点名的、自己造能力的那两个、think、唯一的编排入口、盯着用户做完没的那个，以及桌面三件套，都要在里面", () => {
   // 用户 2026-08-18 点名："把初始化编排工具从 11 提升到 16，把那些加进来"（那五个取外部
   // 资源的）。后来又按同一条理由加了 run_in_terminal + read_logs：harness 自己有三处**硬拒**
   // 并点名要 run_in_terminal（timeout 包住的 dev server、前台长命令、需要真 TTY 的交互程序），
@@ -12889,7 +12889,9 @@ test("Agent 开局窗口 28 个：取外部资源那一族、读本机依赖真�
   // 「用户没要求也全跑」。现在它们由**档位**授予（agent/automation-need.js + _AUTOMATION_NEED_TOOLS）：
   // 原话里有「点一下 / 打开 / 看看 / 操作」这类要求、报告了运行时问题、或裁决声明了自动化才进窗口，
   // 纯写代码的一轮不进——不在手边就不会被顺手拿来「验收」。「帮我点一下那个弹窗」由词表认。
-  assert.equal(names.length + 1, 26, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 26`);
+  // 2026-09-08 +1：find_symbol。理由和证伪判据写在 main.js 的 roleCoreMap 上面 ——
+  // 「按符号定位」那一族此前子体有、主体一个都没有，而九处成功回执在点名要它们。
+  assert.equal(names.length + 1, 27, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 27`);
   for (const t of ["read_screen", "ui_click", "computer"]) {
     assert.ok(!names.includes(t), `${t} 回到开局窗口了——它该按自动化档位授予，见 test/automation-need.test.mjs`);
   }
@@ -13045,7 +13047,7 @@ test("Agent initial tools keep the role nucleus independent of intent profile", 
   // 这条测的是「画像不许**增删**核心能力」，那个不变量没变：下面三份画像的输出必须逐字相同。
   assert.deepEqual(greeting, [
     "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user", "knowledge_search",
-    "edit_file", "multi_edit", "write_file", "run_cmd", "read_logs", "run_in_terminal", "search_tools",
+    "find_symbol", "edit_file", "multi_edit", "write_file", "run_cmd", "read_logs", "run_in_terminal", "search_tools",
   ], "profile must not remove registered Agent capabilities from the initial schema");
 
   const assessment = namesFor({
@@ -13158,7 +13160,7 @@ test("explicit bug fixes retain read, write, and verification capabilities", () 
   // "按需装载的那些（LSP/诊断/Git）不会因为一句 bug 描述就被塞进来"，那个保证没动。
   assert.deepEqual(names, [
     "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user", "knowledge_search",
-    "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
+    "find_symbol", "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
   ]);
   for (const deferred of [
     "semantic_search", "get_diagnostics", "lsp_definition", "git_status", "git_diff",
