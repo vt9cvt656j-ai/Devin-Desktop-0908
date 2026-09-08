@@ -77,10 +77,17 @@ test("第一发把「模型画像到没到」当条件传进事实腿", () => {
   // 不传这个条件，engineering 就只剩模型裁决一个来源。线上实测：免费线被上游限流 159 次、
   // 83% 的装配画像全空，于是 13KB 架构纪律和 4.3MB 专业语料**同时**够不着模型
   // （网关那边 engineering_intent 一面旗门着这两样）。
+  // 2026-09-08：条件从 `!_routeSource` 换成 `!_routeJudged`。**这条测试此前是恒绿的**：
+  // `_routeSource` 的兜底项是本地证据对象，永远 truthy，所以 `!_routeSource` 恒假——
+  // 这里断言的那条兜底一次都没触发过，而断言只看字面量在不在，看不出这一点。
+  // 现在钉的是单独算的 `_routeJudged`，它只认「完整裁决落定」和「快通道落定」。
   const at = send.indexOf("_executionFactSemanticFlags(");
   const seg = send.slice(at, at + 240);
-  assert.match(seg, /modelProfileMissing: !_routeSource/,
+  assert.match(seg, /modelProfileMissing: !_routeJudged/,
     "没把「这一轮两条腿都没回」传下去——分类器一挂，engineering 就永远补不上");
+  // 并且这个条件必须真的可能为真：拿本地证据兜底的表达式恒真，等于这条兜底是死的。
+  assert.ok(!/const _routeJudged = [^\n]*\|\| _turnEngineeringResolved\b/.test(send),
+    "_routeJudged 又挂了本地证据兜底——那样它恒真，这条兜底重新变死");
 });
 
 // ── 二、删掉零读者维度 ────────────────────────────────────────────────

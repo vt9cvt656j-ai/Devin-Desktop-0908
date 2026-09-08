@@ -37054,6 +37054,11 @@ function _epForLedger(entries, outcome = "success") {
     // 这条测试的落点之一——它一抛，整条情景记录会被外层 try 吞掉、静默消失。
     _summarizeTiming: summarizeTiming,
     _summarizeIntentRace: summarizeIntentRace,
+    // 2026-09-08 起 ep 里记「这一轮判成了什么」。用真函数不打桩：旗标串的取法本身
+    // 就是这条记录的价值所在，打桩等于把它换成常量。注意 load() 抠出来的函数体里
+    // 出现的每个自由标识符都必须在这里给到，漏一个会 ReferenceError，
+    // 而 _recordEpisode 整个包在 try 里——表现是情景**静默不落盘**，不是报错。
+    _ideSemanticProfile: load("_ideSemanticProfile"),
     _epLoad: () => [],
     _epSave: (root, eps) => { saved.push(JSON.parse(JSON.stringify(eps))); },
     _markReworkIfAny: () => {},
