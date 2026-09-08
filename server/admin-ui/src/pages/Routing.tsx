@@ -118,6 +118,10 @@ type Conn = {
   protocol?: string;
   /** 显示分组：把这条线路的模型挂在另一条线路的名字下。只影响 IDE 选择器上的标题。 */
   group_into?: string | null;
+  /** 派单真正认的那一份：线路自己的 ∪ 各出口带来的。IDE 列表按它出。 */
+  effective_models?: string[];
+  /** 出口带来的模型 → 带来它的出口（备注或主机名）。 */
+  carried_by?: Record<string, string[]>;
 };
 
 /** GET /api/admin/model-usage returns totals only (models.rs:1978-1991). */
@@ -951,7 +955,13 @@ type Caps = {
   accepts_image?: boolean | null;
   generates_image?: boolean | null;
 };
-type Row = { id: string; on: boolean; name: string; pin: string; pout: string; mode: string; fee: string; ctx: string; caps?: Caps };
+type Row = {
+  id: string; on: boolean; name: string; pin: string; pout: string; mode: string; fee: string; ctx: string; caps?: Caps;
+  /** 非空 = 这个模型不是线路自己的，是这些出口带来的。取消勾选会把它从那些出口上拿掉。 */
+  carried?: string[];
+  /** 拉取之后：上游已经不提供这个模型了。勾着也派不出去，该取消。 */
+  gone?: boolean;
+};
 
 /** 把一列上下文档位写成人看的样子：1000000 → 1M，204800 → 200K。 */
 function fmtCtx(n: number): string {
@@ -1015,15 +1025,22 @@ function initialRows(c: Conn | null): Row[] {
   const billing = asMap<BillingOverride>(c.model_billing);
   const caps = asMap<{ contexts?: number[] }>(c.model_caps);
   const live = c.catalog_prices || {};
-  return allowedIds(c).map((id) => {
+  const own = allowedIds(c);
+  // 出口带来的模型也要在这张表里：IDE 按 effective_models 出列表，这里只列线路自己的话，
+  // 运维在 IDE 里看到一个模型、回到这页却找不到它，也没法取消 —— 所有者「我没用的模型了，
+  // 他还保存着，很奇怪」。它们带着「由出口带来」的标记，取消勾选会从那些出口上拿掉。
+  const carriedIds = (c.effective_models || []).filter((id) => !own.includes(id));
+  return [...own, ...carriedIds].map((id) => {
     const p = prices[id] || {};
     const b = billing[id] || {};
     // This box is the model's OWN fee. Never prefill it from the connection — saving would
     // then write the channel fee back as a per-model override that stops following it.
     const micro = Number(b.per_call_micro_usd) || (Number(b.per_call_cents) || 0) * 10_000;
+    const carried = carriedIds.includes(id) ? (c.carried_by?.[id]?.length ? c.carried_by[id] : ["出口"]) : undefined;
     return {
       id,
       on: true,
+      carried,
       name: names[id] || "",
       // 0 也要显示。用 `p.in ? …` 的话，存的 0 回显成空串，再保存一次就变成「留空」
       // ——一条配好的免费线路会在下一次编辑时**静默变回按官方价收费**。
@@ -1123,6 +1140,7 @@ function ConnectionDialog({
       }>(`/api/admin/models/${conn.id}/available`);
       const stored = new Set(r.enabled || []);
       const caps = r.capabilities || {};
+      const upstream = new Set(r.models || []);
       setRows((prev) => {
         const seen = new Set(prev.map((x) => x.id));
         const added = (r.models || [])
@@ -1140,13 +1158,24 @@ function ConnectionDialog({
           }));
         // 能力要贴到**已存在**的行上，不只新增的：常见操作是重复点"拉取"来刷新能力，
         // 只给新增行赋值的话，已经开着的模型永远看不到实时数据。
-        return [...prev.map((x) => (caps[x.id] ? { ...x, caps: caps[x.id] } : x)), ...added];
+        // 已经在表里、但这次上游没回的：标成「已下架」，不替人取消 —— 出口带来的模型
+        // 线路自己的地址本来就不一定有，那不算下架。
+        return [
+          ...prev.map((x) => ({
+            ...x,
+            ...(caps[x.id] ? { caps: caps[x.id] } : {}),
+            gone: !x.carried && !upstream.has(x.id),
+          })),
+          ...added,
+        ];
       });
+      const goneNow = rows.filter((x) => !x.carried && x.on && !upstream.has(x.id)).length;
       const liveCount = Object.values(caps).filter((c) => c?.source === "live").length;
       setHint(
-        (r.catalog_size ?? 0) > 0
+        ((r.catalog_size ?? 0) > 0
           ? `供应商返回 ${(r.models || []).length} 个模型，其中 ${liveCount} 个有实时能力数据（上下文/思考档位/价格自动带入，留空即用实时值）`
-          : `供应商返回 ${(r.models || []).length} 个模型。能力目录暂不可用（网关刚启动或目录源不可达），价格请手填`,
+          : `供应商返回 ${(r.models || []).length} 个模型。能力目录暂不可用（网关刚启动或目录源不可达），价格请手填`) +
+          (goneNow ? ` 已勾选的里有 ${goneNow} 个上游已不再提供，标了「已下架」，用旁边的按钮一键取消。` : ""),
       );
     } catch (e) {
       setFormErr(e instanceof Error ? e.message : "拉取失败");
@@ -1168,6 +1197,11 @@ function ConnectionDialog({
       return;
     }
     const on = rows.filter((r) => r.on);
+    // 线路自己的名单只收线路自己的模型：出口带来的留在出口上（它进了这份名单，线路自带地址
+    // 就会去接它的请求，而那个地址根本没有它，只会撞 404）。取消勾选的出口模型单独报给后端，
+    // 从那些出口上拿掉。
+    const ownOn = on.filter((r) => !r.carried);
+    const dropFromEndpoints = rows.filter((r) => r.carried && !r.on).map((r) => r.id);
     // A one-sided price override is not "half configured", it is $0 for the other side:
     // compute_cost takes the pair as soon as either number is > 0 (models.rs:2669-2673).
     const half = on.find((r) => (priceNum(r.pin) !== null) !== (priceNum(r.pout) !== null));
@@ -1207,7 +1241,8 @@ function ConnectionDialog({
           ...base,
           active,
           protocol,
-          enabled_models: on.map((r) => r.id),
+          enabled_models: ownOn.map((r) => r.id),
+          drop_from_endpoints: dropFromEndpoints,
           // 手填的上下文兜底。只对实时目录没收录的模型有意义——目录有的时候网关不看这里。
           model_caps: Object.fromEntries(
             on
@@ -1452,6 +1487,18 @@ function ConnectionDialog({
                     全部用现价
                   </Button>
                 )}
+                {rows.some((r) => r.gone && r.on) && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    title="拉取结果里没有的、但还勾着的模型：一键取消勾选（保存后生效）"
+                    onClick={() =>
+                      setRows((prev) => prev.map((r) => (r.gone && r.on ? { ...r, on: false } : r)))
+                    }
+                  >
+                    去掉已下架的（{rows.filter((r) => r.gone && r.on).length}）
+                  </Button>
+                )}
                 <Button
                   variant="outline"
                   size="sm"
@@ -1472,8 +1519,28 @@ function ConnectionDialog({
                       onChange={(e) => patch(r.id, { on: e.target.checked })}
                     />
                     <span className="flex min-w-0 flex-1 flex-col leading-tight">
-                      <span className="truncate font-mono text-xs" title={r.id}>
-                        {r.id}
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className="truncate font-mono text-xs" title={r.id}>
+                          {r.id}
+                        </span>
+                        {r.carried && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 text-[10px]"
+                            title={`线路自己的地址没有这个模型，是出口带来的：${r.carried.join("、")}。取消勾选会把它从那些出口上拿掉，IDE 里就看不到了。`}
+                          >
+                            由出口带来 · {r.carried.join("、")}
+                          </Badge>
+                        )}
+                        {r.gone && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 border-destructive/40 text-[10px] text-destructive"
+                            title="这次拉取上游没有回这个模型：勾着也派不出去。"
+                          >
+                            已下架
+                          </Badge>
+                        )}
                       </span>
                       <CapsLine caps={r.caps} />
                     </span>

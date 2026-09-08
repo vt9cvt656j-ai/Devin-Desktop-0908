@@ -675,7 +675,11 @@ export function RouteEndpoints() {
     }
   }
 
-  /// 问这个中转有哪些模型，并把线路开放但它没有的自动取消勾选。
+  /// 问这个中转有哪些模型：线路开放但它没有的自动取消勾选；它多出来的只**列出来**，不替你勾。
+  ///
+  /// 原来是「它有的全勾上（含线路本来没有的新模型）」—— 所有者：「我每次问他有什么模型，
+  /// 新增的他都自动勾选一堆」。一个中转动辄回八九十款模型，全勾上等于把整份目录塞进 IDE。
+  /// 勾哪些新模型是运维的决定，拉取只负责把事实摆出来。
   async function fetchModels() {
     if (!draft) return;
     setFetching(true);
@@ -702,9 +706,21 @@ export function RouteEndpoints() {
         extra: r.extra ?? [],
         extra_no_price: r.extra_no_price ?? [],
       });
-      // 它有的全勾上（含线路本来没有、但能定价的新模型 —— 那些勾上就会出现在
-      // IDE 的模型列表里）；它没有的取消掉。拉取的意义就是省掉人工比对。
-      setDraft({ ...draft, enabled_models: [...(r.here ?? []), ...(r.extra ?? [])] });
+      // 只做减法：当前勾着的（空 = 线路全部）去掉它没有的。多出来的那些在下面标「这家新有」，
+      // 要开放自己勾。
+      const routeModels = routeOf(draft.route_id)?.models ?? [];
+      const cur = draft.enabled_models.length ? draft.enabled_models : routeModels;
+      const missing = new Set(r.missing ?? []);
+      const next = cur.filter((m) => !missing.has(m));
+      setDraft({ ...draft, enabled_models: next });
+      const gone = cur.length - next.length;
+      const fresh = (r.extra ?? []).length + (r.extra_no_price ?? []).length;
+      setNote({
+        text: `这家有 ${(r.here ?? []).length} 个线路上的模型` +
+          (gone ? `，${gone} 个它没有（已取消勾选）` : "") +
+          (fresh ? `；另有 ${fresh} 个线路上没有的，列在下面，要开放自己勾` : ""),
+        ok: true,
+      });
     } catch (e) {
       setNote({ text: e instanceof Error ? e.message : "拉取失败", ok: false });
     } finally {
@@ -860,7 +876,11 @@ export function RouteEndpoints() {
                       </div>
                       <p className="mt-0.5 text-xs text-muted-foreground">
                         {vname ? `${vname} · ` : ""}
-                        {r.model_count} 个模型 · {r.protocol} 协议
+                        {r.model_count} 个模型
+                        {r.effective_models.length > r.model_count
+                          ? `（另有 ${r.effective_models.length - r.model_count} 个由出口带来）`
+                          : ""}
+                        {" · "}{r.protocol} 协议
                         {r.endpoints.filter((e) => e.active).length
                           ? ` · ${r.endpoints.filter((e) => e.active).length} 个额外出口`
                           : ""}
@@ -948,13 +968,22 @@ export function RouteEndpoints() {
                                     */}
                                     {e.enabled_models.length > 0 &&
                                       (() => {
+                                        // 名字要写出来。原来只写「只承载 3/5 个模型」，运维得打开编辑
+                                        // 窗口才知道是哪三个 —— 而窗口里当时也不列出口带来的那些。
                                         const onRoute = e.enabled_models.filter((m) =>
                                           (r.models || []).includes(m),
-                                        ).length;
-                                        const extra = e.enabled_models.length - onRoute;
-                                        return ` · 只承载 ${onRoute}/${r.model_count} 个模型${
-                                          extra > 0 ? `（另有 ${extra} 个不在这条线路上）` : ""
-                                        }`;
+                                        );
+                                        const extra = e.enabled_models.filter(
+                                          (m) => !(r.models || []).includes(m),
+                                        );
+                                        const few = (xs: string[]) =>
+                                          xs.length <= 6 ? xs.join("、") : `${xs.slice(0, 6).join("、")} 等 ${xs.length} 个`;
+                                        return (
+                                          <span title={e.enabled_models.join("\n")}>
+                                            {` · 只承载 ${onRoute.length}/${r.model_count} 个：${few(onRoute) || "（线路上的一个都不承载）"}`}
+                                            {extra.length > 0 && ` · 另带来线路没有的 ${extra.length} 个：${few(extra)}`}
+                                          </span>
+                                        );
                                       })()}
                                     {e.capacity != null && ` · 容量 ${e.capacity}`}
                                     {e.protocol ? ` · ${e.protocol} 协议` : ""}
@@ -1416,14 +1445,20 @@ export function RouteEndpoints() {
                     线上那个 89 款模型的出口就会撞到这个上限 —— 定值在那儿是真会溢出的。
                   */}
                   <div className="max-h-[min(24rem,calc(88vh-24rem))] overflow-y-auto">
-                  {[
+                  {[...new Set([
                     ...(routeOf(draft.route_id)?.models ?? []),
+                    // 这个出口**自己带来的**（线路没有、之前勾过的）。原来不在这份清单里 ——
+                    // 不重新拉取就看不见，而它们正是运维最想核对的那几个：
+                    // 所有者「多路由那些勾选的模型看不到」说的就是这个。
+                    ...draft.enabled_models,
                     // 这家有、线路没有的：勾上会新增到 IDE 列表。算不出价的也列出来，
                     // 但标红且勾不动 —— 让人看见「为什么这个不能用」，而不是它凭空消失。
                     ...(fetched?.extra ?? []),
                     ...(fetched?.extra_no_price ?? []),
-                  ].map((m) => {
-                    const isNew = (fetched?.extra ?? []).includes(m);
+                  ])].map((m) => {
+                    const onRoute = (routeOf(draft.route_id)?.models ?? []).includes(m);
+                    const carried = !onRoute && draft.enabled_models.includes(m);
+                    const isNew = !carried && (fetched?.extra ?? []).includes(m);
                     const noPrice = (fetched?.extra_no_price ?? []).includes(m);
                     const on =
                       draft.enabled_models.length === 0 || draft.enabled_models.includes(m);
@@ -1502,9 +1537,18 @@ export function RouteEndpoints() {
                           }
                         />
                         <span className="flex shrink-0 items-center gap-1">
+                        {carried && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0"
+                            title="线路自己没有这个模型，是这个出口带来的；取消勾选它就不再出现在 IDE 里（除非别的出口也带）"
+                          >
+                            这个出口带来的
+                          </Badge>
+                        )}
                         {isNew && (
                           <Badge variant="success" className="shrink-0">
-                            新增
+                            这家新有
                           </Badge>
                         )}
                         {noPrice && (
@@ -1528,8 +1572,8 @@ export function RouteEndpoints() {
                   </div>
                 </div>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  勾上「线路没有」的那些，它们会<b>新增到 IDE 的模型列表</b>，按这条线路的
-                  倍率计费。
+                  「问它有什么」只会取消它没有的模型，<b>不会替你勾新模型</b>；它多出来的标「这家新有」，
+                  勾上才会<b>新增到 IDE 的模型列表</b>，按这条线路的倍率计费。
                   <br />
                   <b className="text-foreground">输入价 / 输出价是「用户付多少」，不是你的进价。</b>
                   单位每百万 token 美元，最终扣费 = 这个价 × 这条线路的倍率。

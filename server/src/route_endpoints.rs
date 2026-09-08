@@ -466,6 +466,103 @@ pub fn effective_models(route: &Model, outlets: &[Endpoint]) -> Vec<String> {
     all
 }
 
+/// 出口带来的模型 → 带来它的出口（备注，没备注就用地址的主机名）。
+///
+/// 只算在轮转里的出口，和 `effective_models` 同一口径：停用的出口带不来任何模型。
+pub fn carried_by(route: &Model, outlets: &[Endpoint]) -> serde_json::Value {
+    let own = crate::models::allowed_ids(route);
+    let mut map = serde_json::Map::new();
+    for e in outlets.iter().filter(|e| e.active) {
+        let who = if e.label.trim().is_empty() { host_of(&e.base_url) } else { e.label.trim().to_string() };
+        for m in &e.enabled_models {
+            if own.iter().any(|x| x == m) {
+                continue;
+            }
+            let entry = map.entry(m.clone()).or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let Some(arr) = entry.as_array_mut() {
+                if !arr.iter().any(|v| v.as_str() == Some(&who)) {
+                    arr.push(serde_json::Value::String(who.clone()));
+                }
+            }
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+fn host_of(url: &str) -> String {
+    let s = url.trim();
+    let s = s.split("://").nth(1).unwrap_or(s);
+    s.split('/').next().unwrap_or(s).to_string()
+}
+
+/// 线路上取消勾选了某个模型之后，这个出口的名单该变成什么。
+///
+/// `None` = 不用动：名单本来就是空（空 = 跟线路，线路那边已经改了），或者它本来就不带这个模型。
+/// `orphaned` = 拿掉之后一个都不剩。**不能**存成空名单 —— 空的意思是「跟线路」，
+/// 而这个出口之前明明只承载那几款，跟线路等于把它没有的货派给它撞 404。这时停用它，
+/// 备注里写明为什么，运维在「多路由」里看得见。
+pub struct Retire {
+    pub remaining: Vec<String>,
+    pub orphaned: bool,
+}
+
+pub fn retire_from_outlet(enabled: &[String], retired: &[String]) -> Option<Retire> {
+    if enabled.is_empty() {
+        return None;
+    }
+    let remaining: Vec<String> = enabled.iter().filter(|m| !retired.contains(m)).cloned().collect();
+    if remaining.len() == enabled.len() {
+        return None;
+    }
+    Some(Retire { orphaned: remaining.is_empty(), remaining })
+}
+
+/// 线路那页取消勾选的模型，从这条线路的每个出口上也拿掉。返回改了几个出口。
+pub async fn retire_models(
+    state: &AppState,
+    route_id: uuid::Uuid,
+    retired: &[String],
+) -> Result<usize, AppError> {
+    if retired.is_empty() {
+        return Ok(0);
+    }
+    let eps: Vec<(uuid::Uuid, Vec<String>, String)> = sqlx::query_as(
+        "SELECT id, enabled_models, note FROM route_endpoints WHERE route_id = $1",
+    )
+    .bind(route_id)
+    .fetch_all(&state.db)
+    .await?;
+    let mut touched = 0usize;
+    for (id, enabled, note) in eps {
+        let Some(r) = retire_from_outlet(&enabled, retired) else {
+            continue;
+        };
+        if r.orphaned {
+            let note = if note.trim().is_empty() {
+                "线路已不再开放它承载的模型，自动停用".to_string()
+            } else {
+                format!("{note} · 线路已不再开放它承载的模型，自动停用")
+            };
+            sqlx::query(
+                "UPDATE route_endpoints SET enabled_models = '{}', active = false, note = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(&note)
+            .execute(&state.db)
+            .await?;
+        } else {
+            sqlx::query("UPDATE route_endpoints SET enabled_models = $2 WHERE id = $1")
+                .bind(id)
+                .bind(&r.remaining)
+                .execute(&state.db)
+                .await?;
+        }
+        tracing::info!(route = %route_id, endpoint = %id, retired = ?retired, orphaned = r.orphaned, "出口名单随线路收缩");
+        touched += 1;
+    }
+    Ok(touched)
+}
+
 /// 这个模型在这条线路上算不算得出价格。
 ///
 /// 三条来源，任一条有就行：每模型覆盖 → 实时目录 → 线路自己的兜底价。
@@ -5745,5 +5842,86 @@ mod applied_migrations {
             "有已上线的迁移被改动了，部署会让后端起不来。要加列请新开一个文件：\n  {}",
             bad.join("\n  "),
         );
+    }
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::*;
+
+    fn ep(enabled: &[&str], active: bool, label: &str, url: &str) -> Endpoint {
+        Endpoint {
+            id: uuid::Uuid::new_v4(),
+            balance_token: String::new(),
+            last_ok_at: None,
+            last_fail_at: None,
+            real_sum: None,
+            real_n: None,
+            real_ok: None,
+            real_bad: None,
+            route_id: uuid::Uuid::nil(),
+            label: label.into(),
+            base_url: url.into(),
+            api_key: String::new(),
+            cost_ratio: 1.0,
+            active,
+            note: String::new(),
+            probe_ok: None,
+            probe_at: None,
+            probe_ms: None,
+            probe_note: String::new(),
+            enabled_models: enabled.iter().map(|s| s.to_string()).collect(),
+            protocol: String::new(),
+            capacity: None,
+        }
+    }
+    fn route(models: &[&str]) -> Model {
+        Model {
+            id: uuid::Uuid::new_v4(),
+            enabled_models: models.iter().map(|s| s.to_string()).collect(),
+            ..Model::blank()
+        }
+    }
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 所有者「我没用的模型了，他还保存着」：线路取消勾选，出口那份名单要跟着收。
+    #[test]
+    fn unchecking_on_the_route_retires_the_model_from_its_outlets() {
+        let r = retire_from_outlet(&v(&["a", "b", "c"]), &v(&["b"])).expect("有变化");
+        assert_eq!(r.remaining, v(&["a", "c"]));
+        assert!(!r.orphaned);
+    }
+
+    /// 空名单 = 跟线路，线路那边已经改了，这里不用动；本来就不带这个模型的也不动。
+    #[test]
+    fn outlets_that_follow_the_route_or_never_carried_it_are_left_alone() {
+        assert!(retire_from_outlet(&[], &v(&["b"])).is_none());
+        assert!(retire_from_outlet(&v(&["a"]), &v(&["b"])).is_none());
+    }
+
+    /// 拿掉之后一个都不剩：**不能**存成空名单（空 = 跟线路 = 把它没有的货派给它撞 404），要停用。
+    #[test]
+    fn an_outlet_left_with_nothing_is_orphaned_not_emptied() {
+        let r = retire_from_outlet(&v(&["b"]), &v(&["b"])).expect("有变化");
+        assert!(r.orphaned);
+        assert!(r.remaining.is_empty());
+    }
+
+    /// 线路那页要知道「这个模型是哪个出口带来的」；停用的出口带不来任何模型。
+    #[test]
+    fn carried_by_names_the_outlet_and_skips_inactive_ones() {
+        let r = route(&["a"]);
+        let eps = vec![
+            ep(&["a", "x"], true, "转卖A", "https://a.example/v1"),
+            ep(&["x", "y"], true, "", "https://relay.example.com/v1"),
+            ep(&["z"], false, "停用的", "https://z.example/v1"),
+        ];
+        let m = carried_by(&r, &eps);
+        assert_eq!(m["x"], serde_json::json!(["转卖A", "relay.example.com"]));
+        assert_eq!(m["y"], serde_json::json!(["relay.example.com"]));
+        assert!(m.get("a").is_none(), "线路自己的模型不算「带来的」");
+        assert!(m.get("z").is_none(), "停用的出口带不来模型");
     }
 }

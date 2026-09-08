@@ -3003,10 +3003,15 @@ pub(crate) fn model_key(stored: &str) -> String {
 }
 
 pub(crate) fn allowed_ids(m: &Model) -> Vec<String> {
-    if !m.enabled_models.is_empty() {
-        return m.enabled_models.clone();
+    allowed_ids_parts(&m.enabled_models, &m.model_id)
+}
+
+/// 同 `allowed_ids`，但按字段传：admin_update 里 `m` 的别的字段已经被搬走，整体借不了。
+pub(crate) fn allowed_ids_parts(enabled_models: &[String], model_id: &Option<String>) -> Vec<String> {
+    if !enabled_models.is_empty() {
+        return enabled_models.to_vec();
     }
-    match &m.model_id {
+    match model_id {
         Some(s) if !s.is_empty() => vec![s.clone()],
         _ => vec![],
     }
@@ -3587,7 +3592,10 @@ pub async fn admin_list(
                 //
                 // 这里直接从内存里的目录取（每 6 小时刷新，不发网络请求），所以列表一打开
                 // 就有，且永远是现价。
-                "catalog_prices": allowed_ids(m)
+                "catalog_prices": crate::route_endpoints::effective_models(
+                        m,
+                        outlets.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]),
+                    )
                     .iter()
                     .filter_map(|mid| {
                         let e = crate::model_catalog::lookup(mid)?;
@@ -3605,6 +3613,12 @@ pub async fn admin_list(
                     .collect::<serde_json::Map<_, _>>(),
                 "power_route": m.power_route,
                 "effective_models": crate::route_endpoints::effective_models(
+                    m,
+                    outlets.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]),
+                ),
+                // 出口带来的模型是哪个出口带来的。线路那页要把这些模型**列出来**（不然运维
+                // 只能在 IDE 里看到一个不知道从哪来的模型），并标明来路。
+                "carried_by": crate::route_endpoints::carried_by(
                     m,
                     outlets.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]),
                 ),
@@ -4191,6 +4205,10 @@ pub struct UpdateReq {
     pub active: Option<bool>,
     pub sort: Option<i32>,
     pub enabled_models: Option<Vec<String>>,
+    /// 线路那页取消勾选的**出口带来的**模型（它们不在 enabled_models 里，取消勾选在那份
+    /// 名单上体现不出来）。和「从 enabled_models 里去掉」走同一条路：从这条线路的出口上拿掉。
+    #[serde(default)]
+    pub drop_from_endpoints: Option<Vec<String>>,
     pub billing_mode: Option<String>,
     pub per_call_cents: Option<i64>,
     pub per_call_micro_usd: Option<i64>,
@@ -4265,6 +4283,9 @@ pub async fn admin_update(
         .unwrap_or(m.description);
     let active = req.active.unwrap_or(m.active);
     let sort = req.sort.unwrap_or(m.sort);
+    // 改之前的名单，要在 enabled_models 被搬走之前算（下面出口收缩那一步用）。
+    let before_allowed: Vec<String> = allowed_ids_parts(&m.enabled_models, &m.model_id);
+    let legacy_model_id = m.model_id.clone();
     let enabled = req.enabled_models.unwrap_or(m.enabled_models);
     let billing_mode = match req.billing_mode.as_deref() {
         Some("per_call") => "per_call".to_string(),
@@ -4383,6 +4404,22 @@ pub async fn admin_update(
         .bind(&balance_token)
         .execute(&state.db)
         .await?;
+    // 线路上取消勾选的模型，也要从它的出口上拿掉。
+    //
+    // IDE 拿到的列表是 effective_models = 线路自己的 ∪ 各出口 enabled_models（list_for_client），
+    // 而这里只改线路自己那一份。于是运维在线路那页取消一个模型，它照样经某个出口留在 IDE 里
+    // —— 所有者原话「我没用的模型了，他还保存着，很奇怪」。取消勾选的意思就是「不用了」，
+    // 出口那份名单跟着改；出口带来的模型（drop_from_endpoints）同理。
+    {
+        let after = allowed_ids_parts(&enabled, &legacy_model_id);
+        let mut retired: Vec<String> = before_allowed.into_iter().filter(|x| !after.contains(x)).collect();
+        retired.extend(req.drop_from_endpoints.clone().unwrap_or_default());
+        retired.sort();
+        retired.dedup();
+        if !retired.is_empty() {
+            crate::route_endpoints::retire_models(&state, id, &retired).await?;
+        }
+    }
     invalidate_active_models_cache();
     Ok(Json(json!({ "ok": true })))
 }
