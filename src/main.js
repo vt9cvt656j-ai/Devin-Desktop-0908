@@ -36123,11 +36123,38 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
   const mcpNames = new Set((Array.isArray(mcpTools) ? mcpTools : [])
     .map((tool) => String(tool?.function?.name || "")).filter(Boolean));
   
+  // find_symbol 四个角色都给（2026-09-08）。
+  //
+  // 病：主体只有整文件 `read_file`，而"按符号定位"那一族（find_symbol / lsp_symbols /
+  // lsp_definition / lsp_references / semantic_search）**子体有、主体一个都没有**。
+  // 于是"这个函数在哪儿定义的"只能靠读整个文件或全文 grep。
+  //
+  // 更糟的是回执自相矛盾：read_file 超 2500 行时的提示点名 lsp_symbols / find_symbol、
+  // search 零命中时点名 semantic_search、Explorer 纪律点名三个 LSP 工具——至少九处文案
+  // 在指模型去用它当轮根本够不着的工具。而这些都是**成功回执**、不带失败标记，
+  // 所以 `_admitToolsNamedInText` 的自愈装载也不会触发。这正是这个文件里反复写过的
+  // 那条规矩的反面：**文案点名的工具必须在手里**。
+  //
+  // 证据（60 天工具步遥测）：这一族合计 11 次 / 35,273 步 = 0.31‰，同期 read_file 22.1%。
+  // 而 ≥9 步的长 run 里 read_file 占工具步 24.0%、占模型输出 token 21.0% —— 按"一步墙钟
+  // ≈ 输出 token ÷ 吐字速度"，那是 21% 的墙钟池子。
+  //
+  // 同仓自然实验（这条才是决定动手的依据，上面那个是相关不是因果）：think 2026-08-22
+  // 进窗口，之前 60 天 0 次 / 16,593 步，之后 361 次 / 18,680 步（19.3‰）。同代码、同用户，
+  // 唯一的变量是进没进窗口。"够不着 = 永远不被选"在这个库里量过。
+  //
+  // **只加这一个**：它走仓内正则符号索引，零外部依赖、全语言、IDE 启动 3 秒后就绪。
+  // lsp_symbols 要连同"按需装载"那条注释一起改；lsp_definition / lsp_references /
+  // semantic_search 会直接撞 test/logic.test.mjs 的字面快照——那三个单独决策。
+  //
+  // 怎么证伪（照 think 那条的规矩，别让它靠"看起来合理"赖在窗口里）：21 天后
+  // ① 长 run 里 find_symbol 的出现率没上去 → 不是窗口的问题，撤回；
+  // ② 出现率上去了但 read_file 那 21% 没动 → 它没替下任何东西，同样撤回。
   const roleCoreMap = {
-    plan: ["read_file", "list_dir", "search", "find_files", "update_plan"],
-    explorer: ["read_file", "list_dir", "search", "find_files"],
+    plan: ["read_file", "list_dir", "search", "find_files", "find_symbol", "update_plan"],
+    explorer: ["read_file", "list_dir", "search", "find_files", "find_symbol"],
     reviewer: [
-      "read_file", "search", "find_files", "get_diagnostics", "git_diff",
+      "read_file", "search", "find_files", "find_symbol", "get_diagnostics", "git_diff",
     ],
     // Agent 开局 11 → 16：把**取外部资源**那一族直接放进窗口。
     //
@@ -36167,7 +36194,7 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
     // ① 长任务里 think 的出现率没上去 → 说明不是窗口的问题，把它撤回去；
     // ② 出现率上去了但长任务成功率没动 → 说明当初那 22% 只是"本来就顺"的伴随现象，
     //    同样撤回去。别让它靠"看起来合理"一直赖在窗口里。
-agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user", "think",
+agent: ["read_file", "list_dir", "search", "find_files", "find_symbol", "update_plan", "ask_user", "think",
             "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
             // save_skill / mcp_server 也在这里，理由和上面那两条一样，只是更极端：
             //   · save_skill 的时机在**收尾**——刚摸清一套还会再用的流程。模型绝不会为一件

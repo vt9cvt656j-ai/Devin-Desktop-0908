@@ -32,7 +32,7 @@ import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn } from "./helpers/s
 // 2026-08-22 又扩一个：package_source——零网络零成本（读本机 node_modules/site-packages 里
 // 装着的那一份真源码），却是这一族里唯一够不着的；package_search 在窗口里而它不在，正是
 // github_search 曾经缺 github_repo 后手的同一种缺口：注册表搜索一个签名都不给。
-const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user", "think",
+const CORE = ["read_file", "list_dir", "search", "find_files", "find_symbol", "update_plan", "ask_user", "think",
               "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
               "save_skill", "mcp_server",
               // 2026-08-23 再扩一个：background_monitor。理由和 github_repo 那条逐字

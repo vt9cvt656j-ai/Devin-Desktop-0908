@@ -192,7 +192,7 @@ test("冷启动首轮不会漏掉磁盘上的技能", () => {
 // 或者干脆放弃、凭记忆自己写。清单列了 28 个技能却一个都读不到，就是这一环断的。
 function selectWith({ skills = [], mode = "agent", includeWrite = true } = {}) {
   const READ_SKILL = { type: "function", function: { name: "read_skill", parameters: {} } };
-  const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
+  const CORE = ["read_file", "list_dir", "search", "find_files", "find_symbol", "update_plan", "ask_user",
                 "write_file", "edit_file", "multi_edit", "run_cmd", "get_diagnostics", "git_diff"]
     .map((n) => ({ type: "function", function: { name: n, parameters: {} } }));
   const fn = load("_selectInitialTools", {
