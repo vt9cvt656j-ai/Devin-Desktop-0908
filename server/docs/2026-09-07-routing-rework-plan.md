@@ -2,12 +2,42 @@
 
 > 依据：微信文档《新建DOCX 文档.docx》（2026-09-07 收）
 > 目标代码库：`server/`（Rust + Axum + Postgres + Redis；admin-ui 为 React 管理台）
-> 本文档只负责**把改动说清楚**，不实施。按 Phase 顺序执行，每步独立可验证。
+> 本文档先把改动说清楚，再按 Phase 实施。每步独立可验证。**进度以 git 为准，见下方「实施进度」。**
 
 > 这份文档解决什么问题：把产品文档（模型线路页的八个界面需求）翻译成后端可执行的改动清单。
 > 它在整体里的位置：`server/` 的模型线路/多路由/健康体系重构的**第一个交付物**——先定迁移与
 > 接口形状，再动代码。最不显然的取舍：用户日志和数据模型都**故意新增表、不碰计费链路**，
 > 因为本项目注释里反复踩过"为报表改计费事务把钱改没"的坑（详见 §6）。
+
+---
+
+## 实施进度（2026-09-08 对照 `gao-dev` HEAD `3478fb5a`）
+
+对照仓库实况回写，**未完成的不标完成**。工作区除 IDE 目录 `.mrdayone/` 外干净；该 HEAD 已与 `origin/gao-dev` 对齐。
+
+| Phase | 状态 | 合入提交 | 证据 |
+|---|---|---|---|
+| 0 拍板 | **完成** | `c475e5f9` → `d18ba053` → `4da94d06` | A1 号池锁定；出口直挂分组；拍板 1–4 写入 §10；docx 逐项核对 5 处差异已按原文改 md |
+| 1 迁移 M1–M6 | **完成** | `4d25a1fb` | `server/migrations/20260907_{model_groups,route_endpoints_group,endpoint_pricing,usage_log,channel_rates_pay,route_credentials}.sql`（6 文件 / +185 行） |
+| 2 后端实体 | **前半完成** | `3478fb5a` | 见下表；派单埋点 / 停用护栏 / 线路新列 **未做** |
+| 3 查询 API | 未开始 | — | 健康两视图、usage-log 三视图+搜索、official-prices、汇率同步排查 |
+| 4 admin-ui | 未开始 | — | 用户日志、官方原价新屏 + 分组/线路/多路由/健康重构 |
+| 5 收口 | 未开始 | — | 全链路走查；gao-dev → main 的 PR 尚未开（本轮只推 gao-dev） |
+
+Phase 2 拆开（`3478fb5a`，+1054 / −2，5 文件）：
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| `model_groups` CRUD + 排序/上下移 | **完成** | `server/src/model_groups.rs`（347 行）；`GET/POST /api/admin/model-groups`、`POST .../reorder`、`POST/DELETE .../:id`、`POST .../:id/move`（`main.rs` 499–513） |
+| 号池 CRUD（A1） | **完成** | `server/src/route_credentials.rs`（431 行）；`GET/POST /api/admin/models/:id/credentials`、`POST/DELETE .../:cid`（`main.rs` 488–494） |
+| 删线路护栏 | **完成** | `models.rs` `admin_delete`：`line_impact` 先返 `{needs_confirm, affected, total}`，`?confirm=true` 后同一事务删 `route_endpoints` + `models` |
+| `usage_log` 骨架 | **完成** | `server/src/usage_log.rs`（211 行）：`spawn_ok` / `spawn_fail` / `spawn_stall`；写失败静默、不进结算事务 |
+| `usage_log` 派单埋点 | **未做** | `server/src/` 除本文件外 **零处** `usage_log::` 调用；热路径尚未记成功/失败/卡死 |
+| 线路停用护栏 | **未做** | 只有删除二次确认；停用（`active=false`）未做引用提示 |
+| 线路界面新列 | **未做** | 计划里的 last_used / 启用模型 / Claude 强力版等未挂到 `admin_list` |
+| Phase 2 验收 | **未做** | 计划要求 `cargo check` + `cargo test`（改 `models.rs` 必跑全量）+ 删组护栏手测；本批提交未把这三项当合入门槛跑过 |
+
+下一步按计划顺序：Phase 2 后半（派单埋点 → 停用护栏 → 线路新列 → check/test），然后 Phase 3。
 
 ---
 
@@ -337,17 +367,19 @@ ALTER TABLE channel_rates
 
 ## 5. 执行顺序与验证（每个 Phase 的验收标准）
 
-- **Phase 0 拍板（先做，不写码）**：A（号池）二读已锁 **A1**；剩余拍板见 §10 拍板 1–4（Claude强力版
+进度细节与提交哈希见文首「实施进度」。下面验收标准不改，只标当前状态。
+
+- **Phase 0 拍板（先做，不写码）** ✅：A（号池）二读已锁 **A1**；剩余拍板见 §10 拍板 1–4（Claude强力版
   语义 / 出口能否属多组 / 出口价格进不进账单 / 行级倍率口径）。拍完再动 Phase 1。
-- **Phase 1 迁移**：M1–M6（M6 随 A1 必做）。跑 `cargo test`（sqlx 迁移测试若钉了旧表会立刻红，先改测试预期）。
-- **Phase 2 后端采集与实体**：usage_log 埋点 + model_groups 模块 + models/route_endpoints 归属与护栏。
+- **Phase 1 迁移** ✅：M1–M6（M6 随 A1 必做）。跑 `cargo test`（sqlx 迁移测试若钉了旧表会立刻红，先改测试预期）。
+- **Phase 2 后端采集与实体** ◐ 前半已合入，后半未做：usage_log 埋点 + model_groups 模块 + models/route_endpoints 归属与护栏。
   验证：`cargo check` + `cargo test`（本项目测试很重，注释风格看，改 models.rs 必跑全量）；护栏手动
   （建组→加路由→删组应 400）。
-- **Phase 3 查询 API**：健康两视图 / usage-log 三视图+搜索 / official-prices / 汇率计算与同步排查。
+- **Phase 3 查询 API** ☐：健康两视图 / usage-log 三视图+搜索 / official-prices / 汇率计算与同步排查。
   验证：起服务（run_in_terminal）用真实库各点一发请求核对列；汇率同步 bug 走复现步骤。
-- **Phase 4 admin-ui**：按 §4 逐屏，每屏 `npm run build`（admin-ui）过 typecheck。注意现有
+- **Phase 4 admin-ui** ☐：按 §4 逐屏，每屏 `npm run build`（admin-ui）过 typecheck。注意现有
   admin-ui 有 262 个存量 TS 报错（含 `Routing.tsx` 等文件的历史问题），**只认新增的，先修自己引入的**。
-- **Phase 5 收口**：全链路走查（建分组→建线路号池→拉模型→多路由→发真请求→健康→日志溯源）；
+- **Phase 5 收口** ☐：全链路走查（建分组→建线路号池→拉模型→多路由→发真请求→健康→日志溯源）；
   IDE 侧模型表单确认分组/图标/顺序生效（文档反复强调"IDE 中展示"）；按 AGENTS.md 提交流程走
   gao-dev → PR。
 
