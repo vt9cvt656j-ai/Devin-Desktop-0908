@@ -59,7 +59,7 @@ import { _localizationPlan } from "./agent/localization-plan.js";
 import { _lineDiffHunksCore } from "./agent/line-diff-core.js";
 import { _localDiscoveryVisibleSummary } from "./agent/local-discovery-summary.js";
 import { planFactLands as _planFactLands } from "./agent/plan-fact-note.js";
-import { planModeOffer as _planModeOffer, planModeAnswerIsYes as _planModeAnswerIsYes, dropWriteTools as _dropWriteTools, planModeEnteredNote as _planModeEnteredNote, planModeDeclinedNote as _planModeDeclinedNote, planModeNotOfferedNote as _planModeNotOfferedNote } from "./agent/plan-mode-offer.js";
+import { planModeOffer as _planModeOffer, planModeAnswerIsYes as _planModeAnswerIsYes, dropWriteTools as _dropWriteTools, planModeEnteredNote as _planModeEnteredNote, planModeDeclinedNote as _planModeDeclinedNote, planModeNotOfferedNote as _planModeNotOfferedNote, planExecuteIntent as _planExecuteIntent } from "./agent/plan-mode-offer.js";
 import { spinTargetOf as _spinTargetOf, annotateCrossToolMisses as _annotateCrossToolMisses } from "./agent/spin-target.js";
 import { NUDGE_GATE_EXEMPT as _NUDGE_GATE_EXEMPT } from "./agent/nudge-gate.js";
 import { decideQuietTurn as _decideQuietTurn, QUIET_RESUME_POOL as _QUIET_RESUME_POOL } from "./agent/quiet-turn.js";
@@ -5645,16 +5645,74 @@ function _planUI() {
     },
     openFiles, renderTabs, syncWelcome, activate, getActivePath: () => activePath,
     closeTab: () => closeFile(PLAN_TAB_PATH),
-    onAccept: () => { // Plan 是只读模式，照做之前先切回 Agent
-      _currentAiMode = "agent"; try { _updateModeUI(); } catch {}
-      const s = _currentSession(); if (s) { s.mode = "agent"; try { _renderChatTabs(); saveChatHistory(); } catch {} }
-    },
+    onAccept: () => { _planExecute(_currentSession(), { via: "plan_tab" }); }, // Plan 是只读模式，照做之前先切回 Agent（三个入口共用一条放行）
     onDoc: (md, title) => { _plan.md = md; _plan.title = title; },
     isPlanMode: () => inTauri && _normalizeAiMode(_currentSession()?.mode || _currentAiMode) === "plan",
   });
   return _planTab;
 }
 const openPlanTab = (md, opts) => _planUI().openFromReply(md, opts), commitPlanTab = (turn, md) => _planUI().commit(turn, md), showPlanPane = () => _planUI().show(), hidePlanPane = () => _planTab?.hide();
+
+// ── Plan → Agent：三个入口共用的「放行」 ─────────────────────────────────────────
+//
+// 所有者（2026-09-07）：「plan 模式只能写出计划给我；用户点击执行的话，下面的 plan 模式自动切换成
+// agent 模式」。入口有三个：回复末尾的「用 Agent 执行此方案」按钮、方案页签的「按这个方案执行」、
+// 以及用户直接在输入框里说「执行 / 开始做 / 就这么办」（判据在 agent/plan-mode-offer.js 的
+// planExecuteIntent）。第三条原来没有：那一轮照旧按只读跑，模型只能再写一份方案。
+// 按钮是临时 DOM（重画历史 / 重开软件就没了），所以方案消息上打 _ideMeta.planOffer 标记，重画时按
+// 标记把按钮画回来；放行之后标记清掉、按钮撤掉，别让一份已经做完的方案还挂着「执行」。
+
+/** 这个会话有没有一份还没执行的方案（Plan 模式交付的）。 */
+function _planDelivered(sess) {
+  try {
+    if (String(sess?._lastRunState?.mode || "") === "plan") return true;
+    const entries = sess?.memory?.transcriptEntries?.() || sess?.memory?.recent || [];
+    return entries.some((m) => m?.role === "assistant" && m?._ideMeta?.planOffer === true);
+  } catch { return false; }
+}
+
+/** 放行（或被更新的方案顶替）之后：撤掉按钮、清掉标记——内存里的和已落盘的都清。 */
+function _planOfferClear(sess, via) {
+  if (!sess) return;
+  try { sess.container?.querySelectorAll?.(".plan-exec-btn").forEach((b) => b.remove()); } catch {}
+  try {
+    const entries = sess.memory?.transcriptEntries?.() || sess.memory?.recent || [];
+    // 序号算法和 _msgRecordFor 同一套（entries[seq - offset]）；同序号重写在日志那边就是更新。
+    const offset = Math.max(0, Number(sess.memory?.transcriptOffset) || 0);
+    entries.forEach((m, i) => {
+      if (!m?._ideMeta?.planOffer) return;
+      m._ideMeta = { ...m._ideMeta, planOffer: false, planExecutedVia: via };
+      try { _queueTranscriptMutation(sess, { kind: "append", sequence: offset + i, message: m }); } catch {}
+    });
+  } catch {}
+}
+
+/** 把会话从 Plan 切回 Agent，界面（底部选择器、标签页）一起跟着改。via：button / plan_tab / typed。 */
+function _planExecute(sess, { via = "button" } = {}) {
+  const s = sess || _currentSession();
+  if (!s) return false;
+  const was = _normalizeAiMode(s.mode || (s === _currentSession() ? _currentAiMode : "agent"));
+  s.mode = "agent";
+  if (s === _currentSession()) { _currentAiMode = "agent"; try { _updateModeUI(); } catch {} }
+  _planOfferClear(s, via);
+  try { _renderChatTabs(); saveChatHistory({ immediate: true }); } catch {}
+  return was === "plan";
+}
+
+/** 回复末尾那颗「用 Agent 执行此方案」。跑完当场挂一颗，重画历史时按 planOffer 标记再挂一颗。 */
+function _planExecButton(sess) {
+  const exec = document.createElement("button");
+  exec.className = "plan-exec-btn";
+  exec.type = "button";
+  exec.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="currentColor"><path d="M4 2.5v9l7-4.5z"/></svg> 用 Agent 执行此方案`;
+  exec.addEventListener("click", () => {
+    if (_isStreaming()) return;
+    exec.disabled = true;
+    _planExecute(sess || _currentSession(), { via: "button" });
+    sendPrompt("按上面给出的方案逐步实施：直接开始实现，按真实结果逐步收敛，收尾前验证。");
+  });
+  return exec;
+}
 
 
 const _preview = {
@@ -17952,6 +18010,10 @@ async function _renderMsgRange(session, from, to, options = {}) {
         feedback: m.role === "assistant" ? String(m.feedback || "") : "",
         settled: true,
       });
+      // Plan 模式交付、还没执行的方案：把「用 Agent 执行此方案」画回来（按钮是临时 DOM，重画 / 重开就没了）。
+      if (m.role === "assistant" && m._ideMeta?.planOffer === true && typeof _planExecButton === "function") {
+        try { body?.appendChild(_planExecButton(session)); } catch {}
+      }
       // 软件重启打断的那一轮：把关闭前那一刻的 DOM 快照原样塞回（思考卡、工具卡、正文段一个不少），
       // 上面按 markdown 重画的那份只是兜底。快照挂在 session 上、按 _ideMeta.interrupted + 探针认领，
       // 用过即删；之后整个容器的快照会把它一起存下来。typeof 守卫：本函数会被测试抠出来求值。
@@ -29408,6 +29470,15 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const _earlyRoot = String(sess?.project || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
   // 判据和预热那边共用一份（`_intentActivePath`）—— 不共用的话指纹对不上，预取白跑。
   const _earlyActiveForSession = _intentActivePath(_earlyRoot);
+  // Plan 模式里用户说「执行 / 开始做 / 就这么办」：这就是放行，自动切回 Agent 再跑——不然这一轮照旧
+  // 只读，模型只能再写一份方案（所有者：「用户点击执行的话，下面的 plan 模式自动切换成 agent」）。
+  // 判据在 agent/plan-mode-offer.js（planExecuteIntent）；只在确实交付过方案时才认；IDE 自己续上的
+  // 一轮（后台通知 / 实时监听）不算用户说话。
+  if (!opts.notice && _normalizeAiMode(sess?.mode || _currentAiMode) === "plan"
+      && typeof _planExecuteIntent === "function" && _planDelivered(sess) && _planExecuteIntent(text).execute) {
+    _planExecute(sess, { via: "typed" });
+    if (sess === _currentSession()) showToast("已切到 Agent 模式，按方案开始执行");
+  }
   // 本轮模式取**这个会话自己的**。_currentAiMode 只代表前台标签的选择器指着哪儿（五个
   // 写入点都同时写了 _currentSession().mode，所以 sess.mode 才是每个会话的真值）。而
   // sendPrompt 不只被"当前标签按回车"触发：插话重发、「用 Agent 执行此方案」都会拿一个
@@ -56413,6 +56484,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const _msg = { role: "assistant", content: _record, model: config.model || "" };
         if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll;
         _attachExecutionFacts(_msg, run?._mutatedFiles);
+        // Plan 模式交付的方案：打上「还没执行」标记，重画历史 / 重开软件时那颗「用 Agent 执行此方案」照样在。
+        if (run.mode === "plan" && !finalErr) { _planOfferClear(session, "superseded"); _msg._ideMeta = { ...(_msg._ideMeta || {}), planOffer: true }; }
         session.memory.push(_msg);
       }
     } catch {
@@ -56570,23 +56643,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // (Claude Code's plan → execute flow). The plan is already in history, so
     // the agent sees it.
     if (run.mode === "plan" && !finalErr && summaryText && summaryText.trim()) {
-      const exec = document.createElement("button");
-      exec.className = "plan-exec-btn";
-      exec.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="currentColor"><path d="M4 2.5v9l7-4.5z"/></svg> 用 Agent 执行此方案`;
-      exec.addEventListener("click", () => {
-        if (_isStreaming()) return;
-        exec.disabled = true;
-        const s = _currentSession();
-        if (s) {
-          s.mode = "agent";
-          _currentAiMode = "agent";
-          _updateModeUI();
-          _renderChatTabs();
-          saveChatHistory();
-        }
-        sendPrompt("按上面给出的方案逐步实施：直接开始实现，按真实结果逐步收敛，收尾前验证。");
-      });
-      body.appendChild(exec);
+      // 按钮本体和放行逻辑在 _planExecButton / _planExecute（三个入口共用）；方案消息上的 planOffer
+      // 标记在上面入账时打的，重画历史 / 重开软件时按同一个标记把按钮画回来。
+      body.appendChild(_planExecButton(session));
     }
     // Growth: an edit-bearing run that verified its own work (tests/build/diag)
     // vs shipped unverified — the beneficial-usage signal that counters deskilling.
