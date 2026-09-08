@@ -724,11 +724,8 @@ pub async fn sync_once(state: &AppState) {
         n += 1;
         for e in eps.get(&r.id).into_iter().flatten().filter(|e| e.active) {
             let key = if e.api_key.trim().is_empty() { r.api_key.clone() } else { e.api_key.clone() };
-            let tok = if e.balance_token.trim().is_empty() {
-                r.balance_token.clone()
-            } else {
-                e.balance_token.clone()
-            };
+            // 同上：令牌只在线路那一级。
+            let tok = r.balance_token.clone();
             sync_endpoint(
                 state,
                 e.id,

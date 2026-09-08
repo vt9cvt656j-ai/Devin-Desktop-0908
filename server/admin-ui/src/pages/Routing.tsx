@@ -97,6 +97,10 @@ type Conn = {
   output_price?: number;
   cache_read_price?: number;
   cache_create_price?: number;
+  /** 这条线路的价在后台按哪种货币录。**价本身永远是美元每百万 token**，这个只管输入框。 */
+  price_currency?: "usd" | "cny";
+  /** 1 美元折多少人民币（后台设置里那个全局汇率）。拿不到就只能按美元录。 */
+  cny_per_usd?: number;
   cache_disabled?: boolean;
   description?: string;
   enabled_models?: string[];
@@ -1018,6 +1022,21 @@ function CapsLine({ caps }: { caps?: Caps }) {
   return <span className="text-[10px] text-muted-foreground">{bits.join(" · ")}</span>;
 }
 
+/**
+ * 换算一个价格框里的字符串。空串原样返回 —— **留空是「跟随目录现价」，不是 0**，
+ * 换个币种不该把它变成一个具体的数。
+ *
+ * 只在切换币种时调用，不在渲染时调用：每渲染一次换算一次，用户打字打到一半就被四舍五入。
+ * 和 RouteEndpoints.tsx 里那个是同一条判据，两处必须同解。
+ */
+function convertPrice(text: string, factor: number): string {
+  const t = String(text ?? "").trim();
+  if (!t) return t;
+  const n = parseFloat(t);
+  if (!Number.isFinite(n) || n < 0 || !Number.isFinite(factor) || factor <= 0) return t;
+  return String(Number((n * factor).toFixed(6)));
+}
+
 function initialRows(c: Conn | null): Row[] {
   if (!c) return [];
   const names = asMap<string>(c.model_names);
@@ -1107,8 +1126,14 @@ function ConnectionDialog({
   const [baseUrl, setBaseUrl] = useState(conn?.base_url || "");
   const [protocol, setProtocol] = useState(conn?.protocol || "anthropic");
   const [apiKey, setApiKey] = useState("");
-  // 查余额用的控制台令牌。和 API Key 一样：留空 = 不改。
-  const [balanceToken, setBalanceToken] = useState("");
+  // 报价币种。**只管这一屏的输入框**：价存进库永远是美元每百万 token，
+  // 折算发生在切币种和保存这两个时刻（见 convertPrice / toUsd）。
+  // 汇率取不到（后台没下发）时一律锁在美元 —— 宁可显示美元，也不要用一个凭空的汇率
+  // 把整条线路的进价算错一个数量级。
+  const cnyRate = conn?.cny_per_usd && conn.cny_per_usd > 0 ? conn.cny_per_usd : 0;
+  const [currency, setCurrency] = useState<"usd" | "cny">(
+    conn?.price_currency === "cny" && (conn?.cny_per_usd ?? 0) > 0 ? "cny" : "usd",
+  );
   const [active, setActiveField] = useState(conn ? isOn(conn) : true);
   const [description, setDescription] = useState(conn?.description || "");
   const [mode, setMode] = useState(conn?.billing_mode === "per_call" ? "per_call" : "rate");
@@ -1119,11 +1144,25 @@ function ConnectionDialog({
   // 「Claude 强力版」：勾上之后，IDE 里打开强力版开关的那一轮请求只会落到这条线路上。
   const [powerRoute, setPowerRoute] = useState(Boolean(conn?.power_route));
   const [perCall, setPerCall] = useState(String(conn ? channelFeeUsd(conn) : 0.2));
-  const [rows, setRows] = useState<Row[]>(() => initialRows(conn));
+  // 库里存的是美元；这一屏若按人民币录，装进输入框时先折一次。
+  // 折在**初始化**这一步，不在渲染那一步：渲染时折会让输入框在每次按键后被四舍五入。
+  const [rows, setRows] = useState<Row[]>(() => {
+    const base = initialRows(conn);
+    const rate = conn?.cny_per_usd && conn.cny_per_usd > 0 ? conn.cny_per_usd : 0;
+    if (conn?.price_currency !== "cny" || rate <= 0) return base;
+    return base.map((r) => ({ ...r, pin: convertPrice(r.pin, rate), pout: convertPrice(r.pout, rate) }));
+  });
   const [hint, setHint] = useState("");
   const [fetching, setFetching] = useState(false);
   const [busy, setBusy] = useState(false);
   const [formErr, setFormErr] = useState("");
+
+  /// 屏幕上那个数 → 存库用的美元。选美元时是恒等。
+  const toUsd = (n: number) => (currency === "cny" && cnyRate > 0 ? Number((n / cnyRate).toFixed(9)) : n);
+  /// 美元 → 屏幕上那个数。给现价、提示这类只读展示用。
+  const toShown = (n: number) => (currency === "cny" && cnyRate > 0 ? Number((n * cnyRate).toFixed(6)) : n);
+  const sym = currency === "cny" ? "¥" : "$";
+  const ccy = currency === "cny" ? "人民币" : "美元";
 
   const patch = (id: string, part: Partial<Row>) =>
     setRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...part } : r)));
@@ -1236,7 +1275,6 @@ function ConnectionDialog({
         await api.post("/api/admin/models", {
           ...base,
           api_key: apiKey.trim(),
-          balance_token: balanceToken.trim(),
         });
       } else {
         const body: Record<string, unknown> = {
@@ -1266,10 +1304,14 @@ function ConnectionDialog({
           //
           // admin_update 是**整体替换**，不是 merge——只保留有手填价的模型，
           // 其它的不出现就等于清掉旧覆盖，自动跟随目录现价。
+          // 报价币种：只影响这一屏怎么读写，价本身永远是美元每百万 token。
+          price_currency: currency,
+          // 折回美元。库里、算钱那一路全是美元，这里和下面 toUsd 是唯一的换算点。
+          // 除以 cny_per_usd 而不是乘：那个数是「1 美元等于多少人民币」。
           model_prices: Object.fromEntries(
             on
               .filter((r) => priceNum(r.pin) !== null && priceNum(r.pout) !== null)
-              .map((r) => [r.id, { in: priceNum(r.pin) ?? 0, out: priceNum(r.pout) ?? 0 }]),
+              .map((r) => [r.id, { in: toUsd(priceNum(r.pin) ?? 0), out: toUsd(priceNum(r.pout) ?? 0) }]),
           ),
           model_billing: Object.fromEntries(
             on
@@ -1288,7 +1330,6 @@ function ConnectionDialog({
         };
         if (apiKey.trim()) body.api_key = apiKey.trim();
         // 空 = 沿用原值，和 api_key 同一规矩。一次「只改价格」的保存不该把令牌清掉。
-        if (balanceToken.trim()) body.balance_token = balanceToken.trim();
         await api.post(`/api/admin/models/${conn.id}`, body);
       }
       onSaved();
@@ -1351,24 +1392,38 @@ function ConnectionDialog({
               autoComplete="off"
             />
           </div>
+          {/*
+            这一格原来是「余额令牌」（查中转控制台余额的第二套凭据）。2026-09-08 换成报价币种。
+            令牌那一列**没有删**，已经填过的两条线路照旧能查余额，只是不再出现在表单里 ——
+            要改它得改数据库。真正的理由是这一格的位置：中转商各报各的价，海外报美元每百万
+            token，国内直接报人民币；此前只有一个美元框，运维拿到人民币报价单得自己先除一遍
+            汇率，除错一位就是整条线路的进价错一个数量级，而这件事在屏幕上看不出来。
+          */}
           <div>
-            <Label htmlFor="cd-btok">余额令牌{editing && "（留空=不改）"}</Label>
-            <Input
-              id="cd-btok"
-              type="password"
-              value={balanceToken}
-              onChange={(e) => setBalanceToken(e.target.value)}
-              placeholder="中转控制台的登录令牌"
-              autoComplete="off"
-            />
-            {/*
-              实测（2026-08-25）：线上三家中转的余额接口 /api/v1/auth/me 和
-              /api/v1/subscriptions/summary 认的是**控制台登录令牌**，不是 sk- 调用密钥。
-              拿调用密钥去问，7 个出口一个都查不到 —— 对账页的余额那一列就永远空着。
-            */}
+            <Label htmlFor="cd-cur">报价币种</Label>
+            <Select
+              id="cd-cur"
+              value={currency}
+              disabled={cnyRate <= 0}
+              onChange={(e) => {
+                const next = e.target.value === "cny" ? "cny" : "usd";
+                if (next === currency || cnyRate <= 0) { setCurrency(next); return; }
+                // 数值不变，变的只是它的单位：把每一行的两个价一起换过去。
+                const factor = next === "cny" ? cnyRate : 1 / cnyRate;
+                setRows((prev) => prev.map((r) => ({
+                  ...r, pin: convertPrice(r.pin, factor), pout: convertPrice(r.pout, factor),
+                })));
+                setCurrency(next);
+              }}
+            >
+              <option value="usd">美元（$ / 百万 token）</option>
+              <option value="cny">人民币（¥ / 百万 token）</option>
+            </Select>
             <p className="mt-1 text-xs text-muted-foreground">
-              查这个中转还剩多少钱用。多数中转的余额接口认的是控制台登录令牌，不是上面那个
-              调用密钥；留空会先拿密钥试一次。加密存储。
+              下面「开放的模型」里的入价出价按这个币种读写。<b>存进库的永远是美元</b>——
+              {cnyRate > 0
+                ? `选人民币时按后台设置里的汇率（此刻 1 美元 ≈ ¥${cnyRate.toFixed(2)}）在保存那一刻折一次，之后这条线路的价就是一个定数，以后改汇率不会改动它。`
+                : "后台还没下发汇率，暂时只能按美元录。"}
             </p>
           </div>
           {editing && (
@@ -1559,14 +1614,12 @@ function ConnectionDialog({
                       min="0"
                       step="0.01"
                       value={r.pin}
-                      placeholder={r.caps?.input_price != null ? String(r.caps.input_price) : "入价"}
+                      placeholder={r.caps?.input_price != null ? String(toShown(r.caps.input_price)) : "入价"}
                       title={
                         r.caps?.input_price != null
-                          ? `留空即用官方价 $${r.caps.input_price}/1M` +
-                            (r.caps.cny_per_usd
-                              ? `（≈ ¥${(r.caps.input_price * r.caps.cny_per_usd).toFixed(2)}/1M）`
-                              : "") +
-                            `。这一栏的单位是**美元**每百万 token。`
+                          // 官方价是美元，这里按这一屏选定的币种折过再显示。不再并排摆两种
+                          // 货币：一个框旁边有两个数，最容易发生的就是照着另一种货币的数字填。
+                          ? `留空即用官方价 ${sym}${toShown(r.caps.input_price)}/1M。这一栏的单位是**${ccy}**每百万 token。`
                           : undefined
                       }
                       aria-label={`${r.id} 输入价`}
@@ -1578,14 +1631,12 @@ function ConnectionDialog({
                       min="0"
                       step="0.01"
                       value={r.pout}
-                      placeholder={r.caps?.output_price != null ? String(r.caps.output_price) : "出价"}
+                      placeholder={r.caps?.output_price != null ? String(toShown(r.caps.output_price)) : "出价"}
                       title={
                         r.caps?.output_price != null
-                          ? `留空即用官方价 $${r.caps.output_price}/1M` +
-                            (r.caps.cny_per_usd
-                              ? `（≈ ¥${(r.caps.output_price * r.caps.cny_per_usd).toFixed(2)}/1M）`
-                              : "") +
-                            `。这一栏的单位是**美元**每百万 token。`
+                          // 官方价是美元，这里按这一屏选定的币种折过再显示。不再并排摆两种
+                          // 货币：一个框旁边有两个数，最容易发生的就是照着另一种货币的数字填。
+                          ? `留空即用官方价 ${sym}${toShown(r.caps.output_price)}/1M。这一栏的单位是**${ccy}**每百万 token。`
                           : undefined
                       }
                       aria-label={`${r.id} 输出价`}
@@ -1606,9 +1657,11 @@ function ConnectionDialog({
                                 "tabular-nums",
                                 priceGap(r) >= 2 ? "font-medium text-amber-600" : "text-muted-foreground",
                               )}
-                              title={`OpenRouter 现价 $${r.caps.input_price}/$${r.caps.output_price} 每 1M`}
+                              // OpenRouter 报的是美元；按这一屏的币种折过再说，
+                              // 否则「现价」那个数和旁边输入框里的数不是同一种货币。
+                              title={`OpenRouter 现价 ${sym}${toShown(r.caps.input_price ?? 0)}/${sym}${toShown(r.caps.output_price ?? 0)} 每 1M`}
                             >
-                              现价 {r.caps.input_price}/{r.caps.output_price}
+                              现价 {sym}{toShown(r.caps.input_price ?? 0)}/{sym}{toShown(r.caps.output_price ?? 0)}
                               {priceGap(r) >= 1.1 && ` · 你 ${priceGap(r).toFixed(1)}×`}
                             </span>
                             <button

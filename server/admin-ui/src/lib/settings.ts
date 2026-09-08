@@ -27,6 +27,13 @@ export type PlanQuota = {
 
 export type AdminSettings = {
   raw_cents_per_credit_usd: number;
+  /**
+   * 结算汇率：1 人民币分折合多少美元分，万分比。7.10 CNY/USD → 10000/7.10 ≈ 1408。
+   *
+   * **字段缺席 = 这台网关还不能改它**（老版本只能改数据库）。别给兜底值就当它支持了 ——
+   * 那会让界面印出一个能编辑的框，改了却不生效。判据同 free_points_daily_member。
+   */
+  usd_per_cny_bps?: number;
   free_points_daily: number;
   /**
    * 会员那一档配的是什么。三态，别压成两态：
@@ -40,6 +47,7 @@ export type AdminSettings = {
   plans: PlanQuota[];
   limits: {
     raw_cents_per_credit_usd: [number, number];
+    usd_per_cny_bps?: [number, number];
     free_points_daily: [number, number];
     /** 旧网关不下发。它的**存在与否**就是「这台网关认不认第二档」的探针。 */
     free_points_daily_member?: [number, number];
@@ -185,4 +193,21 @@ export function useSettings(): AdminSettings {
 /** 这台网关认不认「会员那一档」。判据是 limits 里有没有这一项，不是值是不是 null。 */
 export function memberTierSupported(s: AdminSettings = snapshot): boolean {
   return s.limits?.free_points_daily_member !== undefined;
+}
+
+/**
+ * 这台网关能不能**改**结算汇率。判据同上：看 limits 里有没有这一项。
+ *
+ * 老版本只把汇率读进来算钱，接口里既不下发也不接收 —— 那时候画一个能编辑的框，
+ * 改了却不生效，比不画更糟。
+ */
+export function fxRateEditable(s: AdminSettings = snapshot): boolean {
+  return s.limits?.usd_per_cny_bps !== undefined;
+}
+
+/** 1 美元折多少人民币。汇率没下发时返回 0 —— **不要给默认值**：一个凭空的汇率
+ *  会让按人民币录的价静默错一个数量级。 */
+export function cnyPerUsd(s: AdminSettings = snapshot): number {
+  const bps = s.usd_per_cny_bps;
+  return typeof bps === "number" && bps > 0 ? 10000 / bps : 0;
 }

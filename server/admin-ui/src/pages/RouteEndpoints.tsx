@@ -124,6 +124,8 @@ type Route = {
   /** 每个模型此刻的目录现价（每百万 token 美元）。留空的价格框按它收。 */
   catalog_prices?: Record<string, { in: number; out: number; cache_read?: number | null; cache_write?: number | null }>;
   cny_per_usd?: number;
+  /** 这条线路的价在后台按哪种货币录。价本身永远是美元每百万 token。 */
+  price_currency?: "usd" | "cny";
   sched: string;
   retry_in: number | null;
   live: string;
@@ -136,8 +138,10 @@ type Draft = {
   label: string;
   base_url: string;
   api_key: string;
-  /// 查余额用的控制台令牌。空 = 不改（和密钥同一规矩）。
-  balance_token: string;
+  /// 这条**线路**的报价币种（不是出口的）。在这个弹窗里改，保存时和价格一起提交。
+  /// 放进 draft 而不是直接改 routes：切换币种要连着把几个价格框里的数换算过去，
+  /// 那是一次编辑动作，取消弹窗就该整体作废。
+  price_currency: Currency;
   cost_ratio: string;
   note: string;
   /// 空 = 跟线路一样。
@@ -557,6 +561,26 @@ const priceNum = (s: string): number | null => {
   return Number.isFinite(n) && n >= 0 ? n : null;
 };
 
+/** 报价币种。价存进库永远是美元每百万 token，这个只管后台的输入框。 */
+type Currency = "usd" | "cny";
+
+/**
+ * 换算一个价格框里的字符串。空串原样返回 —— **留空是「跟随现价」，不是 0**，
+ * 换个币种不该把它变成一个具体的数。
+ *
+ * 只在切换币种和保存这两个时刻调用，不在每次渲染时调用：每渲染一次换算一次会让
+ * 输入框里的数被反复四舍五入，用户打字打到一半就被改掉。
+ */
+const convertPrice = (text: string, factor: number): string => {
+  const t = String(text ?? "").trim();
+  if (!t) return t;
+  const n = parseFloat(t);
+  if (!Number.isFinite(n) || n < 0 || !Number.isFinite(factor) || factor <= 0) return t;
+  // 六位有效小数：美元每百万 token 最低到 0.01，折成人民币也就 0.07，
+  // 再往下的位数是浮点噪音（`0.30000000000000004` 那种）。
+  return String(Number((n * factor).toFixed(6)));
+};
+
 export function RouteEndpoints() {
   const [routes, setRoutes] = useState<Route[] | null>(null);
   // 「按哪个模型看」。空 = 全部模型合计（老行为）。
@@ -613,7 +637,6 @@ export function RouteEndpoints() {
           label: draft.label,
           base_url: draft.base_url,
           api_key: draft.api_key,
-          balance_token: draft.balance_token,
           cost_ratio: Number(draft.cost_ratio) || 1,
           note: draft.note,
           protocol: draft.protocol,
@@ -633,10 +656,17 @@ export function RouteEndpoints() {
           // 必须原样发上去（和 Routing.tsx 那一处同解）。
           // merge_route_pricing 是 merge 模式——不出现的键会保留旧值。
           // 所以清空价格（跟随现价）必须显式发 null 让后端把旧覆盖删掉。
+          // 报价币种存在**线路**上（和价格同一条线：同线路的出口共用一份价）。
+          price_currency: draft.price_currency,
+          // 折回美元再提交。库里、算钱那一路全是美元每百万 token，这里是唯一的换算点。
+          // 除以汇率而不是乘：cny_per_usd 是「1 美元等于多少人民币」。
           model_prices: Object.fromEntries(
             Object.entries(draft.prices).map(([k, v]) => {
               const hasPrice = priceNum(v.in) !== null && priceNum(v.out) !== null;
-              return [k, hasPrice ? { in: priceNum(v.in) ?? 0, out: priceNum(v.out) ?? 0 } : null];
+              if (!hasPrice) return [k, null];
+              const rate = draft.price_currency === "cny" ? cnyRate(draft.route_id) : 0;
+              const back = (n: number) => (rate > 0 ? Number((n / rate).toFixed(9)) : n);
+              return [k, { in: back(priceNum(v.in) ?? 0), out: back(priceNum(v.out) ?? 0) }];
             }),
           ),
           model_names: Object.fromEntries(
@@ -755,16 +785,58 @@ export function RouteEndpoints() {
   const list = routes ?? [];
   /// 编辑出口时要知道它属于哪条线路 —— 那条线路开放的模型就是这个出口的可选范围。
   const routeOf = (id: string) => list.find((r) => r.id === id);
-  /// 库里**已经存着**的每模型价,字符串形态。改一半时另一半从这里回填 ——
+
+  // ── 报价币种 ──────────────────────────────────────────────────────
+  //
+  // 库里存的、后端算钱用的，**永远是美元每百万 token**。这里只有输入框和它旁边那些
+  // 提示按选定的币种显示；换算发生在两个时刻：切换币种（把框里的数换过去）和保存
+  // （换回美元再提交）。渲染时不换算 —— 每渲染一次换算一次会让用户打字打到一半被四舍五入。
+  //
+  // 汇率取后台设置里那一个（cny_per_usd = 10000 / usd_per_cny_bps），和扣费同源。
+  // 拿不到就退回美元：**宁可显示美元，也不要用一个默认汇率把人民币价算错** ——
+  // 一个凭空的汇率会静默地让整条线路的进价错一个数量级。
+  const cnyRate = (routeId: string): number => {
+    const v = routeOf(routeId)?.cny_per_usd;
+    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+  };
+  /// 这条线路此刻按哪种货币录（改到一半时以 draft 为准）。汇率取不到一律当美元。
+  const routeCurrency = (routeId: string): Currency => {
+    const want = draft && draft.route_id === routeId ? draft.price_currency : routeOf(routeId)?.price_currency;
+    return want === "cny" && cnyRate(routeId) > 0 ? "cny" : "usd";
+  };
+  /// 美元 → 屏幕上显示的那个币种。
+  const showNum = (usd: number, routeId: string): number =>
+    routeCurrency(routeId) === "cny" ? Number((usd * cnyRate(routeId)).toFixed(6)) : usd;
+  /// 当前币种的符号和中文名，只用于文案。
+  const sym = (routeId: string) => (routeCurrency(routeId) === "cny" ? "¥" : "$");
+  const ccy = (routeId: string) => (routeCurrency(routeId) === "cny" ? "人民币" : "美元");
+  /// 切币种：把几个价格框里的数一起换过去，数值本身不变，变的只是它的单位。
+  const setRouteCurrency = (routeId: string, next: Currency) => {
+    setDraft((d) => {
+      if (!d) return d;
+      const rate = cnyRate(routeId);
+      if (next === d.price_currency || rate <= 0) return { ...d, price_currency: next };
+      const factor = next === "cny" ? rate : 1 / rate;
+      const prices = Object.fromEntries(
+        Object.entries(d.prices).map(([k, v]) => [k, { in: convertPrice(v.in, factor), out: convertPrice(v.out, factor) }]),
+      );
+      return { ...d, price_currency: next, prices };
+    });
+  };
+
+  /// 库里**已经存着**的每模型价,字符串形态,按当前币种。改一半时另一半从这里回填 ——
   /// 回填空串的话,提交判据一收紧就会把这一条整个丢掉(等于运维改一半就撤销了另一半)。
   const storedPrice = (m: string, side: "in" | "out"): string => {
     const v = draft ? routeOf(draft.route_id)?.model_prices?.[m]?.[side] : undefined;
-    return v === undefined || v === null ? "" : String(v);
+    if (v === undefined || v === null) return "";
+    return String(draft ? showNum(v, draft.route_id) : v);
   };
-  /// 这个模型此刻的目录现价；目录没收录就没有。
+  /// 这个模型此刻的目录现价，按当前币种；目录没收录就没有。
   const livePrice = (m: string): { in: number; out: number } | null => {
     const v = draft ? routeOf(draft.route_id)?.catalog_prices?.[m] : undefined;
-    return v && typeof v.in === "number" && typeof v.out === "number" ? { in: v.in, out: v.out } : null;
+    return v && typeof v.in === "number" && typeof v.out === "number"
+      ? { in: showNum(v.in, draft!.route_id), out: showNum(v.out, draft!.route_id) }
+      : null;
   };
   /// 价格框里此刻显示的那个数（草稿里填的，其次库里存的）。
   const shownPrice = (m: string, side: "in" | "out"): string =>
@@ -916,10 +988,11 @@ export function RouteEndpoints() {
                       onClick={() =>
                         setDraft({
                           route_id: r.id,
+                          // 币种从线路读；这一格改的是线路，保存时随价格一起提交。
+                          price_currency: (r?.price_currency === "cny" ? "cny" : "usd"),
                           label: "",
                           base_url: "",
                           api_key: "",
-                          balance_token: "",
                           cost_ratio: "1",
                           note: "",
                           protocol: "",
@@ -1125,12 +1198,13 @@ export function RouteEndpoints() {
                                       setDraft({
                                         id: e.id,
                                         route_id: e.route_id,
+                                        // 币种从线路读；这一格改的是线路，保存时随价格一起提交。
+                                        price_currency: (routeOf(e.route_id)?.price_currency === "cny" ? "cny" : "usd"),
                                         label: e.label,
                                         base_url: e.base_url,
                                         // 服务端不回密钥，所以这里必然是空的；空着保存 = 沿用。
                                         api_key: "",
-                                        balance_token: "",
-                                        cost_ratio: String(e.cost_ratio),
+                                                      cost_ratio: String(e.cost_ratio),
                                         note: e.note,
                                         protocol: e.protocol,
                                         active: e.active,
@@ -1200,11 +1274,12 @@ export function RouteEndpoints() {
                                     setDraft({
                                       id: e.id,
                                       route_id: e.route_id,
+                                      // 币种从线路读；这一格改的是线路，保存时随价格一起提交。
+                                      price_currency: (routeOf(e.route_id)?.price_currency === "cny" ? "cny" : "usd"),
                                       label: e.label,
                                       base_url: e.base_url,
                                       api_key: "",
-                                      balance_token: "",
-                                      cost_ratio: String(e.cost_ratio),
+                                                  cost_ratio: String(e.cost_ratio),
                                       note: e.note,
                                       protocol: e.protocol,
                                       active: e.active,
@@ -1293,25 +1368,31 @@ export function RouteEndpoints() {
                   留空就用线路自己的密钥。存进库时加密，之后任何页面都读不回来。
                 </p>
               </div>
+              {/*
+                这一格原来是「余额令牌」（查中转控制台余额用的第二套凭据）。
+                2026-09-08 换成报价币种，两个理由：
+                  · 令牌那一格线上 **16 个出口填了 0 个**，从上线到现在一次都没走过 ——
+                    余额探针一直走「留空就用调用密钥」那条兜底。线路那一级还留着，探针照常。
+                  · 中转商各报各的价：海外报美元每百万 token，国内直接报人民币。此前只有一个
+                    美元框，运维拿到人民币报价单得自己先除一遍汇率再填，除错一位就是整条线路
+                    的进价错一个数量级，而这件事在屏幕上看不出来。
+                币种挂在**线路**上（同线路的出口共用一份价，见下面价格框那段注释），
+                所以这里改的是线路的字段，保存时和价格一起提交。
+              */}
               <div>
-                <Label htmlFor="e-btok">余额令牌</Label>
-                <Input
-                  id="e-btok"
-                  type="password"
-                  autoComplete="off"
-                  value={draft.balance_token}
-                  placeholder={draft.id ? "留空 = 不改" : "中转控制台的登录令牌"}
-                  onChange={(ev) => setDraft({ ...draft, balance_token: ev.target.value })}
-                />
-                {/*
-                  为什么要单独一个令牌：实测线上三家中转的余额接口
-                  （/api/v1/auth/me、/api/v1/subscriptions/summary）认的是**控制台登录令牌**，
-                  不是 sk- 开头的调用密钥 —— 拿调用密钥去问，7 个出口一个都查不到，
-                  对账页的余额那一列就永远空着。留空会先拿调用密钥试一次（有些中转两者通用）。
-                */}
+                <Label htmlFor="e-cur">报价币种</Label>
+                <Select
+                  id="e-cur"
+                  value={routeCurrency(draft.route_id)}
+                  onChange={(ev) => setRouteCurrency(draft.route_id, ev.target.value as Currency)}
+                >
+                  <option value="usd">美元（$ / 百万 token）</option>
+                  <option value="cny">人民币（¥ / 百万 token）</option>
+                </Select>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  查余额用。多数中转的余额接口认的是控制台登录令牌，不是调用密钥——
-                  留空会先拿密钥试一次。同样加密存储。
+                  下面的价格框按这个币种读写。<b>存进库的永远是美元</b>——选人民币时按后台
+                  设置里的汇率（此刻 1 美元 ≈ ¥{(routeOf(draft.route_id)?.cny_per_usd ?? 0).toFixed(2)}）
+                  在保存那一刻折一次，之后这条线路的价就是一个定数，以后改汇率不会改动它。
                 </p>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
@@ -1530,12 +1611,12 @@ export function RouteEndpoints() {
                           placeholder={livePrice(m) ? String(livePrice(m)!.in) : "输入价"}
                           title={
                             livePrice(m)
-                              ? `留空即按现价 $${livePrice(m)!.in}/1M 收` +
-                                (routeOf(draft.route_id)?.cny_per_usd
-                                  ? `（≈ ¥${(livePrice(m)!.in * routeOf(draft.route_id)!.cny_per_usd!).toFixed(2)}/1M）`
-                                  : "") +
-                                "。单位是美元每百万 token，这是用户付的价。"
-                              : "目录里没有这个模型的现价：要开放它，入价出价都得填（美元每百万 token）"
+                              // 现价（目录价）本身是美元，livePrice 已经按这条线路的币种折过了，
+                              // 所以这里直接用，不再乘一次汇率。选人民币时不再并排显示美元：
+                              // 一个框旁边摆两种货币，最容易发生的就是照着另一种的数字填。
+                              ? `留空即按现价 ${sym(draft.route_id)}${livePrice(m)!.in}/1M 收。`
+                                + `单位是${ccy(draft.route_id)}每百万 token，这是用户付的价。`
+                              : `目录里没有这个模型的现价：要开放它，入价出价都得填（${ccy(draft.route_id)}每百万 token）`
                           }
                           value={
                             draft.prices[m]?.in ?? storedPrice(m, "in")
@@ -1556,12 +1637,12 @@ export function RouteEndpoints() {
                           placeholder={livePrice(m) ? String(livePrice(m)!.out) : "输出价"}
                           title={
                             livePrice(m)
-                              ? `留空即按现价 $${livePrice(m)!.out}/1M 收` +
-                                (routeOf(draft.route_id)?.cny_per_usd
-                                  ? `（≈ ¥${(livePrice(m)!.out * routeOf(draft.route_id)!.cny_per_usd!).toFixed(2)}/1M）`
-                                  : "") +
-                                "。单位是美元每百万 token，这是用户付的价。"
-                              : "目录里没有这个模型的现价：要开放它，入价出价都得填（美元每百万 token）"
+                              // 现价（目录价）本身是美元，livePrice 已经按这条线路的币种折过了，
+                              // 所以这里直接用，不再乘一次汇率。选人民币时不再并排显示美元：
+                              // 一个框旁边摆两种货币，最容易发生的就是照着另一种的数字填。
+                              ? `留空即按现价 ${sym(draft.route_id)}${livePrice(m)!.out}/1M 收。`
+                                + `单位是${ccy(draft.route_id)}每百万 token，这是用户付的价。`
+                              : `目录里没有这个模型的现价：要开放它，入价出价都得填（${ccy(draft.route_id)}每百万 token）`
                           }
                           value={
                             draft.prices[m]?.out ?? storedPrice(m, "out")
@@ -1592,7 +1673,7 @@ export function RouteEndpoints() {
                             return (
                               <span
                                 className="text-[11px] text-emerald-600"
-                                title={`按 OpenRouter 现价收：$${live.in}/$${live.out} 每 1M，它降价你自动跟着降`}
+                                title={`按 OpenRouter 现价收：${sym(draft.route_id)}${live.in}/${sym(draft.route_id)}${live.out} 每 1M，它降价你自动跟着降`}
                               >
                                 跟随现价
                               </span>
@@ -1640,7 +1721,7 @@ export function RouteEndpoints() {
                           <Badge
                             variant="outline"
                             className="shrink-0 border-destructive/40 text-destructive"
-                            title="目录里查不到这个模型的官方价。在左边两个价都填上（每百万 token 美元）就能开放 —— 那是用户付的价，不是你的进价。不填的话用户一分不付、上游照收你的钱。"
+                            title={`目录里查不到这个模型的官方价。在左边两个价都填上（每百万 token ${ccy(draft.route_id)}）就能开放 —— 那是用户付的价，不是你的进价。不填的话用户一分不付、上游照收你的钱。`}
                           >
                             要填价
                           </Badge>
@@ -1661,7 +1742,7 @@ export function RouteEndpoints() {
                   勾上才会<b>新增到 IDE 的模型列表</b>，按这条线路的倍率计费。
                   <br />
                   <b className="text-foreground">输入价 / 输出价是「用户付多少」，不是你的进价。</b>
-                  单位每百万 token 美元，最终扣费 = 这个价 × 这条线路的倍率。
+                  单位每百万 token {ccy(draft.route_id)}，最终扣费 = 这个价 × 这条线路的倍率。
                   <b>填了会存到线路上</b>（同一条线路的几个出口共用一份价，和「线路」那页是同一份）；
                   留空 = 按框里灰字写的现价收，它降价你自动跟着降；目录里没现价的要两个都填。
                   你付给中转的<b>进价</b>在「模型对账」里填，两者不是一回事 ——

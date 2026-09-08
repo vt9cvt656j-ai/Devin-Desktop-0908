@@ -87,8 +87,9 @@ pub async fn snapshot_once(state: &AppState) {
             vec![(r.id, r.base_url.clone(), r.api_key.clone(), r.balance_token.clone())];
         for e in eps.get(&r.id).into_iter().flatten().filter(|e| e.active) {
             let key = if e.api_key.trim().is_empty() { r.api_key.clone() } else { e.api_key.clone() };
-            // 出口没配令牌就用线路的 —— 同一个中转账号挂几个入口是常见配置。
-            let btok = if e.balance_token.trim().is_empty() { r.balance_token.clone() } else { e.balance_token.clone() };
+            // 余额令牌只在**线路**那一级有：出口那一格线上 16 个填了 0 个（2026-09-08 实测），
+            // 整列已删。同一个中转账号挂几个入口是常见配置，本来也是共用线路那一份。
+            let btok = r.balance_token.clone();
             targets.push((e.id, e.base_url.clone(), key, btok));
         }
         for (id, base, key, btok) in targets {

@@ -2427,6 +2427,17 @@ pub struct Model {
     /// api_key 是 `sk-` 开头的调用密钥。实测线上三家中转都是这个情况。
     #[sqlx(default)]
     pub balance_token: String,
+    /// 这条线路的价**在后台是按哪种货币录的**：`"usd"`（默认）或 `"cny"`。
+    ///
+    /// 它只管录入和显示，**不管记账**：下面几个价格字段无论选哪种货币，存进来的永远是
+    /// 「美元每百万 token」。后台在保存的那一刻按 `usd_per_cny_bps` 折一次，之后这条线路
+    /// 的价就是一个确定的美元数，和以后的汇率再无关系（汇率变了不该改写历史价）。
+    ///
+    /// 为什么要有它：中转商各报各的价，海外报美元、国内直接报人民币。此前只有一个美元框，
+    /// 运维拿到人民币报价单得自己先除一遍汇率，除错一位就是整条线路的进价错一个数量级，
+    /// 而这件事在屏幕上看不出来。
+    #[sqlx(default)]
+    pub price_currency: String,
     /// USD per 1,000,000 INPUT tokens (real-API unit). 0 = not set → bill the flat `rate`.
     pub input_price: f64,
     /// USD per 1,000,000 OUTPUT tokens. 0 = not set → bill the flat `rate`.
@@ -2528,6 +2539,7 @@ impl Model {
         Model {
             id: uuid::Uuid::new_v4(),
             balance_token: String::new(),
+            price_currency: "usd".into(),
             label: String::new(),
             provider: String::new(),
             base_url: String::new(),
@@ -3597,6 +3609,10 @@ pub async fn admin_list(
                 "id": m.id, "label": m.label, "provider": m.provider, "base_url": m.base_url,
                 "model_id": m.model_id, "api_key_masked": mask(&m.api_key), "has_key": !m.api_key.is_empty(),
                 "price_cents": m.price_cents, "rate": m.rate, "active": m.active, "sort": m.sort, "created_at": m.created_at,
+                // 这条线路的价在后台按哪种货币录。只管输入框，价本身永远是美元每百万 token。
+                "price_currency": m.price_currency,
+                // 汇率一并下发，前端才折得动（此前只有「多路由」那页有这个数）。
+                "cny_per_usd": 10_000.0 / crate::settings::usd_per_cny_bps() as f64,
                 "input_price": m.input_price, "output_price": m.output_price,
                 "cache_read_price": m.cache_read_price, "cache_create_price": m.cache_create_price,
                 "description": m.description,
@@ -4204,6 +4220,10 @@ pub struct UpdateReq {
     /// 查余额用的控制台令牌。空/缺省 = 沿用原值（和 api_key 同一规矩）。
     pub balance_token: Option<String>,
     pub rate: Option<f64>,
+    /// 这条线路的价按哪种货币录：`"usd"` / `"cny"`。缺省 = 沿用原值。
+    /// **只影响后台的输入框**：下面几个价传上来的时候已经是美元了，折算在前端保存的那一刻做完。
+    /// 后端只负责把这个选择存下来，好让下次打开表单知道该按哪种货币显示。
+    pub price_currency: Option<String>,
     pub input_price: Option<f64>,
     pub output_price: Option<f64>,
     pub cache_read_price: Option<f64>,
@@ -4383,7 +4403,7 @@ pub async fn admin_update(
     };
     // 没传就保持原值——和上面 protocol 一样的语义，别让一次只改价格的保存把开关关掉。
     let effort_passthrough = req.effort_passthrough.unwrap_or(m.effort_passthrough);
-    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22, model_caps=$23, power_route=$24, cache_disabled=$25, balance_token=$26 WHERE id=$19")
+    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22, model_caps=$23, power_route=$24, cache_disabled=$25, balance_token=$26, price_currency=$27 WHERE id=$19")
         .bind(&label)
         .bind(&provider)
         .bind(&base_url)
@@ -4410,6 +4430,13 @@ pub async fn admin_update(
         .bind(req.power_route.unwrap_or(m.power_route))
         .bind(req.cache_disabled.unwrap_or(m.cache_disabled))
         .bind(&balance_token)
+        // 只认两个值。传别的一律落回 usd —— 这一列有 CHECK 约束，
+        // 让一个拼错的值把整次保存打成 500 是更坏的结果。
+        .bind(match req.price_currency.as_deref() {
+            Some("cny") => "cny",
+            Some("usd") => "usd",
+            _ => m.price_currency.as_str(),
+        })
         .execute(&state.db)
         .await?;
     // 线路上取消勾选的模型，也要从它的出口上拿掉。

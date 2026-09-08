@@ -24,7 +24,7 @@ import {
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { cents } from "@/lib/format";
-import { applySettings, creditCentsFromRaw, memberTierSupported, useSettings, type AdminSettings, type PlanQuota } from "@/lib/settings";
+import { applySettings, creditCentsFromRaw, fxRateEditable, memberTierSupported, useSettings, type AdminSettings, type PlanQuota } from "@/lib/settings";
 
 /**
  * 设置 —— 三个原本写死在代码里的运营参数，现在落在 app_settings / plan_quotas 表里。
@@ -71,6 +71,16 @@ function planDraftFrom(plans: PlanQuota[]): PlanDraft {
   return d;
 }
 
+/** 万分比 → 「1 美元 = 多少人民币」。拿不到就空串（**不给默认值**，见 cnyPerUsd）。 */
+function fxToYuan(bps: number | undefined): string {
+  return typeof bps === "number" && bps > 0 ? String(Number((10000 / bps).toFixed(4))) : "";
+}
+/** 「1 美元 = 多少人民币」→ 万分比。输入非法回 0，调用方据此拒绝提交。 */
+function yuanToFx(text: string): number {
+  const n = parseFloat(String(text).trim());
+  return Number.isFinite(n) && n > 0 ? Math.round(10000 / n) : 0;
+}
+
 function Hint({ children }: { children: React.ReactNode }) {
   return <p className="mt-2 text-xs leading-relaxed text-muted-foreground">{children}</p>;
 }
@@ -83,6 +93,12 @@ export function Settings() {
   const [busy, setBusy] = useState(false);
 
   const [denomInput, setDenomInput] = useState(toDollars(live.raw_cents_per_credit_usd));
+  /**
+   * 汇率输入框用「1 美元 = 多少人民币」（7.10），因为那是运营脑子里的数；
+   * 库里存的是它的**倒数的万分比**（1 人民币分折多少美元分，1408）。
+   * 两个方向都在这一屏换算，别把万分比摆到用户面前 —— 1408 这个数没有人能一眼判断对错。
+   */
+  const [fxInput, setFxInput] = useState(fxToYuan(live.usd_per_cny_bps));
   const [freeInput, setFreeInput] = useState(String(live.free_points_daily));
   /**
    * 会员那一档的草稿。**空串 = 跟随非会员**（提交 `_clear: true`），填 0 = 关掉会员的
@@ -159,6 +175,7 @@ export function Settings() {
       const r = await api.post<AdminSettings>("/api/admin/settings", body);
       applySettings(r);
       setDenomInput(toDollars(r.raw_cents_per_credit_usd));
+      if (typeof r.usd_per_cny_bps === "number") setFxInput(fxToYuan(r.usd_per_cny_bps));
       setFreeInput(String(r.free_points_daily));
       // 保存接口返回的**是另一份更小的 JSON**（settings.rs::admin_put 结尾那个 json!，
       // 没有 limits、没有 raw_cents_per_point），所以这里只按值回填，不去重算「支不支持」。
@@ -218,6 +235,46 @@ export function Settings() {
             <Badge variant={msg.ok ? "success" : "outline"}>{msg.ok ? "已保存" : "未保存"}</Badge>
             <span className="ml-2">{msg.text}</span>
           </div>
+        </SectionReveal>
+      )}
+
+      {/*
+        结算汇率。这一格 2026-09-08 才补上：在此之前汇率**只能改数据库**，而上面那段
+        「由 1 点 = 1 人民币分和下面那格汇率推导，改汇率它自动跟上」的文案早就写着它 ——
+        那格 UI 一直不存在。线路按人民币报价（模型线路 → 线路 / 多路由）直接踩在它上面：
+        汇率错，录进去的每一条人民币价都错，而屏幕上看不出来。
+      */}
+      {fxRateEditable(live) && (
+        <SectionReveal delay={60}>
+          <Panel title="结算汇率" bodyClassName="p-5">
+            <div className="max-w-md">
+              <Label htmlFor="fx">1 美元 = 多少人民币</Label>
+              <Input
+                id="fx"
+                inputMode="decimal"
+                value={fxInput}
+                onChange={(e) => setFxInput(e.target.value)}
+                className="mt-1.5"
+              />
+              <Hint>
+                当前 <span className="tabular-nums">¥{fxToYuan(live.usd_per_cny_bps) || "—"}</span>。
+                两个地方用它：<b>每一笔扣费</b>（计价全程按美元算，最后一步折成用户钱包的人民币口径），
+                以及<b>线路按人民币报价时的折算</b>。
+                改它<b>不会改写任何已存的价</b> —— 那是当初谈定的价，不该随汇率漂；
+                也不改动任何人已有的余额，改的是往后每一笔的折算。
+              </Hint>
+              <Button
+                className="mt-3"
+                disabled={busy || yuanToFx(fxInput) <= 0 || yuanToFx(fxInput) === live.usd_per_cny_bps}
+                onClick={() => void save({ usd_per_cny_bps: yuanToFx(fxInput) }, "汇率已更新")}
+              >
+                保存汇率
+              </Button>
+              {fxInput.trim() !== "" && yuanToFx(fxInput) <= 0 && (
+                <Hint>填一个大于 0 的数，比如 7.10。</Hint>
+              )}
+            </div>
+          </Panel>
         </SectionReveal>
       )}
 

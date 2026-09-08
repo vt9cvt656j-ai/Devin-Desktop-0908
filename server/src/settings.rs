@@ -552,11 +552,16 @@ pub async fn admin_get(claims: Claims) -> ApiResult<Json<serde_json::Value>> {
     let s = current();
     Ok(Json(json!({
         "raw_cents_per_credit_usd": s.raw_cents_per_credit_usd,
+        // 结算汇率。2026-09-08 才补进这个接口：在此之前它**只能改数据库**，
+        // 而设置页的文案早就写着「改下面那格汇率它自动跟上」——那格 UI 根本不存在。
+        // 线路按人民币报价这件事直接踩在它上面：汇率错，录进去的每一条人民币价都错。
+        "usd_per_cny_bps": s.usd_per_cny_bps,
         "free_points_daily": s.free_points_daily,
         "plans": plans_json(),
         "limits": {
             "raw_cents_per_credit_usd": [MIN_RAW_CENTS_PER_CREDIT_USD, MAX_RAW_CENTS_PER_CREDIT_USD],
             "free_points_daily": [MIN_FREE_POINTS_DAILY, MAX_FREE_POINTS_DAILY],
+            "usd_per_cny_bps": [MIN_USD_PER_CNY_BPS, MAX_USD_PER_CNY_BPS],
         },
         // 只读：由**后台设定**推导，不是编译期常量。100 积分 = ¥1，所以 1 点 = 1 人民币分，
         // 折成真实计费分要过 usd_per_cny_bps —— 改那一格，这个数自动跟上。
@@ -578,6 +583,10 @@ pub struct PlanPatch {
 #[derive(Debug, Deserialize)]
 pub struct SettingsPatch {
     pub raw_cents_per_credit_usd: Option<i64>,
+    /// 结算汇率：1 人民币分折合多少美元分，万分比。7.10 CNY/USD → 10000/7.10 ≈ 1408。
+    /// 不传 = 不改。**改它会改变每一笔新扣费的人民币口径**，也会改变后台按人民币录价时
+    /// 的折算，但**不改写任何已存的美元价**——那是当初谈定的价，不该随汇率漂。
+    pub usd_per_cny_bps: Option<i64>,
     pub free_points_daily: Option<i64>,
     /// 会员那一档每天赠送多少点。不传 = 这一项不改。
     pub free_points_daily_member: Option<i64>,
@@ -670,6 +679,7 @@ pub async fn admin_put(
         .map_err(|e| AppError::internal(format!("开启事务失败: {e}")))?;
 
     if req.raw_cents_per_credit_usd.is_some()
+        || req.usd_per_cny_bps.is_some()
         || req.free_points_daily.is_some()
         || req.default_model.is_some()
         // 新增的两条必须在这里。前端按「只提交改过的那一档」发请求，「只改会员档」是
@@ -681,6 +691,7 @@ pub async fn admin_put(
         sqlx::query(
             "UPDATE app_settings SET \
                raw_cents_per_credit_usd = COALESCE($1, raw_cents_per_credit_usd), \
+               usd_per_cny_bps = COALESCE($7, usd_per_cny_bps), \
                free_points_daily = COALESCE($2, free_points_daily), \
                default_model = COALESCE($4, default_model), \
                free_points_daily_member = CASE WHEN $5 THEN NULL \
@@ -696,6 +707,9 @@ pub async fn admin_put(
         // 都没有 → COALESCE 保持原样。
         .bind(req.free_points_daily_member_clear)
         .bind(req.free_points_daily_member.map(|v| v as i32))
+        // 夹在合法区间：这个数是每一笔扣费的除数，一个离谱的值会静默地把全站账单
+        // 放大或抹平。区间和 settings 里的常量、迁移里的 CHECK 三处一致。
+        .bind(req.usd_per_cny_bps.map(|v| v.clamp(MIN_USD_PER_CNY_BPS, MAX_USD_PER_CNY_BPS) as i32))
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::internal(format!("写入设置失败: {e}")))?;
@@ -737,6 +751,7 @@ pub async fn admin_put(
     Ok(Json(json!({
         "ok": true,
         "raw_cents_per_credit_usd": s.raw_cents_per_credit_usd,
+        "usd_per_cny_bps": s.usd_per_cny_bps,
         "free_points_daily": s.free_points_daily,
         "plans": plans_json(),
     })))

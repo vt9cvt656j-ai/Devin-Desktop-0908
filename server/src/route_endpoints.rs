@@ -111,11 +111,6 @@ pub struct Endpoint {
     pub probe_ms: Option<i32>,
     pub probe_note: String,
     /// 查余额用的凭据（加密存）。空 = 没配，退回去用调用密钥试。
-    ///
-    /// 和 api_key 分开是因为它们是**两套凭据**：余额接口要的是控制台登录令牌，
-    /// 而 api_key 是 `sk-` 开头的调用密钥。实测线上三家中转都是这个情况。
-    #[sqlx(default)]
-    pub balance_token: String,
     /// 最近一次**真实成功**／**真实失败**的时刻，从 `route_attempt` 连出来的，
     /// 不是这张表自己的列。排序拿它当「执行事实」用，见 `availability_tier`。
     #[sqlx(default)]
@@ -2329,6 +2324,9 @@ pub struct RouteOut {
     pub catalog_prices: serde_json::Value,
     /// 人民币口径的换算，和「线路」页同源。
     pub cny_per_usd: f64,
+    /// 这条线路的价在后台按哪种货币录：`"usd"` / `"cny"`。**只管输入框怎么读怎么写**，
+    /// 上面那些价字段无论如何都是美元每百万 token。
+    pub price_currency: String,
     /// 线路自带那个地址的调度状态（它也是一个出口）。
     pub sched: &'static str,
     pub retry_in: Option<u64>,
@@ -2500,9 +2498,11 @@ pub async fn admin_health(
                 e.probe_ms,
                 e.probe_note.clone(),
                 key,
-                // 出口没配令牌就用线路的：同一个中转账号下挂几个入口地址是常见配置，
-                // 逼人把同一个令牌抄几遍只会抄错。
-                if e.balance_token.trim().is_empty() { r.balance_token.clone() } else { e.balance_token.clone() },
+                // 令牌只在**线路**那一级有。出口那一级曾经也有一格，线上 16 个出口
+                // 填了的是 0 个（2026-09-08 实测），而那一格正好挡着币种选择的位置，
+                // 所以整列删了。同一个中转账号下挂几个入口地址是常见配置，
+                // 本来也是共用线路那一份。
+                r.balance_token.clone(),
             ));
         }
 
@@ -2732,6 +2732,7 @@ pub async fn admin_list(
             model_prices: r.model_prices.clone(),
             model_names: r.model_names.clone(),
             cny_per_usd: 10_000.0 / crate::settings::usd_per_cny_bps() as f64,
+            price_currency: r.price_currency.clone(),
             sched: sched_word(r.id),
             retry_in: retry_in_secs(r.id),
             live: aggregate_live(&state, r.id, now).await.to_string(),
@@ -2776,10 +2777,6 @@ pub struct SaveReq {
     /// 空串 = 跟线路一样。只收 anthropic / openai。
     #[serde(default, deserialize_with = "null_as_default")]
     pub protocol: String,
-    /// 查余额用的控制台令牌。空串 = **不改**（和 api_key 同一规矩：改地址时
-    /// 不用把令牌再抄一遍）。要清空得另外做一个动作，别让「没填」等于「清掉」。
-    #[serde(default, deserialize_with = "null_as_default")]
-    pub balance_token: String,
     /// 能扛多少（相对值）。None / 0 = 不填。
     #[serde(default)]
     pub capacity: Option<f64>,
@@ -3013,13 +3010,13 @@ pub async fn admin_save(
         Some(id) => {
             // 密钥空着 = 沿用原值。这一步必须在 UPDATE 之外先取出来，
             // 不然一次「只改地址」的保存会把密钥清成空。
-            let keep: Option<(String, String, String)> = sqlx::query_as(
-                "SELECT api_key, balance_token, key_fp FROM route_endpoints WHERE id = $1",
+            let keep: Option<(String, String)> = sqlx::query_as(
+                "SELECT api_key, key_fp FROM route_endpoints WHERE id = $1",
             )
             .bind(id)
             .fetch_optional(&state.db)
             .await?;
-            let Some((keep, keep_tok, keep_fp)) = keep else {
+            let Some((keep, keep_fp)) = keep else {
                 return Err(AppError::bad("这个出口不存在"));
             };
             // 指纹必须和密钥同进同退：密钥沿用原值时指纹也沿用，否则一次「只改地址」的
@@ -3034,17 +3031,11 @@ pub async fn admin_save(
             } else {
                 crate::field_crypto::encrypt(req.api_key.trim(), crate::models::MODEL_KEY_CTX)
             };
-            // 令牌和密钥同一条规矩：空 = 沿用。一次「只改地址」的保存不该把它清掉。
-            let stored_tok = if req.balance_token.trim().is_empty() {
-                keep_tok
-            } else {
-                crate::field_crypto::encrypt(req.balance_token.trim(), crate::models::MODEL_KEY_CTX)
-            };
             sqlx::query(
                 "UPDATE route_endpoints SET route_id = $2, label = $3, base_url = $4, \
                  api_key = $5, cost_ratio = $6, active = $7, note = $8, \
                  enabled_models = $9, protocol = $10, capacity = $11, \
-                 balance_token = $12, key_fp = $13, updated_at = now() \
+                 key_fp = $12, updated_at = now() \
                  WHERE id = $1",
             )
             .bind(id)
@@ -3058,7 +3049,6 @@ pub async fn admin_save(
             .bind(&enabled_models)
             .bind(&protocol)
             .bind(capacity)
-            .bind(&stored_tok)
             .bind(&key_fp)
             .execute(&state.db)
             .await
@@ -3068,18 +3058,10 @@ pub async fn admin_save(
         None => {
             let stored =
                 crate::field_crypto::encrypt(req.api_key.trim(), crate::models::MODEL_KEY_CTX);
-            // 新建时空令牌就存空串，**不能**走 encrypt —— 没配 FIELD_ENC_KEY 时它是
-            // passthrough，配了则会把空串加密成一段密文，那段密文解出来不是空，
-            // 于是「没配令牌」会被后面的 `trim().is_empty()` 判成「配了」。
-            let stored_tok = if req.balance_token.trim().is_empty() {
-                String::new()
-            } else {
-                crate::field_crypto::encrypt(req.balance_token.trim(), crate::models::MODEL_KEY_CTX)
-            };
             sqlx::query_scalar(
                 "INSERT INTO route_endpoints (route_id, label, base_url, api_key, cost_ratio, \
-                 active, note, enabled_models, protocol, capacity, balance_token, key_fp) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
+                 active, note, enabled_models, protocol, capacity, key_fp) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id",
             )
             .bind(req.route_id)
             .bind(&label)
@@ -3091,7 +3073,6 @@ pub async fn admin_save(
             .bind(&enabled_models)
             .bind(&protocol)
             .bind(capacity)
-            .bind(&stored_tok)
             .bind(key_fingerprint(&req.api_key))
             .fetch_one(&state.db)
             .await
@@ -3611,7 +3592,6 @@ mod tests {
     fn ep(cost: f64, probe: Option<bool>, url: &str) -> Endpoint {
         Endpoint {
             id: uuid::Uuid::new_v4(),
-            balance_token: String::new(),
             last_ok_at: None,
             last_fail_at: None,
             real_sum: None,
@@ -4729,6 +4709,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 报价币种**只管后台的输入框**，一个字都不许漏进算钱那一路。
+    ///
+    /// 2026-09-08 加了「线路按美元还是人民币报价」。这件事很容易做成一场事故：
+    /// 只要有人图省事，让 `compute_cost` 那条路去看一眼币种、按汇率折一下，
+    /// 历史账就会**随汇率漂**——今天算出来的成本，明天改个汇率就变了另一个数，
+    /// 而 plan_health.rs 那句「单位永不随汇率漂」正是为此写的。
+    ///
+    /// 所以判据是结构性的：折算只许发生在后台前端（保存那一刻折回美元），
+    /// Rust 这边**只存这个选择**，从不拿它做任何算术。
+    #[test]
+    fn the_quote_currency_never_touches_the_money_path() {
+        let s = src();
+        // 只准出现在两个地方：结构体字段声明，和列表下发时的一次 clone。
+        let uses: Vec<&str> = s
+            .lines()
+            .filter(|l| l.contains("price_currency") && !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect();
+        assert!(
+            uses.len() <= 3,
+            "price_currency 在 route_endpoints.rs 里出现了 {} 处，只该有字段声明和一次下发：\n{}",
+            uses.len(),
+            uses.join("\n"),
+        );
+        for line in &uses {
+            assert!(
+                !line.contains("usd_per_cny_bps") && !line.contains("cny_per_usd") && !line.contains('*') && !line.contains('/'),
+                "币种参与了算术 —— 折算只许在后台前端做，这里一折，历史账就随汇率漂：{line}",
+            );
+        }
+        // 存的价永远是美元：出口表上一个计价列都不许有（这条由隔壁那个测试守着），
+        // 而线路上那几个价格字段的单位注释必须还写着美元。
+        let m = include_str!("models.rs");
+        assert!(
+            m.contains("/// USD per 1,000,000 INPUT tokens"),
+            "线路上输入价的单位注释被改了 —— 那是全链路唯一说明单位的地方",
+        );
     }
 
     /// 合并，不是覆盖。
@@ -6051,7 +6069,6 @@ mod retire_tests {
     fn ep(enabled: &[&str], active: bool, label: &str, url: &str) -> Endpoint {
         Endpoint {
             id: uuid::Uuid::new_v4(),
-            balance_token: String::new(),
             last_ok_at: None,
             last_fail_at: None,
             real_sum: None,

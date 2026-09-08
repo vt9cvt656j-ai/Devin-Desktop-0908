@@ -207,6 +207,8 @@ impl ByoUpstream {
             price_cents: 0,
             rate: 0.0,
             balance_token: String::new(),
+            // 自定义端点不走后台录价，币种没有意义；给默认值让结构体完整。
+            price_currency: "usd".into(),
             input_price: 0.0,
             output_price: 0.0,
             cache_read_price: 0.0,
