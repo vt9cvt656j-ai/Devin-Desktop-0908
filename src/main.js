@@ -25356,7 +25356,16 @@ function _ideSemanticProfile(profile) {
   // （实测 {uiProject:true} 就点亮）。现在快通道会产这个字段了，判据仍要按"确实声明了要
   // 数据"来判，缺席时不点。
   add("design_data", p.uiProject && ["local", "server", "inspect_existing", "undecided"].includes(p.dataStrategy));
-  add("design_motion", p.motionDesignRequired || p.advancedMotionRequired || p.motionChoreographyRequired || p.fullWebsite);
+  // 动效：四个声明字段 + 整站。**再加一条「改已有界面」**——那四个字段是裁决模型填的，
+  // 用户说「按钮改好看点」不会让它填 true；而 fullWebsite 明确排除了改现有页面。
+  // 结果是「改 UI 效果」这条路上一条动效指导都拿不到（实测那一轮全部动效知识只有一行
+  // --duration:150ms），而 hover 抬升、焦点环、点击反馈恰恰是这类请求要的全部内容。
+  add("design_motion", p.motionDesignRequired || p.advancedMotionRequired || p.motionChoreographyRequired
+    || p.fullWebsite || (p.ui && p.workspaceAction === "modify"));
+  // 改已有界面：先取证再改、只改被要求的那个。服务端也按用户原话推了一遍
+  // （prompts.rs 的 looks_like_restyle_task），两边都判是因为这类请求最高频、
+  // 而裁决模型最容易漏填字段——用户就说四个字「改好看点」。
+  add("design_restyle", p.ui && p.workspaceAction === "modify");
   // 设计验收模块（起 dev server、桌面+手机矩阵）只在用户要求看 / 测页面时挂：档位 none 的一轮不挂。
   add("design_verification", p.ui && p.workspaceAction === "modify" && !!p.automationNeed && p.automationNeed !== "none");
   add("design_knowledge_full", p.fullWebsite || p.designMode === "michael_design_2_5_greenfield" || p.changeScope === "project" || p.changeScope === "system");
