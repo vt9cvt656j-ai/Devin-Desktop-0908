@@ -4526,15 +4526,17 @@ mod tests {
         let i = s.find("pub async fn admin_save(").expect("保存入口不见了");
         let body = &s[i..];
         assert!(
-            body.contains("enabled_models.iter().all(|m| allowed.contains(m))"),
+            body.contains("enabled_models.iter().all(|m| has_model(&allowed, m))"),
             "还在按长度判：勾了同样多但含新模型时，那几个新模型会被静默清掉"
         );
         // 纯逻辑复现一遍，防止实现改成别的等价写法后这条断言失去意义。
         let allowed = vec!["a".to_string(), "b".into(), "c".into()];
         let same_len_but_different = vec!["a".to_string(), "b".into(), "新模型".into()];
-        let exactly = vec!["a".to_string(), "b".into(), "c".into()];
+        // 大小写变体属于「正好等于线路那一份」：存成空 = 跟线路走，以后线路加模型它自动跟着有。
+        let exactly = vec!["A".to_string(), "b".into(), "C".into()];
+        // 复现的是实现里那条判据本身（含忽略大小写那把尺），不是它的旧写法。
         let judge = |sel: &Vec<String>| {
-            sel.len() == allowed.len() && sel.iter().all(|m| allowed.contains(m))
+            sel.len() == allowed.len() && sel.iter().all(|m| has_model(&allowed, m))
         };
         assert!(!judge(&same_len_but_different), "含新模型的选择被当成了「就是线路那一份」");
         assert!(judge(&exactly));
@@ -4602,7 +4604,9 @@ mod tests {
         let i = s.find("pub async fn admin_save(").expect("保存入口不见了");
         let body = &s[i..];
         let merged = body.find("merge_route_pricing(&state, &mut route, &req)").expect("没合并定价");
-        let gate = body.find("!allowed.contains(m) && !priceable(&route, m)").expect("价格闸不见了");
+        let gate = body
+            .find("!has_model(&allowed, m) && !priceable(&route, m)")
+            .expect("价格闸不见了");
         assert!(
             merged < gate,
             "价格闸跑在合并之前：这次填的价还没落库，新模型必然被判成「查不到价」"
@@ -4616,7 +4620,7 @@ mod tests {
         let i = s.find("pub async fn admin_save(").expect("保存入口不见了");
         let body = &s[i..];
         assert!(
-            body.contains("!allowed.contains(m) && !priceable(&route, m)"),
+            body.contains("!has_model(&allowed, m) && !priceable(&route, m)"),
             "价格闸没了 —— 出口能开放一个用户不付钱、你照付的模型"
         );
     }
