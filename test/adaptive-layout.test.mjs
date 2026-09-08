@@ -52,7 +52,7 @@ test("有效视口变量：写入点、两条触发路径、CSS 里不再有裸�
   const bare = decl.match(/(?<![\w.-])\d+(?:\.\d+)?v[hw]\b/g) || [];
   assert.deepEqual(bare, [], `还有裸的 vh/vw：${JSON.stringify(bare)}——放大时会按未缩放的视口撑大`);
   assert.ok((CSS.match(/var\(--eh, 100vh\)/g) || []).length >= 20, "--eh 的替换面不够，像是被整体回退了");
-  for (const f of ["gallery.jsx", "memory-center.jsx", "session-picker.jsx"]) {
+  for (const f of ["memory-center.jsx", "session-picker.jsx"]) {
     const jsx = readFileSync(join(HERE, "../src/ui", f), "utf8");
     assert.ok(!/\[\d+vh\]/.test(jsx), `${f} 里的 Tailwind 视口值没换成 --eh`);
   }

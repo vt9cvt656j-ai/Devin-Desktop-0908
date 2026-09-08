@@ -133,9 +133,11 @@ import "./styles/app.css";
 import "./styles/shadcn.css";
 import "./styles/custom-models.css";
 
-// React 岛：真正的 shadcn 组件（Radix 行为 + Tailwind）。这一行同时把 Tailwind 的
-// 样式带进来。控制台敲 showUIGallery() 看全部组件在当前配色下的样子。
-import "./ui/mount-gallery.jsx";
+// React 岛的底座（Radix 行为 + Tailwind）。这一行把 Tailwind 的样式带进 bundle，位置必须留在
+// 这里：排在上面三份 CSS 之后、其它样式之前，岛里的组件靠这个顺序压过旧选择器。
+// 原来引的是组件长廊（mount-gallery.jsx），2026-09-07 按所有者要求整个删掉了；
+// 岛的用法样例看 mount-slash-menu.jsx。
+import "./ui/island.jsx";
 import { renderMarkdownInto, renderMarkdownStream, langLabel, monacoLang, langIcon } from "./markdown.js";
 import { ExtensionHost } from "./ext/host.js";
 import { createExtensionManager } from "./ext/manager.js";
@@ -73585,11 +73587,6 @@ function getMenus() {
         { label: t("menu.problems"), icon: "i-error", hint: shortcutLabel("shift+mod+m"), action: () => toggleProblems() },
         { sep: true },
         { label: t("menu.commandPalette"), icon: "i-command", hint: shortcutLabel("shift+mod+p"), action: () => editorAction("editor.action.quickCommand") },
-        { sep: true },
-        // shadcn 组件长廊。走菜单而不是"控制台里敲函数"：IDE 自带的终端是真 shell，
-        // 在那里敲 showUIGallery() 只会得到 command not found —— 让人去开浏览器
-        // DevTools 才能看一眼 UI，本身就是个糟糕的入口。
-        { label: t("menu.uiGallery"), icon: "i-sparkle", action: () => window.showUIGallery?.() },
       ],
     },
     {
@@ -73606,9 +73603,10 @@ function getMenus() {
       label: t("menu.help"),
       items: [
         { label: t("menu.documentation"), icon: "i-book", action: () => openExternal("https://github.com/fendoushaonian/Devin-Desktop") },
+        // 「文档」和「关于」是一组（都是看东西），「检查更新」是动作、单独一组——所有者 2026-09-07 定的顺序。
+        { label: t("menu.about"), icon: "i-info", action: () => showAboutDialog() },
         { sep: true },
         { label: t("updates.check"), icon: "i-arrow-down", action: () => checkForIdeUpdate({ manual: true, force: true }) },
-        { label: t("menu.about"), icon: "i-info", action: () => showAboutDialog() },
       ],
     },
   ];
